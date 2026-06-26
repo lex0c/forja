@@ -22,12 +22,15 @@ import type { ProviderMessage } from '../providers/types.ts';
 //
 // Shared by every "bottom-of-turn" injector (working-state panel, static
 // guidance) so the alternation/replace-not-mutate contract lives in one place.
-export const appendTextToLastUserMessage = (messages: ProviderMessage[], text: string): void => {
-  if (messages.length === 0) return;
+// Returns true when the text was appended, false on the no-op paths (empty array / tail
+// not a user turn) so callers that must know whether the block actually reached the
+// request (e.g. proactive provenance) can branch on it.
+export const appendTextToLastUserMessage = (messages: ProviderMessage[], text: string): boolean => {
+  if (messages.length === 0) return false;
 
   const i = messages.length - 1;
   const last = messages[i];
-  if (last === undefined || last.role !== 'user') return;
+  if (last === undefined || last.role !== 'user') return false;
 
   if (typeof last.content === 'string') {
     // Plain text input → concatenate at the bottom (a blank input still gets
@@ -36,7 +39,7 @@ export const appendTextToLastUserMessage = (messages: ProviderMessage[], text: s
       role: 'user',
       content: last.content.length > 0 ? `${last.content}\n\n${text}` : text,
     };
-    return;
+    return true;
   }
 
   // tool_result blocks → append a trailing text block. A user message may carry
@@ -54,7 +57,8 @@ export const appendTextToLastUserMessage = (messages: ProviderMessage[], text: s
       role: 'user',
       content: [...content.slice(0, -1), { type: 'text', text: merged }],
     };
-    return;
+    return true;
   }
   messages[i] = { role: 'user', content: [...content, { type: 'text', text }] };
+  return true;
 };

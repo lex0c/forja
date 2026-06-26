@@ -249,6 +249,10 @@ export interface BootstrapInput {
   // memorySemanticVerify + memoryConflictDetect. CLI surfaces from
   // `args.memoryOverrideLlm` (S3.5 follow-up wires the flag).
   memoryOverrideDetect?: boolean;
+  // Phase 3 §4.4 — proactive memory injection override. When omitted, bootstrap resolves
+  // it from the [memory] config (DEFAULT_MEMORY_CONFIG.proactiveInject = true → default
+  // ON); threaded to HarnessConfig.memoryProactiveInject. Pass false to force it off.
+  memoryProactiveInject?: boolean;
   // Slice Q — suppress operator-facing stderr banners when the CLI
   // is producing structured NDJSON. The boot banner for the default-
   // ON governance detectors fires when both resolve via default;
@@ -1673,6 +1677,15 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
         : memoryLoaded.projectHadField.overrideDetectLlm
           ? 'project-config'
           : memoryLoaded.userHadField.overrideDetectLlm
+            ? 'user-config'
+            : 'default',
+    memoryProactiveInject: input.memoryProactiveInject ?? memoryLoaded.config.proactiveInject,
+    memoryProactiveInjectSource:
+      input.memoryProactiveInject !== undefined
+        ? 'cli'
+        : memoryLoaded.projectHadField.proactiveInject
+          ? 'project-config'
+          : memoryLoaded.userHadField.proactiveInject
             ? 'user-config'
             : 'default',
     ...(resolvedSystemPrompt !== undefined ? { systemPrompt: resolvedSystemPrompt } : {}),

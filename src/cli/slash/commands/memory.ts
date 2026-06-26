@@ -851,7 +851,10 @@ const parseProvenanceFlags = (args: string[]): ProvenanceFlags | { error: string
 
 const formatProvenanceRow = (row: MemoryProvenanceRow): string => {
   const ts = formatAuditTimestamp(row.createdAt);
-  const tc = row.toolCallId !== null ? row.toolCallId.slice(0, 8) : 'eager---';
+  // tool_call_id is null for base-context surfaces (eager + proactive); mark WHICH one
+  // produced the exposure — `eager---` / `proactive---` — so a proactive row isn't
+  // mislabeled as an eager load (the schema allows null only for those two surfaces).
+  const tc = row.toolCallId !== null ? row.toolCallId.slice(0, 8) : `${row.surface}---`;
   // Show hash prefix when present — full 64-char hex hides actual
   // identifying info we'd want at-a-glance; first 8 chars match
   // the existing prefix convention for session/tool ids.
@@ -3211,7 +3214,8 @@ const handleGovernanceAudit = (ctx: SlashContext, args: string[]): SlashResult =
       lines.push(`    exposures (${exposures.length}):`);
       for (const ex of exposures) {
         const ts = formatGovernanceTimestamp(ex.createdAt);
-        const tc = ex.toolCallId === null ? 'eager---' : displayGov(ex.toolCallId).slice(0, 8);
+        const tc =
+          ex.toolCallId === null ? `${ex.surface}---` : displayGov(ex.toolCallId).slice(0, 8);
         const session = displayGov(ex.sessionId).slice(0, 8);
         lines.push(`      ${ts} · ${ex.surface.padEnd(16)} · session=${session} · tc=${tc}`);
       }
@@ -3463,9 +3467,15 @@ const mutateMemoryConfig = (params: {
     const v = m.verify_semantic_llm ?? m.verifySemanticLlm;
     const c = m.conflict_detect_llm ?? m.conflictDetectLlm;
     const o = m.override_detect_llm ?? m.overrideDetectLlm;
+    // §4.4 — proactive_inject defaults ON, so `false` is the operator's persisted
+    // opt-out. It's not a governance patch, but it MUST survive this rewrite:
+    // dropping it lets the next boot fall back to the default and silently
+    // re-enable proactive injection.
+    const p = m.proactive_inject ?? m.proactiveInject;
     if (typeof v === 'boolean') memBlock.verify_semantic_llm = v;
     if (typeof c === 'boolean') memBlock.conflict_detect_llm = c;
     if (typeof o === 'boolean') memBlock.override_detect_llm = o;
+    if (typeof p === 'boolean') memBlock.proactive_inject = p;
   }
   if (patches.verifySemanticLlm !== undefined) {
     memBlock.verify_semantic_llm = patches.verifySemanticLlm;

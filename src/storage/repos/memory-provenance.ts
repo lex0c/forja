@@ -26,12 +26,13 @@ import { createHash } from 'node:crypto';
 import type { MemoryScope } from '../../memory/index.ts';
 import type { DB } from '../db.ts';
 
-export type ProvenanceSurface = 'eager' | 'memory_read' | 'retrieve_context';
+export type ProvenanceSurface = 'eager' | 'memory_read' | 'retrieve_context' | 'proactive';
 
 const VALID_SURFACES: ReadonlySet<ProvenanceSurface> = new Set([
   'eager',
   'memory_read',
   'retrieve_context',
+  'proactive',
 ]);
 
 // Mirror of MemoryScope. The DB CHECK at the schema layer is the
@@ -157,9 +158,13 @@ export const recordProvenance = (db: DB, input: RecordProvenanceInput): MemoryPr
   // surfaces MUST link to the originating tool_call — silently
   // accepting NULL there would orphan the provenance row from its
   // causal context (the very thing this table exists to record).
-  if (input.surface === 'eager') {
+  if (input.surface === 'eager' || input.surface === 'proactive') {
+    // Proactive injection (§4.4) appends a recalled body to the turn
+    // without a tool_call — like eager-load, the only legal toolCallId
+    // is null. Per-call surfaces (memory_read / retrieve_context) MUST
+    // link their originating tool_call.
     if (input.toolCallId !== null) {
-      throw new Error('recordProvenance: surface=eager requires toolCallId=null');
+      throw new Error(`recordProvenance: surface=${input.surface} requires toolCallId=null`);
     }
   } else if (input.toolCallId === null) {
     throw new Error(`recordProvenance: surface=${input.surface} requires a non-null toolCallId`);

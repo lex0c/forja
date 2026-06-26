@@ -30,7 +30,13 @@ const writeBody = (
   dir: string,
   name: string,
   body: string,
-  fm: { description?: string; state?: string; expires?: string } = {},
+  fm: {
+    description?: string;
+    state?: string;
+    expires?: string;
+    trust?: string;
+    triggers?: string[];
+  } = {},
 ): void => {
   mkdirSync(dir, { recursive: true });
   const lines = [
@@ -41,6 +47,8 @@ const writeBody = (
   ];
   if (fm.state !== undefined) lines.push(`state: ${fm.state}`);
   if (fm.expires !== undefined) lines.push(`expires: ${fm.expires}`);
+  if (fm.trust !== undefined) lines.push(`trust: ${fm.trust}`);
+  if (fm.triggers !== undefined) lines.push(`triggers: [${fm.triggers.join(', ')}]`);
   writeFileSync(join(dir, `${name}.md`), `---\n${lines.join('\n')}\n---\n\n${body}\n`);
 };
 
@@ -540,5 +548,128 @@ describe('createMemoryView', () => {
       excludeScopes: ['project_local'],
     }).search({ ...baseQuery, text: 'moat' });
     expect(offline.map((c) => c.nodeId)).toEqual(['memory:project_shared/bar']);
+  });
+});
+
+describe('createMemoryView — trustedOnly (§4.4 I3)', () => {
+  test('folds triggers: tags into the corpus on the proactive path (§4.4 P3)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Deploy](deploy-mem.md) — release steps\n');
+    // neither name/description/body says "kubernetes" — only the trigger tag.
+    writeBody(roots.user, 'deploy-mem', 'shipping notes', {
+      description: 'release steps',
+      triggers: ['kubernetes'],
+    });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    // proactive path: the tag is in the corpus → the query matches.
+    const safe = await createMemoryView({ registry, trustedOnly: true }).search({
+      ...baseQuery,
+      text: 'kubernetes',
+    });
+    expect(safe.map((c) => c.nodeId)).toContain('memory:user/deploy-mem');
+    // model-driven path: tags are NOT indexed → no match (corpus unchanged).
+    const open = await createMemoryView({ registry }).search({ ...baseQuery, text: 'kubernetes' });
+    expect(open.map((c) => c.nodeId)).not.toContain('memory:user/deploy-mem');
+  });
+
+  test('excludes quarantined memories (I3 active-only)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Act](act-auth.md) — auth\n- [Quar](quar-auth.md) — auth\n');
+    writeBody(roots.user, 'act-auth', 'body', { description: 'auth notes' });
+    writeBody(roots.user, 'quar-auth', 'body', { description: 'auth notes', state: 'quarantined' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const safe = await createMemoryView({ registry, trustedOnly: true }).search({
+      ...baseQuery,
+      text: 'auth',
+    });
+    expect(safe.map((c) => c.nodeId)).toContain('memory:user/act-auth');
+    expect(safe.map((c) => c.nodeId)).not.toContain('memory:user/quar-auth');
+    // Without trustedOnly the model-driven path still sees quarantined.
+    const open = await createMemoryView({ registry }).search({ ...baseQuery, text: 'auth' });
+    expect(open.map((c) => c.nodeId)).toContain('memory:user/quar-auth');
+  });
+
+  test('trusted lower-precedence sibling survives an untrusted shadow (trust before dedupe)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    // project_local/foo (higher precedence) is untrusted; user/foo (lower) is
+    // trusted. Deduping before the trust filter keeps only the untrusted shadow,
+    // drops it, and loses the trusted fallback. The proactive view must surface
+    // user/foo — mirrors assembleMemorySection's trust-before-dedupe order.
+    writeIndex(roots.projectLocal, '- [Foo](foo.md) — auth helper\n');
+    writeBody(roots.projectLocal, 'foo', 'untrusted shadow', {
+      description: 'auth helper',
+      trust: 'untrusted',
+    });
+    writeIndex(roots.user, '- [Foo](foo.md) — auth helper\n');
+    writeBody(roots.user, 'foo', 'trusted fallback', { description: 'auth helper' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const out = await createMemoryView({ registry, trustedOnly: true }).search({
+      ...baseQuery,
+      text: 'auth helper',
+    });
+    expect(out.map((c) => c.nodeId)).toContain('memory:user/foo');
+    expect(out.map((c) => c.nodeId)).not.toContain('memory:project_local/foo');
+  });
+
+  test('drops untrusted memories, keeps trusted', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(
+      roots.user,
+      '- [Trusted](trusted-auth.md) — auth\n- [Untrusted](untrusted-auth.md) — auth\n',
+    );
+    writeBody(roots.user, 'trusted-auth', 'body', { description: 'auth notes', trust: 'trusted' });
+    writeBody(roots.user, 'untrusted-auth', 'body', {
+      description: 'auth notes',
+      trust: 'untrusted',
+    });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const view = createMemoryView({ registry, trustedOnly: true });
+    const ids = (await view.search({ ...baseQuery, text: 'auth' })).map((c) => c.nodeId);
+    expect(ids).toContain('memory:user/trusted-auth');
+    expect(ids).not.toContain('memory:user/untrusted-auth');
+  });
+
+  test('keeps memories with trust absent (default trusted)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Plain](plain-auth.md) — auth\n');
+    writeBody(roots.user, 'plain-auth', 'body', { description: 'auth notes' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const view = createMemoryView({ registry, trustedOnly: true });
+    const ids = (await view.search({ ...baseQuery, text: 'auth' })).map((c) => c.nodeId);
+    expect(ids).toContain('memory:user/plain-auth');
+  });
+
+  test('without trustedOnly, untrusted still surfaces (the parked retrieve_context gap)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Untrusted](untrusted-auth.md) — auth\n');
+    writeBody(roots.user, 'untrusted-auth', 'body', {
+      description: 'auth notes',
+      trust: 'untrusted',
+    });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const view = createMemoryView({ registry });
+    const ids = (await view.search({ ...baseQuery, text: 'auth' })).map((c) => c.nodeId);
+    expect(ids).toContain('memory:user/untrusted-auth');
+  });
+
+  test('trustedOnly + loadBodies: untrusted body tokens never enter the corpus', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    // 'kerberos' lives only in the untrusted body — a body-only match.
+    writeIndex(roots.user, '- [U](untrusted-x.md) — unrelated\n');
+    writeBody(roots.user, 'untrusted-x', 'kerberos ticket', {
+      description: 'unrelated',
+      trust: 'untrusted',
+    });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const view = createMemoryView({ registry, trustedOnly: true, loadBodies: true });
+    const cands = await view.search({ ...baseQuery, text: 'kerberos' });
+    expect(cands).toEqual([]);
   });
 });

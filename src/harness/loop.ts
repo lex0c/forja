@@ -11,6 +11,7 @@ import { emitToolCallOutcome } from '../feedback/outcome-emitter.ts';
 import { buildScopeChain } from '../feedback/scope-detect.ts';
 import { type HookChainResult, type HookEventPayload, dispatchChain } from '../hooks/index.ts';
 import { resolveRepoRoot } from '../memory/paths.ts';
+import type { RecalledMemory } from '../memory/proactive-recall.ts';
 import { type MemoryRegistry, createScopeFilteredRegistry } from '../memory/registry.ts';
 import {
   type SemanticVerifyScheduler,
@@ -85,6 +86,13 @@ import {
 import { resolveProviderEffort } from './effort.ts';
 import { type ExhaustionSynthesisResult, synthesizeOnExhaustion } from './exhaustion-synthesis.ts';
 import { invokeTool } from './invoke-tool.ts';
+import {
+  type ProactiveRecallCacheEntry,
+  createProactiveRecall,
+  injectProactiveMemoryBlock,
+  recordProactiveExposures,
+  resolveCachedRecall,
+} from './proactive-memory-inject.ts';
 import { MAX_RESUME_MESSAGES } from './resume.ts';
 import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
 import { type HydrateInfo, SessionContext } from './session-context.ts';
@@ -488,6 +496,34 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // db. Built once per run (the store is stateless over the db) and reused in
   // buildCtx, rather than re-wrapping on every tool call.
   const contextPinsStore = config.contextPinsStore ?? createContextPinsStore(config.db);
+  // §4.4 P2 — proactive memory injection. Built once, primary-agent-only
+  // (`subagentDepth === 0`, the same primary signal the sibling memory
+  // detectors gate on — a subagent must not proactively inject), when the
+  // flag is on and a registry is wired. The view is trusted+active+
+  // loadBodies (I3) and mirrors the trust-probe scope posture. `undefined`/false
+  // → the injection site below is a no-op. (Product default is ON, resolved into
+  // config.memoryProactiveInject by bootstrap.)
+  const proactiveRecall =
+    config.memoryProactiveInject === true &&
+    (config.subagentDepth ?? 0) === 0 &&
+    config.memoryRegistry !== undefined
+      ? createProactiveRecall({
+          registry: config.memoryRegistry,
+          ...(config.memoryExcludeScopes !== undefined && config.memoryExcludeScopes.length > 0
+            ? { excludeScopes: config.memoryExcludeScopes }
+            : {}),
+        })
+      : undefined;
+  // Per-session recall cache (the P3 gate): recompute only when the working-
+  // state focus changes; re-inject the cached result each step. Function-
+  // local — dies with the run, like todoStore.
+  const proactiveCache = new Map<string, ProactiveRecallCacheEntry>();
+  // The recall for the CURRENT step, computed at the top of the loop (before
+  // maybeCompact) so its injected body size is counted in the compaction /
+  // output-fit decision; the injection site below consumes it. `recomputed`
+  // drives the provenance write (recompute = the working-state focus changed).
+  let proactiveRecalled: RecalledMemory[] = [];
+  let proactiveRecomputed = false;
   // Per-run totals. Each completed provider turn adds its usage and
   // its computed cost; HarnessResult.usage / costUsd report THIS
   // RUN's numbers — caller telemetry that has to stay self-
@@ -2614,6 +2650,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           const shape = [...messages];
           if (!force) {
             injectWorkingStateBlock(shape, workingStateStore.get(sessionId), steps);
+            // Count the proactive bodies too (computed before this call): they're
+            // appended to the real request below, AFTER this gate — omitting them
+            // here lets a near-ceiling request tip over context_window instead of
+            // compacting first.
+            injectProactiveMemoryBlock(shape, proactiveRecalled);
             if (config.enableStaticGuidance)
               injectStaticGuidance(shape, isSmallWindow(contextWindow));
           }
@@ -2962,6 +3003,34 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           toolsDirty = false;
         }
 
+        // §4.4 — compute the proactive recall BEFORE maybeCompact so its body
+        // size is counted in the compaction / output-fit decision (the block is
+        // appended to the request below, AFTER this gate). The injection site
+        // consumes this same result; `recomputed` drives its provenance write.
+        // Best-effort I/O (frontmatter peek + BM25): a failure leaves it empty.
+        proactiveRecalled = [];
+        proactiveRecomputed = false;
+        if (proactiveRecall !== undefined) {
+          try {
+            const focusKey = workingStateStore.get(sessionId).focus?.text ?? '';
+            const res = await resolveCachedRecall(
+              proactiveCache,
+              sessionId,
+              focusKey,
+              proactiveRecall,
+              config.userPrompt,
+            );
+            proactiveRecalled = res.recalled;
+            proactiveRecomputed = res.recomputed;
+          } catch (err) {
+            process.stderr.write(
+              `forja: proactive memory recall failed (continuing without it): ${
+                err instanceof Error ? err.message : String(err)
+              }\n`,
+            );
+          }
+        }
+
         // Compact BEFORE the provider call when over threshold (see
         // maybeCompact above). Runs every iteration, so it covers the first
         // call of a resumed/long session — the post-tool-result-only site
@@ -2991,7 +3060,39 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // Inject the working-state panel at the bottom of [current_turn]
         // (appended to the last user message) — max-attention, cache-neutral,
         // alternation-safe (WORKING_STATE.md §5). No-op when the panel is empty.
-        injectWorkingStateBlock(reqMessages, workingStateStore.get(sessionId), wsStep);
+        const ws = workingStateStore.get(sessionId);
+        injectWorkingStateBlock(reqMessages, ws, wsStep);
+        // §4.4 — inject the proactive recall onto the reqMessages tail (below the
+        // working-state panel) so it rides the uncached turn — never the cached
+        // prefix (I1) and never the persisted history (I2). The recall itself ran
+        // at the top of the loop (before maybeCompact, so its body size was counted
+        // in the compaction decision); here we append the cached result and, on
+        // recompute (focus changed), record the I5 exposure (one row per memory per
+        // focus, not per step). Best-effort: the provenance write re-peeks each
+        // memory (I/O), so guard it — a nudge must fail to nothing.
+        if (proactiveRecalled.length > 0) {
+          // Inject returns ONLY the memories the body budget actually rendered; record
+          // provenance for that subset, not the full recall — a memory dropped by the
+          // cap never reached the provider and must not get a surface='proactive' row.
+          const injected = injectProactiveMemoryBlock(reqMessages, proactiveRecalled);
+          if (proactiveRecomputed && config.memoryRegistry !== undefined && injected.length > 0) {
+            try {
+              recordProactiveExposures(
+                config.db,
+                config.memoryRegistry,
+                sessionId,
+                injected,
+                config.memoryExcludeScopes,
+              );
+            } catch (err) {
+              process.stderr.write(
+                `forja: proactive provenance write failed (continuing): ${
+                  err instanceof Error ? err.message : String(err)
+                }\n`,
+              );
+            }
+          }
+        }
         // Static operating guidance sits directly below the working-state panel
         // at the bottom of [current_turn]. Injected after the panel (so it stays
         // below) but gated to the primary agent: subagents have no working-state

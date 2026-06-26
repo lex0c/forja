@@ -294,6 +294,105 @@ Each task lands as one or more commits on the active branch. Each slice closes w
 
 ---
 
+# Phase 3 — Proactive memory injection (§4.4) · ✅ COMPLETE · default ON (`feat/proactive-memory`)
+
+**Branch: `feat/proactive-memory`** — the §4.4 spec is committed on this branch and the code follows on the same branch (spec precedes code in commit order, satisfying spec-first). Slice P0 is done; P1–P6 remain. Goal: an opt-in mode where the runtime identifies the turn's context, retrieves relevant memories by BM25, and injects their bodies into the turn — without the model calling `retrieve_context`. It is the materialization of the runtime triggers §4.3 left open. Default OFF; aimed at local/weak models where model-driven retrieval is unreliable (a strong model that already uses `retrieve_context` well only pays the added cache cost).
+
+**Architecture decision — the injection seam.** Inject via the `injectWorkingStateBlock` pattern (`src/harness/working-state-inject.ts`, called at `loop.ts:2994`): an ephemeral block appended to `reqMessages` per turn. NOT the `UserPromptSubmit` hook's `additionalContext` — the loop collects it but never injects it into context (`loop.ts:2545` only reads `blockedBy`; only the tool path in `invoke-tool.ts` consumes `additionalContext`). The reqMessages-tail seam gives I1 (tail sits after the last cache breakpoint → prefix intact) and I2 (reqMessages rebuilt per turn → ephemeral) for free, off an already-tested path.
+
+**Invariants carried from spec §4.4 (these ARE the acceptance gates):**
+
+- **I1 — prefix intact.** Injection never re-renders the system-prompt index segment (§4.1); the body lands in the reqMessages tail, after the last cache breakpoint. Cost is the turn's new tokens only.
+- **I2 — ephemeral.** The block lives for the turn that produced it; never persisted to `messages`, recomputed each turn.
+- **I3 — trust preserved.** Only `trusted` + `active`. `untrusted` is NEVER injected proactively (§7.2 rule 2). **This requires the trust filter parked in "Memory trust filter on `retrieve_context` slot" (DEFERRED below)** — §4.4 I3 resolves that item's open design decision: hard-filter (mirror eager-load), not marker/opt-in, for the proactive path.
+- **I4 — explicit floor + cap.** BM25 score floor + small top-K (~2–3). The floor is contract, not tuning.
+- **I5 — auditable.** Every proactive recall emits a `retrieval_trace` row (surface `proactive`) + a `memory_provenance` exposure.
+
+## Slice P0 — Foundation: flag + trust filter · ✅ DONE
+
+| Task | Description |
+|---|---|
+| **TP0.1** | Add `memoryProactiveInject?: boolean` + `memoryProactiveInjectSource?: 'cli' \| 'project-config' \| 'user-config' \| 'default'` to `HarnessConfig` (mirror `memorySemanticVerify`, `harness/types.ts:1042`). Resolve precedence in `bootstrap.ts`. Default OFF. Config key `[memory] proactive_inject`. |
+| **TP0.2** | Trust filter on the memory view — closes the parked "trust filter on `retrieve_context` slot" item (`retrieval/views/memory.ts:114-118`). Add `trustedOnly?: boolean` to `MemoryViewDeps`; when set, hard-filter `trust: untrusted` before BM25 indexing. This is the §4.4 I3 contract. |
+| **TP0.3** | Tests: flag precedence (cli > project > user > default); untrusted never surfaces with `trustedOnly` (I3 at the view layer). `tests/retrieval/memory-view.test.ts` + a bootstrap flag test. |
+
+**Done:** flag wired through `HarnessConfig` + `BootstrapInput` + `config/loaders.ts` (`[memory] proactive_inject` / `proactiveInject`, snake>camel, **default OFF**) and resolved in `bootstrap.ts` with cli>project>user>default precedence + a `memoryProactiveInjectSource` field. `trustedOnly` filter on `retrieval/views/memory.ts` enforcing the §4.4 I3 trusted+active contract — drops `trust: untrusted` (fail-closed; the `.map` corpus build became a `for` loop, one peek serves trust-check + bodies) AND narrows states to `active`-only (excludes quarantined; active-only landed in the P1 review). Default `retrieve_context` behavior unchanged — the broader untrusted-slot gap stays parked. Tests cover config precedence + the view trust/active filters; retrieval + bootstrap/governance/init suites green, typecheck + lint clean.
+
+## Slice P1 — Proactive recall producer (pure) · `src/memory/proactive-recall.ts` (new) · ✅ DONE
+
+| Task | Description |
+|---|---|
+| **TP1.1** | `buildProactiveRecall({ retrieve, threshold, topK })`: given `(goalText, prompt)`, build the query, call `ctx.retrieveContext(query, { views: ['memory'], loadBodies: true })` (`RetrieveFn`, `retrieval/types.ts:337`), filter `score ≥ floor`, take top-K, return `RecalledMemory[]`. |
+| **TP1.2** | Query builder = `workingStateStore.get(sid).focus?.text ?? goalText` + the latest prompt (reuse the `session-context.ts:348` pattern). |
+| **TP1.3** | Constants `PROACTIVE_RECALL_MIN_SCORE` + `PROACTIVE_RECALL_TOP_K` (exported, tunable). |
+| **TP1.4** | Tests (I4): floor cuts; top-K respected; empty query → empty; trusted-only honored. Pure given the runner → deterministic fixtures. |
+
+**Done:** `buildProactiveRecall(deps)` builds the query (goal + prompt; blank → recall nothing), scans the view's score order, applies the BM25 floor (`break` — sorted-desc) then the top-K cap (checked first, so `topK <= 0` recalls nothing), and resolves bodies via an injected `loadBody` (null/empty → dropped). Constants `PROACTIVE_RECALL_MIN_SCORE` (1.0, raw-BM25 scale) + `PROACTIVE_RECALL_TOP_K` (3), exported/tunable; P5 calibrates. **Design change from the plan:** deps are injected (`search` + `loadBody`), NOT `ctx.retrieveContext` — the runner takes no per-call `trustedOnly` (`RetrieveFnOpts` is `{toolCallId}` only; the memory view is built at boot), and routing through it would either flip the model-driven `retrieve_context` (the parked untrusted-slot gap) or drag in the pipeline's compression/levels. So P2 builds the `trustedOnly` + `loadBodies` view and passes its `search`; I3 stays in the view (P0), the trace (I5) in P4. **Review (medium):** extended `trustedOnly` to the full I3 contract (trusted + **active**), which removed the need for an in-producer re-rank (active-only ⇒ no quarantine-penalty reshuffle ⇒ the view's order is already final) and dropped the duplicated `===` comparator the finders flagged; also fixed a `topK <= 0` off-by-one. 8 producer tests + a quarantine-exclusion view test; retrieval suite green.
+
+## Slice P2 — Injection point (I1/I2) · `src/harness/proactive-memory-inject.ts` (new, mirrors `working-state-inject.ts`) · ✅ DONE
+
+| Task | Description |
+|---|---|
+| **TP2.1** | `injectProactiveMemoryBlock(reqMessages, recalled, step)` at the `loop.ts:2994` injection site. Marked block (`# Recalled for this turn`), ephemeral, never written to `messages`. |
+| **TP2.2** | Wire into the loop behind `config.memoryProactiveInject` + the P3 gate. Build the recall (P1) just before the provider call. |
+| **TP2.3** | Tests: I1 — system-prompt `memory` segment byte-identical with/without injection, breakpoint count unchanged; I2 — block present in `reqMessages`, absent from persisted `messages`; OFF when the flag is disabled. |
+
+**Done:** the feature turns on (behind the flag, default OFF + primary-agent-only). `proactive-memory-inject.ts` (new): `injectProactiveMemoryBlock` appends the `# Recalled for this turn` block to the bottom of [current_turn] via the shared `appendTextToLastUserMessage` — I1 (never touches the system-prompt index segment → cached prefix intact) + I2 (replace-not-mutate on the `reqMessages` snapshot → nothing persisted); bodies framed as reference, not instructions. `createProactiveRecall` wires the §4.4 I3 view (trusted+active+loadBodies) + a `parseMemoryNodeId` body loader. Wired in `loop.ts` after `injectWorkingStateBlock`, gated on `memoryProactiveInject && enableStaticGuidance` (the primary-agent proxy) `&& memoryRegistry`. **The P3 focus-change gate folded in here** as `resolveCachedRecall`: recompute only when the working-state focus changes (a stable goal pays once), re-inject the cached block each step. 12 tests (renderer I1/I2; the gate's recompute/reuse/per-session; end-to-end wiring with the I3 trust+active filter); loop suite green, typecheck + lint clean.
+
+## Slice P3 — Runtime-trigger gating · ✅ DONE (prompt-mention) · tool-call event deferred
+
+The focus-change gate (TP3.1) shipped inside P2 (`resolveCachedRecall`). **Scope finding:** `runAgent` runs per-turn (each REPL prompt = a fresh run + fresh cache), so the recall already recomputes per prompt and BM25 already matches what the prompt says — a runtime-trigger *gate* is redundant with that. The non-redundant piece is surfacing `triggers:`-tagged memories the prompt mentions but the body doesn't carry — done below by folding the tags into the proactive corpus. The tool-call event trigger (the bigger win) is deferred (see below).
+
+| Task | Description |
+|---|---|
+| **TP3.1** | ✅ Done in P2 — focus-change gate (`resolveCachedRecall`): recompute only when the working-state focus changes. |
+| **TP3.2** | Runtime-trigger matcher: match the prompt/event against `triggers:` runtime tags (the §4.3 runtime layer the boot-only `triggers.ts` left open). Compose with the focus gate (recall when EITHER fires). |
+| **TP3.3** | Tests: a trigger-tagged prompt recalls on a stable focus; no trigger + stable focus → no recall. |
+
+**Done (prompt-mention):** the memory view folds each memory's `triggers:` tags into the BM25 corpus (`TRIGGER_WEIGHT = 2`) ONLY on the proactive `trustedOnly` path, so a memory tagged `triggers: [deploy]` surfaces for a prompt mentioning "deploy" even when name/desc/body never say it — the §4.3 prompt-mention runtime trigger, no loop/gate change, zero effect on model-driven `retrieve_context` (tags aren't indexed there). The test pins both sides (proactive matches the tag-only term; model-driven doesn't).
+
+**Deferred — tool-call event trigger:** the genuinely distinct signal — model calls `bash` ⇒ surface `triggers: [bash]` memories the prompt never named — needs the loop to track tools-called-this-turn and feed them into the recall query/key. Higher value than prompt-mention but a loop-touching slice; parked as the §4.3 runtime "tool fired" layer.
+
+## Slice P4 — Trace + provenance (I5) · ✅ DONE
+
+| Task | Description |
+|---|---|
+| **TP4.1** | The runner already writes `retrieval_trace`; tag the proactive call `surface='proactive'`. |
+| **TP4.2** | Emit a `memory_provenance` exposure per injected memory (reuse the `eagerExposures` emitter). |
+| **TP4.3** | Tests (I5): each injection → provenance row with `surface='proactive'`; visible via `/memory provenance`. |
+
+**Done:** I5 is **provenance-only** for the proactive path — it bypasses the `retrieve_context` pipeline (no `retrieval_query_id`), so it's shaped like `eager`, not `retrieve_context`; there's no `retrieval_trace` to tag (TP4.1 assumed the runner — the runner isn't on this path). Migration 080 widens the `memory_provenance.surface` CHECK with `'proactive'` (rebuild, like 069; FKs + indexes preserved); `ProvenanceSurface` + `recordProvenance` treat it like `eager` (toolCallId null, no retrieval grouping fields). `recordProactiveExposures` (in `proactive-memory-inject.ts`) emits one exposure per injected memory, called from the loop on RECOMPUTE only (one row per memory per focus, not per step), best-effort inside the same try; `resolveCachedRecall` now returns `{recalled, recomputed}` to drive it. `/memory provenance` renders it unchanged (the renderer is surface-generic). Tests: repo (proactive inserts; rejects non-null toolCallId / retrieval fields), the emitter (a row per memory, malformed ids skipped), migration applies; slash + provenance suites green.
+
+## Slice P5 — Eval (default gate) · ✅ DONE · calibration cleared → default ON
+
+`evals/memory/proactive/`. Measures, on target (local/weak) models: useful recall vs injected noise; Δcache cost vs the reactive baseline (§4.1–4.2); I3 robustness under keyword-stuffing. **No default-ON without a green eval** — the flag stays OFF until the numbers justify it.
+
+**Done:** `evals/memory/proactive/` — 6 deterministic fixtures (no model) + `tests/memory/proactive-eval-fixtures.test.ts`, mirroring the `evals/memory/` governance-eval shape. Covers the axes above: useful recall vs noise (01); Δcache cost = 0 on off-topic turns + bounded (≤600 chars, ~100 tokens) at top-K (02/05); I3 robustness — untrusted (03) + quarantined (04) memories keyword-stuffed to the top of BM25 still never surface (the trust/active gate precedes scoring); top-K cap (05); P3 prompt-mention trigger (06). Runs against the REAL production defaults (floor 1.0, top-K 3).
+
+**Finding (feeds calibration):** the BM25 floor is absolute but IDF is corpus-relative — a term shared across a tiny corpus scores below 1.0 even when obviously relevant (the 06 trigger match scored 0.96 in a 2-doc corpus). The floor right for a large store is too high for a small one. **This pins the mechanism, not the values** — useful-recall-rate vs noise-rate tuning against a target (local/weak) model is the deferred default-ON calibration; the flag stays OFF until then.
+
+## Slice P6 (optional) — Operator surface
+
+`/memory` shows what was proactively injected this turn/session; toggle like `/memory governance`.
+
+## Dependency graph
+
+```
+P0 (flag + trust filter)   →  unblocks P1 (I3) and P2
+P1 (recall producer)       →  feeds P2
+P3 (gating)                →  feeds P2
+P2 (injection, I1/I2)      →  P4 (trace, I5)  →  P5 (eval gate)
+P6 (operator surface)      →  optional, after P2
+```
+
+Recommended order: **P0 → P1 + P3 (parallel) → P2 → P4 → P5**. P6 optional.
+
+**Reuses:** BM25 memory view, `ctx.retrieveContext` runner, `retrieval_trace` + `memory_provenance`, the detector feature-flag pattern, and `injectWorkingStateBlock`. No vector (principle 9). New code is small: `proactive-recall.ts` + `proactive-memory-inject.ts` + the trust-filter option + the flag + the gate.
+
+**Pull-in signal:** the §4.4 spec PR merges AND a target use-case lands — a local-model session where the operator reports memory not being recalled because the model never calls `retrieve_context`.
+
+---
+
 # DEFERRED — items intentionally left for later
 
 ## Shimmer on verb chips — §13 alignment (or removal)

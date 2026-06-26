@@ -32,6 +32,12 @@ const VIEW: RetrievalView = 'memory';
 const TITLE_WEIGHT = 3;
 const DESCRIPTION_WEIGHT = 2;
 const BODY_WEIGHT = 1;
+// §4.4 P3 — `triggers:` runtime tags fold into the corpus ONLY on the proactive
+// (`trustedOnly`) path, weighted like the description, so a memory tagged
+// `triggers: [deploy]` surfaces for a prompt mentioning "deploy" even when the
+// body never says it (the §4.3 runtime prompt-mention trigger). Off the
+// proactive path the tags don't shift model-driven retrieve_context scores.
+const TRIGGER_WEIGHT = 2;
 const DEFAULT_LIMIT = 20;
 
 // Stable node id format. `memory:<scope>/<name>` — scope-qualified
@@ -83,6 +89,19 @@ export interface MemoryViewDeps {
   // posture as the eager-load section. Empty / absent = no
   // exclusion.
   excludeScopes?: ReadonlyArray<MemoryScope>;
+  // §4.4 I3 proactive-safety filter. When true, the view enforces the
+  // full "trusted + active" contract an automatic injection requires:
+  //   - drops `trust: untrusted` (peeked from the body frontmatter —
+  //     the index carries no trust column — fail-closed: a memory whose
+  //     trust can't be read is dropped too);
+  //   - narrows the state set to `active` only (the `registry.list`
+  //     call below) — the model-driven path keeps `quarantined` with a
+  //     penalty + flag for the model to judge, but an automatic
+  //     injection must not surface a memory under review.
+  // Off/absent preserves today's behavior: untrusted + quarantined
+  // bodies still reach the model-driven retrieve_context slot (that
+  // broader gap stays parked). Only the §4.4 proactive path sets this.
+  trustedOnly?: boolean;
 }
 
 export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
@@ -155,8 +174,21 @@ export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
     // over allowed scopes and the local > shared > user fallback
     // is preserved.
     const listings = deps.registry.list({
-      deduplicateByName: true,
-      states: ['active', 'quarantined'],
+      // §4.4 I3 — on the trustedOnly path, DON'T dedupe here. Trust is a per-
+      // frontmatter property the index-only list() can't see, so deduping by
+      // name first lets an untrusted higher-precedence shadow eclipse a trusted
+      // same-name sibling: the peek below drops the shadow and the name vanishes
+      // from recall entirely. Dedupe AFTER the trust filter instead (below),
+      // keeping the first surviving precedence winner — the order
+      // assembleMemorySection uses (spec §7.2.2: trust is per-MEMORY, not
+      // per-name). The model-driven path doesn't trust-filter, so the registry's
+      // dedupe is correct there.
+      deduplicateByName: deps.trustedOnly !== true,
+      // §4.4 I3 — the proactive path (`trustedOnly`) is `active`-only:
+      // an automatic injection must not surface a memory under review
+      // (`quarantined`) any more than an untrusted one. The model-driven
+      // path keeps quarantined visible (penalty + flag, model judges).
+      states: deps.trustedOnly === true ? ['active'] : ['active', 'quarantined'],
       includeExpired: false,
       ...(deps.excludeScopes !== undefined && deps.excludeScopes.length > 0
         ? { excludeScopes: deps.excludeScopes }
@@ -170,51 +202,76 @@ export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
     // for a small registry that's nothing, but a Map keeps the
     // shape honest as the corpus grows.
     const listingById = new Map<string, (typeof listings)[number]>();
+    // Trust-aware name dedupe for the trustedOnly path: the list above is NOT
+    // deduped there, so collapse same-name shadows AFTER the trust filter below,
+    // keeping the first survivor (the list comes back in precedence order).
+    const seenNames = new Set<string>();
 
     // Build the corpus. Per-field weighting via token repetition —
     // the BM25 index doesn't care about fields, only term frequencies.
     // We pre-load bodies in one pass when requested so the BM25
     // index sees a complete corpus (avg-doc-length needs all docs
     // sized before scoring starts).
-    const docs: BM25Document[] = listings.map((l) => {
+    const docs: BM25Document[] = [];
+    for (const l of listings) {
       const id = memoryNodeId(l.scope, l.name);
+      // One peek serves both the trust check (`trustedOnly`) and the
+      // body tokens (`loadBodies`); skip it when neither needs a read.
+      //
+      // Use `registry.peek` (not `read`) — BM25 corpus construction
+      // reads EVERY listed memory body just to compute term
+      // frequencies for ranking. Only the top-K hits become
+      // candidates, and only the included slot entries ever reach the
+      // model. Emitting `memory_events action=read` per indexed memory
+      // would flood the audit log with rows for content the model
+      // never saw — same policy as compression fallback
+      // (§retrieval/compression.ts).
+      //
+      // Scope-pinned via `listingScopeOption(l)`: the listing already
+      // carries the post-dedupe winning scope; pinning keeps the body
+      // load symmetric with the compression resolver and avoids a
+      // precedence re-walk landing on a different scope's body.
+      const needsPeek = deps.loadBodies === true || deps.trustedOnly === true;
+      const file = needsPeek ? deps.registry.peek(l.name, listingScopeOption(l)) : undefined;
+      // §4.4 I3 — hard trust filter, fail-closed: drop when the trust
+      // marker can't be read (peek not `present`) OR is `untrusted`.
+      // An automatic injection must not surface content it can't prove
+      // is trusted. Skipped entirely when `trustedOnly` is off, so the
+      // prior behavior (untrusted bodies included) is preserved.
+      if (deps.trustedOnly === true) {
+        if (file === undefined || file.kind !== 'present') continue;
+        if (file.file.frontmatter.trust === 'untrusted') continue;
+        // Dedupe AFTER trust: the first surviving (highest-precedence) entry per
+        // name wins, so a trusted lower-precedence sibling isn't lost to an
+        // untrusted shadow that was just dropped above.
+        if (seenNames.has(l.name)) continue;
+        seenNames.add(l.name);
+      }
       listingById.set(id, l);
       const nameTokens = tokenize(l.name);
       const descTokens = tokenize(l.entry.hook);
       const tokens: string[] = [];
       for (let i = 0; i < TITLE_WEIGHT; i++) tokens.push(...nameTokens);
       for (let i = 0; i < DESCRIPTION_WEIGHT; i++) tokens.push(...descTokens);
-      if (deps.loadBodies === true) {
-        // Use `registry.peek` (not `read`) — BM25 corpus
-        // construction reads EVERY listed memory body just to
-        // compute term frequencies for ranking. Only the top-K
-        // hits actually become candidates, and only the included
-        // slot entries ever reach the model. Emitting
-        // `memory_events action=read` per indexed memory would
-        // flood the audit log with rows for content the model
-        // never saw — same policy as compression fallback
-        // (§retrieval/compression.ts).
-        //
-        // Scope-pinned via `{ scope: l.scope }`: the listing
-        // already carries the post-dedupe winning scope, and
-        // pinning makes the body load symmetric with the
-        // compression resolver (compression.ts memoryResolver).
-        // Without the pin, peek re-walks precedence and could
-        // land on a different scope's body if the registry's
-        // disk state changes between corpus build and body load
-        // — a race the listing-set is supposed to lock down.
-        // `present` means body loaded; `missing` / `malformed` /
-        // `unknown` fall through as title+description only (the
-        // candidate is still ranked on its name + description
-        // signal).
-        const file = deps.registry.peek(l.name, listingScopeOption(l));
-        if (file.kind === 'present') {
-          const bodyTokens = tokenize(file.file.body);
-          for (let i = 0; i < BODY_WEIGHT; i++) tokens.push(...bodyTokens);
+      // `present` means body loaded; `missing` / `malformed` /
+      // `unknown` fall through as title+description only (the candidate
+      // is still ranked on its name + description signal).
+      if (deps.loadBodies === true && file?.kind === 'present') {
+        const bodyTokens = tokenize(file.file.body);
+        for (let i = 0; i < BODY_WEIGHT; i++) tokens.push(...bodyTokens);
+      }
+      // §4.4 P3 — fold `triggers:` runtime tags into the corpus on the proactive
+      // path so a prompt mentioning a tag surfaces the tagged memory even when
+      // the body doesn't carry the term. `trustedOnly`-gated → the model-driven
+      // retrieve_context corpus is unchanged.
+      if (deps.trustedOnly === true && file?.kind === 'present') {
+        for (const trig of file.file.frontmatter.triggers ?? []) {
+          const trigTokens = tokenize(trig);
+          for (let i = 0; i < TRIGGER_WEIGHT; i++) tokens.push(...trigTokens);
         }
       }
-      return { id, tokens };
-    });
+      docs.push({ id, tokens });
+    }
 
     const index = createBM25Index(docs);
     const hits = index.topK(query.text, limit);
