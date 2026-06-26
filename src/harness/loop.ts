@@ -3070,14 +3070,17 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // focus, not per step). Best-effort: the provenance write re-peeks each
         // memory (I/O), so guard it — a nudge must fail to nothing.
         if (proactiveRecalled.length > 0) {
-          injectProactiveMemoryBlock(reqMessages, proactiveRecalled);
-          if (proactiveRecomputed && config.memoryRegistry !== undefined) {
+          // Inject returns ONLY the memories the body budget actually rendered; record
+          // provenance for that subset, not the full recall — a memory dropped by the
+          // cap never reached the provider and must not get a surface='proactive' row.
+          const injected = injectProactiveMemoryBlock(reqMessages, proactiveRecalled);
+          if (proactiveRecomputed && config.memoryRegistry !== undefined && injected.length > 0) {
             try {
               recordProactiveExposures(
                 config.db,
                 config.memoryRegistry,
                 sessionId,
-                proactiveRecalled,
+                injected,
                 config.memoryExcludeScopes,
               );
             } catch (err) {

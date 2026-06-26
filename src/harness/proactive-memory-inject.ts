@@ -84,13 +84,7 @@ const capRecalledBodies = (
   return out;
 };
 
-export const formatProactiveRecallBlock = (
-  recalled: readonly RecalledMemory[],
-  budgetTokens: number = PROACTIVE_BLOCK_BODY_BUDGET_TOKENS,
-): string | undefined => {
-  if (recalled.length === 0) return undefined;
-  const capped = capRecalledBodies(recalled, budgetTokens);
-  if (capped.length === 0) return undefined;
+const renderCappedBlock = (capped: ReadonlyArray<{ nodeId: string; body: string }>): string => {
   const lines: string[] = [
     BLOCK_HEADER,
     '',
@@ -104,13 +98,33 @@ export const formatProactiveRecallBlock = (
   return lines.join('\n');
 };
 
+export const formatProactiveRecallBlock = (
+  recalled: readonly RecalledMemory[],
+  budgetTokens: number = PROACTIVE_BLOCK_BODY_BUDGET_TOKENS,
+): string | undefined => {
+  if (recalled.length === 0) return undefined;
+  const capped = capRecalledBodies(recalled, budgetTokens);
+  if (capped.length === 0) return undefined;
+  return renderCappedBlock(capped);
+};
+
+// Inject the block at the turn tail and RETURN the memories actually rendered. The
+// body budget can drop (or truncate) later recalled items, so the caller MUST record
+// provenance for THIS subset — not the full recalled array. Recording the full array
+// would log surface='proactive' rows for bytes that never reached the provider,
+// corrupting the exposure audit and any detector that reads those rows as
+// model-visible context. The returned list is the original RecalledMemory objects
+// (a precedence-ordered prefix of `recalled`) whose nodeId survived the cap.
 export const injectProactiveMemoryBlock = (
   messages: ProviderMessage[],
   recalled: readonly RecalledMemory[],
-): void => {
-  const block = formatProactiveRecallBlock(recalled);
-  if (block === undefined) return;
-  appendTextToLastUserMessage(messages, block);
+  budgetTokens: number = PROACTIVE_BLOCK_BODY_BUDGET_TOKENS,
+): RecalledMemory[] => {
+  const capped = capRecalledBodies(recalled, budgetTokens);
+  if (capped.length === 0) return [];
+  appendTextToLastUserMessage(messages, renderCappedBlock(capped));
+  const injectedIds = new Set(capped.map((c) => c.nodeId));
+  return recalled.filter((m) => injectedIds.has(m.nodeId));
 };
 
 // Resolve a recalled node to the SAME on-disk file the proactive view ranked —

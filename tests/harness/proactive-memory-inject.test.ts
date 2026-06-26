@@ -328,6 +328,34 @@ describe('createProactiveRecall (wiring)', () => {
     expect(listProvenanceByName(db, sessionId, 'beta')).toHaveLength(1);
     expect(listProvenanceByName(db, sessionId, 'ghost')).toHaveLength(0);
   });
+
+  test('records provenance only for memories the budget injected (dropped overflow gets no row)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    // Two recalled memories whose bodies together exceed the block budget: the first
+    // fills it (~4000 chars), so the second is DROPPED at render and never reaches the
+    // provider. It must NOT get a surface='proactive' row. Mirrors the loop sequence:
+    // record exactly what injectProactiveMemoryBlock RETURNS, not the full recall.
+    const bigBody = `BIG_FILLS_BUDGET ${'lorem ipsum dolor sit amet '.repeat(300)}`;
+    writeIndex(roots.user, '- [Big](big.md) — big\n- [Small](small.md) — small\n');
+    writeBody(roots.user, 'big', bigBody, { description: 'big' });
+    writeBody(roots.user, 'small', 'small body', { description: 'small' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+
+    const messages: ProviderMessage[] = [{ role: 'user', content: 'p' }];
+    const injected = injectProactiveMemoryBlock(messages, [
+      rec('memory:user/big', bigBody),
+      rec('memory:user/small', 'small body'),
+    ]);
+    recordProactiveExposures(db, registry, sessionId, injected);
+
+    // Only big was injected; small was dropped by the cap.
+    expect(injected.map((m) => m.nodeId)).toEqual(['memory:user/big']);
+    expect(messages[0]?.content).not.toContain('small body');
+    // Provenance reflects exactly what reached the provider.
+    expect(listProvenanceByName(db, sessionId, 'big')).toHaveLength(1);
+    expect(listProvenanceByName(db, sessionId, 'small')).toHaveLength(0);
+  });
 });
 
 describe('resolveCachedRecall (the P3 focus-change gate)', () => {
