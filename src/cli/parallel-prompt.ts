@@ -7,13 +7,15 @@
 // ORCHESTRATION.md §1.3) and the `task_async` /
 // `task_await` family go unused — capability-dormant.
 //
-// The hint is short on purpose: tool descriptions carry the
-// per-tool "Parallel-safe: ..." line, so the system prompt
-// only needs to teach the META rule ("emit several tool_uses
-// in one turn when the work is independent"). Anchoring the
-// rule to concrete tools (read_file, grep, glob) and the
-// concrete subagent surface (task_async/task_await) keeps it
-// actionable rather than abstract.
+// The hint stays compact: tool descriptions carry the per-tool
+// "Parallel-safe: ..." line, so the system prompt only needs the
+// META rule. It frames parallel as the DEFAULT (not a balanced
+// "parallel-when-independent / sequential-when-dependent" choice
+// — models under-fan-out, so the burden is inverted: serialize
+// ONLY on a real data dependency) and names the concrete
+// anti-pattern (looping one read/grep per turn). Anchoring to
+// concrete tools (read_file, grep, glob) and the subagent surface
+// (task_async/task_await) keeps it actionable rather than abstract.
 //
 // Composition (principal): in the assembled prompt this hint
 // lands AFTER `# Constraints` and BEFORE `# Tool ergonomics` — it
@@ -26,13 +28,12 @@
 // recap, which is what drifted stale here.
 export const PARALLEL_HINT_PROMPT = `# Parallelism
 
-When the work is independent, emit MULTIPLE tool calls in a SINGLE turn — the harness dispatches them concurrently:
+Default to parallelism. When the work is independent, emit MULTIPLE tool calls in a SINGLE turn — the harness dispatches them concurrently and hands you every result at once.
 
-- Read-only tools (\`read_file\`, \`grep\`, \`glob\`, \`memory_read\`, \`memory_list\`, \`memory_search\`) are parallel-safe. Batch them in one turn instead of looping turn-by-turn.
-- For independent subtasks that need a full subagent run, use \`task_async\` to spawn several subagents in parallel, then \`task_await\` each to collect their outputs. Use \`task_cancel\` to abort one mid-run if its results are no longer needed.
-- Use \`task_list\` to recover handle ids you may have lost track of (long context, post-compaction, after a resume) or to confirm what is still in flight before fanning out more work.
+- Read-only tools (\`read_file\`, \`grep\`, \`glob\`, \`memory_read\`, \`memory_list\`, \`memory_search\`) are parallel-safe. The moment you know the set — "read these N files", "search for X, Y, and Z", "check the callers and the definition" — emit them together. Looping one read or grep per turn is the anti-pattern: it serializes work that carries no dependency and pays a round-trip per item.
+- For independent subtasks that need a full subagent run, spawn several with \`task_async\` in one turn, then \`task_await\` each to collect. The child's intermediate tool output stays out of your context — you keep the conclusion, not the file dumps — so fanning out is cheaper than reading it all yourself. \`task_cancel\` aborts one whose result is no longer needed; \`task_list\` recovers handle ids you lost track of (long context, post-compaction, after a resume) or confirms what is still in flight before fanning out more.
 
-Sequential dispatch is the right call when each step depends on the previous one's result; parallel dispatch is the right call when steps are independent — default to parallel for read-heavy exploration ("explore these N files", "search for X across the tree").`;
+Sequential dispatch is correct ONLY when a call's inputs depend on a previous call's output — read the file the grep just located, spawn B from A's result. Absent that dependency, fan out; when unsure whether two calls depend, assume they do not.`;
 
 // Compose the parallelism hint with a downstream (caller-
 // supplied) prompt. The hint goes FIRST as the background

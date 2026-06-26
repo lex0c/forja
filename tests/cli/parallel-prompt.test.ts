@@ -24,6 +24,16 @@ describe('parallel-prompt', () => {
     expect(PARALLEL_HINT_PROMPT.toLowerCase()).toContain('depend');
   });
 
+  test('PARALLEL_HINT_PROMPT frames parallel as the default and names the anti-pattern', () => {
+    // The strengthening intent (push MORE parallelism): parallel
+    // must be the stated DEFAULT, and the one-call-per-turn loop
+    // must be called out as the anti-pattern — otherwise a future
+    // edit could silently flatten the hint back to a neutral tone
+    // and the model would drift to one tool_use per turn.
+    expect(PARALLEL_HINT_PROMPT.toLowerCase()).toContain('default to parallel');
+    expect(PARALLEL_HINT_PROMPT.toLowerCase()).toContain('anti-pattern');
+  });
+
   test('composeWithParallelHint returns the hint alone when downstream is undefined', () => {
     const out = composeWithParallelHint(undefined);
     expect(out).toBe(PARALLEL_HINT_PROMPT);
