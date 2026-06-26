@@ -61,38 +61,46 @@ export const injectProactiveMemoryBlock = (
 // used for BOTH the injected body and its provenance row, so they can never
 // refer to different bytes. The node id carries no subdir, so an unqualified
 // peek(name, {scope}) can resolve a higher-precedence shadow (e.g. an expired /
-// quarantined top-level over the active seed the view selected). Re-run the
-// view's trustedOnly listing filters (active, non-expired, deduped, AND the same
-// excludeScopes — mirror createMemoryView's list()), find this node's surviving
-// listing, and peek it scope-pinned via listingScopeOption so the subdir matches.
-// Re-validate trust / active on the loaded bytes (fail-closed).
+// quarantined top-level over the active seed the view selected). Resolve the way
+// the view ranks: in PRECEDENCE ORDER, with trust applied BEFORE dedupe.
 //
-// excludeScopes MUST match the view's: it changes which (scope, name) listing
-// wins the dedupe. If bootstrap excludes project_shared, the view ranks the
-// allowed user/foo, but an unfiltered list here would keep the excluded
-// project_shared/foo shadow — and .find() couldn't locate the ranked user
-// listing, dropping the recall (and its provenance) entirely.
+// Trust before dedupe (mirror createMemoryView's trustedOnly path, spec §7.2.2):
+// trust is per-MEMORY, so deduping the index-only list() first would let an
+// untrusted higher-precedence same-name shadow collapse the name and hide the
+// trusted sibling the view actually ranked — .find() would then miss the ranked
+// memory:user/foo, loadBody returns null, and the safe memory is never injected
+// or audited. So DON'T dedupe in list(); filter to this node's (scope, name)
+// candidates — the scope pin drops cross-scope shadows, the precedence-ordered
+// walk drops within-scope subdir shadows — and return the FIRST that survives the
+// trust + active recheck (fail-closed on the loaded bytes). peek is scope-pinned
+// via listingScopeOption so the subdir matches the candidate.
+//
+// excludeScopes MUST match the view's: an excluded higher-precedence scope must
+// not reappear here, so it's threaded into the same list() call. If bootstrap
+// excludes project_shared, the view ranks the allowed user/foo and so must this.
 const resolveRankedMemoryFile = (
   registry: MemoryRegistry,
   scope: MemoryScope,
   name: string,
   excludeScopes?: ReadonlyArray<MemoryScope>,
 ) => {
-  const listing = registry
+  const candidates = registry
     .list({
-      deduplicateByName: true,
+      deduplicateByName: false,
       states: ['active'],
       includeExpired: false,
       ...(excludeScopes !== undefined && excludeScopes.length > 0 ? { excludeScopes } : {}),
     })
-    .find((l) => l.scope === scope && l.name === name);
-  if (listing === undefined) return null;
-  const file = registry.peek(listing.name, listingScopeOption(listing));
-  if (file.kind !== 'present') return null;
-  const fm = file.file.frontmatter;
-  if (fm.trust === 'untrusted') return null;
-  if (fm.state !== undefined && fm.state !== 'active') return null;
-  return file.file;
+    .filter((l) => l.scope === scope && l.name === name);
+  for (const listing of candidates) {
+    const file = registry.peek(listing.name, listingScopeOption(listing));
+    if (file.kind !== 'present') continue;
+    const fm = file.file.frontmatter;
+    if (fm.trust === 'untrusted') continue;
+    if (fm.state !== undefined && fm.state !== 'active') continue;
+    return file.file;
+  }
+  return null;
 };
 
 // Build the proactive recall fn from the registry (MEMORY.md §4.4 P2

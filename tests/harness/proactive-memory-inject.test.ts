@@ -260,6 +260,29 @@ describe('createProactiveRecall (wiring)', () => {
     expect(foo?.body).toContain('user fallback');
   });
 
+  test('resolves the body for a trusted sibling shadowed by an untrusted higher-precedence memory', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    // project_local/foo (higher precedence) is active but UNTRUSTED; user/foo is
+    // trusted. The view ranks user/foo (it filters trust before dedupe), so the
+    // resolver must too — else the dedupe keeps the untrusted shadow, .find misses
+    // the ranked user listing, and the safe memory loads as null (dropped + unaudited).
+    writeIndex(roots.projectLocal, '- [Foo](foo.md) — auth helper\n');
+    writeBody(roots.projectLocal, 'foo', 'untrusted shadow body', {
+      description: 'auth helper',
+      trust: 'untrusted',
+    });
+    writeIndex(roots.user, '- [Foo](foo.md) — auth helper\n');
+    writeBody(roots.user, 'foo', 'trusted fallback body', { description: 'auth helper' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const recall = createProactiveRecall({ registry, minScore: 0 });
+    const out = await recall({ goalText: 'auth', prompt: 'auth helper' });
+    const foo = out.find((r) => r.nodeId === 'memory:user/foo');
+    expect(foo).toBeDefined();
+    expect(foo?.body).toContain('trusted fallback');
+    expect(out.map((r) => r.nodeId)).not.toContain('memory:project_local/foo');
+  });
+
   test('recordProactiveExposures writes a canonical proactive row per loaded memory', () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);
