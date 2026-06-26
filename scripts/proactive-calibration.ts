@@ -32,7 +32,9 @@ const REPEAT = Number(process.argv[3] ?? '1');
 const FILTER = process.argv[4];
 
 if (MODEL === undefined || MODEL.length === 0) {
-  console.error('usage: bun run scripts/proactive-calibration.ts <model-id> [repeat] [name-filter]');
+  console.error(
+    'usage: bun run scripts/proactive-calibration.ts <model-id> [repeat] [name-filter]',
+  );
   process.exit(1);
 }
 
@@ -96,7 +98,8 @@ const SCENARIOS: Scenario[] = [
 // Detectors OFF: the default-ON verify/conflict schedulers try to spawn a
 // subagent mid-run (crashes under the eval harness) and add cost/noise
 // orthogonal to what we're measuring.
-const CONFIG_TOML = '[memory]\nverify_semantic_llm = false\nconflict_detect_llm = false\noverride_detect_llm = false\n';
+const CONFIG_TOML =
+  '[memory]\nverify_semantic_llm = false\nconflict_detect_llm = false\noverride_detect_llm = false\n';
 
 const buildCase = (s: Scenario): EvalCase => ({
   name: s.name,
@@ -124,7 +127,9 @@ const pad = (s: string, n: number) => s.padEnd(n).slice(0, n);
 console.error(`\nProactive calibration — model=${MODEL} repeat=${REPEAT} (floor=1.0 topK=3)`);
 console.error('A = proactive ON, B = proactive OFF; steps = mean. Body is index-hidden,');
 console.error('so B must memory_read to answer (a round-trip A avoids).\n');
-console.error(`${pad('scenario', 18)} ${pad('kind', 7)} ${pad('A pass', 7)} ${pad('A steps', 8)} ${pad('B pass', 7)} ${pad('B steps', 8)} verdict`);
+console.error(
+  `${pad('scenario', 18)} ${pad('kind', 7)} ${pad('A pass', 7)} ${pad('A steps', 8)} ${pad('B pass', 7)} ${pad('B steps', 8)} verdict`,
+);
 
 for (const s of SCENARIOS) {
   if (FILTER !== undefined && !s.name.includes(FILTER)) continue;
