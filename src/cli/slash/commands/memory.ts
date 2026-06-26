@@ -851,7 +851,10 @@ const parseProvenanceFlags = (args: string[]): ProvenanceFlags | { error: string
 
 const formatProvenanceRow = (row: MemoryProvenanceRow): string => {
   const ts = formatAuditTimestamp(row.createdAt);
-  const tc = row.toolCallId !== null ? row.toolCallId.slice(0, 8) : 'eager---';
+  // tool_call_id is null for base-context surfaces (eager + proactive); mark WHICH one
+  // produced the exposure — `eager---` / `proactive---` — so a proactive row isn't
+  // mislabeled as an eager load (the schema allows null only for those two surfaces).
+  const tc = row.toolCallId !== null ? row.toolCallId.slice(0, 8) : `${row.surface}---`;
   // Show hash prefix when present — full 64-char hex hides actual
   // identifying info we'd want at-a-glance; first 8 chars match
   // the existing prefix convention for session/tool ids.
@@ -3211,7 +3214,8 @@ const handleGovernanceAudit = (ctx: SlashContext, args: string[]): SlashResult =
       lines.push(`    exposures (${exposures.length}):`);
       for (const ex of exposures) {
         const ts = formatGovernanceTimestamp(ex.createdAt);
-        const tc = ex.toolCallId === null ? 'eager---' : displayGov(ex.toolCallId).slice(0, 8);
+        const tc =
+          ex.toolCallId === null ? `${ex.surface}---` : displayGov(ex.toolCallId).slice(0, 8);
         const session = displayGov(ex.sessionId).slice(0, 8);
         lines.push(`      ${ts} · ${ex.surface.padEnd(16)} · session=${session} · tc=${tc}`);
       }

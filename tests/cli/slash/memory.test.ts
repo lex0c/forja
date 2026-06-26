@@ -2452,6 +2452,30 @@ describe('/memory provenance (S1/T1.6)', () => {
     expect(text).toContain(`tc=${tc.slice(0, 8)}`);
   });
 
+  test('proactive exposure renders tc=proactive--- (not mislabeled as eager)', async () => {
+    const repo = makeTmp();
+    const { ctx, db, sessionId } = makeCtx(repo);
+    if (sessionId === null) throw new Error('expected sessionId');
+    // Proactive rows share eager's null tool_call_id; the formatter must brand them by
+    // surface, not stamp every null exposure as an eager load.
+    recordProvenance(db, {
+      sessionId,
+      toolCallId: null,
+      memoryScope: 'user',
+      memoryName: 'role',
+      surface: 'proactive',
+      memoryContentHash: 'c'.repeat(64),
+      memoryStateAtExposure: 'active',
+      createdAt: 1000,
+    });
+    const r = await memoryCommand.exec(['provenance', 'role'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = (r.notes ?? []).join('\n');
+    expect(text).toContain('tc=proactive---');
+    expect(text).not.toContain('tc=eager---');
+  });
+
   test('name lookup with no rows hints at --all', async () => {
     const repo = makeTmp();
     const { ctx } = makeCtx(repo);
