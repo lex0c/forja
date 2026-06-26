@@ -57,7 +57,10 @@ describe('formatProactiveRecallBlock', () => {
     expect(block).toContain('HEAD_MARKER'); // the prefix survives
     expect(block).not.toContain('TAIL_MARKER'); // the tail is dropped
     expect(block).toContain('truncated to fit the recall budget');
-    expect(block).toContain('memory_read memory:user/big'); // escape hatch to the full body
+    // The escape hatch uses memory_read's real args (name + scope), NOT the node id —
+    // memory_read("memory:user/big") would be an invalid name.
+    expect(block).toContain('memory_read name="big" scope="user"');
+    expect(block).not.toContain('memory_read memory:');
     // Bounded near the budget — far below the ~8000-char un-truncated body.
     expect(block.length).toBeLessThan(5000);
   });

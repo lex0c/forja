@@ -55,6 +55,16 @@ const truncateAtBoundary = (s: string, maxChars: number): string => {
   return (lastSpace > maxChars * 0.6 ? slice.slice(0, lastSpace) : slice).trimEnd();
 };
 
+// The body was clipped to the budget — tell the model how to fetch the rest. memory_read
+// takes a canonical name (+ optional scope), NOT the retrieval node id, so render the
+// PARSED name/scope; echoing the node id would have the model issue an invalid call.
+const truncationHint = (nodeId: string): string => {
+  const parsed = parseMemoryNodeId(nodeId);
+  return parsed === null
+    ? '[truncated to fit the recall budget]'
+    : `[truncated to fit the recall budget — read the full body with memory_read name="${parsed.name}" scope="${parsed.scope}"]`;
+};
+
 // Cap the recalled bodies against a greedy running budget. Bodies arrive in score order,
 // so the most relevant keep full content; a body that overflows the remaining budget is
 // truncated to a prefix with a pointer to fetch the rest, and nothing after it renders.
@@ -74,10 +84,7 @@ const capRecalledBodies = (
     }
     if (remainingChars >= MIN_BODY_PREFIX_CHARS) {
       const prefix = truncateAtBoundary(body, remainingChars);
-      out.push({
-        nodeId: m.nodeId,
-        body: `${prefix}\n\n[truncated to fit the recall budget — read the full memory with memory_read ${m.nodeId}]`,
-      });
+      out.push({ nodeId: m.nodeId, body: `${prefix}\n\n${truncationHint(m.nodeId)}` });
     }
     break; // budget spent (or the remainder is too small for a useful fragment).
   }
