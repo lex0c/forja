@@ -8,6 +8,7 @@ import { canonicalHash } from './canonical.ts';
 import {
   type Capability,
   type CapabilityKind,
+  bareDirScopeHint,
   effectiveCovers,
   formatCapability,
   hostPassthrough,
@@ -1977,9 +1978,16 @@ export const createPermissionEngine = (
         const { uncovered } = effectiveCovers(effectiveCapabilities, resolvedCapabilities, cwd);
         if (uncovered.length > 0) {
           const uncoveredStrings = sortCapabilities(uncovered).map(formatCapability);
+          // Self-correcting hint for the overwhelmingly common cause: a
+          // directory scope declared as a bare path instead of <dir>/**.
+          // Surfaces back to the parent via the child's error so the next
+          // spawn declares the right scope (see capabilities.ts).
+          const hint = bareDirScopeHint(effectiveCapabilities, uncovered);
           const decision: Decision = {
             kind: 'deny',
-            reason: `subagent capability outside declared envelope: ${uncoveredStrings.join(', ')}`,
+            reason: `subagent capability outside declared envelope: ${uncoveredStrings.join(', ')}${
+              hint !== null ? ` — ${hint}` : ''
+            }`,
             source: { layer: 'default', section: 'subagent-effective' },
           };
           const e = emitAudit(toolName, args, decision, resolvedCapabilities, 0, {}, null);

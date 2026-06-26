@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   type Capability,
   INVALID_SCOPE_SENTINEL,
+  bareDirScopeHint,
   capabilityCovers,
   capabilityCoversCwdAware,
   capabilityEquals,
@@ -203,6 +204,36 @@ describe('parseCapability — errors', () => {
   });
   test('scoped kind without colon throws', () => {
     expect(() => parseCapability('read-fs')).toThrow(/requires a scope/);
+  });
+  test('requires-scope errors suggest the /** form for fs kinds (self-correcting)', () => {
+    // Both throw sites (no-colon and empty-scope) must point a model at
+    // the directory-coverage form, since a bare `read-fs:/repo` covers no
+    // files inside it (it killed a subagent: every read denied).
+    expect(() => parseCapability('read-fs')).toThrow(/\/\*\*/);
+    expect(() => parseCapability('read-fs:')).toThrow(/\/\*\*/);
+  });
+});
+
+describe('bareDirScopeHint', () => {
+  test('suggests /** when an uncovered read sits under a declared bare-dir scope', () => {
+    const hint = bareDirScopeHint(
+      [parseCapability('read-fs:/repo')],
+      [parseCapability('read-fs:/repo/src/a.ts')],
+    );
+    expect(hint).toContain('/repo/**');
+  });
+  test('null when the declared scope already globs', () => {
+    expect(
+      bareDirScopeHint(
+        [parseCapability('read-fs:/repo/**')],
+        [parseCapability('read-fs:/other/x')],
+      ),
+    ).toBeNull();
+  });
+  test('null when the uncovered cap is a different kind than the bare dir', () => {
+    expect(
+      bareDirScopeHint([parseCapability('read-fs:/repo')], [parseCapability('write-fs:/repo/x')]),
+    ).toBeNull();
   });
 });
 

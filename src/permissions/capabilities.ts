@@ -147,6 +147,18 @@ export const formatCapability = (c: Capability): string => {
   return `${c.kind}:${c.scope}`;
 };
 
+// Example scope for the "requires a scope" errors, so a scope-missing
+// message is self-correcting instead of a dead-end. Path kinds get the
+// /** form (the directory-coverage footgun a bare path falls into);
+// exec/net get a representative scope.
+const scopeExampleFor = (kind: CapabilityKind): string => {
+  if (PATH_SCOPED_KINDS.has(kind)) return `${kind}:/abs/dir/**`;
+  if (kind === 'exec') return `${kind}:shell`;
+  if (kind === 'net-egress') return `${kind}:example.com`;
+  if (kind === 'net-ingress') return `${kind}:8080`;
+  return `${kind}:<scope>`;
+};
+
 // Parse the wire form. Throws on unknown kind or malformed shape.
 // Tolerant of empty scope only when the kind is scope-less.
 export const parseCapability = (s: string): Capability => {
@@ -159,7 +171,7 @@ export const parseCapability = (s: string): Capability => {
       throw new Error(`capability: unknown kind '${s}' — ${VALID_KINDS_HINT}`);
     }
     if (!KINDS_WITHOUT_SCOPE.has(s)) {
-      throw new Error(`capability: kind '${s}' requires a scope`);
+      throw new Error(`capability: kind '${s}' requires a scope, e.g. '${scopeExampleFor(s)}'`);
     }
     return { kind: s, scope: null };
   }
@@ -172,7 +184,9 @@ export const parseCapability = (s: string): Capability => {
     throw new Error(`capability: kind '${kind}' must not carry a scope (got '${scope}')`);
   }
   if (scope.length === 0) {
-    throw new Error(`capability: kind '${kind}' requires a non-empty scope`);
+    throw new Error(
+      `capability: kind '${kind}' requires a non-empty scope, e.g. '${scopeExampleFor(kind)}'`,
+    );
   }
   return { kind, scope };
 };
@@ -395,6 +409,35 @@ export const effectiveCovers = (
     else uncovered.push(r);
   }
   return { covered, uncovered };
+};
+
+// When a subagent tool is denied for "outside declared envelope", the
+// most common cause is a directory scope declared as a bare path
+// (read-fs:/repo) instead of read-fs:/repo/** — the bare form covers
+// ONLY that exact path, so every file read inside is uncovered (it
+// killed a `general-purpose` explore: denied on every read until
+// maxToolErrors). This derives a self-correcting hint for the deny
+// message: if some uncovered cap sits under a declared same-kind path
+// scope that lacks a trailing glob, suggest the /** form. Returns null
+// when no such pattern applies, so the caller appends nothing for
+// unrelated denials.
+export const bareDirScopeHint = (
+  effective: readonly Capability[],
+  uncovered: readonly Capability[],
+): string | null => {
+  for (const u of uncovered) {
+    if (!PATH_SCOPED_KINDS.has(u.kind) || u.scope === null) continue;
+    for (const e of effective) {
+      if (e.kind !== u.kind || e.scope === null) continue;
+      // Already a glob/wildcard scope → the bare-dir footgun does not apply.
+      if (e.scope.endsWith('*')) continue;
+      const base = e.scope.endsWith('/') ? e.scope.slice(0, -1) : e.scope;
+      if (base.length > 0 && u.scope.startsWith(`${base}/`)) {
+        return `'${formatCapability(e)}' is a bare path that covers only itself — declare '${base}/**' to grant the directory's contents`;
+      }
+    }
+  }
+  return null;
 };
 
 // Apply the intersection rule. Each `declared` capability covered

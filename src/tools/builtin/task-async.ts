@@ -70,7 +70,7 @@ export const taskAsyncTool: Tool<TaskAsyncInput, TaskAsyncOutput> = {
       capabilities: {
         type: 'array',
         items: { type: 'string' },
-        description: `Capability list the child needs (PERMISSION_ENGINE.md §10.1). Each entry is a bare kind or kind:scope, e.g. "read-fs:src/**", "exec:shell", "env-mutate". The kind MUST be one of the closed set [${CAPABILITY_KINDS.join(', ')}] — any other (e.g. "env-read") is rejected. REQUIRED — engine intersects declared ∩ parent; spawn refused if any declared capability is outside the parent's set. Pass [] to run pure-LLM (no side-effect capabilities). Slice 94 closed the prior gap where task_async had ZERO §10 wiring.`,
+        description: `Capabilities the child needs (PERMISSION_ENGINE.md §10.1), REQUIRED. Each entry is "kind" or "kind:scope"; kind ∈ [${CAPABILITY_KINDS.join(', ')}]. Only env-mutate, forja-mutate and host-passthrough are scope-less — every other kind REQUIRES a scope (read-fs:<path>, write-fs:<path>, delete-fs:<path>, exec:<shell|python|node|arbitrary>, net-egress:<host>, net-ingress:<port>, secret-access:<store>, git-write:<repo>). For a directory and everything under it the path MUST end in /** (e.g. read-fs:src/** or read-fs:/abs/repo/**); a bare read-fs:/abs/repo matches ONLY that path and covers NO files inside it — the #1 cause of a child denied on every read. The engine intersects declared ∩ parent and refuses the spawn if any capability is outside the parent's set. Pass [] for a pure-LLM child (no side-effect capabilities).`,
       },
     },
     required: ['subagent', 'prompt', 'capabilities'],
