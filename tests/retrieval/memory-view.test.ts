@@ -545,6 +545,24 @@ describe('createMemoryView', () => {
 });
 
 describe('createMemoryView — trustedOnly (§4.4 I3)', () => {
+  test('excludes quarantined memories (I3 active-only)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Act](act-auth.md) — auth\n- [Quar](quar-auth.md) — auth\n');
+    writeBody(roots.user, 'act-auth', 'body', { description: 'auth notes' });
+    writeBody(roots.user, 'quar-auth', 'body', { description: 'auth notes', state: 'quarantined' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const safe = await createMemoryView({ registry, trustedOnly: true }).search({
+      ...baseQuery,
+      text: 'auth',
+    });
+    expect(safe.map((c) => c.nodeId)).toContain('memory:user/act-auth');
+    expect(safe.map((c) => c.nodeId)).not.toContain('memory:user/quar-auth');
+    // Without trustedOnly the model-driven path still sees quarantined.
+    const open = await createMemoryView({ registry }).search({ ...baseQuery, text: 'auth' });
+    expect(open.map((c) => c.nodeId)).toContain('memory:user/quar-auth');
+  });
+
   test('drops untrusted memories, keeps trusted', async () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);

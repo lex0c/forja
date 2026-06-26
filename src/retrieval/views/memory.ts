@@ -83,15 +83,18 @@ export interface MemoryViewDeps {
   // posture as the eager-load section. Empty / absent = no
   // exclusion.
   excludeScopes?: ReadonlyArray<MemoryScope>;
-  // Hard trust filter (§4.4 I3 / the parked "trust filter on the
-  // retrieve_context slot" item). When true, drop `trust: untrusted`
-  // memories before BM25 indexing. The index carries no trust column,
-  // so we peek the body frontmatter to decide — fail-closed: a memory
-  // whose trust can't be read is dropped too. Off/absent preserves
-  // today's behavior (untrusted bodies still reach the model-driven
-  // retrieve_context slot — that broader gap stays parked). The §4.4
-  // proactive-injection path switches this on so an automatic
-  // injection never surfaces untrusted content.
+  // §4.4 I3 proactive-safety filter. When true, the view enforces the
+  // full "trusted + active" contract an automatic injection requires:
+  //   - drops `trust: untrusted` (peeked from the body frontmatter —
+  //     the index carries no trust column — fail-closed: a memory whose
+  //     trust can't be read is dropped too);
+  //   - narrows the state set to `active` only (the `registry.list`
+  //     call below) — the model-driven path keeps `quarantined` with a
+  //     penalty + flag for the model to judge, but an automatic
+  //     injection must not surface a memory under review.
+  // Off/absent preserves today's behavior: untrusted + quarantined
+  // bodies still reach the model-driven retrieve_context slot (that
+  // broader gap stays parked). Only the §4.4 proactive path sets this.
   trustedOnly?: boolean;
 }
 
@@ -166,7 +169,11 @@ export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
     // is preserved.
     const listings = deps.registry.list({
       deduplicateByName: true,
-      states: ['active', 'quarantined'],
+      // §4.4 I3 — the proactive path (`trustedOnly`) is `active`-only:
+      // an automatic injection must not surface a memory under review
+      // (`quarantined`) any more than an untrusted one. The model-driven
+      // path keeps quarantined visible (penalty + flag, model judges).
+      states: deps.trustedOnly === true ? ['active'] : ['active', 'quarantined'],
       includeExpired: false,
       ...(deps.excludeScopes !== undefined && deps.excludeScopes.length > 0
         ? { excludeScopes: deps.excludeScopes }
