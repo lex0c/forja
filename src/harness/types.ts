@@ -1061,10 +1061,11 @@ export interface HarnessConfig {
   // pre-S3.5 omit (loop treats undefined as "off").
   memoryOverrideDetect?: boolean;
   memoryOverrideDetectSource?: 'cli' | 'project-config' | 'user-config' | 'default';
-  // Phase 3 §4.4 — proactive memory injection (opt-in). DEFAULT OFF
-  // (unlike the three detectors above). When true, the loop proactively
-  // recalls + injects relevant memory bodies on eligible turns instead
-  // of waiting for the model to call retrieve_context.
+  // Phase 3 §4.4 — proactive memory injection. The PRODUCT default is ON (bootstrap
+  // resolves it from DEFAULT_MEMORY_CONFIG.proactiveInject = true). The loop gates on
+  // `=== true`, so a caller building HarnessConfig directly and OMITTING this disables it
+  // — set it explicitly to mirror bootstrap. When true, the loop proactively recalls +
+  // injects relevant memory bodies on eligible turns instead of waiting for retrieve_context.
   memoryProactiveInject?: boolean;
   memoryProactiveInjectSource?: 'cli' | 'project-config' | 'user-config' | 'default';
   // Inventory of memories that landed in the eager-load section

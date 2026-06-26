@@ -249,8 +249,9 @@ export interface BootstrapInput {
   // memorySemanticVerify + memoryConflictDetect. CLI surfaces from
   // `args.memoryOverrideLlm` (S3.5 follow-up wires the flag).
   memoryOverrideDetect?: boolean;
-  // Phase 3 §4.4 — proactive memory injection opt-in. Default false;
-  // threaded straight to HarnessConfig.memoryProactiveInject.
+  // Phase 3 §4.4 — proactive memory injection override. When omitted, bootstrap resolves
+  // it from the [memory] config (DEFAULT_MEMORY_CONFIG.proactiveInject = true → default
+  // ON); threaded to HarnessConfig.memoryProactiveInject. Pass false to force it off.
   memoryProactiveInject?: boolean;
   // Slice Q — suppress operator-facing stderr banners when the CLI
   // is producing structured NDJSON. The boot banner for the default-

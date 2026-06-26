@@ -70,6 +70,15 @@ describe('formatProactiveRecallBlock', () => {
     expect(block).toContain('short fact');
     expect(block).not.toContain('truncated to fit the recall budget');
   });
+
+  test('a body barely over budget renders whole, not as a LONGER truncated fragment', () => {
+    // budget 75 tokens → 300 chars remaining; a ~312-char body would truncate to ~300 +
+    // a ~90-char hint (longer than the body itself), so it must be emitted whole instead.
+    const body = `TINYOVERFLOW ${'word '.repeat(60)}`.trim();
+    const block = formatProactiveRecallBlock([rec('memory:user/x', body)], 75) as string;
+    expect(block).toContain(body); // the whole body is present, not a fragment
+    expect(block).not.toContain('truncated to fit the recall budget');
+  });
 });
 
 describe('injectProactiveMemoryBlock', () => {
@@ -104,10 +113,13 @@ describe('injectProactiveMemoryBlock', () => {
     expect(messages[0]).not.toBe(original);
   });
 
-  test('no-op when the last message is not a user turn', () => {
+  test('no-op when the last message is not a user turn → returns no exposures', () => {
     const messages: ProviderMessage[] = [{ role: 'assistant', content: 'x' }];
-    injectProactiveMemoryBlock(messages, [rec('memory:user/a', 'B')]);
+    const injected = injectProactiveMemoryBlock(messages, [rec('memory:user/a', 'B')]);
     expect(messages[0]?.content).toBe('x');
+    // The append no-op'd → nothing reached the provider → no exposures, so the loop
+    // records no phantom surface='proactive' rows.
+    expect(injected).toEqual([]);
   });
 });
 
@@ -402,7 +414,7 @@ describe('resolveCachedRecall (the P3 focus-change gate)', () => {
     expect(calls()).toBe(1);
     expect(out.recomputed).toBe(true);
     expect(out.recalled.map((r) => r.nodeId)).toEqual(['memory:user/focusA']);
-    expect(cache.get('s1')?.focusKey).toBe('focusA');
+    expect(cache.get('s1')?.focusKey).toBe('focusa'); // cache key is normalized (lowercased)
   });
 
   test('same focus reuses the cache (no recompute)', async () => {
@@ -423,7 +435,7 @@ describe('resolveCachedRecall (the P3 focus-change gate)', () => {
     expect(calls()).toBe(2);
     expect(out.recomputed).toBe(true);
     expect(out.recalled.map((r) => r.nodeId)).toEqual(['memory:user/focusB']);
-    expect(cache.get('s1')?.focusKey).toBe('focusB');
+    expect(cache.get('s1')?.focusKey).toBe('focusb'); // normalized cache key
   });
 
   test('sessions cache independently', async () => {
@@ -432,5 +444,16 @@ describe('resolveCachedRecall (the P3 focus-change gate)', () => {
     await resolveCachedRecall(cache, 's1', 'focusA', recall, 'p');
     await resolveCachedRecall(cache, 's2', 'focusA', recall, 'p');
     expect(calls()).toBe(2);
+  });
+
+  test('cosmetic rephrase (case / collapsed whitespace) reuses the cache — no re-record', async () => {
+    const cache = new Map<string, ProactiveRecallCacheEntry>();
+    const { recall, calls } = mk();
+    const r1 = await resolveCachedRecall(cache, 's1', 'Implement Auth', recall, 'p');
+    expect(r1.recomputed).toBe(true);
+    // Same focus, only case + surrounding/inner whitespace differ → same normalized key.
+    const r2 = await resolveCachedRecall(cache, 's1', '  implement   auth ', recall, 'p');
+    expect(r2.recomputed).toBe(false); // cache hit → no recompute, no duplicate provenance
+    expect(calls()).toBe(1);
   });
 });

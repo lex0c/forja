@@ -42,9 +42,9 @@ export interface MemoryConfigKeys {
   conflictDetectLlm: boolean;
   // S3 LLM-judge `user_override_repeated` detector.
   overrideDetectLlm: boolean;
-  // Phase 3 §4.4 — proactive memory injection. UNLIKE the three
-  // detectors above, this defaults OFF (opt-in): it trades cache
-  // stability for recall, aimed at weak/local models.
+  // Phase 3 §4.4 — proactive memory injection. LIKE the three detectors above, this
+  // defaults ON (the calibration gate cleared); set false to opt out. It trades a little
+  // cache stability for recall — strong models gain efficiency, weak/local models accuracy.
   proactiveInject: boolean;
 }
 
@@ -193,7 +193,8 @@ const parseMemoryLayer = (
     }
   }
 
-  // Phase 3 §4.4 — proactive_inject. Same parse shape; defaults OFF.
+  // Phase 3 §4.4 — proactive_inject. Same parse shape as the detectors; the default (ON)
+  // lives in DEFAULT_MEMORY_CONFIG, not here — this layer only parses an explicit value.
   const snakeProactive = m.proactive_inject;
   const camelProactive = m.proactiveInject;
   if (snakeProactive !== undefined && camelProactive !== undefined) {

@@ -499,9 +499,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // §4.4 P2 — proactive memory injection. Built once, primary-agent-only
   // (`subagentDepth === 0`, the same primary signal the sibling memory
   // detectors gate on — a subagent must not proactively inject), when the
-  // opt-in flag is on and a registry is wired. The view is trusted+active+
-  // loadBodies (I3) and mirrors the trust-probe scope posture. `undefined`
-  // when off → the injection site below is a no-op (default OFF).
+  // flag is on and a registry is wired. The view is trusted+active+
+  // loadBodies (I3) and mirrors the trust-probe scope posture. `undefined`/false
+  // → the injection site below is a no-op. (Product default is ON, resolved into
+  // config.memoryProactiveInject by bootstrap.)
   const proactiveRecall =
     config.memoryProactiveInject === true &&
     (config.subagentDepth ?? 0) === 0 &&

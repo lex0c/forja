@@ -83,12 +83,15 @@ const capRecalledBodies = (
       continue;
     }
     if (remainingChars >= MIN_BODY_PREFIX_CHARS) {
-      const prefix = truncateAtBoundary(body, remainingChars);
-      out.push({
-        nodeId: m.nodeId,
-        body: `${prefix}\n\n${truncationHint(m.nodeId)}`,
-        truncated: true,
-      });
+      const truncatedBody = `${truncateAtBoundary(body, remainingChars)}\n\n${truncationHint(m.nodeId)}`;
+      // Only truncate when it actually SAVES space. A body barely over budget can yield a
+      // prefix+hint LONGER than the whole body — pure waste, and it would falsely null the
+      // provenance hash + nudge a pointless memory_read. Emit it whole in that case.
+      out.push(
+        truncatedBody.length < body.length
+          ? { nodeId: m.nodeId, body: truncatedBody, truncated: true }
+          : { nodeId: m.nodeId, body, truncated: false },
+      );
     }
     break; // budget spent (or the remainder is too small for a useful fragment).
   }
@@ -141,7 +144,9 @@ export const injectProactiveMemoryBlock = (
 ): InjectedExposure[] => {
   const capped = capRecalledBodies(recalled, budgetTokens);
   if (capped.length === 0) return [];
-  appendTextToLastUserMessage(messages, renderCappedBlock(capped));
+  // If the tail isn't a user turn the append no-ops — nothing reached the provider, so
+  // return no exposures (recording them would log phantom surface='proactive' rows).
+  if (!appendTextToLastUserMessage(messages, renderCappedBlock(capped))) return [];
   return capped.map((c) => ({ nodeId: c.nodeId, truncated: c.truncated }));
 };
 
@@ -239,11 +244,18 @@ export interface ProactiveRecallCacheEntry {
   recalled: RecalledMemory[];
 }
 
-// The §4.4 P3 gate. Recompute the recall ONLY when the working-state focus
-// changed since the last recall for this session; otherwise reuse the cached
-// result — a stable goal across steps pays the recall cost once, while the
-// caller still re-injects the block each step. Mutates `cache`; pure given
-// `recall`.
+// Normalize the focus to a stable cache key: case + surrounding/inner whitespace are
+// cosmetic to the BM25 recall (it lowercases and splits on the same boundaries), so they
+// must NOT miss the cache and re-record a duplicate provenance row for an identical
+// recall. Punctuation-only differences still recompute — the cost there is one extra
+// recall, never a wrong result.
+const normalizeFocusKey = (focus: string): string =>
+  focus.trim().toLowerCase().split(/\s+/).join(' ');
+
+// The §4.4 P3 gate. Recompute the recall ONLY when the working-state focus changed
+// (modulo cosmetic normalization) since the last recall for this session; otherwise
+// reuse the cached result — a stable goal across steps pays the recall cost once, while
+// the caller still re-injects the block each step. Mutates `cache`; pure given `recall`.
 export const resolveCachedRecall = async (
   cache: Map<string, ProactiveRecallCacheEntry>,
   sessionId: string,
@@ -251,12 +263,15 @@ export const resolveCachedRecall = async (
   recall: (input: { goalText: string; prompt: string }) => Promise<RecalledMemory[]>,
   prompt: string,
 ): Promise<{ recalled: RecalledMemory[]; recomputed: boolean }> => {
+  const key = normalizeFocusKey(focusKey);
   const cached = cache.get(sessionId);
-  if (cached !== undefined && cached.focusKey === focusKey) {
+  if (cached !== undefined && cached.focusKey === key) {
     return { recalled: cached.recalled, recomputed: false };
   }
+  // BM25 tokenizes the raw focus anyway, so pass the original text to the recall and keep
+  // only the normalized form as the cache identity.
   const recalled = await recall({ goalText: focusKey, prompt });
-  cache.set(sessionId, { focusKey, recalled });
+  cache.set(sessionId, { focusKey: key, recalled });
   return { recalled, recomputed: true };
 };
 
@@ -284,9 +299,12 @@ export const recordProactiveExposures = (
   for (const m of exposures) {
     const parsed = parseMemoryNodeId(m.nodeId);
     if (parsed === null) continue;
-    const file = resolveRankedMemoryFile(registry, parsed.scope, parsed.name, excludeScopes);
-    if (file === null) continue;
     try {
+      // Resolve INSIDE the try: it does I/O (list() peeks every active listing, and a
+      // single unreadable corpus file re-throws non-ENOENT), so a throw here must drop
+      // only this row, honoring the per-row "one failure must not drop the rest" contract.
+      const file = resolveRankedMemoryFile(registry, parsed.scope, parsed.name, excludeScopes);
+      if (file === null) continue;
       recordProvenance(db, {
         sessionId,
         toolCallId: null,
@@ -297,8 +315,18 @@ export const recordProactiveExposures = (
           m.truncated === true ? null : hashMemoryContent(serializeMemoryFile(file)),
         memoryStateAtExposure: file.frontmatter.state ?? 'active',
       });
-    } catch {
-      // best-effort per row — swallow so the rest still record.
+    } catch (err) {
+      // Best-effort per row: one failure (I/O on the resolve, or a SQLite error on the
+      // write) must not drop the rest. But SURFACE it (AUDIT DRIFT) — now that the resolve
+      // sits inside this catch, silently swallowing would hide an unauditable exposure
+      // that previously reached the loop's logging catch. The bound params are only
+      // hash / name / scope (none secret, unlike the body-carrying emitters), so the
+      // message needs no redaction.
+      process.stderr.write(
+        `forja: proactive provenance row skipped (${m.nodeId}): ${
+          err instanceof Error ? err.message : String(err)
+        }\n`,
+      );
     }
   }
 };
