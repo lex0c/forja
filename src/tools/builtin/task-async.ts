@@ -1,4 +1,4 @@
-import { parseCapability } from '../../permissions/capabilities.ts';
+import { CAPABILITY_KINDS, parseCapability } from '../../permissions/capabilities.ts';
 import { MAX_SUBAGENT_DEPTH } from '../../subagents/types.ts';
 import { DEFER_BELOW_TOKENS_SMALL } from '../context-budget.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
@@ -70,8 +70,7 @@ export const taskAsyncTool: Tool<TaskAsyncInput, TaskAsyncOutput> = {
       capabilities: {
         type: 'array',
         items: { type: 'string' },
-        description:
-          "Capability list the child needs (PERMISSION_ENGINE.md §10.1). REQUIRED — engine intersects declared ∩ parent; spawn refused if any declared capability is outside the parent's set. Pass [] to run pure-LLM (no side-effect capabilities). Slice 94 closed the prior gap where task_async had ZERO §10 wiring.",
+        description: `Capability list the child needs (PERMISSION_ENGINE.md §10.1). Each entry is a bare kind or kind:scope, e.g. "read-fs:src/**", "exec:shell", "env-mutate". The kind MUST be one of the closed set [${CAPABILITY_KINDS.join(', ')}] — any other (e.g. "env-read") is rejected. REQUIRED — engine intersects declared ∩ parent; spawn refused if any declared capability is outside the parent's set. Pass [] to run pure-LLM (no side-effect capabilities). Slice 94 closed the prior gap where task_async had ZERO §10 wiring.`,
       },
     },
     required: ['subagent', 'prompt', 'capabilities'],

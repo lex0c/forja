@@ -186,6 +186,15 @@ describe('parseCapability — errors', () => {
     expect(() => parseCapability('bogus:x')).toThrow(/unknown kind/);
     expect(() => parseCapability('unknownkind')).toThrow(/unknown kind/);
   });
+  test('unknown-kind error enumerates the valid kinds (self-correcting hint)', () => {
+    // The message must list the closed set so a model that guessed a
+    // bogus kind (observed: `env-read`, by analogy to read-fs/env-mutate)
+    // can self-correct on retry instead of guessing again. Covers both
+    // throw sites: scope-less (no colon) and scoped (with colon).
+    expect(() => parseCapability('env-read')).toThrow(/valid kinds:.*read-fs/);
+    expect(() => parseCapability('env-read')).toThrow(/env-mutate/);
+    expect(() => parseCapability('env-read:x')).toThrow(/valid kinds:.*read-fs/);
+  });
   test('scoped kind missing scope throws', () => {
     expect(() => parseCapability('read-fs:')).toThrow(/non-empty scope/);
   });

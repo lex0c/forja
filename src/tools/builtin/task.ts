@@ -1,4 +1,4 @@
-import { parseCapability } from '../../permissions/capabilities.ts';
+import { CAPABILITY_KINDS, parseCapability } from '../../permissions/capabilities.ts';
 import type { WorktreeOutcome } from '../../subagents/types.ts';
 import { DEFER_BELOW_TOKENS_SMALL } from '../context-budget.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
@@ -93,8 +93,7 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
       capabilities: {
         type: 'array',
         items: { type: 'string' },
-        description:
-          'Capability list the child needs (PERMISSION_ENGINE.md §10.1). Each entry is a capability string like "read-fs:src/**", "exec:shell", "env-mutate". REQUIRED — the spec demands explicit declaration of what the child can do; the engine intersects declared ∩ parent and refuses the spawn if any declared capability is outside the parent\'s set. Pass [] to run the subagent pure-LLM (no side-effect capabilities). Slice 94 closed the prior "omit for legacy bypass" path — operator must declare.',
+        description: `Capability list the child needs (PERMISSION_ENGINE.md §10.1). Each entry is a bare kind or kind:scope, e.g. "read-fs:src/**", "exec:shell", "env-mutate". The kind MUST be one of the closed set [${CAPABILITY_KINDS.join(', ')}] — any other (e.g. "env-read") is rejected. REQUIRED — the spec demands explicit declaration of what the child can do; the engine intersects declared ∩ parent and refuses the spawn if any declared capability is outside the parent's set. Pass [] to run the subagent pure-LLM (no side-effect capabilities). Slice 94 closed the prior "omit for legacy bypass" path — operator must declare.`,
       },
     },
     required: ['subagent', 'prompt', 'capabilities'],

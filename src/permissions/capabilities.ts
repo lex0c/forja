@@ -101,6 +101,19 @@ export interface Capability {
 
 export const isCapabilityKind = (s: string): s is CapabilityKind => ALL_KINDS.has(s);
 
+// The closed set of valid kinds, in stable declaration order. Exported as
+// the SINGLE SOURCE for the "unknown kind" error below and the task tools'
+// capability-arg description, so the model sees the allowlist instead of
+// inventing kinds by analogy (a model declared `env-read` from the read-fs /
+// env-mutate examples — there is no env-read; reading env is not a gated
+// capability). Derived from ALL_KINDS, not a second hardcoded list, so the
+// two cannot drift.
+export const CAPABILITY_KINDS: readonly CapabilityKind[] = [...ALL_KINDS] as CapabilityKind[];
+
+// Reusable suffix for the unknown-kind errors: turns a dead-end "unknown
+// kind 'x'" into a self-correcting hint the model can act on next try.
+const VALID_KINDS_HINT = `valid kinds: ${CAPABILITY_KINDS.join(', ')}`;
+
 // Sentinel scope emitted when a scoped capability is constructed
 // with `scope === null`. The pre-fix path emitted `<kind>:*`
 // (wildcard), which silently WIDENED authorization — exactly the
@@ -143,7 +156,7 @@ export const parseCapability = (s: string): Capability => {
   const colon = s.indexOf(':');
   if (colon === -1) {
     if (!isCapabilityKind(s)) {
-      throw new Error(`capability: unknown kind '${s}'`);
+      throw new Error(`capability: unknown kind '${s}' — ${VALID_KINDS_HINT}`);
     }
     if (!KINDS_WITHOUT_SCOPE.has(s)) {
       throw new Error(`capability: kind '${s}' requires a scope`);
@@ -153,7 +166,7 @@ export const parseCapability = (s: string): Capability => {
   const kind = s.slice(0, colon);
   const scope = s.slice(colon + 1);
   if (!isCapabilityKind(kind)) {
-    throw new Error(`capability: unknown kind '${kind}'`);
+    throw new Error(`capability: unknown kind '${kind}' — ${VALID_KINDS_HINT}`);
   }
   if (KINDS_WITHOUT_SCOPE.has(kind)) {
     throw new Error(`capability: kind '${kind}' must not carry a scope (got '${scope}')`);
