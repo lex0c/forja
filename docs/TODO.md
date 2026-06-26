@@ -294,7 +294,7 @@ Each task lands as one or more commits on the active branch. Each slice closes w
 
 ---
 
-# Phase 3 — Proactive memory injection (§4.4) · IN PROGRESS (`feat/proactive-memory`)
+# Phase 3 — Proactive memory injection (§4.4) · ✅ COMPLETE · default ON (`feat/proactive-memory`)
 
 **Branch: `feat/proactive-memory`** — the §4.4 spec is committed on this branch and the code follows on the same branch (spec precedes code in commit order, satisfying spec-first). Slice P0 is done; P1–P6 remain. Goal: an opt-in mode where the runtime identifies the turn's context, retrieves relevant memories by BM25, and injects their bodies into the turn — without the model calling `retrieve_context`. It is the materialization of the runtime triggers §4.3 left open. Default OFF; aimed at local/weak models where model-driven retrieval is unreliable (a strong model that already uses `retrieve_context` well only pays the added cache cost).
 
@@ -363,7 +363,7 @@ The focus-change gate (TP3.1) shipped inside P2 (`resolveCachedRecall`). **Scope
 
 **Done:** I5 is **provenance-only** for the proactive path — it bypasses the `retrieve_context` pipeline (no `retrieval_query_id`), so it's shaped like `eager`, not `retrieve_context`; there's no `retrieval_trace` to tag (TP4.1 assumed the runner — the runner isn't on this path). Migration 080 widens the `memory_provenance.surface` CHECK with `'proactive'` (rebuild, like 069; FKs + indexes preserved); `ProvenanceSurface` + `recordProvenance` treat it like `eager` (toolCallId null, no retrieval grouping fields). `recordProactiveExposures` (in `proactive-memory-inject.ts`) emits one exposure per injected memory, called from the loop on RECOMPUTE only (one row per memory per focus, not per step), best-effort inside the same try; `resolveCachedRecall` now returns `{recalled, recomputed}` to drive it. `/memory provenance` renders it unchanged (the renderer is surface-generic). Tests: repo (proactive inserts; rejects non-null toolCallId / retrieval fields), the emitter (a row per memory, malformed ids skipped), migration applies; slash + provenance suites green.
 
-## Slice P5 — Eval (default gate) · ✅ DONE (deterministic mechanism) · model calibration deferred
+## Slice P5 — Eval (default gate) · ✅ DONE · calibration cleared → default ON
 
 `evals/memory/proactive/`. Measures, on target (local/weak) models: useful recall vs injected noise; Δcache cost vs the reactive baseline (§4.1–4.2); I3 robustness under keyword-stuffing. **No default-ON without a green eval** — the flag stays OFF until the numbers justify it.
 

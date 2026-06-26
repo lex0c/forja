@@ -223,16 +223,17 @@ override_detect_llm = false
 });
 
 describe('loadMemoryConfig — proactive_inject (§4.4)', () => {
-  test('absent → defaults OFF (false) + hadField false, detectors unaffected', () => {
+  test('absent → defaults ON (true) + hadField false, detectors unaffected', () => {
     const cwd = makeTempCwd();
     const home = mkdtempSync(join(tmpdir(), 'forja-mem-home-'));
     try {
       const result = loadMemoryConfig({ cwd, env: { HOME: home } });
-      expect(result.config.proactiveInject).toBe(false);
+      // §4.4 default ON after the calibration gate cleared.
+      expect(result.config.proactiveInject).toBe(true);
       expect(result.config.proactiveInject).toBe(DEFAULT_MEMORY_CONFIG.proactiveInject);
       expect(result.userHadField.proactiveInject).toBe(false);
       expect(result.projectHadField.proactiveInject).toBe(false);
-      // Detectors stay at their (inverted) ON default.
+      // Detectors also ON by default.
       expect(result.config.verifySemanticLlm).toBe(true);
     } finally {
       rmSync(cwd, { recursive: true, force: true });

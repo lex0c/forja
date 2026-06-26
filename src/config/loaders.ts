@@ -57,7 +57,12 @@ export const DEFAULT_MEMORY_CONFIG: MemoryConfigKeys = {
   verifySemanticLlm: true,
   conflictDetectLlm: true,
   overrideDetectLlm: true,
-  proactiveInject: false,
+  // §4.4 default ON since the calibration gate cleared: across a weak→strong
+  // model spectrum the injection helped (accuracy for a weak 7B; −50% steps and
+  // −13% cost for strong models that would otherwise round-trip memory_read),
+  // with zero harm on irrelevant turns (the BM25 floor injects nothing). The
+  // operator disables via [memory] proactive_inject = false.
+  proactiveInject: true,
 };
 
 // Provenance signal for the boot banner. `false` means the field was

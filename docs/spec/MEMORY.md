@@ -302,14 +302,14 @@ Algumas memórias são **carregadas eager mesmo sem o índice**, em momentos esp
 
 Configuração via `triggers:` no frontmatter — opcional, opt-in.
 
-### 4.4 Injeção proativa (opt-in)
+### 4.4 Injeção proativa (default ON)
 
 §4.1–4.3 são **reativas ao modelo**: o índice é eager, mas a decisão de puxar conteúdo é do modelo (§4.2) ou de um trigger de filesystem no boot (§4.3). A injeção proativa é o modo **ativo do sistema**: a cada turno elegível, o runtime identifica o contexto, recupera memórias relevantes via BM25 e injeta o **conteúdo** — sem o modelo pedir. É a materialização dos *runtime triggers* que §4.3 deixa em aberto (eventos durante a sessão, não só no boot).
 
-**Default OFF — complementa o índice, não substitui** (princípio 6 permanece intacto: index eager, content lazy). Liga por feature flag ou por trigger declarado no frontmatter. Duas razões para não ser default:
+**Default ON — complementa o índice, não substitui** (princípio 6 permanece intacto: index eager, content lazy). Ligada por padrão; o operador desliga via flag, e um trigger no frontmatter a ativa pontualmente. Foi default OFF até a calibração (eval, abaixo) cumprir o gate. Duas considerações moldam o design — ambas endereçadas:
 
 1. **Cache.** O índice (§4.1) é estável entre turnos — é o que mantém o prefixo cacheável e o breakpoint de §4.1 válido. Conteúdo recuperado muda a cada turno; injetá-lo no prefixo destruiria o cache. Daí o invariante I1.
-2. **Quem julga relevância.** No modo reativo, o **modelo** julga (lê o hook do índice e decide). No proativo, quem julga é o BM25 — mais barato, mais burro. Compensa quando o modelo não exerce esse julgamento (modelos locais/fracos, tool-use frágil); não compensa quando exerce.
+2. **Quem julga relevância.** No modo reativo, o **modelo** julga (lê o hook do índice e decide). No proativo, quem julga é o BM25 — mais barato, mais burro, gateado por I4 (piso + cap). Compensa fortemente quando o modelo não exerce o julgamento (locais/fracos → vira acerto); e ainda compensa quando exerce — modelos fortes economizam o round-trip de `memory_read` (a calibração mediu −50% passos, custo neutro-a-favorável).
 
 ```
 [user prompt]
@@ -342,7 +342,7 @@ retrieval_trace + provenance
 - **Cobertura lexical, não semântica** (princípio 9). BM25 não casa paráfrase. É limite escolhido, não bug a corrigir com vetor.
 - **Custo por turno.** Mesmo fora do prefixo, cada turno elegível paga retrieval + tokens injetados. O *gating* (não-todo-turno) é o que mantém isso proporcional ao valor.
 
-**Eval (sem ela, fica desligada).** O modo não vira default sem eval que meça, nos modelos-alvo (locais/fracos): (a) recall útil vs ruído injetado, (b) Δ custo de cache vs baseline reativo (§4.1–4.2), (c) que I1–I3 se sustentam sob prompt adversário.
+**Eval (gate cumprido — por isso default ON).** O default ON foi liberado após eval medir, num espectro de modelos-alvo (fraco 7B → fortes): (a) recall útil vs ruído — útil confirmado (acerto em modelo fraco; −50% passos nos fortes), ruído contido pelo piso (turno irrelevante não injeta nada); (b) Δ custo — neutro-a-favorável (a injeção corta o round-trip de `memory_read`: −13% em cenários úteis); (c) I1–I3 sob prompt adversário — sustentados (keyword-stuffing não fura I3). Resíduo medido honestamente: store grande com memórias *marginalmente* relevantes não foi exercido em escala — é o próximo eixo se o piso precisar de tuning.
 
 ---
 
