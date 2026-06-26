@@ -1,4 +1,9 @@
-import { type MemoryRegistry, type MemoryScope, serializeMemoryFile } from '../memory/index.ts';
+import {
+  type MemoryRegistry,
+  type MemoryScope,
+  listingScopeOption,
+  serializeMemoryFile,
+} from '../memory/index.ts';
 import { type RecalledMemory, buildProactiveRecall } from '../memory/proactive-recall.ts';
 import type { ProviderMessage } from '../providers/types.ts';
 import { parseMemoryNodeId } from '../retrieval/node-ids.ts';
@@ -80,16 +85,29 @@ export const createProactiveRecall = (deps: {
     loadBody: (nodeId) => {
       const parsed = parseMemoryNodeId(nodeId);
       if (parsed === null) return null;
-      // The node id carries no subdir, so this re-peek by scope could in
-      // principle resolve a different on-disk snapshot than the view
-      // trust-validated (registry re-peek contract). Re-validate trust +
-      // active on the loaded body — fail-closed — so an automatic injection
-      // can never surface untrusted / under-review content even if the two
-      // peeks diverge. Today the view's dedupe precedence matches the peek
-      // walk so they don't, but this keeps I3 a property of the loaded bytes,
-      // not of an assumption.
-      const file = deps.registry.peek(parsed.name, { scope: parsed.scope });
+      // Resolve the body via the SAME listing the view ranked — NOT an
+      // unqualified peek(name, {scope}). The node id carries no subdir, so
+      // peek(name, {scope}) can resolve a different on-disk file than BM25
+      // ranked: e.g. an expired top-level `foo.md` shadowing the active
+      // `seeds/foo.md` the view selected (the view's list() drops expired and
+      // dedupes by name, then peeks scope-pinned). Re-run those listing filters
+      // — must mirror createMemoryView's list() on the trustedOnly path (active,
+      // non-expired, deduped) — find this node's surviving listing, and peek it
+      // scope-pinned via listingScopeOption so the subdir matches the candidate.
+      const listings = deps.registry.list({
+        deduplicateByName: true,
+        states: ['active'],
+        includeExpired: false,
+        ...(deps.excludeScopes !== undefined && deps.excludeScopes.length > 0
+          ? { excludeScopes: deps.excludeScopes }
+          : {}),
+      });
+      const listing = listings.find((l) => l.scope === parsed.scope && l.name === parsed.name);
+      if (listing === undefined) return null;
+      const file = deps.registry.peek(listing.name, listingScopeOption(listing));
       if (file.kind !== 'present') return null;
+      // Defense-in-depth on the loaded bytes: the listing already passed the
+      // filters, but fail closed if the snapshot drifted between list and peek.
       const fm = file.file.frontmatter;
       if (fm.trust === 'untrusted') return null;
       if (fm.state !== undefined && fm.state !== 'active') return null;

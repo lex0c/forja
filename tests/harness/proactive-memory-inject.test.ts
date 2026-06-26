@@ -172,6 +172,36 @@ describe('createProactiveRecall (wiring)', () => {
     expect(out.map((r) => r.nodeId)).not.toContain('memory:user/quar');
   });
 
+  test('loadBody resolves the ranked snapshot, not an unqualified peek (seed shadowed by expired top-level)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    // user/foo.md: EXPIRED (expires in the past). The view's list() drops it
+    // (includeExpired:false) and ranks the seed below — its body must NEVER
+    // surface. An unqualified peek(name,{scope:'user'}) would resolve it.
+    mkdirSync(roots.user, { recursive: true });
+    writeIndex(roots.user, '- [Foo](foo.md) — auth helper\n');
+    writeFileSync(
+      join(roots.user, 'foo.md'),
+      '---\nname: foo\ndescription: auth helper\ntype: feedback\nsource: inferred\nexpires: 2020-01-01\n---\n\nSTALE auth token body\n',
+    );
+    // user/seeds/foo.md: ACTIVE seed of the same name — what the view ranks.
+    const seedsDir = join(roots.user, 'seeds');
+    mkdirSync(seedsDir, { recursive: true });
+    writeIndex(seedsDir, '- [Foo](foo.md) — auth helper\n');
+    writeFileSync(
+      join(seedsDir, 'foo.md'),
+      '---\nname: foo\ndescription: auth helper\ntype: feedback\nsource: seed\nseed_origin: vendor\nseed_version: "1.0"\n---\n\nFRESH auth token seed body\n',
+    );
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const recall = createProactiveRecall({ registry, minScore: 0 });
+    const out = await recall({ goalText: 'auth', prompt: 'auth token' });
+    const foo = out.find((r) => r.nodeId === 'memory:user/foo');
+    expect(foo).toBeDefined();
+    // The fix returns the active seed body, not the expired top-level shadow.
+    expect(foo?.body).toContain('FRESH');
+    expect(foo?.body).not.toContain('STALE');
+  });
+
   test('recordProactiveExposures writes a canonical proactive row per loaded memory', () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);
