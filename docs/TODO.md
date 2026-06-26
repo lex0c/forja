@@ -363,9 +363,13 @@ The focus-change gate (TP3.1) shipped inside P2 (`resolveCachedRecall`). **Scope
 
 **Done:** I5 is **provenance-only** for the proactive path — it bypasses the `retrieve_context` pipeline (no `retrieval_query_id`), so it's shaped like `eager`, not `retrieve_context`; there's no `retrieval_trace` to tag (TP4.1 assumed the runner — the runner isn't on this path). Migration 080 widens the `memory_provenance.surface` CHECK with `'proactive'` (rebuild, like 069; FKs + indexes preserved); `ProvenanceSurface` + `recordProvenance` treat it like `eager` (toolCallId null, no retrieval grouping fields). `recordProactiveExposures` (in `proactive-memory-inject.ts`) emits one exposure per injected memory, called from the loop on RECOMPUTE only (one row per memory per focus, not per step), best-effort inside the same try; `resolveCachedRecall` now returns `{recalled, recomputed}` to drive it. `/memory provenance` renders it unchanged (the renderer is surface-generic). Tests: repo (proactive inserts; rejects non-null toolCallId / retrieval fields), the emitter (a row per memory, malformed ids skipped), migration applies; slash + provenance suites green.
 
-## Slice P5 — Eval (default gate)
+## Slice P5 — Eval (default gate) · ✅ DONE (deterministic mechanism) · model calibration deferred
 
 `evals/memory/proactive/`. Measures, on target (local/weak) models: useful recall vs injected noise; Δcache cost vs the reactive baseline (§4.1–4.2); I3 robustness under keyword-stuffing. **No default-ON without a green eval** — the flag stays OFF until the numbers justify it.
+
+**Done:** `evals/memory/proactive/` — 6 deterministic fixtures (no model) + `tests/memory/proactive-eval-fixtures.test.ts`, mirroring the `evals/memory/` governance-eval shape. Covers the axes above: useful recall vs noise (01); Δcache cost = 0 on off-topic turns + bounded (≤600 chars, ~100 tokens) at top-K (02/05); I3 robustness — untrusted (03) + quarantined (04) memories keyword-stuffed to the top of BM25 still never surface (the trust/active gate precedes scoring); top-K cap (05); P3 prompt-mention trigger (06). Runs against the REAL production defaults (floor 1.0, top-K 3).
+
+**Finding (feeds calibration):** the BM25 floor is absolute but IDF is corpus-relative — a term shared across a tiny corpus scores below 1.0 even when obviously relevant (the 06 trigger match scored 0.96 in a 2-doc corpus). The floor right for a large store is too high for a small one. **This pins the mechanism, not the values** — useful-recall-rate vs noise-rate tuning against a target (local/weak) model is the deferred default-ON calibration; the flag stays OFF until then.
 
 ## Slice P6 (optional) — Operator surface
 
