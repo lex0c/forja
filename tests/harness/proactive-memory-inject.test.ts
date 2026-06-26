@@ -359,6 +359,30 @@ describe('createProactiveRecall (wiring)', () => {
     expect(listProvenanceByName(db, sessionId, 'big')).toHaveLength(1);
     expect(listProvenanceByName(db, sessionId, 'small')).toHaveLength(0);
   });
+
+  test('truncated injection records a null (partial) content hash; a full one keeps the canonical hash', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const bigBody = `BIG ${'lorem ipsum dolor sit amet '.repeat(300)}`; // > budget → truncated
+    writeIndex(roots.user, '- [Big](big.md) — big\n- [Sm](sm.md) — sm\n');
+    writeBody(roots.user, 'big', bigBody, { description: 'big' });
+    writeBody(roots.user, 'sm', 'small body', { description: 'sm' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    // Separate renders so each is the sole injection (one truncated, one full).
+    const m1: ProviderMessage[] = [{ role: 'user', content: 'p' }];
+    const big = injectProactiveMemoryBlock(m1, [rec('memory:user/big', bigBody)]);
+    recordProactiveExposures(db, registry, sessionId, big);
+    const m2: ProviderMessage[] = [{ role: 'user', content: 'p' }];
+    const sm = injectProactiveMemoryBlock(m2, [rec('memory:user/sm', 'small body')]);
+    recordProactiveExposures(db, registry, sessionId, sm);
+
+    // big was truncated → the model saw a prefix → null (partial) hash, not the full file.
+    expect(big[0]?.truncated).toBe(true);
+    expect(listProvenanceByName(db, sessionId, 'big')[0]?.memoryContentHash).toBeNull();
+    // sm fit whole → canonical hash, cross-comparable with eager/retrieve rows.
+    expect(sm[0]?.truncated).toBe(false);
+    expect(listProvenanceByName(db, sessionId, 'sm')[0]?.memoryContentHash).not.toBeNull();
+  });
 });
 
 describe('resolveCachedRecall (the P3 focus-change gate)', () => {

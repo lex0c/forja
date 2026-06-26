@@ -71,20 +71,24 @@ const truncationHint = (nodeId: string): string => {
 const capRecalledBodies = (
   recalled: readonly RecalledMemory[],
   budgetTokens: number,
-): Array<{ nodeId: string; body: string }> => {
-  const out: Array<{ nodeId: string; body: string }> = [];
+): Array<{ nodeId: string; body: string; truncated: boolean }> => {
+  const out: Array<{ nodeId: string; body: string; truncated: boolean }> = [];
   let remainingChars = Math.max(0, budgetTokens) * CHARS_PER_TOKEN;
   for (const m of recalled) {
     const body = m.body.trim();
     if (body.length === 0) continue;
     if (body.length <= remainingChars) {
-      out.push({ nodeId: m.nodeId, body });
+      out.push({ nodeId: m.nodeId, body, truncated: false });
       remainingChars -= body.length;
       continue;
     }
     if (remainingChars >= MIN_BODY_PREFIX_CHARS) {
       const prefix = truncateAtBoundary(body, remainingChars);
-      out.push({ nodeId: m.nodeId, body: `${prefix}\n\n${truncationHint(m.nodeId)}` });
+      out.push({
+        nodeId: m.nodeId,
+        body: `${prefix}\n\n${truncationHint(m.nodeId)}`,
+        truncated: true,
+      });
     }
     break; // budget spent (or the remainder is too small for a useful fragment).
   }
@@ -115,23 +119,30 @@ export const formatProactiveRecallBlock = (
   return renderCappedBlock(capped);
 };
 
-// Inject the block at the turn tail and RETURN the memories actually rendered. The
+// One memory that actually reached the provider this turn: its node id plus whether the
+// budget truncated it (the model saw only a prefix). `truncated` is optional so a plain
+// RecalledMemory[] still satisfies the recorder for callers that never truncate.
+export interface InjectedExposure {
+  nodeId: string;
+  truncated?: boolean;
+}
+
+// Inject the block at the turn tail and RETURN what actually reached the provider. The
 // body budget can drop (or truncate) later recalled items, so the caller MUST record
 // provenance for THIS subset — not the full recalled array. Recording the full array
 // would log surface='proactive' rows for bytes that never reached the provider,
-// corrupting the exposure audit and any detector that reads those rows as
-// model-visible context. The returned list is the original RecalledMemory objects
-// (a precedence-ordered prefix of `recalled`) whose nodeId survived the cap.
+// corrupting the exposure audit and any detector that reads those rows as model-visible
+// context. The result is a precedence-ordered prefix of `recalled`, each flagged
+// `truncated` so provenance can hash only what the model actually saw.
 export const injectProactiveMemoryBlock = (
   messages: ProviderMessage[],
   recalled: readonly RecalledMemory[],
   budgetTokens: number = PROACTIVE_BLOCK_BODY_BUDGET_TOKENS,
-): RecalledMemory[] => {
+): InjectedExposure[] => {
   const capped = capRecalledBodies(recalled, budgetTokens);
   if (capped.length === 0) return [];
   appendTextToLastUserMessage(messages, renderCappedBlock(capped));
-  const injectedIds = new Set(capped.map((c) => c.nodeId));
-  return recalled.filter((m) => injectedIds.has(m.nodeId));
+  return capped.map((c) => ({ nodeId: c.nodeId, truncated: c.truncated }));
 };
 
 // Resolve a recalled node to the SAME on-disk file the proactive view ranked —
@@ -256,19 +267,21 @@ export const resolveCachedRecall = async (
 //
 // Resolves each memory via the SAME ranked listing the body was loaded from
 // (resolveRankedMemoryFile — subdir included), so the hash + state describe the
-// EXACT bytes that were injected, not a higher-precedence shadow. The hash is
-// over `serializeMemoryFile` (frontmatter + body) so it cross-compares with the
-// eager / retrieve_context rows for the same memory, and the state is the REAL
-// frontmatter state. Per-row try/catch (also like eager): one audit-write
-// failure must not drop the exposures for the rest.
+// EXACT file that was injected, not a higher-precedence shadow. For a FULL
+// exposure the hash is over `serializeMemoryFile` (frontmatter + body) so it
+// cross-compares with the eager / retrieve_context rows for the same memory. For a
+// TRUNCATED exposure the model saw only a prefix, so the canonical full-file hash
+// would overstate it and false-match this memory's full rows — record null (partial)
+// instead; the row still attests the (partial) exposure. State is the REAL frontmatter
+// state. Per-row try/catch (like eager): one audit-write failure must not drop the rest.
 export const recordProactiveExposures = (
   db: DB,
   registry: MemoryRegistry,
   sessionId: string,
-  recalled: readonly RecalledMemory[],
+  exposures: readonly InjectedExposure[],
   excludeScopes?: ReadonlyArray<MemoryScope>,
 ): void => {
-  for (const m of recalled) {
+  for (const m of exposures) {
     const parsed = parseMemoryNodeId(m.nodeId);
     if (parsed === null) continue;
     const file = resolveRankedMemoryFile(registry, parsed.scope, parsed.name, excludeScopes);
@@ -280,7 +293,8 @@ export const recordProactiveExposures = (
         memoryScope: parsed.scope,
         memoryName: parsed.name,
         surface: 'proactive',
-        memoryContentHash: hashMemoryContent(serializeMemoryFile(file)),
+        memoryContentHash:
+          m.truncated === true ? null : hashMemoryContent(serializeMemoryFile(file)),
         memoryStateAtExposure: file.frontmatter.state ?? 'active',
       });
     } catch {
