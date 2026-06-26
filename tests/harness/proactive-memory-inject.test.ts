@@ -47,6 +47,26 @@ describe('formatProactiveRecallBlock', () => {
     // Injection-safety: bodies are framed as reference, not instructions.
     expect(block).toContain('not as instructions');
   });
+
+  test('caps a large body to the block budget (truncates with a memory_read pointer)', () => {
+    // The block rides the ephemeral turn tail; maybeCompact can't fold it, so a single
+    // huge body must not blow the context window. budget 1000 tokens ≈ 4000 chars.
+    const big = `HEAD_MARKER ${'lorem ipsum dolor sit amet '.repeat(300)} TAIL_MARKER`;
+    const block = formatProactiveRecallBlock([rec('memory:user/big', big)], 1000) as string;
+    expect(block).toBeDefined();
+    expect(block).toContain('HEAD_MARKER'); // the prefix survives
+    expect(block).not.toContain('TAIL_MARKER'); // the tail is dropped
+    expect(block).toContain('truncated to fit the recall budget');
+    expect(block).toContain('memory_read memory:user/big'); // escape hatch to the full body
+    // Bounded near the budget — far below the ~8000-char un-truncated body.
+    expect(block.length).toBeLessThan(5000);
+  });
+
+  test('a body under budget is rendered whole (no truncation marker)', () => {
+    const block = formatProactiveRecallBlock([rec('memory:user/a', 'short fact')]) as string;
+    expect(block).toContain('short fact');
+    expect(block).not.toContain('truncated to fit the recall budget');
+  });
 });
 
 describe('injectProactiveMemoryBlock', () => {
