@@ -14,7 +14,7 @@ import {
   recordProactiveExposures,
   resolveCachedRecall,
 } from '../../src/harness/proactive-memory-inject.ts';
-import { serializeMemoryFile } from '../../src/memory/index.ts';
+import { parseMemoryFile, serializeMemoryFile } from '../../src/memory/index.ts';
 import type { ScopeRoots } from '../../src/memory/paths.ts';
 import type { RecalledMemory } from '../../src/memory/proactive-recall.ts';
 import { createMemoryRegistry } from '../../src/memory/registry.ts';
@@ -394,6 +394,41 @@ describe('createProactiveRecall (wiring)', () => {
     // sm fit whole → canonical hash, cross-comparable with eager/retrieve rows.
     expect(sm[0]?.truncated).toBe(false);
     expect(listProvenanceByName(db, sessionId, 'sm')[0]?.memoryContentHash).not.toBeNull();
+  });
+
+  test('carries the resolved file onto each recalled memory (for provenance reuse)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Auth](auth.md) — auth\n');
+    writeBody(roots.user, 'auth', 'use JWT bearer tokens', { description: 'auth notes' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const recall = createProactiveRecall({ registry, minScore: 0 });
+    const out = await recall({ goalText: 'auth', prompt: 'auth' });
+    const auth = out.find((r) => r.nodeId === 'memory:user/auth');
+    expect(auth?.file).toBeDefined();
+    expect(auth?.file?.body).toBe(auth?.body); // the SAME bytes loadBody loaded
+  });
+
+  test('recordProactiveExposures hashes the CARRIED file, not a re-resolved one', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Foo](foo.md) — foo\n');
+    writeBody(roots.user, 'foo', 'DISK body', { description: 'foo' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    // Carry a file whose body differs from disk; provenance must hash the carried bytes,
+    // proving it reused the recall's resolution instead of re-resolving from disk.
+    const carried = parseMemoryFile(
+      '---\nname: foo\ndescription: foo\ntype: feedback\nsource: inferred\n---\n\nCARRIED body\n',
+    );
+    recordProactiveExposures(db, registry, sessionId, [
+      { nodeId: 'memory:user/foo', file: carried },
+    ]);
+    const row = listProvenanceByName(db, sessionId, 'foo')[0];
+    expect(row?.memoryContentHash).toBe(hashMemoryContent(serializeMemoryFile(carried)));
+    const disk = registry.peek('foo', { scope: 'user' });
+    if (disk.kind === 'present') {
+      expect(row?.memoryContentHash).not.toBe(hashMemoryContent(serializeMemoryFile(disk.file)));
+    }
   });
 });
 

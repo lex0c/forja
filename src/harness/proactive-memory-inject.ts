@@ -1,4 +1,5 @@
 import {
+  type MemoryFile,
   type MemoryRegistry,
   type MemoryScope,
   listingScopeOption,
@@ -128,6 +129,9 @@ export const formatProactiveRecallBlock = (
 export interface InjectedExposure {
   nodeId: string;
   truncated?: boolean;
+  // The file the recall already resolved for this node, carried through so provenance
+  // hashes the SAME bytes without a second resolve. Absent → provenance re-resolves.
+  file?: MemoryFile;
 }
 
 // Inject the block at the turn tail and RETURN what actually reached the provider. The
@@ -136,7 +140,8 @@ export interface InjectedExposure {
 // would log surface='proactive' rows for bytes that never reached the provider,
 // corrupting the exposure audit and any detector that reads those rows as model-visible
 // context. The result is a precedence-ordered prefix of `recalled`, each flagged
-// `truncated` so provenance can hash only what the model actually saw.
+// `truncated` (provenance hashes only what the model saw) and carrying the recall's
+// already-resolved `file` (provenance reuses it instead of re-resolving).
 export const injectProactiveMemoryBlock = (
   messages: ProviderMessage[],
   recalled: readonly RecalledMemory[],
@@ -147,7 +152,17 @@ export const injectProactiveMemoryBlock = (
   // If the tail isn't a user turn the append no-ops — nothing reached the provider, so
   // return no exposures (recording them would log phantom surface='proactive' rows).
   if (!appendTextToLastUserMessage(messages, renderCappedBlock(capped))) return [];
-  return capped.map((c) => ({ nodeId: c.nodeId, truncated: c.truncated }));
+  // Carry each recalled memory's already-resolved file onto its exposure so provenance
+  // reuses it instead of re-resolving.
+  const fileByNode = new Map(recalled.map((m) => [m.nodeId, m.file] as const));
+  return capped.map((c) => {
+    const file = fileByNode.get(c.nodeId);
+    return {
+      nodeId: c.nodeId,
+      truncated: c.truncated,
+      ...(file !== undefined ? { file } : {}),
+    };
+  });
 };
 
 // Resolve a recalled node to the SAME on-disk file the proactive view ranked —
@@ -219,7 +234,11 @@ export const createProactiveRecall = (deps: {
       ? { excludeScopes: deps.excludeScopes }
       : {}),
   });
-  return buildProactiveRecall({
+  // loadBody resolves each survivor's file once; stash it so the returned recall can carry
+  // it onto each RecalledMemory and provenance reuses it (no second resolve, body + hash
+  // from the same bytes). Cleared per recall so a focus change can't leak stale files.
+  const resolvedFiles = new Map<string, MemoryFile>();
+  const recallFn = buildProactiveRecall({
     search: (query) => view.search(query),
     loadBody: (nodeId) => {
       const parsed = parseMemoryNodeId(nodeId);
@@ -230,11 +249,21 @@ export const createProactiveRecall = (deps: {
         parsed.name,
         deps.excludeScopes,
       );
-      return file === null ? null : file.body;
+      if (file === null) return null;
+      resolvedFiles.set(nodeId, file);
+      return file.body;
     },
     ...(deps.minScore !== undefined ? { minScore: deps.minScore } : {}),
     ...(deps.topK !== undefined ? { topK: deps.topK } : {}),
   });
+  return async (input) => {
+    resolvedFiles.clear();
+    const recalled = await recallFn(input);
+    return recalled.map((m) => {
+      const file = resolvedFiles.get(m.nodeId);
+      return file === undefined ? m : { ...m, file };
+    });
+  };
 };
 
 // Per-session cache entry for the focus-change gate (§4.4 P3): the focus the
@@ -300,10 +329,13 @@ export const recordProactiveExposures = (
     const parsed = parseMemoryNodeId(m.nodeId);
     if (parsed === null) continue;
     try {
-      // Resolve INSIDE the try: it does I/O (list() peeks every active listing, and a
-      // single unreadable corpus file re-throws non-ENOENT), so a throw here must drop
-      // only this row, honoring the per-row "one failure must not drop the rest" contract.
-      const file = resolveRankedMemoryFile(registry, parsed.scope, parsed.name, excludeScopes);
+      // Reuse the file the recall already resolved (carried on the exposure) so body +
+      // hash describe the SAME bytes — no re-walk, no extra I/O. Fall back to a resolve
+      // only for hand-built exposures (tests); that resolve does I/O (list() peeks every
+      // active listing, re-throwing non-ENOENT), so it stays INSIDE the try — a throw
+      // drops only this row, honoring "one failure must not drop the rest".
+      const file =
+        m.file ?? resolveRankedMemoryFile(registry, parsed.scope, parsed.name, excludeScopes);
       if (file === null) continue;
       recordProvenance(db, {
         sessionId,

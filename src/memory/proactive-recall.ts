@@ -24,6 +24,7 @@
 // calibrates it against real recall-vs-noise on the target models.
 
 import type { Candidate, RetrievalQuery } from '../retrieval/types.ts';
+import type { MemoryFile } from './types.ts';
 
 // Floor on the memory view's raw BM25 `bootstrapScore`. A single
 // common-term body hit scores well below this; a rare-term or
@@ -56,6 +57,11 @@ export interface RecalledMemory {
   // The memory body to inject (P2). Never empty — survivors whose
   // body can't load are dropped.
   body: string;
+  // The resolved on-disk file the body came from, when the caller carried it
+  // (createProactiveRecall does). Lets provenance hash the SAME bytes loadBody loaded —
+  // one resolve per node, body + hash consistent by construction. Absent for callers
+  // that hand-build RecalledMemory (tests) → provenance falls back to a fresh resolve.
+  file?: MemoryFile;
 }
 
 export interface ProactiveRecallDeps {
