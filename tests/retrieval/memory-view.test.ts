@@ -591,6 +591,29 @@ describe('createMemoryView — trustedOnly (§4.4 I3)', () => {
     expect(open.map((c) => c.nodeId)).toContain('memory:user/quar-auth');
   });
 
+  test('trusted lower-precedence sibling survives an untrusted shadow (trust before dedupe)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    // project_local/foo (higher precedence) is untrusted; user/foo (lower) is
+    // trusted. Deduping before the trust filter keeps only the untrusted shadow,
+    // drops it, and loses the trusted fallback. The proactive view must surface
+    // user/foo — mirrors assembleMemorySection's trust-before-dedupe order.
+    writeIndex(roots.projectLocal, '- [Foo](foo.md) — auth helper\n');
+    writeBody(roots.projectLocal, 'foo', 'untrusted shadow', {
+      description: 'auth helper',
+      trust: 'untrusted',
+    });
+    writeIndex(roots.user, '- [Foo](foo.md) — auth helper\n');
+    writeBody(roots.user, 'foo', 'trusted fallback', { description: 'auth helper' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const out = await createMemoryView({ registry, trustedOnly: true }).search({
+      ...baseQuery,
+      text: 'auth helper',
+    });
+    expect(out.map((c) => c.nodeId)).toContain('memory:user/foo');
+    expect(out.map((c) => c.nodeId)).not.toContain('memory:project_local/foo');
+  });
+
   test('drops untrusted memories, keeps trusted', async () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);

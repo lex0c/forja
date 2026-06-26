@@ -174,7 +174,16 @@ export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
     // over allowed scopes and the local > shared > user fallback
     // is preserved.
     const listings = deps.registry.list({
-      deduplicateByName: true,
+      // §4.4 I3 — on the trustedOnly path, DON'T dedupe here. Trust is a per-
+      // frontmatter property the index-only list() can't see, so deduping by
+      // name first lets an untrusted higher-precedence shadow eclipse a trusted
+      // same-name sibling: the peek below drops the shadow and the name vanishes
+      // from recall entirely. Dedupe AFTER the trust filter instead (below),
+      // keeping the first surviving precedence winner — the order
+      // assembleMemorySection uses (spec §7.2.2: trust is per-MEMORY, not
+      // per-name). The model-driven path doesn't trust-filter, so the registry's
+      // dedupe is correct there.
+      deduplicateByName: deps.trustedOnly !== true,
       // §4.4 I3 — the proactive path (`trustedOnly`) is `active`-only:
       // an automatic injection must not surface a memory under review
       // (`quarantined`) any more than an untrusted one. The model-driven
@@ -193,6 +202,10 @@ export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
     // for a small registry that's nothing, but a Map keeps the
     // shape honest as the corpus grows.
     const listingById = new Map<string, (typeof listings)[number]>();
+    // Trust-aware name dedupe for the trustedOnly path: the list above is NOT
+    // deduped there, so collapse same-name shadows AFTER the trust filter below,
+    // keeping the first survivor (the list comes back in precedence order).
+    const seenNames = new Set<string>();
 
     // Build the corpus. Per-field weighting via token repetition —
     // the BM25 index doesn't care about fields, only term frequencies.
@@ -228,6 +241,11 @@ export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
       if (deps.trustedOnly === true) {
         if (file === undefined || file.kind !== 'present') continue;
         if (file.file.frontmatter.trust === 'untrusted') continue;
+        // Dedupe AFTER trust: the first surviving (highest-precedence) entry per
+        // name wins, so a trusted lower-precedence sibling isn't lost to an
+        // untrusted shadow that was just dropped above.
+        if (seenNames.has(l.name)) continue;
+        seenNames.add(l.name);
       }
       listingById.set(id, l);
       const nameTokens = tokenize(l.name);
