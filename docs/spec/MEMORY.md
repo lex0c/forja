@@ -302,6 +302,48 @@ Algumas memórias são **carregadas eager mesmo sem o índice**, em momentos esp
 
 Configuração via `triggers:` no frontmatter — opcional, opt-in.
 
+### 4.4 Injeção proativa (opt-in)
+
+§4.1–4.3 são **reativas ao modelo**: o índice é eager, mas a decisão de puxar conteúdo é do modelo (§4.2) ou de um trigger de filesystem no boot (§4.3). A injeção proativa é o modo **ativo do sistema**: a cada turno elegível, o runtime identifica o contexto, recupera memórias relevantes via BM25 e injeta o **conteúdo** — sem o modelo pedir. É a materialização dos *runtime triggers* que §4.3 deixa em aberto (eventos durante a sessão, não só no boot).
+
+**Default OFF — complementa o índice, não substitui** (princípio 6 permanece intacto: index eager, content lazy). Liga por feature flag ou por trigger declarado no frontmatter. Duas razões para não ser default:
+
+1. **Cache.** O índice (§4.1) é estável entre turnos — é o que mantém o prefixo cacheável e o breakpoint de §4.1 válido. Conteúdo recuperado muda a cada turno; injetá-lo no prefixo destruiria o cache. Daí o invariante I1.
+2. **Quem julga relevância.** No modo reativo, o **modelo** julga (lê o hook do índice e decide). No proativo, quem julga é o BM25 — mais barato, mais burro. Compensa quando o modelo não exerce esse julgamento (modelos locais/fracos, tool-use frágil); não compensa quando exerce.
+
+```
+[user prompt]
+   │  gatilho elegível? (runtime trigger §4.3 | mudança de goal | PreCompact §6.4)
+   ▼
+query = goal (working-state) + último prompt
+   │
+   ▼
+BM25 sobre a memory view (princípio 9: sem vetor)
+filtro: trusted + active + score ≥ piso + top-K pequeno (~2–3)
+   │
+   ▼
+injeta bloco EFÊMERO, fora do prefixo cacheável, não-persistido
+   │
+   ▼
+retrieval_trace + provenance
+```
+
+**Invariantes (normativos):**
+
+- **I1 — prefixo intacto.** A injeção **nunca** re-renderiza o segmento de índice do system prompt (§4.1). O conteúdo entra *depois* do último breakpoint cacheável; o custo fica restrito aos tokens novos do turno e o prefixo segue cacheado.
+- **I2 — efêmero.** O bloco vale só para o turno que o gerou e **não** acumula no histórico (recomputa-se por turno). Sem isso o contexto cresce sem limite e §6 (compaction) herda o ruído.
+- **I3 — trust preservado.** Só `trusted` + `active`. Memória `untrusted` **nunca** é injetada proativamente — mantém o princípio 7 e §7.2 regra 2 (untrusted só via `memory_read` explícito). Injeção automática de conteúdo não-confiável é o pior caso do vetor de §7.
+- **I4 — piso explícito + cap.** Há piso de score BM25 e top-K pequeno. O piso é parte do contrato (sem ele, injeta-se ruído), não detalhe de tuning.
+- **I5 — rastreável.** Todo recall proativo emite linha em `retrieval_trace` + exposição em provenance (princípio 2: user-auditável). O operador audita "o modelo recebeu X proativamente quando produziu Y?".
+
+**Trade-offs declarados (medir duas vezes — o que NÃO se resolve):**
+
+- **Superfície de injection maior.** O piso vira alvo (keyword-stuffing pra forçar a injeção). I3 contém o pior caso (untrusted fora); memória *trusted-porém-ruim* injetada sem o filtro do modelo é risco residual, aceito em troca da cobertura pra modelos fracos.
+- **Cobertura lexical, não semântica** (princípio 9). BM25 não casa paráfrase. É limite escolhido, não bug a corrigir com vetor.
+- **Custo por turno.** Mesmo fora do prefixo, cada turno elegível paga retrieval + tokens injetados. O *gating* (não-todo-turno) é o que mantém isso proporcional ao valor.
+
+**Eval (sem ela, fica desligada).** O modo não vira default sem eval que meça, nos modelos-alvo (locais/fracos): (a) recall útil vs ruído injetado, (b) Δ custo de cache vs baseline reativo (§4.1–4.2), (c) que I1–I3 se sustentam sob prompt adversário.
+
 ---
 
 ## 5. Writing
