@@ -222,6 +222,74 @@ override_detect_llm = false
   });
 });
 
+describe('loadMemoryConfig — proactive_inject (§4.4)', () => {
+  test('absent → defaults OFF (false) + hadField false, detectors unaffected', () => {
+    const cwd = makeTempCwd();
+    const home = mkdtempSync(join(tmpdir(), 'forja-mem-home-'));
+    try {
+      const result = loadMemoryConfig({ cwd, env: { HOME: home } });
+      expect(result.config.proactiveInject).toBe(false);
+      expect(result.config.proactiveInject).toBe(DEFAULT_MEMORY_CONFIG.proactiveInject);
+      expect(result.userHadField.proactiveInject).toBe(false);
+      expect(result.projectHadField.proactiveInject).toBe(false);
+      // Detectors stay at their (inverted) ON default.
+      expect(result.config.verifySemanticLlm).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('project [memory] proactive_inject = true → resolved true + projectHadField true', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
+      writeFileSync(join(cwd, '.forja', 'config.toml'), '\n[memory]\nproactive_inject = true\n');
+      const result = loadMemoryConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.proactiveInject).toBe(true);
+      expect(result.projectHadField.proactiveInject).toBe(true);
+      // Detectors untouched by the proactive key.
+      expect(result.config.verifySemanticLlm).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('camelCase alias proactiveInject accepted', () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
+      writeFileSync(join(cwd, '.forja', 'config.toml'), '\n[memory]\nproactiveInject = true\n');
+      const result = loadMemoryConfig({ cwd, env: { HOME: '/none' } });
+      expect(result.config.proactiveInject).toBe(true);
+      expect(result.projectHadField.proactiveInject).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('user enables, project disables → project wins (precedence)', () => {
+    const cwd = makeTempCwd();
+    const home = mkdtempSync(join(tmpdir(), 'forja-mem-home-'));
+    try {
+      mkdirSync(join(home, '.config', 'forja'), { recursive: true });
+      writeFileSync(
+        join(home, '.config', 'forja', 'config.toml'),
+        '\n[memory]\nproactive_inject = true\n',
+      );
+      mkdirSync(join(cwd, '.forja'), { recursive: true });
+      writeFileSync(join(cwd, '.forja', 'config.toml'), '\n[memory]\nproactive_inject = false\n');
+      const result = loadMemoryConfig({ cwd, env: { HOME: home } });
+      expect(result.config.proactiveInject).toBe(false);
+      expect(result.userHadField.proactiveInject).toBe(true);
+      expect(result.projectHadField.proactiveInject).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('loadMemoryConfig — project layer', () => {
   test('project [memory] verify_semantic_llm = false → resolved false + projectHadField true (banner-suppress signal)', () => {
     const cwd = makeTempCwd();

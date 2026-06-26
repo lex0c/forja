@@ -294,9 +294,9 @@ Each task lands as one or more commits on the active branch. Each slice closes w
 
 ---
 
-# Phase 3 — Proactive memory injection (§4.4) · PLANNED (gated on spec merge)
+# Phase 3 — Proactive memory injection (§4.4) · IN PROGRESS (`feat/proactive-memory`)
 
-**Proposed branch: `feat/proactive-memory`** (the §4.4 spec PR is drafted there). **Gated on that spec PR merging** — code follows spec, per the spec-first rule. Goal: an opt-in mode where the runtime identifies the turn's context, retrieves relevant memories by BM25, and injects their bodies into the turn — without the model calling `retrieve_context`. It is the materialization of the runtime triggers §4.3 left open. Default OFF; aimed at local/weak models where model-driven retrieval is unreliable (a strong model that already uses `retrieve_context` well only pays the added cache cost).
+**Branch: `feat/proactive-memory`** — the §4.4 spec is committed on this branch and the code follows on the same branch (spec precedes code in commit order, satisfying spec-first). Slice P0 is done; P1–P6 remain. Goal: an opt-in mode where the runtime identifies the turn's context, retrieves relevant memories by BM25, and injects their bodies into the turn — without the model calling `retrieve_context`. It is the materialization of the runtime triggers §4.3 left open. Default OFF; aimed at local/weak models where model-driven retrieval is unreliable (a strong model that already uses `retrieve_context` well only pays the added cache cost).
 
 **Architecture decision — the injection seam.** Inject via the `injectWorkingStateBlock` pattern (`src/harness/working-state-inject.ts`, called at `loop.ts:2994`): an ephemeral block appended to `reqMessages` per turn. NOT the `UserPromptSubmit` hook's `additionalContext` — the loop collects it but never injects it into context (`loop.ts:2545` only reads `blockedBy`; only the tool path in `invoke-tool.ts` consumes `additionalContext`). The reqMessages-tail seam gives I1 (tail sits after the last cache breakpoint → prefix intact) and I2 (reqMessages rebuilt per turn → ephemeral) for free, off an already-tested path.
 
@@ -308,13 +308,15 @@ Each task lands as one or more commits on the active branch. Each slice closes w
 - **I4 — explicit floor + cap.** BM25 score floor + small top-K (~2–3). The floor is contract, not tuning.
 - **I5 — auditable.** Every proactive recall emits a `retrieval_trace` row (surface `proactive`) + a `memory_provenance` exposure.
 
-## Slice P0 — Foundation: flag + trust filter
+## Slice P0 — Foundation: flag + trust filter · ✅ DONE
 
 | Task | Description |
 |---|---|
 | **TP0.1** | Add `memoryProactiveInject?: boolean` + `memoryProactiveInjectSource?: 'cli' \| 'project-config' \| 'user-config' \| 'default'` to `HarnessConfig` (mirror `memorySemanticVerify`, `harness/types.ts:1042`). Resolve precedence in `bootstrap.ts`. Default OFF. Config key `[memory] proactive_inject`. |
 | **TP0.2** | Trust filter on the memory view — closes the parked "trust filter on `retrieve_context` slot" item (`retrieval/views/memory.ts:114-118`). Add `trustedOnly?: boolean` to `MemoryViewDeps`; when set, hard-filter `trust: untrusted` before BM25 indexing. This is the §4.4 I3 contract. |
 | **TP0.3** | Tests: flag precedence (cli > project > user > default); untrusted never surfaces with `trustedOnly` (I3 at the view layer). `tests/retrieval/memory-view.test.ts` + a bootstrap flag test. |
+
+**Done:** flag wired through `HarnessConfig` + `BootstrapInput` + `config/loaders.ts` (`[memory] proactive_inject` / `proactiveInject`, snake>camel, **default OFF**) and resolved in `bootstrap.ts` with cli>project>user>default precedence + a `memoryProactiveInjectSource` field. `trustedOnly` hard trust filter on `retrieval/views/memory.ts` (the `.map` corpus build became a `for` loop so untrusted listings drop; one peek serves both trust-check and bodies; fail-closed). Default `retrieve_context` behavior unchanged — the broader untrusted-slot gap stays parked. 8 new tests (4 config + 4 view), 175 area tests green, typecheck + lint clean.
 
 ## Slice P1 — Proactive recall producer (pure) · `src/memory/proactive-recall.ts` (new)
 

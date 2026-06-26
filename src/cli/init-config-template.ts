@@ -68,6 +68,7 @@ compaction_max_tokens = ${b.compactionMaxTokens}
 verify_semantic_llm = ${m.verifySemanticLlm}
 conflict_detect_llm = ${m.conflictDetectLlm}
 override_detect_llm = ${m.overrideDetectLlm}
+proactive_inject = ${m.proactiveInject}
 
 [recap]
 enabled = true

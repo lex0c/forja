@@ -30,7 +30,7 @@ const writeBody = (
   dir: string,
   name: string,
   body: string,
-  fm: { description?: string; state?: string; expires?: string } = {},
+  fm: { description?: string; state?: string; expires?: string; trust?: string } = {},
 ): void => {
   mkdirSync(dir, { recursive: true });
   const lines = [
@@ -41,6 +41,7 @@ const writeBody = (
   ];
   if (fm.state !== undefined) lines.push(`state: ${fm.state}`);
   if (fm.expires !== undefined) lines.push(`expires: ${fm.expires}`);
+  if (fm.trust !== undefined) lines.push(`trust: ${fm.trust}`);
   writeFileSync(join(dir, `${name}.md`), `---\n${lines.join('\n')}\n---\n\n${body}\n`);
 };
 
@@ -540,5 +541,66 @@ describe('createMemoryView', () => {
       excludeScopes: ['project_local'],
     }).search({ ...baseQuery, text: 'moat' });
     expect(offline.map((c) => c.nodeId)).toEqual(['memory:project_shared/bar']);
+  });
+});
+
+describe('createMemoryView — trustedOnly (§4.4 I3)', () => {
+  test('drops untrusted memories, keeps trusted', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(
+      roots.user,
+      '- [Trusted](trusted-auth.md) — auth\n- [Untrusted](untrusted-auth.md) — auth\n',
+    );
+    writeBody(roots.user, 'trusted-auth', 'body', { description: 'auth notes', trust: 'trusted' });
+    writeBody(roots.user, 'untrusted-auth', 'body', {
+      description: 'auth notes',
+      trust: 'untrusted',
+    });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const view = createMemoryView({ registry, trustedOnly: true });
+    const ids = (await view.search({ ...baseQuery, text: 'auth' })).map((c) => c.nodeId);
+    expect(ids).toContain('memory:user/trusted-auth');
+    expect(ids).not.toContain('memory:user/untrusted-auth');
+  });
+
+  test('keeps memories with trust absent (default trusted)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Plain](plain-auth.md) — auth\n');
+    writeBody(roots.user, 'plain-auth', 'body', { description: 'auth notes' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const view = createMemoryView({ registry, trustedOnly: true });
+    const ids = (await view.search({ ...baseQuery, text: 'auth' })).map((c) => c.nodeId);
+    expect(ids).toContain('memory:user/plain-auth');
+  });
+
+  test('without trustedOnly, untrusted still surfaces (the parked retrieve_context gap)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Untrusted](untrusted-auth.md) — auth\n');
+    writeBody(roots.user, 'untrusted-auth', 'body', {
+      description: 'auth notes',
+      trust: 'untrusted',
+    });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const view = createMemoryView({ registry });
+    const ids = (await view.search({ ...baseQuery, text: 'auth' })).map((c) => c.nodeId);
+    expect(ids).toContain('memory:user/untrusted-auth');
+  });
+
+  test('trustedOnly + loadBodies: untrusted body tokens never enter the corpus', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    // 'kerberos' lives only in the untrusted body — a body-only match.
+    writeIndex(roots.user, '- [U](untrusted-x.md) — unrelated\n');
+    writeBody(roots.user, 'untrusted-x', 'kerberos ticket', {
+      description: 'unrelated',
+      trust: 'untrusted',
+    });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const view = createMemoryView({ registry, trustedOnly: true, loadBodies: true });
+    const cands = await view.search({ ...baseQuery, text: 'kerberos' });
+    expect(cands).toEqual([]);
   });
 });

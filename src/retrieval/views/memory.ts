@@ -83,6 +83,16 @@ export interface MemoryViewDeps {
   // posture as the eager-load section. Empty / absent = no
   // exclusion.
   excludeScopes?: ReadonlyArray<MemoryScope>;
+  // Hard trust filter (§4.4 I3 / the parked "trust filter on the
+  // retrieve_context slot" item). When true, drop `trust: untrusted`
+  // memories before BM25 indexing. The index carries no trust column,
+  // so we peek the body frontmatter to decide — fail-closed: a memory
+  // whose trust can't be read is dropped too. Off/absent preserves
+  // today's behavior (untrusted bodies still reach the model-driven
+  // retrieve_context slot — that broader gap stays parked). The §4.4
+  // proactive-injection path switches this on so an automatic
+  // injection never surfaces untrusted content.
+  trustedOnly?: boolean;
 }
 
 export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
@@ -176,45 +186,51 @@ export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
     // We pre-load bodies in one pass when requested so the BM25
     // index sees a complete corpus (avg-doc-length needs all docs
     // sized before scoring starts).
-    const docs: BM25Document[] = listings.map((l) => {
+    const docs: BM25Document[] = [];
+    for (const l of listings) {
       const id = memoryNodeId(l.scope, l.name);
+      // One peek serves both the trust check (`trustedOnly`) and the
+      // body tokens (`loadBodies`); skip it when neither needs a read.
+      //
+      // Use `registry.peek` (not `read`) — BM25 corpus construction
+      // reads EVERY listed memory body just to compute term
+      // frequencies for ranking. Only the top-K hits become
+      // candidates, and only the included slot entries ever reach the
+      // model. Emitting `memory_events action=read` per indexed memory
+      // would flood the audit log with rows for content the model
+      // never saw — same policy as compression fallback
+      // (§retrieval/compression.ts).
+      //
+      // Scope-pinned via `listingScopeOption(l)`: the listing already
+      // carries the post-dedupe winning scope; pinning keeps the body
+      // load symmetric with the compression resolver and avoids a
+      // precedence re-walk landing on a different scope's body.
+      const needsPeek = deps.loadBodies === true || deps.trustedOnly === true;
+      const file = needsPeek ? deps.registry.peek(l.name, listingScopeOption(l)) : undefined;
+      // §4.4 I3 — hard trust filter, fail-closed: drop when the trust
+      // marker can't be read (peek not `present`) OR is `untrusted`.
+      // An automatic injection must not surface content it can't prove
+      // is trusted. Skipped entirely when `trustedOnly` is off, so the
+      // prior behavior (untrusted bodies included) is preserved.
+      if (deps.trustedOnly === true) {
+        if (file === undefined || file.kind !== 'present') continue;
+        if (file.file.frontmatter.trust === 'untrusted') continue;
+      }
       listingById.set(id, l);
       const nameTokens = tokenize(l.name);
       const descTokens = tokenize(l.entry.hook);
       const tokens: string[] = [];
       for (let i = 0; i < TITLE_WEIGHT; i++) tokens.push(...nameTokens);
       for (let i = 0; i < DESCRIPTION_WEIGHT; i++) tokens.push(...descTokens);
-      if (deps.loadBodies === true) {
-        // Use `registry.peek` (not `read`) — BM25 corpus
-        // construction reads EVERY listed memory body just to
-        // compute term frequencies for ranking. Only the top-K
-        // hits actually become candidates, and only the included
-        // slot entries ever reach the model. Emitting
-        // `memory_events action=read` per indexed memory would
-        // flood the audit log with rows for content the model
-        // never saw — same policy as compression fallback
-        // (§retrieval/compression.ts).
-        //
-        // Scope-pinned via `{ scope: l.scope }`: the listing
-        // already carries the post-dedupe winning scope, and
-        // pinning makes the body load symmetric with the
-        // compression resolver (compression.ts memoryResolver).
-        // Without the pin, peek re-walks precedence and could
-        // land on a different scope's body if the registry's
-        // disk state changes between corpus build and body load
-        // — a race the listing-set is supposed to lock down.
-        // `present` means body loaded; `missing` / `malformed` /
-        // `unknown` fall through as title+description only (the
-        // candidate is still ranked on its name + description
-        // signal).
-        const file = deps.registry.peek(l.name, listingScopeOption(l));
-        if (file.kind === 'present') {
-          const bodyTokens = tokenize(file.file.body);
-          for (let i = 0; i < BODY_WEIGHT; i++) tokens.push(...bodyTokens);
-        }
+      // `present` means body loaded; `missing` / `malformed` /
+      // `unknown` fall through as title+description only (the candidate
+      // is still ranked on its name + description signal).
+      if (deps.loadBodies === true && file?.kind === 'present') {
+        const bodyTokens = tokenize(file.file.body);
+        for (let i = 0; i < BODY_WEIGHT; i++) tokens.push(...bodyTokens);
       }
-      return { id, tokens };
-    });
+      docs.push({ id, tokens });
+    }
 
     const index = createBM25Index(docs);
     const hits = index.topK(query.text, limit);

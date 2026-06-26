@@ -66,13 +66,14 @@ describe('renderInitConfigTemplate', () => {
     expect(parsed.budget.compaction_relevance).toBe(DEFAULT_BUDGET.compactionRelevance);
   });
 
-  test('[memory] values match DEFAULT_MEMORY_CONFIG (all three governance detectors)', () => {
+  test('[memory] values match DEFAULT_MEMORY_CONFIG (three detectors + proactive_inject)', () => {
     const parsed = Bun.TOML.parse(renderInitConfigTemplate(defaults())) as {
       memory: Record<string, unknown>;
     };
     expect(parsed.memory.verify_semantic_llm).toBe(DEFAULT_MEMORY_CONFIG.verifySemanticLlm);
     expect(parsed.memory.conflict_detect_llm).toBe(DEFAULT_MEMORY_CONFIG.conflictDetectLlm);
     expect(parsed.memory.override_detect_llm).toBe(DEFAULT_MEMORY_CONFIG.overrideDetectLlm);
+    expect(parsed.memory.proactive_inject).toBe(DEFAULT_MEMORY_CONFIG.proactiveInject);
   });
 
   test('scaffold contains NO comments (slash round-trip would kill them)', () => {

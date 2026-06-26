@@ -42,6 +42,10 @@ export interface MemoryConfigKeys {
   conflictDetectLlm: boolean;
   // S3 LLM-judge `user_override_repeated` detector.
   overrideDetectLlm: boolean;
+  // Phase 3 §4.4 — proactive memory injection. UNLIKE the three
+  // detectors above, this defaults OFF (opt-in): it trades cache
+  // stability for recall, aimed at weak/local models.
+  proactiveInject: boolean;
 }
 
 // Inverted default since Slice Q (post-S13) and extended to S3 in
@@ -53,6 +57,7 @@ export const DEFAULT_MEMORY_CONFIG: MemoryConfigKeys = {
   verifySemanticLlm: true,
   conflictDetectLlm: true,
   overrideDetectLlm: true,
+  proactiveInject: false,
 };
 
 // Provenance signal for the boot banner. `false` means the field was
@@ -65,6 +70,7 @@ export interface MemoryConfigPresence {
   verifySemanticLlm: boolean;
   conflictDetectLlm: boolean;
   overrideDetectLlm: boolean;
+  proactiveInject: boolean;
 }
 
 export interface LoadedMemoryConfig {
@@ -82,9 +88,11 @@ interface PartialMemoryLayer {
   verifySemanticLlm?: boolean;
   conflictDetectLlm?: boolean;
   overrideDetectLlm?: boolean;
+  proactiveInject?: boolean;
   hadVerifyField: boolean;
   hadConflictField: boolean;
   hadOverrideField: boolean;
+  hadProactiveField: boolean;
 }
 
 const parseMemoryLayer = (
@@ -95,6 +103,7 @@ const parseMemoryLayer = (
     hadVerifyField: false,
     hadConflictField: false,
     hadOverrideField: false,
+    hadProactiveField: false,
   };
   const warnings: string[] = [];
   const section = loadTomlSection(path, 'memory', source);
@@ -179,6 +188,27 @@ const parseMemoryLayer = (
     }
   }
 
+  // Phase 3 §4.4 — proactive_inject. Same parse shape; defaults OFF.
+  const snakeProactive = m.proactive_inject;
+  const camelProactive = m.proactiveInject;
+  if (snakeProactive !== undefined && camelProactive !== undefined) {
+    warnings.push(
+      `${source} config (${path}): [memory] declares both proactive_inject and proactiveInject; snake_case wins, camelCase ignored`,
+    );
+  }
+  const proactiveVal = snakeProactive ?? camelProactive;
+  const proactiveKey = snakeProactive !== undefined ? 'proactive_inject' : 'proactiveInject';
+  if (proactiveVal !== undefined) {
+    if (typeof proactiveVal !== 'boolean') {
+      warnings.push(
+        `${source} config (${path}): [memory].${proactiveKey}=${fmtBad(proactiveVal)} must be a boolean; ignoring`,
+      );
+    } else {
+      layer.proactiveInject = proactiveVal;
+      layer.hadProactiveField = true;
+    }
+  }
+
   return { layer, warnings };
 };
 
@@ -212,6 +242,10 @@ export const loadMemoryConfig = (input: LoadMemoryConfigInput): LoadedMemoryConf
       projectResult.layer.overrideDetectLlm ??
       userResult.layer.overrideDetectLlm ??
       DEFAULT_MEMORY_CONFIG.overrideDetectLlm,
+    proactiveInject:
+      projectResult.layer.proactiveInject ??
+      userResult.layer.proactiveInject ??
+      DEFAULT_MEMORY_CONFIG.proactiveInject,
   };
 
   return {
@@ -220,11 +254,13 @@ export const loadMemoryConfig = (input: LoadMemoryConfigInput): LoadedMemoryConf
       verifySemanticLlm: userResult.layer.hadVerifyField,
       conflictDetectLlm: userResult.layer.hadConflictField,
       overrideDetectLlm: userResult.layer.hadOverrideField,
+      proactiveInject: userResult.layer.hadProactiveField,
     },
     projectHadField: {
       verifySemanticLlm: projectResult.layer.hadVerifyField,
       conflictDetectLlm: projectResult.layer.hadConflictField,
       overrideDetectLlm: projectResult.layer.hadOverrideField,
+      proactiveInject: projectResult.layer.hadProactiveField,
     },
     userPath,
     projectPath,
