@@ -92,14 +92,19 @@ describe('buildProactiveRecall', () => {
     ]);
   });
 
-  test('drops survivors whose body cannot load (null or empty)', async () => {
+  test('drops survivors whose body cannot load (null, empty, or whitespace-only)', async () => {
     const recall = buildProactiveRecall({
       search: fakeSearch([
         cand('memory:user/withbody', 3.0),
         cand('memory:user/nullbody', 2.5),
         cand('memory:user/emptybody', 2.0),
+        cand('memory:user/wsbody', 1.5),
       ]),
-      loadBody: bodyFor({ 'memory:user/withbody': 'B', 'memory:user/emptybody': '' }),
+      loadBody: bodyFor({
+        'memory:user/withbody': 'B',
+        'memory:user/emptybody': '',
+        'memory:user/wsbody': '   \n  ',
+      }),
     });
     const out = await recall({ goalText: 'x', prompt: 'y' });
     expect(out.map((r) => r.nodeId)).toEqual(['memory:user/withbody']);

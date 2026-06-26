@@ -329,7 +329,7 @@ Each task lands as one or more commits on the active branch. Each slice closes w
 
 **Done:** `buildProactiveRecall(deps)` builds the query (goal + prompt; blank → recall nothing), scans the view's score order, applies the BM25 floor (`break` — sorted-desc) then the top-K cap (checked first, so `topK <= 0` recalls nothing), and resolves bodies via an injected `loadBody` (null/empty → dropped). Constants `PROACTIVE_RECALL_MIN_SCORE` (1.0, raw-BM25 scale) + `PROACTIVE_RECALL_TOP_K` (3), exported/tunable; P5 calibrates. **Design change from the plan:** deps are injected (`search` + `loadBody`), NOT `ctx.retrieveContext` — the runner takes no per-call `trustedOnly` (`RetrieveFnOpts` is `{toolCallId}` only; the memory view is built at boot), and routing through it would either flip the model-driven `retrieve_context` (the parked untrusted-slot gap) or drag in the pipeline's compression/levels. So P2 builds the `trustedOnly` + `loadBodies` view and passes its `search`; I3 stays in the view (P0), the trace (I5) in P4. **Review (medium):** extended `trustedOnly` to the full I3 contract (trusted + **active**), which removed the need for an in-producer re-rank (active-only ⇒ no quarantine-penalty reshuffle ⇒ the view's order is already final) and dropped the duplicated `===` comparator the finders flagged; also fixed a `topK <= 0` off-by-one. 8 producer tests + a quarantine-exclusion view test; retrieval suite green.
 
-## Slice P2 — Injection point (I1/I2) · `src/harness/proactive-memory-inject.ts` (new, mirrors `working-state-inject.ts`)
+## Slice P2 — Injection point (I1/I2) · `src/harness/proactive-memory-inject.ts` (new, mirrors `working-state-inject.ts`) · ✅ DONE
 
 | Task | Description |
 |---|---|
@@ -337,15 +337,17 @@ Each task lands as one or more commits on the active branch. Each slice closes w
 | **TP2.2** | Wire into the loop behind `config.memoryProactiveInject` + the P3 gate. Build the recall (P1) just before the provider call. |
 | **TP2.3** | Tests: I1 — system-prompt `memory` segment byte-identical with/without injection, breakpoint count unchanged; I2 — block present in `reqMessages`, absent from persisted `messages`; OFF when the flag is disabled. |
 
-## Slice P3 — Gating (when to recall) · extends `src/memory/triggers.ts`
+**Done:** the feature turns on (behind the flag, default OFF + primary-agent-only). `proactive-memory-inject.ts` (new): `injectProactiveMemoryBlock` appends the `# Recalled for this turn` block to the bottom of [current_turn] via the shared `appendTextToLastUserMessage` — I1 (never touches the system-prompt index segment → cached prefix intact) + I2 (replace-not-mutate on the `reqMessages` snapshot → nothing persisted); bodies framed as reference, not instructions. `createProactiveRecall` wires the §4.4 I3 view (trusted+active+loadBodies) + a `parseMemoryNodeId` body loader. Wired in `loop.ts` after `injectWorkingStateBlock`, gated on `memoryProactiveInject && enableStaticGuidance` (the primary-agent proxy) `&& memoryRegistry`. **The P3 focus-change gate folded in here** as `resolveCachedRecall`: recompute only when the working-state focus changes (a stable goal pays once), re-inject the cached block each step. 12 tests (renderer I1/I2; the gate's recompute/reuse/per-session; end-to-end wiring with the I3 trust+active filter); loop suite green, typecheck + lint clean.
 
-The runtime-trigger machinery `triggers.ts:27` deferred. Not every turn — gate it.
+## Slice P3 — Runtime-trigger gating · extends `src/memory/triggers.ts`
+
+The focus-change gate (TP3.1) shipped inside P2 (`resolveCachedRecall`). What remains is the runtime-trigger machinery `triggers.ts:27` deferred — a second gate so a prompt that fires a `triggers:` runtime tag recalls even when the focus didn't change.
 
 | Task | Description |
 |---|---|
-| **TP3.1** | Goal/focus-change gate: hash the working-state focus; recall only when it changes (no per-turn cost on a stable goal). |
-| **TP3.2** | Runtime-trigger matcher: match the prompt/event against `triggers:` runtime tags (the §4.3 runtime layer the boot-only `triggers.ts` left open). |
-| **TP3.3** | Tests: fires only on the gate; same goal without a trigger → no recall. |
+| **TP3.1** | ✅ Done in P2 — focus-change gate (`resolveCachedRecall`): recompute only when the working-state focus changes. |
+| **TP3.2** | Runtime-trigger matcher: match the prompt/event against `triggers:` runtime tags (the §4.3 runtime layer the boot-only `triggers.ts` left open). Compose with the focus gate (recall when EITHER fires). |
+| **TP3.3** | Tests: a trigger-tagged prompt recalls on a stable focus; no trigger + stable focus → no recall. |
 
 ## Slice P4 — Trace + provenance (I5)
 

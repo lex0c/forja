@@ -111,7 +111,7 @@ export const buildProactiveRecall = (
       if (recalled.length >= topK) break;
       if (c.bootstrapScore < minScore) break;
       const body = deps.loadBody(c.nodeId);
-      if (body === null || body.length === 0) continue;
+      if (body === null || body.trim().length === 0) continue;
       recalled.push({ nodeId: c.nodeId, score: c.bootstrapScore, body });
     }
     return recalled;

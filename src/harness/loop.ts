@@ -85,6 +85,12 @@ import {
 import { resolveProviderEffort } from './effort.ts';
 import { type ExhaustionSynthesisResult, synthesizeOnExhaustion } from './exhaustion-synthesis.ts';
 import { invokeTool } from './invoke-tool.ts';
+import {
+  type ProactiveRecallCacheEntry,
+  createProactiveRecall,
+  injectProactiveMemoryBlock,
+  resolveCachedRecall,
+} from './proactive-memory-inject.ts';
 import { MAX_RESUME_MESSAGES } from './resume.ts';
 import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
 import { type HydrateInfo, SessionContext } from './session-context.ts';
@@ -488,6 +494,27 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // db. Built once per run (the store is stateless over the db) and reused in
   // buildCtx, rather than re-wrapping on every tool call.
   const contextPinsStore = config.contextPinsStore ?? createContextPinsStore(config.db);
+  // §4.4 P2 — proactive memory injection. Built once, primary-agent-only
+  // (`subagentDepth === 0`, the same primary signal the sibling memory
+  // detectors gate on — a subagent must not proactively inject), when the
+  // opt-in flag is on and a registry is wired. The view is trusted+active+
+  // loadBodies (I3) and mirrors the trust-probe scope posture. `undefined`
+  // when off → the injection site below is a no-op (default OFF).
+  const proactiveRecall =
+    config.memoryProactiveInject === true &&
+    (config.subagentDepth ?? 0) === 0 &&
+    config.memoryRegistry !== undefined
+      ? createProactiveRecall({
+          registry: config.memoryRegistry,
+          ...(config.memoryExcludeScopes !== undefined && config.memoryExcludeScopes.length > 0
+            ? { excludeScopes: config.memoryExcludeScopes }
+            : {}),
+        })
+      : undefined;
+  // Per-session recall cache (the P3 gate): recompute only when the working-
+  // state focus changes; re-inject the cached result each step. Function-
+  // local — dies with the run, like todoStore.
+  const proactiveCache = new Map<string, ProactiveRecallCacheEntry>();
   // Per-run totals. Each completed provider turn adds its usage and
   // its computed cost; HarnessResult.usage / costUsd report THIS
   // RUN's numbers — caller telemetry that has to stay self-
@@ -2991,7 +3018,37 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // Inject the working-state panel at the bottom of [current_turn]
         // (appended to the last user message) — max-attention, cache-neutral,
         // alternation-safe (WORKING_STATE.md §5). No-op when the panel is empty.
-        injectWorkingStateBlock(reqMessages, workingStateStore.get(sessionId), wsStep);
+        const ws = workingStateStore.get(sessionId);
+        injectWorkingStateBlock(reqMessages, ws, wsStep);
+        // §4.4 P2 — proactive memory injection (opt-in, default OFF; built
+        // above only for the primary agent). The P3 gate: recompute the recall
+        // only when the working-state focus changed since the last recall, else
+        // reuse the cached result; either way re-inject it onto the reqMessages
+        // tail (below the working-state panel) so it rides the uncached turn —
+        // never the cached prefix (I1) and never the persisted history (I2).
+        // Best-effort: unlike the synchronous neighbors, the recall does real
+        // I/O (frontmatter peek + BM25) and sits OUTSIDE the per-step try, so a
+        // throw would abort an otherwise-healthy turn. Isolate it — a default-
+        // OFF nudge must fail to nothing (FAILURE_MODES / §0.4 fallback).
+        if (proactiveRecall !== undefined) {
+          try {
+            const focusKey = ws.focus?.text ?? '';
+            const recalled = await resolveCachedRecall(
+              proactiveCache,
+              sessionId,
+              focusKey,
+              proactiveRecall,
+              config.userPrompt,
+            );
+            injectProactiveMemoryBlock(reqMessages, recalled);
+          } catch (err) {
+            process.stderr.write(
+              `forja: proactive memory recall failed (continuing without it): ${
+                err instanceof Error ? err.message : String(err)
+              }\n`,
+            );
+          }
+        }
         // Static operating guidance sits directly below the working-state panel
         // at the bottom of [current_turn]. Injected after the panel (so it stays
         // below) but gated to the primary agent: subagents have no working-state
