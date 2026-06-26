@@ -211,6 +211,23 @@ model = "anthropic/claude-opus-4-7"
     expect(raw).not.toContain('# model pinned post-eval');
   });
 
+  test('preserves proactive_inject opt-out through a detector toggle (§4.4 default ON)', async () => {
+    // proactive_inject defaults ON, so `false` is the operator's persisted
+    // opt-out. Toggling an UNRELATED detector must not drop it — else the next
+    // boot falls back to the default and silently re-enables proactive injection.
+    mkdirSync(join(workdir, '.forja'), { recursive: true });
+    writeFileSync(
+      join(workdir, '.forja', 'config.toml'),
+      '[memory]\nproactive_inject = false\nverify_semantic_llm = true\n',
+    );
+    const r = await memoryCommand.exec(['governance', 'disable', 'conflict'], ctx);
+    expect(r.kind).toBe('ok');
+    const raw = readFileSync(join(workdir, '.forja', 'config.toml'), 'utf8');
+    expect(raw).toContain('conflict_detect_llm = false'); // the toggle landed
+    expect(raw).toContain('proactive_inject = false'); // the opt-out survived
+    expect(raw).toContain('verify_semantic_llm = true'); // unrelated detector kept
+  });
+
   test('replaces existing [memory] block in place (no duplicate)', async () => {
     mkdirSync(join(workdir, '.forja'), { recursive: true });
     writeFileSync(

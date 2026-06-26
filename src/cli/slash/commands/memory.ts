@@ -3463,9 +3463,15 @@ const mutateMemoryConfig = (params: {
     const v = m.verify_semantic_llm ?? m.verifySemanticLlm;
     const c = m.conflict_detect_llm ?? m.conflictDetectLlm;
     const o = m.override_detect_llm ?? m.overrideDetectLlm;
+    // §4.4 — proactive_inject defaults ON, so `false` is the operator's persisted
+    // opt-out. It's not a governance patch, but it MUST survive this rewrite:
+    // dropping it lets the next boot fall back to the default and silently
+    // re-enable proactive injection.
+    const p = m.proactive_inject ?? m.proactiveInject;
     if (typeof v === 'boolean') memBlock.verify_semantic_llm = v;
     if (typeof c === 'boolean') memBlock.conflict_detect_llm = c;
     if (typeof o === 'boolean') memBlock.override_detect_llm = o;
+    if (typeof p === 'boolean') memBlock.proactive_inject = p;
   }
   if (patches.verifySemanticLlm !== undefined) {
     memBlock.verify_semantic_llm = patches.verifySemanticLlm;
