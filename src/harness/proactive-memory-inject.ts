@@ -1,8 +1,10 @@
-import type { MemoryRegistry, MemoryScope } from '../memory/index.ts';
+import { type MemoryRegistry, type MemoryScope, serializeMemoryFile } from '../memory/index.ts';
 import { type RecalledMemory, buildProactiveRecall } from '../memory/proactive-recall.ts';
 import type { ProviderMessage } from '../providers/types.ts';
 import { parseMemoryNodeId } from '../retrieval/node-ids.ts';
 import { createMemoryView } from '../retrieval/views/memory.ts';
+import type { DB } from '../storage/db.ts';
+import { hashMemoryContent, recordProvenance } from '../storage/repos/memory-provenance.ts';
 import { appendTextToLastUserMessage } from './turn-append.ts';
 
 // Render + inject the proactive recall block (MEMORY.md §4.4 P2).
@@ -116,10 +118,50 @@ export const resolveCachedRecall = async (
   focusKey: string,
   recall: (input: { goalText: string; prompt: string }) => Promise<RecalledMemory[]>,
   prompt: string,
-): Promise<RecalledMemory[]> => {
+): Promise<{ recalled: RecalledMemory[]; recomputed: boolean }> => {
   const cached = cache.get(sessionId);
-  if (cached !== undefined && cached.focusKey === focusKey) return cached.recalled;
+  if (cached !== undefined && cached.focusKey === focusKey) {
+    return { recalled: cached.recalled, recomputed: false };
+  }
   const recalled = await recall({ goalText: focusKey, prompt });
   cache.set(sessionId, { focusKey, recalled });
-  return recalled;
+  return { recalled, recomputed: true };
+};
+
+// Emit one §4.4 I5 provenance exposure per proactively-injected memory —
+// surface='proactive' (toolCallId null, no retrieval link, like eager). Call on
+// RECOMPUTE only (not every re-inject) so a stable goal logs one exposure per
+// focus, not per step.
+//
+// Re-peeks each memory to build the exposure the way the eager /
+// retrieve_context emitters do: the content hash is over `serializeMemoryFile`
+// (frontmatter + body) so it cross-compares with those surfaces' rows for the
+// same memory, and the state is the REAL frontmatter state, not an assumption.
+// Per-row try/catch (also like eager): one audit-write failure must not drop
+// the exposures for the rest.
+export const recordProactiveExposures = (
+  db: DB,
+  registry: MemoryRegistry,
+  sessionId: string,
+  recalled: readonly RecalledMemory[],
+): void => {
+  for (const m of recalled) {
+    const parsed = parseMemoryNodeId(m.nodeId);
+    if (parsed === null) continue;
+    const file = registry.peek(parsed.name, { scope: parsed.scope });
+    if (file.kind !== 'present') continue;
+    try {
+      recordProvenance(db, {
+        sessionId,
+        toolCallId: null,
+        memoryScope: parsed.scope,
+        memoryName: parsed.name,
+        surface: 'proactive',
+        memoryContentHash: hashMemoryContent(serializeMemoryFile(file.file)),
+        memoryStateAtExposure: file.file.frontmatter.state ?? 'active',
+      });
+    } catch {
+      // best-effort per row — swallow so the rest still record.
+    }
+  }
 };

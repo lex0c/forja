@@ -77,6 +77,7 @@ import { migration076SubagentRunsModelEntry } from './076-subagent-runs-model-en
 import { migration077MessagesModel } from './077-messages-model.ts';
 import { migration078CompactionEventsModel } from './078-compaction-events-model.ts';
 import { migration079MessagesRetracted } from './079-messages-retracted.ts';
+import { migration080MemoryProvenanceProactive } from './080-memory-provenance-proactive.ts';
 
 export interface Migration {
   id: number;
@@ -164,4 +165,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration077MessagesModel,
   migration078CompactionEventsModel,
   migration079MessagesRetracted,
+  migration080MemoryProvenanceProactive,
 ];

@@ -92,6 +92,53 @@ describe('recordProvenance', () => {
     expect(row.positionInCorpus).toBeNull();
   });
 
+  test('proactive surface persists with tool_call_id NULL (§4.4 I5)', () => {
+    // Migration 080 widened the CHECK; an insert that lands proves it applied.
+    const row = recordProvenance(db, {
+      sessionId,
+      toolCallId: null,
+      memoryScope: 'user',
+      memoryName: 'role',
+      surface: 'proactive',
+      memoryContentHash: hashMemoryContent('frontmatter+body'),
+      memoryStateAtExposure: 'active',
+      createdAt: 1500,
+    });
+    expect(row.surface).toBe('proactive');
+    expect(row.toolCallId).toBeNull();
+    expect(row.retrievalQueryId).toBeNull();
+    expect(row.positionInCorpus).toBeNull();
+  });
+
+  test('proactive surface rejects a non-null toolCallId (like eager)', () => {
+    const toolCallId = seedToolCall('x');
+    expect(() =>
+      recordProvenance(db, {
+        sessionId,
+        toolCallId,
+        memoryScope: 'user',
+        memoryName: 'role',
+        surface: 'proactive',
+        createdAt: 1500,
+      }),
+    ).toThrow(/surface=proactive requires toolCallId=null/);
+  });
+
+  test('proactive surface rejects retrieval grouping fields', () => {
+    expect(() =>
+      recordProvenance(db, {
+        sessionId,
+        toolCallId: null,
+        memoryScope: 'user',
+        memoryName: 'role',
+        surface: 'proactive',
+        retrievalQueryId: 'q1',
+        positionInCorpus: 0,
+        createdAt: 1500,
+      }),
+    ).toThrow(/must not set retrievalQueryId/);
+  });
+
   test('memory_read surface links to its tool_call_id', () => {
     // memory_read happens AFTER the model issued a tool call; the
     // provenance row links to that call. Per the invariant added

@@ -349,13 +349,15 @@ The focus-change gate (TP3.1) shipped inside P2 (`resolveCachedRecall`). What re
 | **TP3.2** | Runtime-trigger matcher: match the prompt/event against `triggers:` runtime tags (the §4.3 runtime layer the boot-only `triggers.ts` left open). Compose with the focus gate (recall when EITHER fires). |
 | **TP3.3** | Tests: a trigger-tagged prompt recalls on a stable focus; no trigger + stable focus → no recall. |
 
-## Slice P4 — Trace + provenance (I5)
+## Slice P4 — Trace + provenance (I5) · ✅ DONE
 
 | Task | Description |
 |---|---|
 | **TP4.1** | The runner already writes `retrieval_trace`; tag the proactive call `surface='proactive'`. |
 | **TP4.2** | Emit a `memory_provenance` exposure per injected memory (reuse the `eagerExposures` emitter). |
 | **TP4.3** | Tests (I5): each injection → provenance row with `surface='proactive'`; visible via `/memory provenance`. |
+
+**Done:** I5 is **provenance-only** for the proactive path — it bypasses the `retrieve_context` pipeline (no `retrieval_query_id`), so it's shaped like `eager`, not `retrieve_context`; there's no `retrieval_trace` to tag (TP4.1 assumed the runner — the runner isn't on this path). Migration 080 widens the `memory_provenance.surface` CHECK with `'proactive'` (rebuild, like 069; FKs + indexes preserved); `ProvenanceSurface` + `recordProvenance` treat it like `eager` (toolCallId null, no retrieval grouping fields). `recordProactiveExposures` (in `proactive-memory-inject.ts`) emits one exposure per injected memory, called from the loop on RECOMPUTE only (one row per memory per focus, not per step), best-effort inside the same try; `resolveCachedRecall` now returns `{recalled, recomputed}` to drive it. `/memory provenance` renders it unchanged (the renderer is surface-generic). Tests: repo (proactive inserts; rejects non-null toolCallId / retrieval fields), the emitter (a row per memory, malformed ids skipped), migration applies; slash + provenance suites green.
 
 ## Slice P5 — Eval (default gate)
 

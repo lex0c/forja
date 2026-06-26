@@ -89,6 +89,7 @@ import {
   type ProactiveRecallCacheEntry,
   createProactiveRecall,
   injectProactiveMemoryBlock,
+  recordProactiveExposures,
   resolveCachedRecall,
 } from './proactive-memory-inject.ts';
 import { MAX_RESUME_MESSAGES } from './resume.ts';
@@ -3033,7 +3034,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (proactiveRecall !== undefined) {
           try {
             const focusKey = ws.focus?.text ?? '';
-            const recalled = await resolveCachedRecall(
+            const { recalled, recomputed } = await resolveCachedRecall(
               proactiveCache,
               sessionId,
               focusKey,
@@ -3041,6 +3042,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               config.userPrompt,
             );
             injectProactiveMemoryBlock(reqMessages, recalled);
+            // §4.4 I5 — record the exposure on recompute only (one row per
+            // memory per focus, not per step), inside this best-effort try.
+            if (recomputed && config.memoryRegistry !== undefined) {
+              recordProactiveExposures(config.db, config.memoryRegistry, sessionId, recalled);
+            }
           } catch (err) {
             process.stderr.write(
               `forja: proactive memory recall failed (continuing without it): ${

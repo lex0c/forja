@@ -11,6 +11,7 @@ import {
   createProactiveRecall,
   formatProactiveRecallBlock,
   injectProactiveMemoryBlock,
+  recordProactiveExposures,
   resolveCachedRecall,
 } from '../../src/harness/proactive-memory-inject.ts';
 import type { ScopeRoots } from '../../src/memory/paths.ts';
@@ -19,6 +20,10 @@ import { createMemoryRegistry } from '../../src/memory/registry.ts';
 import type { ProviderMessage } from '../../src/providers/types.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
+import {
+  hashMemoryContent,
+  listProvenanceByName,
+} from '../../src/storage/repos/memory-provenance.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';
 
 const rec = (nodeId: string, body: string): RecalledMemory => ({ nodeId, score: 1, body });
@@ -166,6 +171,32 @@ describe('createProactiveRecall (wiring)', () => {
     expect(out.map((r) => r.nodeId)).toContain('memory:user/act');
     expect(out.map((r) => r.nodeId)).not.toContain('memory:user/quar');
   });
+
+  test('recordProactiveExposures writes a canonical proactive row per loaded memory', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](alpha.md) — x\n');
+    writeBody(roots.user, 'alpha', 'body a', { description: 'x' });
+    writeIndex(roots.projectLocal, '- [B](beta.md) — y\n');
+    writeBody(roots.projectLocal, 'beta', 'body b', { description: 'y' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    recordProactiveExposures(db, registry, sessionId, [
+      rec('memory:user/alpha', 'body a'),
+      rec('memory:project_local/beta', 'body b'),
+      rec('memory:user/ghost', 'no file on disk'), // valid id, no file → skipped
+      rec('not-a-memory-node', 'malformed id'), // parse fail → skipped
+    ]);
+    const alpha = listProvenanceByName(db, sessionId, 'alpha');
+    expect(alpha).toHaveLength(1);
+    expect(alpha[0]?.surface).toBe('proactive');
+    expect(alpha[0]?.toolCallId).toBeNull();
+    // canonical hash (frontmatter + body), NOT the bare body and not null —
+    // so it cross-compares with eager / retrieve_context rows.
+    expect(alpha[0]?.memoryContentHash).not.toBeNull();
+    expect(alpha[0]?.memoryContentHash).not.toBe(hashMemoryContent('body a'));
+    expect(listProvenanceByName(db, sessionId, 'beta')).toHaveLength(1);
+    expect(listProvenanceByName(db, sessionId, 'ghost')).toHaveLength(0);
+  });
 });
 
 describe('resolveCachedRecall (the P3 focus-change gate)', () => {
@@ -183,7 +214,8 @@ describe('resolveCachedRecall (the P3 focus-change gate)', () => {
     const { recall, calls } = mk();
     const out = await resolveCachedRecall(cache, 's1', 'focusA', recall, 'p');
     expect(calls()).toBe(1);
-    expect(out.map((r) => r.nodeId)).toEqual(['memory:user/focusA']);
+    expect(out.recomputed).toBe(true);
+    expect(out.recalled.map((r) => r.nodeId)).toEqual(['memory:user/focusA']);
     expect(cache.get('s1')?.focusKey).toBe('focusA');
   });
 
@@ -193,7 +225,8 @@ describe('resolveCachedRecall (the P3 focus-change gate)', () => {
     await resolveCachedRecall(cache, 's1', 'focusA', recall, 'p');
     const out = await resolveCachedRecall(cache, 's1', 'focusA', recall, 'p');
     expect(calls()).toBe(1); // reused, not recomputed
-    expect(out.map((r) => r.nodeId)).toEqual(['memory:user/focusA']);
+    expect(out.recomputed).toBe(false);
+    expect(out.recalled.map((r) => r.nodeId)).toEqual(['memory:user/focusA']);
   });
 
   test('focus change recomputes and updates the cache', async () => {
@@ -202,7 +235,8 @@ describe('resolveCachedRecall (the P3 focus-change gate)', () => {
     await resolveCachedRecall(cache, 's1', 'focusA', recall, 'p');
     const out = await resolveCachedRecall(cache, 's1', 'focusB', recall, 'p');
     expect(calls()).toBe(2);
-    expect(out.map((r) => r.nodeId)).toEqual(['memory:user/focusB']);
+    expect(out.recomputed).toBe(true);
+    expect(out.recalled.map((r) => r.nodeId)).toEqual(['memory:user/focusB']);
     expect(cache.get('s1')?.focusKey).toBe('focusB');
   });
 
