@@ -11,6 +11,7 @@ import { emitToolCallOutcome } from '../feedback/outcome-emitter.ts';
 import { buildScopeChain } from '../feedback/scope-detect.ts';
 import { type HookChainResult, type HookEventPayload, dispatchChain } from '../hooks/index.ts';
 import { resolveRepoRoot } from '../memory/paths.ts';
+import type { RecalledMemory } from '../memory/proactive-recall.ts';
 import { type MemoryRegistry, createScopeFilteredRegistry } from '../memory/registry.ts';
 import {
   type SemanticVerifyScheduler,
@@ -516,6 +517,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // state focus changes; re-inject the cached result each step. Function-
   // local — dies with the run, like todoStore.
   const proactiveCache = new Map<string, ProactiveRecallCacheEntry>();
+  // The recall for the CURRENT step, computed at the top of the loop (before
+  // maybeCompact) so its injected body size is counted in the compaction /
+  // output-fit decision; the injection site below consumes it. `recomputed`
+  // drives the provenance write (recompute = the working-state focus changed).
+  let proactiveRecalled: RecalledMemory[] = [];
+  let proactiveRecomputed = false;
   // Per-run totals. Each completed provider turn adds its usage and
   // its computed cost; HarnessResult.usage / costUsd report THIS
   // RUN's numbers — caller telemetry that has to stay self-
@@ -2642,6 +2649,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           const shape = [...messages];
           if (!force) {
             injectWorkingStateBlock(shape, workingStateStore.get(sessionId), steps);
+            // Count the proactive bodies too (computed before this call): they're
+            // appended to the real request below, AFTER this gate — omitting them
+            // here lets a near-ceiling request tip over context_window instead of
+            // compacting first.
+            injectProactiveMemoryBlock(shape, proactiveRecalled);
             if (config.enableStaticGuidance)
               injectStaticGuidance(shape, isSmallWindow(contextWindow));
           }
@@ -2990,6 +3002,34 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           toolsDirty = false;
         }
 
+        // §4.4 — compute the proactive recall BEFORE maybeCompact so its body
+        // size is counted in the compaction / output-fit decision (the block is
+        // appended to the request below, AFTER this gate). The injection site
+        // consumes this same result; `recomputed` drives its provenance write.
+        // Best-effort I/O (frontmatter peek + BM25): a failure leaves it empty.
+        proactiveRecalled = [];
+        proactiveRecomputed = false;
+        if (proactiveRecall !== undefined) {
+          try {
+            const focusKey = workingStateStore.get(sessionId).focus?.text ?? '';
+            const res = await resolveCachedRecall(
+              proactiveCache,
+              sessionId,
+              focusKey,
+              proactiveRecall,
+              config.userPrompt,
+            );
+            proactiveRecalled = res.recalled;
+            proactiveRecomputed = res.recomputed;
+          } catch (err) {
+            process.stderr.write(
+              `forja: proactive memory recall failed (continuing without it): ${
+                err instanceof Error ? err.message : String(err)
+              }\n`,
+            );
+          }
+        }
+
         // Compact BEFORE the provider call when over threshold (see
         // maybeCompact above). Runs every iteration, so it covers the first
         // call of a resumed/long session — the post-tool-result-only site
@@ -3021,38 +3061,31 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // alternation-safe (WORKING_STATE.md §5). No-op when the panel is empty.
         const ws = workingStateStore.get(sessionId);
         injectWorkingStateBlock(reqMessages, ws, wsStep);
-        // §4.4 P2 — proactive memory injection (opt-in, default OFF; built
-        // above only for the primary agent). The P3 gate: recompute the recall
-        // only when the working-state focus changed since the last recall, else
-        // reuse the cached result; either way re-inject it onto the reqMessages
-        // tail (below the working-state panel) so it rides the uncached turn —
-        // never the cached prefix (I1) and never the persisted history (I2).
-        // Best-effort: unlike the synchronous neighbors, the recall does real
-        // I/O (frontmatter peek + BM25) and sits OUTSIDE the per-step try, so a
-        // throw would abort an otherwise-healthy turn. Isolate it — a default-
-        // OFF nudge must fail to nothing (FAILURE_MODES / §0.4 fallback).
-        if (proactiveRecall !== undefined) {
-          try {
-            const focusKey = ws.focus?.text ?? '';
-            const { recalled, recomputed } = await resolveCachedRecall(
-              proactiveCache,
-              sessionId,
-              focusKey,
-              proactiveRecall,
-              config.userPrompt,
-            );
-            injectProactiveMemoryBlock(reqMessages, recalled);
-            // §4.4 I5 — record the exposure on recompute only (one row per
-            // memory per focus, not per step), inside this best-effort try.
-            if (recomputed && config.memoryRegistry !== undefined) {
-              recordProactiveExposures(config.db, config.memoryRegistry, sessionId, recalled);
+        // §4.4 — inject the proactive recall onto the reqMessages tail (below the
+        // working-state panel) so it rides the uncached turn — never the cached
+        // prefix (I1) and never the persisted history (I2). The recall itself ran
+        // at the top of the loop (before maybeCompact, so its body size was counted
+        // in the compaction decision); here we append the cached result and, on
+        // recompute (focus changed), record the I5 exposure (one row per memory per
+        // focus, not per step). Best-effort: the provenance write re-peeks each
+        // memory (I/O), so guard it — a nudge must fail to nothing.
+        if (proactiveRecalled.length > 0) {
+          injectProactiveMemoryBlock(reqMessages, proactiveRecalled);
+          if (proactiveRecomputed && config.memoryRegistry !== undefined) {
+            try {
+              recordProactiveExposures(
+                config.db,
+                config.memoryRegistry,
+                sessionId,
+                proactiveRecalled,
+              );
+            } catch (err) {
+              process.stderr.write(
+                `forja: proactive provenance write failed (continuing): ${
+                  err instanceof Error ? err.message : String(err)
+                }\n`,
+              );
             }
-          } catch (err) {
-            process.stderr.write(
-              `forja: proactive memory recall failed (continuing without it): ${
-                err instanceof Error ? err.message : String(err)
-              }\n`,
-            );
           }
         }
         // Static operating guidance sits directly below the working-state panel

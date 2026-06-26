@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { HarnessEvent } from '../../src/harness/index.ts';
 import { runAgent } from '../../src/harness/loop.ts';
 import { type ScopeRoots, rootForScope } from '../../src/memory/paths.ts';
 import { createMemoryRegistry } from '../../src/memory/registry.ts';
@@ -18,11 +19,23 @@ import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';
 import { createToolRegistry } from '../../src/tools/registry.ts';
+import type { Tool } from '../../src/tools/types.ts';
 
-// Minimal provider: one text-only turn, capturing every request it's handed so
-// the test can inspect what the loop actually put on the wire.
-const mockProvider = (): { provider: Provider; requests: GenerateRequest[] } => {
+// Minimal provider: replays a script (default one text-only turn), capturing
+// every request so the test can inspect what the loop put on the wire — and
+// accepts a capabilities override (e.g. a tiny context_window) to drive
+// compaction.
+interface ScriptStep {
+  text?: string;
+  tool?: { id: string; name: string; input: Record<string, unknown> };
+}
+
+const mockProvider = (
+  opts: { caps?: Partial<Provider['capabilities']>; script?: readonly ScriptStep[] } = {},
+): { provider: Provider; requests: GenerateRequest[] } => {
   const requests: GenerateRequest[] = [];
+  const script = opts.script ?? [{ text: 'ok' }];
+  let i = 0;
   const provider: Provider = {
     id: 'mock/m',
     family: 'anthropic',
@@ -37,17 +50,34 @@ const mockProvider = (): { provider: Provider; requests: GenerateRequest[] } => 
       cost_per_1k_input: 0,
       cost_per_1k_output: 0,
       notes: [],
+      ...opts.caps,
     },
     async *generate(req) {
       requests.push(req);
-      yield { kind: 'start', message_id: 'm1' };
-      yield { kind: 'text_delta', text: 'ok' };
-      yield { kind: 'stop', reason: 'end_turn' };
+      const step = script[Math.min(i, script.length - 1)] ?? { text: 'ok' };
+      i += 1;
+      yield { kind: 'start', message_id: `m${i}` };
+      if (step.text !== undefined) yield { kind: 'text_delta', text: step.text };
+      if (step.tool !== undefined) {
+        yield { kind: 'tool_use_start', id: step.tool.id, name: step.tool.name };
+        yield { kind: 'tool_use_stop', id: step.tool.id, final_args: step.tool.input };
+      }
+      yield { kind: 'stop', reason: step.tool !== undefined ? 'tool_use' : 'end_turn' };
     },
     generateConstrained: () => Promise.reject(new Error('not implemented')),
     countTokens: (m) => Promise.resolve(estimateMessagesTokens(m)),
   };
   return { provider, requests };
+};
+
+// Registered so the regression's multi-step script can grow the history past
+// the compaction tail floor with a real tool round-trip.
+const echoTool: Tool = {
+  name: 'echo',
+  description: 'echo back',
+  inputSchema: { type: 'object', properties: {}, required: [] },
+  metadata: { category: 'misc', writes: false, idempotent: true },
+  execute: async () => ({ ok: true }),
 };
 
 let db: DB;
@@ -167,5 +197,70 @@ describe('proactive injection through the loop (§4.4)', () => {
 
     const rows = db.query("SELECT 1 FROM memory_provenance WHERE surface = 'proactive'").all();
     expect(rows).toHaveLength(0);
+  });
+
+  test('compaction sizing counts the proactive bodies (regression)', async () => {
+    // The bug: the block is appended AFTER maybeCompact's size check, so its
+    // tokens were invisible to the compaction trigger. We measure the trigger's
+    // own estimate via compaction_started.promptTokens (built by the same
+    // buildRequestShape) with the flag ON vs OFF — with the fix, ON counts the
+    // injected body and reports more tokens. A big body makes the gap unambiguous.
+    const bigBody = 'Use short-lived JWT bearer tokens for authentication. '.repeat(40);
+    const sizingRun = async (proactive: boolean): Promise<number> => {
+      const base = mkdtempSync(join(tmpdir(), 'forja-proactive-size-'));
+      tmps.push(base);
+      const roots: ScopeRoots = {
+        user: join(base, 'user'),
+        projectShared: join(base, 'shared'),
+        projectLocal: join(base, 'local'),
+      };
+      seedMemory(roots, 'jwt-auth', 'authentication token handling', bigBody);
+      seedMemory(roots, 'css-naming', 'css class naming convention', 'Prefer BEM naming.');
+      seedMemory(roots, 'git-rebase', 'git branch workflow', 'Rebase onto main.');
+      const registry = createMemoryRegistry({
+        roots,
+        db,
+        sessionId: createSession(db, { model: 'mock/m', cwd: '/p' }).id,
+      });
+      // One echo round-trip grows the history past the compaction tail floor;
+      // then a summary response (consumed by the fold), then the turn.
+      const { provider } = mockProvider({
+        caps: { context_window: 1000 },
+        script: [
+          { tool: { id: 't1', name: 'echo', input: {} } },
+          { text: 'SUMMARY' },
+          { text: 'ok' },
+        ],
+      });
+      const toolRegistry = createToolRegistry();
+      toolRegistry.register(echoTool);
+      const events: HarnessEvent[] = [];
+      await runAgent({
+        provider,
+        toolRegistry,
+        permissionEngine: createPermissionEngine(
+          { defaults: { mode: 'bypass' as const }, tools: {} },
+          { cwd: '/p' },
+        ),
+        db,
+        cwd: '/p',
+        userPrompt: 'how should we handle auth tokens on the API',
+        memoryRegistry: registry,
+        memoryProactiveInject: proactive,
+        budget: { compactionThreshold: 0.01, compactionPreserveTail: 0 },
+        onEvent: (e) => events.push(e),
+      });
+      const started = events.find((e) => e.type === 'compaction_started');
+      return started?.type === 'compaction_started' ? started.promptTokens : 0;
+    };
+
+    const onTokens = await sizingRun(true);
+    const offTokens = await sizingRun(false);
+    // Both arms compact (tiny window, low threshold); the ON arm must measure
+    // MORE because buildRequestShape now counts the injected bodies — without the
+    // fix the two were equal and a near-ceiling request shipped over-window.
+    expect(onTokens).toBeGreaterThan(0);
+    expect(offTokens).toBeGreaterThan(0);
+    expect(onTokens).toBeGreaterThan(offTokens);
   });
 });
