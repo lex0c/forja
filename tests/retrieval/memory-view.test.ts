@@ -30,7 +30,13 @@ const writeBody = (
   dir: string,
   name: string,
   body: string,
-  fm: { description?: string; state?: string; expires?: string; trust?: string } = {},
+  fm: {
+    description?: string;
+    state?: string;
+    expires?: string;
+    trust?: string;
+    triggers?: string[];
+  } = {},
 ): void => {
   mkdirSync(dir, { recursive: true });
   const lines = [
@@ -42,6 +48,7 @@ const writeBody = (
   if (fm.state !== undefined) lines.push(`state: ${fm.state}`);
   if (fm.expires !== undefined) lines.push(`expires: ${fm.expires}`);
   if (fm.trust !== undefined) lines.push(`trust: ${fm.trust}`);
+  if (fm.triggers !== undefined) lines.push(`triggers: [${fm.triggers.join(', ')}]`);
   writeFileSync(join(dir, `${name}.md`), `---\n${lines.join('\n')}\n---\n\n${body}\n`);
 };
 
@@ -545,6 +552,27 @@ describe('createMemoryView', () => {
 });
 
 describe('createMemoryView — trustedOnly (§4.4 I3)', () => {
+  test('folds triggers: tags into the corpus on the proactive path (§4.4 P3)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Deploy](deploy-mem.md) — release steps\n');
+    // neither name/description/body says "kubernetes" — only the trigger tag.
+    writeBody(roots.user, 'deploy-mem', 'shipping notes', {
+      description: 'release steps',
+      triggers: ['kubernetes'],
+    });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    // proactive path: the tag is in the corpus → the query matches.
+    const safe = await createMemoryView({ registry, trustedOnly: true }).search({
+      ...baseQuery,
+      text: 'kubernetes',
+    });
+    expect(safe.map((c) => c.nodeId)).toContain('memory:user/deploy-mem');
+    // model-driven path: tags are NOT indexed → no match (corpus unchanged).
+    const open = await createMemoryView({ registry }).search({ ...baseQuery, text: 'kubernetes' });
+    expect(open.map((c) => c.nodeId)).not.toContain('memory:user/deploy-mem');
+  });
+
   test('excludes quarantined memories (I3 active-only)', async () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);

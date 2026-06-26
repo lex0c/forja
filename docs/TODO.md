@@ -339,15 +339,19 @@ Each task lands as one or more commits on the active branch. Each slice closes w
 
 **Done:** the feature turns on (behind the flag, default OFF + primary-agent-only). `proactive-memory-inject.ts` (new): `injectProactiveMemoryBlock` appends the `# Recalled for this turn` block to the bottom of [current_turn] via the shared `appendTextToLastUserMessage` — I1 (never touches the system-prompt index segment → cached prefix intact) + I2 (replace-not-mutate on the `reqMessages` snapshot → nothing persisted); bodies framed as reference, not instructions. `createProactiveRecall` wires the §4.4 I3 view (trusted+active+loadBodies) + a `parseMemoryNodeId` body loader. Wired in `loop.ts` after `injectWorkingStateBlock`, gated on `memoryProactiveInject && enableStaticGuidance` (the primary-agent proxy) `&& memoryRegistry`. **The P3 focus-change gate folded in here** as `resolveCachedRecall`: recompute only when the working-state focus changes (a stable goal pays once), re-inject the cached block each step. 12 tests (renderer I1/I2; the gate's recompute/reuse/per-session; end-to-end wiring with the I3 trust+active filter); loop suite green, typecheck + lint clean.
 
-## Slice P3 — Runtime-trigger gating · extends `src/memory/triggers.ts`
+## Slice P3 — Runtime-trigger gating · ✅ DONE (prompt-mention) · tool-call event deferred
 
-The focus-change gate (TP3.1) shipped inside P2 (`resolveCachedRecall`). What remains is the runtime-trigger machinery `triggers.ts:27` deferred — a second gate so a prompt that fires a `triggers:` runtime tag recalls even when the focus didn't change.
+The focus-change gate (TP3.1) shipped inside P2 (`resolveCachedRecall`). **Scope finding:** `runAgent` runs per-turn (each REPL prompt = a fresh run + fresh cache), so the recall already recomputes per prompt and BM25 already matches what the prompt says — a runtime-trigger *gate* is redundant with that. The non-redundant piece is surfacing `triggers:`-tagged memories the prompt mentions but the body doesn't carry — done below by folding the tags into the proactive corpus. The tool-call event trigger (the bigger win) is deferred (see below).
 
 | Task | Description |
 |---|---|
 | **TP3.1** | ✅ Done in P2 — focus-change gate (`resolveCachedRecall`): recompute only when the working-state focus changes. |
 | **TP3.2** | Runtime-trigger matcher: match the prompt/event against `triggers:` runtime tags (the §4.3 runtime layer the boot-only `triggers.ts` left open). Compose with the focus gate (recall when EITHER fires). |
 | **TP3.3** | Tests: a trigger-tagged prompt recalls on a stable focus; no trigger + stable focus → no recall. |
+
+**Done (prompt-mention):** the memory view folds each memory's `triggers:` tags into the BM25 corpus (`TRIGGER_WEIGHT = 2`) ONLY on the proactive `trustedOnly` path, so a memory tagged `triggers: [deploy]` surfaces for a prompt mentioning "deploy" even when name/desc/body never say it — the §4.3 prompt-mention runtime trigger, no loop/gate change, zero effect on model-driven `retrieve_context` (tags aren't indexed there). The test pins both sides (proactive matches the tag-only term; model-driven doesn't).
+
+**Deferred — tool-call event trigger:** the genuinely distinct signal — model calls `bash` ⇒ surface `triggers: [bash]` memories the prompt never named — needs the loop to track tools-called-this-turn and feed them into the recall query/key. Higher value than prompt-mention but a loop-touching slice; parked as the §4.3 runtime "tool fired" layer.
 
 ## Slice P4 — Trace + provenance (I5) · ✅ DONE
 

@@ -32,6 +32,12 @@ const VIEW: RetrievalView = 'memory';
 const TITLE_WEIGHT = 3;
 const DESCRIPTION_WEIGHT = 2;
 const BODY_WEIGHT = 1;
+// §4.4 P3 — `triggers:` runtime tags fold into the corpus ONLY on the proactive
+// (`trustedOnly`) path, weighted like the description, so a memory tagged
+// `triggers: [deploy]` surfaces for a prompt mentioning "deploy" even when the
+// body never says it (the §4.3 runtime prompt-mention trigger). Off the
+// proactive path the tags don't shift model-driven retrieve_context scores.
+const TRIGGER_WEIGHT = 2;
 const DEFAULT_LIMIT = 20;
 
 // Stable node id format. `memory:<scope>/<name>` — scope-qualified
@@ -235,6 +241,16 @@ export const createMemoryView = (deps: MemoryViewDeps): ViewSearch => ({
       if (deps.loadBodies === true && file?.kind === 'present') {
         const bodyTokens = tokenize(file.file.body);
         for (let i = 0; i < BODY_WEIGHT; i++) tokens.push(...bodyTokens);
+      }
+      // §4.4 P3 — fold `triggers:` runtime tags into the corpus on the proactive
+      // path so a prompt mentioning a tag surfaces the tagged memory even when
+      // the body doesn't carry the term. `trustedOnly`-gated → the model-driven
+      // retrieve_context corpus is unchanged.
+      if (deps.trustedOnly === true && file?.kind === 'present') {
+        for (const trig of file.file.frontmatter.triggers ?? []) {
+          const trigTokens = tokenize(trig);
+          for (let i = 0; i < TRIGGER_WEIGHT; i++) tokens.push(...trigTokens);
+        }
       }
       docs.push({ id, tokens });
     }
