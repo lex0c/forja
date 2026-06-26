@@ -3078,6 +3078,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                 config.memoryRegistry,
                 sessionId,
                 proactiveRecalled,
+                config.memoryExcludeScopes,
               );
             } catch (err) {
               process.stderr.write(

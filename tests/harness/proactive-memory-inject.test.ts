@@ -236,6 +236,30 @@ describe('createProactiveRecall (wiring)', () => {
     }
   });
 
+  test('threads excludeScopes when resolving bodies (excluded shadow does not drop the recall)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    // project_shared/foo (higher precedence) is in an EXCLUDED scope; user/foo is
+    // allowed. The view ranks user/foo, but if the body resolver re-lists WITHOUT
+    // the exclusion it keeps the project_shared shadow and can't find the ranked
+    // user listing — silently dropping the recall. Resolver must share the same
+    // exclusion as the view.
+    writeIndex(roots.projectShared, '- [Foo](foo.md) — auth helper\n');
+    writeBody(roots.projectShared, 'foo', 'shared shadow body', { description: 'auth helper' });
+    writeIndex(roots.user, '- [Foo](foo.md) — auth helper\n');
+    writeBody(roots.user, 'foo', 'user fallback body', { description: 'auth helper' });
+    const registry = createMemoryRegistry({ roots, db, sessionId });
+    const recall = createProactiveRecall({
+      registry,
+      excludeScopes: ['project_shared'],
+      minScore: 0,
+    });
+    const out = await recall({ goalText: 'auth', prompt: 'auth helper' });
+    const foo = out.find((r) => r.nodeId === 'memory:user/foo');
+    expect(foo).toBeDefined();
+    expect(foo?.body).toContain('user fallback');
+  });
+
   test('recordProactiveExposures writes a canonical proactive row per loaded memory', () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);

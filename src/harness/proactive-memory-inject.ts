@@ -62,16 +62,29 @@ export const injectProactiveMemoryBlock = (
 // refer to different bytes. The node id carries no subdir, so an unqualified
 // peek(name, {scope}) can resolve a higher-precedence shadow (e.g. an expired /
 // quarantined top-level over the active seed the view selected). Re-run the
-// view's trustedOnly listing filters (active, non-expired, deduped — mirror
-// createMemoryView's list()), find this node's surviving listing, and peek it
-// scope-pinned via listingScopeOption so the subdir matches. Re-validate trust /
-// active on the loaded bytes (fail-closed). excludeScopes isn't threaded: the
-// node was already validated through a view that applied it, so its scope was
-// never excluded — and the winner among (scope, name) is picked by state/expiry,
-// which a scope filter doesn't change.
-const resolveRankedMemoryFile = (registry: MemoryRegistry, scope: MemoryScope, name: string) => {
+// view's trustedOnly listing filters (active, non-expired, deduped, AND the same
+// excludeScopes — mirror createMemoryView's list()), find this node's surviving
+// listing, and peek it scope-pinned via listingScopeOption so the subdir matches.
+// Re-validate trust / active on the loaded bytes (fail-closed).
+//
+// excludeScopes MUST match the view's: it changes which (scope, name) listing
+// wins the dedupe. If bootstrap excludes project_shared, the view ranks the
+// allowed user/foo, but an unfiltered list here would keep the excluded
+// project_shared/foo shadow — and .find() couldn't locate the ranked user
+// listing, dropping the recall (and its provenance) entirely.
+const resolveRankedMemoryFile = (
+  registry: MemoryRegistry,
+  scope: MemoryScope,
+  name: string,
+  excludeScopes?: ReadonlyArray<MemoryScope>,
+) => {
   const listing = registry
-    .list({ deduplicateByName: true, states: ['active'], includeExpired: false })
+    .list({
+      deduplicateByName: true,
+      states: ['active'],
+      includeExpired: false,
+      ...(excludeScopes !== undefined && excludeScopes.length > 0 ? { excludeScopes } : {}),
+    })
     .find((l) => l.scope === scope && l.name === name);
   if (listing === undefined) return null;
   const file = registry.peek(listing.name, listingScopeOption(listing));
@@ -110,7 +123,12 @@ export const createProactiveRecall = (deps: {
     loadBody: (nodeId) => {
       const parsed = parseMemoryNodeId(nodeId);
       if (parsed === null) return null;
-      const file = resolveRankedMemoryFile(deps.registry, parsed.scope, parsed.name);
+      const file = resolveRankedMemoryFile(
+        deps.registry,
+        parsed.scope,
+        parsed.name,
+        deps.excludeScopes,
+      );
       return file === null ? null : file.body;
     },
     ...(deps.minScore !== undefined ? { minScore: deps.minScore } : {}),
@@ -163,11 +181,12 @@ export const recordProactiveExposures = (
   registry: MemoryRegistry,
   sessionId: string,
   recalled: readonly RecalledMemory[],
+  excludeScopes?: ReadonlyArray<MemoryScope>,
 ): void => {
   for (const m of recalled) {
     const parsed = parseMemoryNodeId(m.nodeId);
     if (parsed === null) continue;
-    const file = resolveRankedMemoryFile(registry, parsed.scope, parsed.name);
+    const file = resolveRankedMemoryFile(registry, parsed.scope, parsed.name, excludeScopes);
     if (file === null) continue;
     try {
       recordProvenance(db, {
