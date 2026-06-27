@@ -39,6 +39,31 @@ jobs:
       - name: Test
         run: bun test
 
+  audit:
+    # Dependency vulnerability gate (SECURITY_GUIDELINE.md §7.1: "Dep
+    # audit em CI; CVE high+ bloqueia merge"). Own job so a CVE signal
+    # is independent of the typecheck/lint/test job. `bun audit` exits
+    # non-zero when any advisory at or above the level is found; we gate
+    # at high. Moderates are reported by `bun audit` locally but do not
+    # block. A new high in a transitive dep fails the PR — bump the
+    # floor via package.json `overrides` (see ws / protobufjs).
+    name: dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+
+      - name: Install deps
+        run: bun install --frozen-lockfile
+
+      - name: Audit (high+ blocks)
+        run: bun audit --audit-level=high
+
   build-matrix:
     # Smoke-builds every release target on every PR. Catches a
     # broken Bun --target before tag time. The size gate runs here

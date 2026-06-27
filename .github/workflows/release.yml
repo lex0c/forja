@@ -16,8 +16,9 @@ on:
         required: true
 
 permissions:
-  contents: write   # uploading release assets
-  id-token: write   # reserved for future cosign keyless (out of scope for this slice)
+  contents: write       # uploading release assets
+  id-token: write       # OIDC token for Sigstore-backed build provenance
+  attestations: write   # writing SLSA provenance to the GitHub attestation store
 
 concurrency:
   # Key by the resolved tag, NOT by `github.ref_name`. On a manual
@@ -94,6 +95,17 @@ jobs:
       - name: Verify checksums (round-trip sanity)
         run: bun run build:verify
 
+      - name: Attest build provenance (SLSA)
+        # Signs a provenance attestation for every artifact listed in
+        # SHA256SUMS (the binaries + the SBOM) via Sigstore-backed GitHub
+        # attestations. Driven off the SUMS — not a dist/forja-* glob —
+        # so it attests exactly what ships and never the unpublished
+        # sourcemaps. Verify a downloaded binary with:
+        #   gh attestation verify <binary> --repo <owner>/<repo>
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -164,12 +176,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Publish binaries only — exclude sourcemaps. The dist/forja-*
+          # glob also matches the .map files, which checksums.ts keeps
+          # OUT of SHA256SUMS by design; publishing them would ship an
+          # unverifiable release asset. The .map stay in the CI artifact
+          # (7-day retention) for debugging instead. Word-splitting on
+          # $bins is intentional (multiple file args); release filenames
+          # are controlled and contain no spaces.
+          bins=$(find dist -maxdepth 1 -type f -name 'forja-*' ! -name '*.map' | sort)
+          [ -n "$bins" ] || { echo "no release binaries found in dist/" >&2; exit 1; }
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" --clobber dist/forja-* dist/sbom.cdx.json dist/SHA256SUMS
+            gh release upload "$TAG" --clobber $bins dist/sbom.cdx.json dist/SHA256SUMS
           else
             gh release create "$TAG" \
               --target "$TAG" \
               --title "$TAG" \
               --generate-notes \
-              dist/forja-* dist/sbom.cdx.json dist/SHA256SUMS
+              $bins dist/sbom.cdx.json dist/SHA256SUMS
           fi
