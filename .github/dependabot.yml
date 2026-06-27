@@ -1,21 +1,28 @@
 # Dependabot config (SECURITY_GUIDELINE.md §7.1). Two ecosystems:
 #
-#   - npm: covers the Bun project. Dependabot reads `bun.lock` under the
-#     `npm` ecosystem (Bun shares the npm registry + lockfile model), so
-#     this keeps `@anthropic-ai/sdk`, `@google/genai`, `openai`, and the
-#     transitive closure current. The `bun audit` CI gate blocks high+
-#     CVEs at merge time; Dependabot is the proactive half that opens the
-#     bump PRs before a CVE lands.
+#   - bun: covers the Bun project. GitHub ships a native `bun` ecosystem,
+#     distinct from `npm` (which serves npm/pnpm/yarn). It MUST be `bun`,
+#     not `npm`: the npm updater does not understand `bun.lock`, so npm-
+#     routed version PRs would bump `package.json` while leaving the
+#     lockfile stale — and every job that runs `bun install
+#     --frozen-lockfile` (CI check, audit, build-matrix, release) would
+#     then fail on the mismatch. The bun updater regenerates `bun.lock`
+#     alongside `package.json`. Keeps `@anthropic-ai/sdk`, `@google/genai`,
+#     `openai`, and the transitive closure current; the `bun audit` CI
+#     gate blocks high+ CVEs at merge, Dependabot is the proactive half
+#     that opens the bump PRs before a CVE lands.
 #   - github-actions: keeps the workflow action pins (`actions/checkout`,
 #     `oven-sh/setup-bun`, `actions/attest-build-provenance`, …) current.
-#     The cheap half of supply-chain hygiene for the release pipeline.
+#     The actions are pinned by commit SHA; Dependabot bumps the SHA and
+#     the `# vN` comment together, so the strong pin carries no manual
+#     update burden.
 #
 # Grouped, weekly, modest PR cap so the queue stays reviewable. Every
 # new direct dep still needs a PR justification per §7.1 — Dependabot
 # only proposes; a human reviews.
 version: 2
 updates:
-  - package-ecosystem: "npm"
+  - package-ecosystem: "bun"
     directory: "/"
     schedule:
       interval: "weekly"
