@@ -55,7 +55,7 @@ export const parseBunLock = (text: string): BunLockfile =>
 // ---------- CycloneDX shaping ----------
 
 export interface Component {
-  type: 'library' | 'application';
+  type: 'library' | 'application' | 'framework';
   'bom-ref': string;
   name: string;
   version: string;
@@ -182,9 +182,38 @@ export interface BomDocument {
   components: Component[];
 }
 
-export const buildBom = (lock: BunLockfile, appName: string, appVersion: string): BomDocument => {
+// The compiled binary embeds the Bun runtime (+ JSC) — ~50-90 MiB of the
+// artifact, larger than the entire npm closure. An SBOM that omits it
+// misrepresents what actually ships, so we record it as a `framework`
+// component. The version is injected (from `Bun.version` at generate
+// time) rather than read here, so `buildBom` stays pure and
+// deterministic. The PURL targets the upstream source repo because Bun
+// distributes as a GitHub release, not an npm package.
+export const bunRuntimeComponent = (version: string): Component => {
+  const purl = `pkg:github/oven-sh/bun@${version}`;
+  return {
+    type: 'framework',
+    'bom-ref': purl,
+    name: 'bun',
+    version,
+    purl,
+  };
+};
+
+export const buildBom = (
+  lock: BunLockfile,
+  appName: string,
+  appVersion: string,
+  runtimeVersion: string,
+): BomDocument => {
   const prodNames = buildProdSet(lock);
-  const components = lockfileToComponents(lock).filter((c) => prodNames.has(c.name));
+  const deps = lockfileToComponents(lock).filter((c) => prodNames.has(c.name));
+  // Merge the npm closure with the embedded runtime, then re-sort by
+  // purl so output stays byte-identical regardless of insertion order
+  // (the reproducibility check downstream depends on this).
+  const components = [bunRuntimeComponent(runtimeVersion), ...deps].sort((a, b) =>
+    a.purl.localeCompare(b.purl),
+  );
   return {
     bomFormat: 'CycloneDX',
     specVersion: CDX_SPEC_VERSION,
@@ -215,7 +244,9 @@ export const generateSbom = (opts: GenerateOptions): { path: string; bom: BomDoc
   const cwd = opts.cwd ?? process.cwd();
   const pkg = JSON.parse(readFileSync(join(cwd, 'package.json'), 'utf-8')) as PackageJson;
   const lock = parseBunLock(readFileSync(join(cwd, 'bun.lock'), 'utf-8'));
-  const bom = buildBom(lock, pkg.name, pkg.version);
+  // `Bun.version` is the runtime compiling the binary — the one that
+  // gets embedded. Recorded in the SBOM via the framework component.
+  const bom = buildBom(lock, pkg.name, pkg.version, Bun.version);
   const out = join(opts.distDir, SBOM_FILENAME);
   // Pretty-print with two-space indent, trailing newline. Stable
   // key order is preserved by JSON.stringify on insertion-ordered

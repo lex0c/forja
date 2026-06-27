@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   buildBom,
+  bunRuntimeComponent,
   generateSbom,
   lockfileToComponents,
   parseBunLock,
@@ -106,21 +107,34 @@ describe('lockfileToComponents', () => {
 describe('buildBom', () => {
   test('filters out devDeps from the production closure', () => {
     const lock = parseBunLock(FIXTURE_BUN_LOCK);
-    const bom = buildBom(lock, 'forja', '0.0.0');
+    const bom = buildBom(lock, 'forja', '0.0.0', '1.3.13');
     const names = bom.components.map((c) => c.name).sort();
-    // direct + @scope/scoped + transitive (pulled by direct), but NOT dev-only
-    expect(names).toEqual(['@scope/scoped', 'direct', 'transitive']);
+    // direct + @scope/scoped + transitive (pulled by direct) + the
+    // embedded Bun runtime, but NOT dev-only.
+    expect(names).toEqual(['@scope/scoped', 'bun', 'direct', 'transitive']);
   });
 
   test('walks transitive deps from the lockfile entries', () => {
     const lock = parseBunLock(FIXTURE_BUN_LOCK);
-    const bom = buildBom(lock, 'forja', '0.0.0');
+    const bom = buildBom(lock, 'forja', '0.0.0', '1.3.13');
     expect(bom.components.find((c) => c.name === 'transitive')).toBeDefined();
+  });
+
+  test('records the embedded Bun runtime as a framework component', () => {
+    const lock = parseBunLock(FIXTURE_BUN_LOCK);
+    const bom = buildBom(lock, 'forja', '0.0.0', '1.3.13');
+    const bun = bom.components.find((c) => c.name === 'bun');
+    expect(bun?.type).toBe('framework');
+    expect(bun?.version).toBe('1.3.13');
+    expect(bun?.purl).toBe('pkg:github/oven-sh/bun@1.3.13');
+    // The merged list stays sorted by purl (deterministic output).
+    const purls = bom.components.map((c) => c.purl);
+    expect(purls).toEqual([...purls].sort());
   });
 
   test('emits CycloneDX 1.5 bom shape', () => {
     const lock = parseBunLock(FIXTURE_BUN_LOCK);
-    const bom = buildBom(lock, 'forja', '0.1.0');
+    const bom = buildBom(lock, 'forja', '0.1.0', '1.3.13');
     expect(bom.bomFormat).toBe('CycloneDX');
     expect(bom.specVersion).toBe('1.5');
     expect(bom.metadata.component.name).toBe('forja');
@@ -129,9 +143,29 @@ describe('buildBom', () => {
 
   test('produces deterministic output across two runs', () => {
     const lock = parseBunLock(FIXTURE_BUN_LOCK);
-    const a = JSON.stringify(buildBom(lock, 'forja', '0.0.0'));
-    const b = JSON.stringify(buildBom(lock, 'forja', '0.0.0'));
+    const a = JSON.stringify(buildBom(lock, 'forja', '0.0.0', '1.3.13'));
+    const b = JSON.stringify(buildBom(lock, 'forja', '0.0.0', '1.3.13'));
     expect(a).toBe(b);
+  });
+
+  test('runtime version varies the SBOM (different Bun ⇒ different output)', () => {
+    const lock = parseBunLock(FIXTURE_BUN_LOCK);
+    const a = JSON.stringify(buildBom(lock, 'forja', '0.0.0', '1.3.13'));
+    const b = JSON.stringify(buildBom(lock, 'forja', '0.0.0', '1.4.0'));
+    expect(a).not.toBe(b);
+  });
+});
+
+describe('bunRuntimeComponent', () => {
+  test('builds a github-purl framework component', () => {
+    const c = bunRuntimeComponent('1.3.13');
+    expect(c).toEqual({
+      type: 'framework',
+      'bom-ref': 'pkg:github/oven-sh/bun@1.3.13',
+      name: 'bun',
+      version: '1.3.13',
+      purl: 'pkg:github/oven-sh/bun@1.3.13',
+    });
   });
 });
 
