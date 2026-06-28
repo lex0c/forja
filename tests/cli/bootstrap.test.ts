@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { DEFAULT_MODEL, bootstrap } from '../../src/cli/bootstrap.ts';
+import { userConfigPath } from '../../src/config/loaders.ts';
 import { setWritableCacheDirsOverride } from '../../src/permissions/sandbox-cache-dirs.ts';
 import { setCachePersistenceOverride } from '../../src/permissions/sandbox-cache-env.ts';
 import type { Provider } from '../../src/providers/index.ts';
@@ -366,6 +367,32 @@ describe('bootstrap', () => {
       expect(config.isCwdTrusted).toBe(true);
       const d = config.permissionEngine.check('bash', 'bash', { command: 'go build' });
       expect(d.sandboxProfile).toBe('cwd-rw');
+      db.close();
+    });
+
+    test('USER-config network=on is honored in an UNtrusted repo (provenance)', async () => {
+      // network from the operator's OWN user config — NOT the repo — so the
+      // repo-root trust gate must NOT veto it (the untrusted repo never set it).
+      const userCfg = userConfigPath(); // XDG_CONFIG_HOME=workdir → workdir/forja/config.toml
+      if (userCfg === null) throw new Error('userConfigPath resolved to null');
+      mkdirSync(dirname(userCfg), { recursive: true });
+      writeFileSync(userCfg, '[sandbox]\nnetwork = "on"\n');
+      // Deliberately NO project [sandbox] network (do not call writeNetworkOn()).
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: ['/other/path'] })); // repo untrusted
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      expect(config.isCwdTrusted).toBe(false);
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'go build' });
+      expect(d.sandboxProfile).toBe('cwd-rw-net');
       db.close();
     });
   });

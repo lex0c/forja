@@ -1495,4 +1495,50 @@ describe('loadSandboxConfig — [sandbox] network', () => {
       rmSync(home, { recursive: true, force: true });
     }
   });
+
+  // Provenance for the trust gate (bootstrap): only a PROJECT-sourced `network`
+  // is gated on repo-root trust; a user-sourced value is the operator's own.
+  test('networkFromProject is true when the PROJECT layer sets network', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProject(cwd, '[sandbox]\nnetwork = "on"\n');
+      const r = loadSandboxConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.network).toBe('on');
+      expect(r.networkFromProject).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('networkFromProject is false when network comes ONLY from the user layer', () => {
+    const home = mkdtempSync(join(tmpdir(), 'forja-sbx-net-user-'));
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(home, '.config', 'forja'), { recursive: true });
+      writeFileSync(join(home, '.config', 'forja', 'config.toml'), '[sandbox]\nnetwork = "on"\n');
+      // No project [sandbox] network — the value comes purely from the user layer.
+      const r = loadSandboxConfig({ cwd, env: { HOME: home } });
+      expect(r.config.network).toBe('on');
+      expect(r.networkFromProject).toBe(false);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('networkFromProject is true when the project overrides a user value', () => {
+    const home = mkdtempSync(join(tmpdir(), 'forja-sbx-net-ov-'));
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(home, '.config', 'forja'), { recursive: true });
+      writeFileSync(join(home, '.config', 'forja', 'config.toml'), '[sandbox]\nnetwork = "off"\n');
+      writeProject(cwd, '[sandbox]\nnetwork = "on"\n');
+      const r = loadSandboxConfig({ cwd, env: { HOME: home } });
+      expect(r.config.network).toBe('on');
+      expect(r.networkFromProject).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 });

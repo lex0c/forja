@@ -867,13 +867,16 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       emitHostPassthrough: input.iKnowWhatImDoing === true,
       // Coarse network posture from `[sandbox] network` (default off via
       // DEFAULT_NETWORK). When `on`, the planner upgrades exec:arbitrary calls
-      // to cwd-rw-net so any toolchain can fetch deps without a per-language
-      // table. Defense-in-depth: requires BOTH the operator opt-in AND trust of
-      // the directory that SUPPLIED the config (`projectConfigCwd`, the repo
-      // root) — gating on cwd instead would let trusting a subdir activate a
-      // `network = "on"` from an untrusted repo-root `.forja/config.toml`
-      // (CLAUDE.md "Explicit trust"). See PERMISSION_ENGINE.md §6.5.
-      networkAllowed: sandboxLoaded.config.network === 'on' && isProjectConfigTrusted,
+      // to cwd-rw-net. Trust gate by PROVENANCE: a PROJECT-sourced `on` (a repo's
+      // own `.forja/config.toml`, attacker-controllable in a clone) requires the
+      // config's directory — the repo root (`projectConfigCwd`) — to be trusted;
+      // a USER-sourced `on` (~/.config/forja, the operator's own machine config)
+      // is honored WITHOUT repo trust (gating it would wrongly ignore the
+      // operator's global opt-in in repos that never supplied the setting).
+      // CLAUDE.md "Explicit trust". See PERMISSION_ENGINE.md §6.5.
+      networkAllowed:
+        sandboxLoaded.config.network === 'on' &&
+        (!sandboxLoaded.networkFromProject || isProjectConfigTrusted),
       // Slice 165 (review — Batch C sandbox observability). Forward
       // the trust marker so bootstrap can emit a
       // `sandbox.path_resolved` failure_event when the install isn't
