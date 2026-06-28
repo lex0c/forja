@@ -39,6 +39,7 @@ import type { Capability } from '../capabilities.ts';
 import {
   deleteFs,
   exec,
+  formatCapability,
   gitWrite,
   netEgress,
   netIngress,
@@ -4722,15 +4723,17 @@ const analyzeCommand = (
   // cwd-scope escape (symlink resolving outside cwd) — tracked separately
   // from escalate-tier so it can route to Conservative (see the return).
   let cwdEscaped = false;
-  // Operand caps for the registry-miss (Conservative) branch. The per-arg
-  // loop classifies escalate-tier positional paths but the unknown-command
-  // branch returned only redirect caps — so under mode:bypass (where the
-  // §11 protected-path floor scans resolved caps and is the ONLY check
-  // that still fires) `sed -i /etc/hosts` / `frobnicate --out=/etc/x`
-  // reached the floor with no write-fs and were silently allowed despite
-  // the escalate-tier operand. Collect those operands here and ride them
-  // onto that branch. Known commands ignore this — their handler emits the
-  // precise positional caps (adding argCaps there would just duplicate).
+  // Escalate-tier operand caps. The per-arg loop classifies escalate-tier
+  // positional paths; under mode:bypass / degraded / host (where the §11
+  // protected-path floor scans resolved caps and is the ONLY check that still
+  // fires) a write to a protected zone MUST surface a write-fs cap or it is
+  // silently allowed (`sed -i /etc/hosts`, `frobnicate --out=/etc/x`, and now
+  // `go build -o ~/.ssh/x`). These ride onto BOTH the registry-miss branch AND
+  // the modeled-command branch (deduped below) — a GENERIC modeled resolver
+  // (e.g. the dep-manager resolver for go/dotnet/mvn) emits exec/read/net but
+  // does NOT parse per-tool output flags, so without this its protected write
+  // operand would be dropped. Dedupe against the handler's own caps so a
+  // precise-modeling handler (cp/sed/…) doesn't double-count.
   const argCaps: Capability[] = [];
   if (!isPureOutputCommand(name)) {
     const targets = protectedTargets(ctx.home, ctx.cwd);
@@ -4852,6 +4855,14 @@ const analyzeCommand = (
   let finalConf: 'high' | 'medium' | 'low' = result.confidence;
   if (escalated || redir.escalated) finalConf = 'low';
 
+  // Escalate-tier operand write-fs that the handler did NOT already emit (a
+  // generic modeled resolver like the dep-manager one doesn't parse output
+  // flags). Deduped against the handler + redirect caps so a precise handler
+  // (cp/sed/…) doesn't double-count. Keeps the §11 protected-path floor honest
+  // for modeled commands under mode:bypass / degraded / host.
+  const handlerCapKeys = new Set([...result.capabilities, ...redir.caps].map(formatCapability));
+  const extraArgCaps = argCaps.filter((c) => !handlerCapKeys.has(formatCapability(c)));
+
   // A cwd-scope escape (a lexical-inside-cwd path whose canonical realpath
   // lands outside cwd, via a symlink) routes to Conservative — NOT merely
   // low confidence. The emitted cap is still the lexical `<cwd>/link`, so
@@ -4863,14 +4874,14 @@ const analyzeCommand = (
   // (`wc -l src/**/*.ts`) keeps `kind: ok` and still auto-approves.
   if (cwdEscaped || redir.cwdEscaped) {
     return {
-      caps: [...result.capabilities, ...redir.caps],
+      caps: [...result.capabilities, ...redir.caps, ...extraArgCaps],
       confidence: 'low',
       conservative: 'cwd-scope escape: a path resolves outside the cwd via a symlink',
     };
   }
 
   return {
-    caps: [...result.capabilities, ...redir.caps],
+    caps: [...result.capabilities, ...redir.caps, ...extraArgCaps],
     confidence: finalConf,
   };
 };

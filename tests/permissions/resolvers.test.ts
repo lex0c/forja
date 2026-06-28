@@ -1027,6 +1027,21 @@ describe('bash resolver — simple commands', () => {
     }
   });
 
+  test('go build -o /etc/x: modeled dep-manager STILL surfaces escalate-tier write operand', () => {
+    // Regression: modeling go/dotnet/mvn with the generic dep-manager resolver
+    // (which emits exec/read/net but does NOT parse output flags) must not drop
+    // the per-arg protected write-fs the registry-miss path used to carry. The
+    // §11 protected-path floor (the ONLY check that fires under mode:bypass /
+    // degraded / host) relies on this write-fs cap. Either kind is acceptable:
+    // the destination MUST be visible to policy (cap on ok, or reason on refuse).
+    const r = resolveCapabilities('bash', { command: 'go build -o /etc/x' }, CTX);
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('write-fs:/etc/x');
+    } else {
+      expect(r.reason).toContain('/etc/x');
+    }
+  });
+
   test('curl -o/tmp/out https://api.example: attached short -o emits write-fs', () => {
     const r = resolveCapabilities('bash', { command: 'curl -o/tmp/out https://api.example' }, CTX);
     expect(r.kind).toBe('ok');
