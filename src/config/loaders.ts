@@ -815,6 +815,11 @@ export interface SandboxConfigKeys {
   // Tri-state: `undefined` → DEFAULT (see DEFAULT_SHARED_TMP); `false` →
   // explicit opt-out; `true` → on.
   sharedTmp?: boolean;
+  // Coarse network posture for the sandbox. `'off'` (default) → exec:arbitrary
+  // calls run in cwd-rw (no egress); `'on'` → they reach cwd-rw-net so any
+  // toolchain can fetch deps. Egress is an operator decision, never inferred
+  // per-binary. Omitted → DEFAULT_NETWORK. See PERMISSION_ENGINE.md §6.5.
+  network?: 'off' | 'on';
 }
 
 // Default posture for the two persistence toggles when NO config layer
@@ -827,6 +832,9 @@ export interface SandboxConfigKeys {
 // `writable_cache_dirs` resolves its DEFAULT at the runner, not the loader.
 export const DEFAULT_CACHE_PERSISTENCE = true;
 export const DEFAULT_SHARED_TMP = true;
+// Network is the ONE sandbox toggle that defaults OFF: egress is a deliberate
+// operator opt-in per project (dev loop that fetches deps), not a baseline.
+export const DEFAULT_NETWORK: 'off' | 'on' = 'off';
 
 export interface LoadedSandboxConfig {
   config: SandboxConfigKeys;
@@ -883,6 +891,19 @@ const parseSandboxLayer = (
       layer.sharedTmp = s.shared_tmp;
     }
   }
+  // Coarse network posture. String enum (not boolean) so a future `allowlist`
+  // value can slot in without a breaking type change; anything else → warn +
+  // ignore (leaves the field unset → consumers apply DEFAULT_NETWORK = off).
+  if (s.network !== undefined) {
+    const net = s.network;
+    if (net === 'off' || net === 'on') {
+      layer.network = net;
+    } else {
+      warnings.push(
+        `${source} config (${path}): [sandbox].network must be "off" or "on"; ignoring`,
+      );
+    }
+  }
   return { layer, warnings };
 };
 
@@ -912,5 +933,7 @@ export const loadSandboxConfig = (input: LoadSandboxConfigInput): LoadedSandboxC
   if (cachePersistence !== undefined) config.cachePersistence = cachePersistence;
   const sharedTmp = projectResult.layer.sharedTmp ?? userResult.layer.sharedTmp;
   if (sharedTmp !== undefined) config.sharedTmp = sharedTmp;
+  const network = projectResult.layer.network ?? userResult.layer.network;
+  if (network !== undefined) config.network = network;
   return { config, userPath, projectPath, warnings };
 };

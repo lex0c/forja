@@ -119,6 +119,21 @@ export interface SelectSandboxProfileOptions {
   // the policy would otherwise allow it. Defense against accidental
   // passthrough.
   hostExplicitlyAllowed: boolean;
+  // Coarse network posture from `[sandbox] network` (default off). When true,
+  // an `exec:arbitrary` call is floored to `cwd-rw-net` (it additionally
+  // requires `net-egress`) so unmodeled toolchains can fetch dependencies.
+  // Egress is an operator-level axis, never inferred from the binary name.
+  // Omitted/false ⇒ off (unbounded exec stays `cwd-rw`, no network). See
+  // PERMISSION_ENGINE.md §6.5.
+  networkAllowed?: boolean;
+  // Trust of the directory being acted on (repo root). When an `exec:arbitrary`
+  // call (a build that runs arbitrary code) ALSO carries `net-egress` (a modeled
+  // dep-manager — npm/go/pip/…), egress is granted only if this is true: an
+  // UNtrusted dir's build lands `cwd-rw` (no network), killing the
+  // clone-and-build exfiltration vector. `net-egress` WITHOUT `exec:arbitrary`
+  // (curl/wget/git/ssh/gh — explicit net actions) is NOT gated. Omitted ⇒
+  // untrusted (fail-closed). See PERMISSION_ENGINE.md §6.5.
+  dirTrusted?: boolean;
 }
 
 export type SelectSandboxProfileResult =
@@ -133,9 +148,64 @@ export type SelectSandboxProfileResult =
 export const selectSandboxProfile = (
   options: SelectSandboxProfileOptions,
 ): SelectSandboxProfileResult => {
+  // Resolver-honest required kinds — EXACTLY what the capabilities carry. This
+  // set drives the refuse `uncovered` report (audit-facing), so it must reflect
+  // only the resolver's attribution, never the floor below.
   const requiredKinds = new Set<CapabilityKind>();
   for (const cap of options.capabilities) {
     requiredKinds.add(cap.kind);
+  }
+
+  // Floor for unbounded exec. A capability that runs arbitrary program code
+  // (`exec:arbitrary` — an unmodeled binary, `sed`/`awk` classified by-effect,
+  // `find -exec` with an arbitrary inner, the `git` pager escape hatch, or a
+  // `python`/`node`/`ruby`/`perl` SCRIPT via cmdInterpreter) can, by
+  // definition, write its own working directory. Without this floor the call
+  // carries only `{exec, read-fs}` → the selector picks `ro` (whole FS
+  // read-only) and EVERY legitimate build/codegen/test write fails with EROFS
+  // ("read-only file system") — the exact bug that made `go build` /
+  // `dotnet build` / `./local-tool` unusable. Requiring `write-fs` prunes `ro`
+  // (it lacks write-fs) and lands `cwd-rw`.
+  //
+  // Keyed on scope `arbitrary` specifically: the `python`/`node` exec scopes
+  // exist in the union but have no emitter today (interpreters emit
+  // `exec:arbitrary`), so `arbitrary` is the sufficient and future-proof
+  // discriminator. `exec:shell` (the baseline every bash pipeline carries) and
+  // read-only commands do NOT trip the floor, so pure reads stay `ro`.
+  const hasUnboundedExec = options.capabilities.some(
+    (cap) => cap.kind === 'exec' && cap.scope === 'arbitrary',
+  );
+
+  // SELECTION set — `requiredKinds` plus the floor's `write-fs`, minus any
+  // trust-gated egress. Kept SEPARATE from `requiredKinds` so neither the floor
+  // nor the trust-gate leaks into the audit-facing `uncovered` report or the
+  // resolved set the engine scores/envelope-gates (PERMISSION_ENGINE.md §6.5).
+  let selectionKinds: ReadonlySet<CapabilityKind> = requiredKinds;
+  if (hasUnboundedExec) {
+    const s = new Set<CapabilityKind>(requiredKinds);
+    // `write-fs` floor: an unbounded-exec call may write its cwd. (Never makes a
+    // set unsatisfiable — cwd-rw covers it — so the floor alone can't refuse.)
+    s.add('write-fs');
+    // INCIDENTAL build egress present? The bash resolver UNIONS the caps of every
+    // sub-command into one plan, so a compound call carries every command's
+    // net-egress. We trust-gate if ANY net-egress is incidental (a dep-manager /
+    // unknown build), even when an explicit one (ssh/curl/scp,
+    // `Capability.explicitEgress`) is also present — otherwise
+    // `ssh host uptime && npm install` in an untrusted dir would let the ONE
+    // explicit ssh egress un-gate npm's incidental egress and the build would get
+    // the network. The exemption thus holds ONLY when EVERY net-egress is explicit
+    // (`!hasIncidentalEgress`); a mixed call fails closed — the whole plan drops to
+    // cwd-rw (ssh loses net too in that dir: run it separately or trust the dir).
+    const hasIncidentalEgress = options.capabilities.some(
+      (cap) => cap.kind === 'net-egress' && cap.explicitEgress !== true,
+    );
+    // Trust-gate BUILD egress: an `exec:arbitrary` call reaches the network only
+    // in a TRUSTED dir. Untrusted + incidental egress → drop `net-egress` so a
+    // modeled dep-manager (npm/go/pip/…) lands `cwd-rw` (no egress) not
+    // `cwd-rw-net`, killing the clone-and-build exfil vector (one confirm would
+    // otherwise grant full egress + broad host read).
+    if (options.dirTrusted !== true && hasIncidentalEgress) s.delete('net-egress');
+    selectionKinds = s;
   }
 
   // `host` needs an explicit operator flag AND a host-passthrough
@@ -151,7 +221,7 @@ export const selectSandboxProfile = (
     if (profile === 'host' && !hostEligible) continue;
     const allowed = PROFILE_ALLOWED_CAPABILITIES[profile];
     let covers = true;
-    for (const kind of requiredKinds) {
+    for (const kind of selectionKinds) {
       if (!allowed.has(kind)) {
         covers = false;
         break;
@@ -161,10 +231,10 @@ export const selectSandboxProfile = (
   }
 
   if (candidates.length === 0) {
-    // Surface every kind nothing covered (under the gated host
-    // rules) so the audit row carries actionable detail. We treat
-    // `requiredKinds` as the uncovered set when the ENTIRE plan
-    // refuses — every kind contributed to at least one rejection.
+    // Surface every kind nothing covered (under the gated host rules) so the
+    // audit row carries actionable detail. Reports `requiredKinds` (the
+    // resolver-honest set) — NOT the floored `selectionKinds` — so the audit
+    // names only what the binary actually requested.
     return {
       kind: 'refuse',
       reason: 'no_viable_sandbox',
@@ -181,5 +251,28 @@ export const selectSandboxProfile = (
   // from a left-to-right walk of the order, so finalists[0] is
   // the most restrictive viable choice.
   const chosen = finalists[0] as SandboxProfile;
+
+  // Coarse network posture — a POST-selection bump for UNMODELED toolchains
+  // (a user binary, `./gradlew`/`./mvnw` wrappers, swift/zig). Egress is an
+  // OPERATOR decision (`[sandbox] network = on`, default off), never inferred
+  // per-binary. Requires BOTH the posture on (`networkAllowed`) AND a TRUSTED
+  // dir (`dirTrusted`): an unbounded-exec call that landed `cwd-rw` is upgraded
+  // to `cwd-rw-net` only then. The `dirTrusted` half makes egress trust-gated
+  // UNIFORMLY — same as the modeled-dep-manager `net-egress` drop above — so an
+  // untrusted clone's build never reaches the network even with a global
+  // `network = on` (kills the drive-by exfil vector). Doing it as a bump (not a
+  // required kind) means it can NEVER turn a viable plan into a refuse:
+  // `exec:arbitrary + secret-access` stays `home-rw` instead of refusing on the
+  // unsatisfiable {secret-access, net-egress} combo. `cwd-rw-net` ⊇ `cwd-rw`, so
+  // the bump is always valid. Modeled dep-managers reach `cwd-rw-net` via their
+  // own `net-egress` (also dirTrusted-gated above), independent of this posture.
+  if (
+    hasUnboundedExec &&
+    options.networkAllowed === true &&
+    options.dirTrusted === true &&
+    chosen === 'cwd-rw'
+  ) {
+    return { kind: 'ok', profile: 'cwd-rw-net' };
+  }
   return { kind: 'ok', profile: chosen };
 };

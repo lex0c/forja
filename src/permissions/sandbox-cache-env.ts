@@ -53,6 +53,14 @@ export const CACHE_ENV_MAP: Readonly<Record<string, readonly CacheEnvEntry[]>> =
   // Go's BUILD cache (GOCACHE) IS XDG (`$XDG_CACHE_HOME/go-build`) → covered
   // by the catch-all; only the MODULE cache (GOPATH-based) needs a redirect.
   go: [{ name: 'GOMODCACHE', subdir: 'go/mod' }], // host: ~/go/pkg/mod (not XDG)
+  // Rust: CARGO_HOME relocates cargo's data home (registry, git, config, credentials). Without it, a
+  // fresh install where ~/.cargo/registry doesn't exist YET hits the runner's existence gate (the
+  // tmpfs carve-out is skipped) and `cargo build`/`fetch` EROFSes creating the registry under a
+  // read-only ~/.cargo. REDIRECT (not mask): the cargo BINARY (~/.cargo/bin, on PATH) is untouched;
+  // rustup toolchains live under ~/.rustup (HIDE_PATHS-masked) so rustup cargo is independently
+  // blocked while a system cargo works. `cargo install` global bins land in the forja cache (off PATH)
+  // — acceptable; build/fetch/test (the common ops) write ./target + the redirected registry.
+  cargo: [{ name: 'CARGO_HOME', subdir: 'cargo' }], // host: ~/.cargo (not XDG)
   nuget: [
     { name: 'NUGET_PACKAGES', subdir: 'nuget' }, // host: ~/.nuget/packages (not XDG)
     { name: 'NUGET_HTTP_CACHE_PATH', subdir: 'nuget-http' }, // host: ~/.local/share/NuGet/v3-cache
@@ -70,6 +78,14 @@ export const CACHE_ENV_MAP: Readonly<Record<string, readonly CacheEnvEntry[]>> =
   // only, no executable hooks).
   gradle: [{ name: 'GRADLE_USER_HOME', subdir: 'gradle' }], // host: ~/.gradle (not XDG)
   maven: [{ name: 'MAVEN_ARGS', subdir: 'maven' }], // host: ~/.m2/repository — 3.9+ only, not XDG
+  // Dart/Flutter: `dart pub` / `flutter pub` honor PUB_CACHE (host ~/.pub-cache; not XDG). Heavy
+  // Flutter dep sets make persistence worth it — without the redirect they'd re-download every spawn.
+  dart: [{ name: 'PUB_CACHE', subdir: 'pub-cache' }], // host: ~/.pub-cache (not XDG)
+  // .NET: DOTNET_CLI_HOME relocates the CLI's USER home (first-run sentinel, telemetry, `dotnet tool`
+  // global tools) away from ~/.dotnet — which may be the SDK INSTALL dir (dotnet-install.sh + PATH).
+  // REDIRECTING (vs masking ~/.dotnet with a tmpfs) keeps the SDK binary execable. It does NOT relocate
+  // the SDK itself (found via the dotnet apphost / DOTNET_ROOT). The NuGet PACKAGE cache is separate.
+  dotnet: [{ name: 'DOTNET_CLI_HOME', subdir: 'dotnet' }], // host: ~/.dotnet (not XDG; may be the SDK)
 };
 
 // Flatten into the concrete env to inject, given the Forja cache base

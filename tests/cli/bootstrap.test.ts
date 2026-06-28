@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { DEFAULT_MODEL, bootstrap } from '../../src/cli/bootstrap.ts';
+import { userConfigPath } from '../../src/config/loaders.ts';
 import { setWritableCacheDirsOverride } from '../../src/permissions/sandbox-cache-dirs.ts';
 import { setCachePersistenceOverride } from '../../src/permissions/sandbox-cache-env.ts';
 import type { Provider } from '../../src/providers/index.ts';
@@ -275,6 +276,239 @@ describe('bootstrap', () => {
       });
       const d = config.permissionEngine.check('bash', 'bash', { command: 'ls -la' });
       expect(d.sandboxProfile).toBe('ro');
+      db.close();
+    });
+  });
+
+  // [sandbox] network = on must require trust of the directory that SUPPLIED the
+  // config (the repo root where .forja/config.toml lives) — NOT the invocation
+  // cwd. Trust is exact-path, so gating on cwd would let a cloned hostile repo
+  // shipping `network = "on"` self-enable egress whenever the operator trusts any
+  // subdir under it (CLAUDE.md "Explicit trust").
+  describe('[sandbox] network posture gated by config-dir trust', () => {
+    const availableSandbox = {
+      available: true as const,
+      tool: 'bwrap' as const,
+      path: '/usr/bin/bwrap',
+      trustLevel: 'canonical' as const,
+      reason: '',
+      trustWarnings: [] as readonly string[],
+    };
+    const writeNetworkOn = (): void => {
+      mkdirSync(join(workdir, '.forja'), { recursive: true });
+      writeFileSync(join(workdir, '.forja', 'config.toml'), '[sandbox]\nnetwork = "on"\n');
+    };
+
+    test('network=on + TRUSTED cwd → exec:arbitrary lands cwd-rw-net (deps fetchable)', async () => {
+      writeNetworkOn();
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      expect(config.isCwdTrusted).toBe(true);
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'frobnicate' });
+      expect(d.sandboxProfile).toBe('cwd-rw-net');
+      db.close();
+    });
+
+    test('network=on + UNTRUSTED cwd → NO egress; exec:arbitrary stays cwd-rw', async () => {
+      writeNetworkOn();
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: ['/other/path'] }));
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      expect(config.isCwdTrusted).toBe(false);
+      // The hostile repo's own config.toml must NOT self-enable egress — the
+      // write floor still applies (cwd-rw) but the network bump does not fire.
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'frobnicate' });
+      expect(d.sandboxProfile).toBe('cwd-rw');
+      db.close();
+    });
+
+    test('network=on, only a SUBDIR trusted (not the config-supplying repo root) → NO egress', async () => {
+      // The [sandbox] config lives at the repo root; trust must be checked THERE,
+      // not at the (trusted) cwd. Make workdir a git repo so resolveRepoRoot()
+      // maps the subdir cwd back to the root that supplies the config.
+      Bun.spawnSync({ cmd: ['git', 'init', workdir] });
+      writeNetworkOn(); // workdir/.forja/config.toml → network = "on"
+      const subdir = join(workdir, 'pkg');
+      mkdirSync(subdir, { recursive: true });
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      // Operator trusts ONLY the subdir they launched from — NOT the repo root.
+      writeFileSync(trustPath, JSON.stringify({ directories: [subdir] }));
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: subdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      // The cwd IS trusted — yet egress stays off because the config's directory
+      // (the repo root) is not. Gating on cwd would wrongly flip this to cwd-rw-net.
+      expect(config.isCwdTrusted).toBe(true);
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'frobnicate' });
+      expect(d.sandboxProfile).toBe('cwd-rw');
+      db.close();
+    });
+
+    test('network=on (even USER config) in an UNtrusted repo → cwd-rw (egress uniformly trust-gated)', async () => {
+      // Build egress requires a TRUSTED dir regardless of which layer set
+      // `network` — a global user `network = on` does NOT grant egress in an
+      // untrusted repo (kills the drive-by exfil vector). The unknown binary
+      // stays cwd-rw despite the posture being on.
+      const userCfg = userConfigPath(); // XDG_CONFIG_HOME=workdir → workdir/forja/config.toml
+      if (userCfg === null) throw new Error('userConfigPath resolved to null');
+      mkdirSync(dirname(userCfg), { recursive: true });
+      writeFileSync(userCfg, '[sandbox]\nnetwork = "on"\n');
+      // Deliberately NO project [sandbox] network (do not call writeNetworkOn()).
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: ['/other/path'] })); // repo untrusted
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      expect(config.isCwdTrusted).toBe(false);
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'frobnicate' });
+      expect(d.sandboxProfile).toBe('cwd-rw');
+      db.close();
+    });
+
+    test('modeled dep-manager (go) in an UNtrusted dir → cwd-rw (build egress trust-gated)', async () => {
+      // go is modeled (own net-egress), but BUILD egress is trust-gated: an
+      // untrusted dir's `go build` lands cwd-rw (no network) — kills the
+      // clone-and-build exfil vector. Nothing trusted, no [sandbox] network.
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [] }));
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      expect(config.isCwdTrusted).toBe(false);
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'go build' });
+      expect(d.sandboxProfile).toBe('cwd-rw');
+      db.close();
+    });
+
+    test('modeled dep-manager (go) in a TRUSTED dir → cwd-rw-net (deps fetch, no posture needed)', async () => {
+      // Trusted dir: go's net-egress is honored → cwd-rw-net, with no [sandbox]
+      // network config (modeled, unlike the coarse posture which also needs on).
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      expect(config.isCwdTrusted).toBe(true);
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'go build' });
+      expect(d.sandboxProfile).toBe('cwd-rw-net');
+      db.close();
+    });
+
+    test('explicit network tool (ssh remote cmd) in an UNtrusted dir → cwd-rw-net (egress NOT stripped)', async () => {
+      // `ssh host <cmd>` carries exec:arbitrary (remote command) AND net-egress,
+      // but its egress is the command's explicit purpose (marked explicitEgress)
+      // → exempt from the build-egress trust-gate. Regression guard: an untrusted
+      // repo must still let ssh connect, not collapse to cwd-rw.
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [] }));
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      expect(config.isCwdTrusted).toBe(false);
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'ssh host uptime' });
+      expect(d.sandboxProfile).toBe('cwd-rw-net');
+      db.close();
+    });
+
+    test('MIXED explicit-egress + local arbitrary exec (ssh && frobnicate) UNtrusted → cwd-rw', async () => {
+      // A single sandbox profile covers the whole shell, so net granted for ssh's
+      // explicit egress would reach the co-present local exec (frobnicate). The
+      // resolver demotes the explicit egress when a local arbitrary exec is
+      // present → the gate strips net → cwd-rw (frobnicate gets no network).
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [] }));
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      expect(config.isCwdTrusted).toBe(false);
+      const d = config.permissionEngine.check('bash', 'bash', {
+        command: 'ssh host uptime && frobnicate',
+      });
+      expect(d.sandboxProfile).toBe('cwd-rw');
+      db.close();
+    });
+
+    test('pure explicit-net shell (ssh a && ssh b) UNtrusted → cwd-rw-net (exemption survives)', async () => {
+      // No local arbitrary exec → the explicit-egress exemption holds for the
+      // whole compound; both ssh connect even untrusted.
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [] }));
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      expect(config.isCwdTrusted).toBe(false);
+      const d = config.permissionEngine.check('bash', 'bash', {
+        command: 'ssh host uptime && ssh other date',
+      });
+      expect(d.sandboxProfile).toBe('cwd-rw-net');
       db.close();
     });
   });
