@@ -3656,4 +3656,59 @@ describe('runAgent — claim-time verify gate (STATE_MACHINE §3.2.1)', () => {
       errSpy.mockRestore();
     }
   });
+
+  test('an armed turn with a text preamble + tool_use streams the preamble BEFORE the tool events', async () => {
+    // The post-nudge happy path: edit, then "let me run the tests" + bash in one
+    // turn. The buffer must flush the preamble when the tool_use appears, not
+    // after the turn — else the live render shows the tool card ahead of its text.
+    const stubBashOk: Tool = {
+      name: 'bash',
+      description: 'stub bash, exits 0',
+      inputSchema: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command'],
+      },
+      metadata: { category: 'misc', writes: false, idempotent: false },
+      async execute() {
+        return { exit_code: 0, stdout: '', stderr: '' };
+      },
+    };
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const { config } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 't1', name: 'edit_file', input: { path: 'a.ts' } }],
+          stop_reason: 'tool_use',
+        },
+        // Armed turn: preamble text AND the verify tool_use together.
+        {
+          text: 'PREAMBLE-RUN-TESTS',
+          tool_uses: [{ id: 't2', name: 'bash', input: { command: 'bun test' } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'verified.', stop_reason: 'end_turn' },
+      ],
+      {
+        extraTools: [stubEdit, stubBashOk],
+        budget: { maxSteps: 12 },
+        verify: { commands: ['bun test'] },
+      },
+    );
+    const result = await runAgent({ ...config, onEvent: (e) => events.push(e) });
+    expect(result.status).toBe('done');
+    const idxText = events.findIndex(
+      (e) =>
+        e.type === 'provider_event' &&
+        e.event.kind === 'text_delta' &&
+        e.event.text.includes('PREAMBLE-RUN-TESTS'),
+    );
+    const idxTool = events.findIndex(
+      (e) =>
+        e.type === 'provider_event' && e.event.kind === 'tool_use_start' && e.event.name === 'bash',
+    );
+    expect(idxText).toBeGreaterThanOrEqual(0);
+    expect(idxTool).toBeGreaterThanOrEqual(0);
+    expect(idxText).toBeLessThan(idxTool); // preamble flushed before the bash tool_use event
+  });
 });

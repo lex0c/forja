@@ -397,6 +397,19 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   const verifyCommands = config.verify?.commands ?? [];
   const verifyState = createVerifyState();
   let verifyAttempts = 0;
+  // A budget exhaustion (maxSteps synthesis / maxCostUsd) finishes with an
+  // answer in hand but no room to nudge for verification — trace an unverified
+  // edit so those exits aren't a silent bypass of the gate's guarantee, matching
+  // the no_tool_use exhaustion's accept-with-trace. No-op when the gate is off
+  // or the run verified / never mutated.
+  const traceUnverifiedAtExhaustion = (): void => {
+    const unsatisfied = unsatisfiedVerifyCommands(verifyState, verifyCommands);
+    if (unsatisfied.length > 0) {
+      console.error(
+        `forja: verify gate — budget exhausted with an unverified edit; not confirmed: ${unsatisfied.join(', ')}`,
+      );
+    }
+  };
   let sessionId = '';
   // Repo root for scope-chain resolution. `config.cwd` is the
   // invocation directory; an operator starting the CLI from a
@@ -2990,16 +3003,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // The synthesis emitted a final answer, but the run is out of steps so
           // it cannot nudge for verification the way the no_tool_use gate does.
           // Apply the gate's EXHAUSTION behavior here too (STATE_MACHINE §3.2.1):
-          // accept the answer but TRACE an unverified edit (stderr) so a low /
-          // just-exhausted step budget isn't a silent bypass of the opt-in
-          // guarantee. No-op when the gate is off or the run verified / never
-          // mutated.
-          const unsatisfiedAtExhaustion = unsatisfiedVerifyCommands(verifyState, verifyCommands);
-          if (unsatisfiedAtExhaustion.length > 0) {
-            console.error(
-              `forja: verify gate — budget exhausted with an unverified edit; not confirmed: ${unsatisfiedAtExhaustion.join(', ')}`,
-            );
-          }
+          // accept the answer but TRACE an unverified edit so a low /
+          // just-exhausted step budget isn't a silent bypass of the guarantee.
+          traceUnverifiedAtExhaustion();
           // The synthesis can be the FIRST turn to cross the hard cost cap; a
           // breach must surface as maxCostUsd, not be masked as step exhaustion.
           if (synth.costOverage !== null) return await finish('maxCostUsd', synth.costOverage);
@@ -3178,6 +3184,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           }
           bufferedAnswer.length = 0;
         };
+        // Whether we're still holding this turn's answer text. Set false the
+        // moment a tool_use appears: a tool call means the turn is NOT a
+        // suppressible final answer, so the held preamble must flush BEFORE the
+        // tool's events (else the live render shows the tool card ahead of the
+        // text that preceded it, and the TUI orphans the block) and the rest of
+        // the turn streams live.
+        let holdingAnswer = verifyArmed;
 
         let collected: Awaited<ReturnType<typeof collectStep>>;
         try {
@@ -3207,9 +3220,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               signal,
             ),
             (ev) => {
-              // Hold the answer text when armed; every other event (tool deltas,
-              // stream errors, usage) still streams live.
-              if (verifyArmed && ev.kind === 'text_delta') {
+              // A tool call settles that this turn is not a suppressible final
+              // answer: flush the held preamble BEFORE the tool's events (keeping
+              // the model's emission order) and stop holding for the rest of it.
+              if (holdingAnswer && ev.kind === 'tool_use_start') {
+                flushBufferedAnswer();
+                holdingAnswer = false;
+              }
+              // Hold the answer text while still possibly-suppressible; every
+              // other event (tool deltas, stream errors, usage) streams live.
+              if (holdingAnswer && ev.kind === 'text_delta') {
                 bufferedAnswer.push(ev);
                 return;
               }
@@ -3381,7 +3401,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // for clean spend, not for surfacing already-broken turns.
         {
           const overage = costCapDetailIfExceeded();
-          if (overage !== null) return await finish('maxCostUsd', overage);
+          if (overage !== null) {
+            traceUnverifiedAtExhaustion();
+            return await finish('maxCostUsd', overage);
+          }
         }
 
         // No tool uses → check the stop_reason before declaring success.
