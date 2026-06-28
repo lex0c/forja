@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from 'bun:test';
+import { beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import type { CollectedStep } from '../../src/harness/collect.ts';
 import { type AssistantUsage, type HarnessEvent, SessionContext } from '../../src/harness/index.ts';
 import { runAgent } from '../../src/harness/loop.ts';
@@ -3627,5 +3627,33 @@ describe('runAgent — claim-time verify gate (STATE_MACHINE §3.2.1)', () => {
     // The partial text was buffered (gate armed) then flushed in the catch —
     // not silently swallowed by the buffering.
     expect(streamed).toContain('PARTIAL-BEFORE-ERROR');
+  });
+
+  test('maxSteps exhaustion after an unverified edit traces the gate bypass', async () => {
+    // Low budget: the edit burns the only step, then the exhaustion-synthesis
+    // turn writes the final answer — a path that does NOT reach the no_tool_use
+    // gate. With an unverified edit it must still trace (accept-with-trace),
+    // not silently emit an unverified claim.
+    const errSpy = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const { config } = buildConfig(
+        [
+          {
+            tool_uses: [{ id: 't1', name: 'edit_file', input: { path: 'a.ts' } }],
+            stop_reason: 'tool_use',
+          },
+          { text: 'PARTIAL: edited a.ts; out of steps', stop_reason: 'end_turn' }, // synthesis turn
+        ],
+        { extraTools: [stubEdit], budget: { maxSteps: 1 }, verify: { commands: ['bun test'] } },
+      );
+      const result = await runAgent(config);
+      expect(result.reason).toBe('maxSteps');
+      const traced = errSpy.mock.calls.some(
+        (c) => String(c[0]).includes('verify gate') && String(c[0]).includes('bun test'),
+      );
+      expect(traced).toBe(true);
+    } finally {
+      errSpy.mockRestore();
+    }
   });
 });

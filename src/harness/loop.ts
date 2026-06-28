@@ -2987,6 +2987,19 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               ? await finish('maxWallClockMs')
               : await finish('aborted', undefined, 'hard');
           }
+          // The synthesis emitted a final answer, but the run is out of steps so
+          // it cannot nudge for verification the way the no_tool_use gate does.
+          // Apply the gate's EXHAUSTION behavior here too (STATE_MACHINE §3.2.1):
+          // accept the answer but TRACE an unverified edit (stderr) so a low /
+          // just-exhausted step budget isn't a silent bypass of the opt-in
+          // guarantee. No-op when the gate is off or the run verified / never
+          // mutated.
+          const unsatisfiedAtExhaustion = unsatisfiedVerifyCommands(verifyState, verifyCommands);
+          if (unsatisfiedAtExhaustion.length > 0) {
+            console.error(
+              `forja: verify gate — budget exhausted with an unverified edit; not confirmed: ${unsatisfiedAtExhaustion.join(', ')}`,
+            );
+          }
           // The synthesis can be the FIRST turn to cross the hard cost cap; a
           // breach must surface as maxCostUsd, not be masked as step exhaustion.
           if (synth.costOverage !== null) return await finish('maxCostUsd', synth.costOverage);
