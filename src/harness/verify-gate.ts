@@ -32,34 +32,27 @@ export const createVerifyState = (): VerifyState => ({
 // UX nudge, not the permission engine; it makes no allow/deny decision).
 const collapseWs = (s: string): string => s.trim().split(/\s+/).join(' ');
 
-// `&&` is the ONLY sound segment separator. The gate trusts the bash tool's
-// OVERALL exit code; only `&&` makes that code faithfully reflect a segment.
-// In `A && B` an exit 0 means every command ran and exited 0 (POSIX
-// short-circuit), so a declared command appearing as any `&&` conjunct did
-// pass. The other operators MASK a segment's exit from the overall code:
-// `bun test || true` / `bun test; true` / `bun test | cat` all exit 0 even
-// when `bun test` failed or was skipped. So they are NOT separators here.
-const CONJUNCTION_SEPARATOR = '&&';
-
 // True when `bashCommand` actually RAN `declared` (the exit-0 check is the
-// caller's). Matched EXACTLY (no prefix): either the whole ws-collapsed command
-// equals the declared command (so a declared compound like `lint && test` is
-// matched when run verbatim — and an operator who declares a self-masking
-// command like `bun test || true` owns that choice), or the declared command
-// equals one `&&` conjunct (so `cd x && bun test` credits a declared
-// `bun test`). Exact-only + `&&`-only is the safe choice for a verification
-// gate: prefix/substring matching would let a mention in a quoted string
-// (`git commit -m "...; bun test"`) or a no-op sibling (`bun test --help`)
-// satisfy it, and a masking operator (see above) would credit a command whose
-// failure was swallowed. The cost is that the model must run the declared
-// command without a leading wrapper (`CI=1`, `time`) or a masking suffix; the
-// nudge names the exact command, and the bound caps the retries. Operates on
-// the structured `command` tool arg, never on model prose.
+// caller's): WHOLE-command equality only — the ws-collapsed bash command must
+// equal the declared command in full. No segment splitting, because matching a
+// declared command as a SEGMENT of a one-liner is unsound two ways:
+//   1. The bash tool reports ONE overall exit code, so a masking operator
+//      (`bun test || true`, `bun test; true`, `bun test | cat`) would credit a
+//      command whose failure was swallowed or which never ran.
+//   2. A textual split can't tell a real shell `&&` from one inside a quoted
+//      string / heredoc / comment, so `echo "x && bun test && y"` (exit 0)
+//      would credit `bun test` though it never executed.
+// As the whole command, the declared command's exit code IS the tool's exit
+// code — unambiguous, with no shell parsing at all (this stays a pure module,
+// not a dependant of the bash tokenizer). The cost is that the model must run
+// the declared command verbatim: an operator who needs a prefix or wrapper
+// declares that exact string (`cd app && bun test`, `CI=1 bun test`), the nudge
+// names it, and the model runs it as-is. Operates on the structured `command`
+// tool arg, never on model prose.
 export const matchesVerifyCommand = (bashCommand: string, declared: string): boolean => {
   const target = collapseWs(declared);
   if (target.length === 0) return false;
-  if (collapseWs(bashCommand) === target) return true;
-  return bashCommand.split(CONJUNCTION_SEPARATOR).some((seg) => collapseWs(seg) === target);
+  return collapseWs(bashCommand) === target;
 };
 
 // Fold one settled tool call into the verify state. A successful file write

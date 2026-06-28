@@ -9,34 +9,38 @@ import {
 
 const CMDS = ['bun run typecheck', 'bun test'];
 
-describe('matchesVerifyCommand (exact, &&-only)', () => {
-  test('matches the whole command, an && conjunct, and a declared compound (ws-collapsed)', () => {
+describe('matchesVerifyCommand (whole-command equality only)', () => {
+  test('credits the declared command run verbatim (ws-collapsed), incl. a declared compound', () => {
     expect(matchesVerifyCommand('bun test', 'bun test')).toBe(true);
     expect(matchesVerifyCommand('bun    test', 'bun test')).toBe(true); // ws-collapse
-    expect(matchesVerifyCommand('cd app && bun test', 'bun test')).toBe(true); // && conjunct
-    expect(matchesVerifyCommand('lint && bun test && echo ok', 'bun test')).toBe(true); // mid &&-chain
-    // A declared COMPOUND matches when run verbatim (whole-command equality).
+    // An operator who needs a prefix declares that EXACT string; running it
+    // verbatim is a whole-command match.
+    expect(matchesVerifyCommand('cd app && bun test', 'cd app && bun test')).toBe(true);
     expect(matchesVerifyCommand('bun run lint && bun test', 'bun run lint && bun test')).toBe(true);
   });
 
-  test('does NOT credit a MASKED declared command — only && is sound', () => {
-    // The bash tool's overall exit code can be 0 even though `bun test` itself
-    // failed or never ran; crediting these would let the gate pass unverified.
-    expect(matchesVerifyCommand('bun test || true', 'bun test')).toBe(false); // failure swallowed
-    expect(matchesVerifyCommand('bun test; true', 'bun test')).toBe(false); // exit is `true`'s
-    expect(matchesVerifyCommand('bun test | cat', 'bun test')).toBe(false); // exit is `cat`'s
-    expect(matchesVerifyCommand('lint || bun test', 'bun test')).toBe(false); // bun test may be skipped
-    expect(matchesVerifyCommand('cd app\nbun test', 'bun test')).toBe(false); // newline = sequential, can mask
-    expect(matchesVerifyCommand('setup; bun test', 'bun test')).toBe(false); // ; sequential
-    expect(matchesVerifyCommand('seed | bun test', 'bun test')).toBe(false); // piped
+  test('does NOT credit the declared command as a SEGMENT of a larger command', () => {
+    // Segment matching is unsound — the tool reports one OVERALL exit code.
+    expect(matchesVerifyCommand('cd app && bun test', 'bun test')).toBe(false); // && conjunct, not whole
+    expect(matchesVerifyCommand('lint && bun test && echo ok', 'bun test')).toBe(false);
+    // Masking operators: exit 0 even though `bun test` failed or was skipped.
+    expect(matchesVerifyCommand('bun test || true', 'bun test')).toBe(false);
+    expect(matchesVerifyCommand('bun test; true', 'bun test')).toBe(false);
+    expect(matchesVerifyCommand('bun test | cat', 'bun test')).toBe(false);
+    expect(matchesVerifyCommand('lint || bun test', 'bun test')).toBe(false);
+    // A `&&` inside a quoted string is NOT a real conjunction — `bun test` never
+    // ran here. Whole-command equality sidesteps the whole parsing class.
+    expect(matchesVerifyCommand('echo "x && bun test && y"', 'bun test')).toBe(false);
   });
 
-  test('EXACT only — no prefix/substring (the false-positives that would defeat the gate)', () => {
+  test('EXACT only — no prefix/substring/wrapper (false-positives that would defeat the gate)', () => {
     // A no-op sibling subcommand (runs zero tests, exits 0) must NOT satisfy it.
     expect(matchesVerifyCommand('bun test --help', 'bun test')).toBe(false);
     // A mere mention inside a quoted string must NOT satisfy it.
     expect(matchesVerifyCommand('git commit -m "fix; bun test passes"', 'bun test')).toBe(false);
     expect(matchesVerifyCommand('echo bun test', 'bun test')).toBe(false);
+    // A leading wrapper is not the whole declared command.
+    expect(matchesVerifyCommand('CI=1 bun test', 'bun test')).toBe(false);
     // A declared prefix must NOT match a different subcommand.
     expect(matchesVerifyCommand('bun install', 'bun')).toBe(false);
     expect(matchesVerifyCommand('bun', 'bun test')).toBe(false);
