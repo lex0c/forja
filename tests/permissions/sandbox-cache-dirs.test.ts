@@ -13,7 +13,6 @@ describe('DEFAULT_WRITABLE_CACHE_DIRS', () => {
       '.npm',
       '.nuget/packages',
       '.local/share/NuGet',
-      '.dotnet',
       '.cargo/registry',
       '.gem',
       '.bundle',
@@ -39,6 +38,9 @@ describe('DEFAULT_WRITABLE_CACHE_DIRS', () => {
     expect(DEFAULT_WRITABLE_CACHE_DIRS).not.toContain('.local/share/pnpm'); // keeps pnpm bin + global bins
     expect(DEFAULT_WRITABLE_CACHE_DIRS).toContain('.bun/install/cache');
     expect(DEFAULT_WRITABLE_CACHE_DIRS).not.toContain('.bun'); // keeps ~/.bun/bin
+    // ~/.dotnet may be the SDK install (dotnet-install.sh + PATH=$HOME/.dotnet); masking it would hide
+    // the dotnet binary. Relocated via the DOTNET_CLI_HOME redirect (sandbox-cache-env) instead.
+    expect(DEFAULT_WRITABLE_CACHE_DIRS).not.toContain('.dotnet');
     // `~/.rustup` stays masked via HIDE_PATHS_DIRS — never a writable cache dir.
     expect(DEFAULT_WRITABLE_CACHE_DIRS).not.toContain('.rustup');
   });

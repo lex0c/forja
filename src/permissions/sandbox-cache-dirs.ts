@@ -77,7 +77,12 @@ export const DEFAULT_WRITABLE_CACHE_DIRS: readonly string[] = [
   '.npm', // npm cache (~/.npm)
   '.nuget/packages', // .NET / NuGet package cache (host default; not XDG)
   '.local/share/NuGet', // NuGet v3 HTTP cache (host default; not XDG)
-  '.dotnet', // dotnet CLI first-run sentinel + telemetry (write here EROFSes otherwise)
+  // NOTE: `~/.dotnet` is intentionally NOT a writable-cache dir. `dotnet-install.sh` installs the SDK
+  // there and users PATH it ($HOME/.dotnet/dotnet), so a blanket tmpfs would MASK the dotnet binary →
+  // `dotnet build` becomes command-not-found instead of fixed. The CLI's user-home writes (first-run
+  // sentinel, telemetry, `dotnet tool`) are relocated via the DOTNET_CLI_HOME redirect in
+  // `sandbox-cache-env.ts` — relocating (not masking) keeps the SDK execable. The NuGet PACKAGE cache
+  // (deps) is covered by the two `.nuget*` entries above, which hold no binary.
   '.cargo/registry', // cargo registry/dep cache — SUBDIR only (keeps ~/.cargo/bin intact)
   '.gem', // RubyGems user gem dir / cache
   '.bundle', // Bundler config + cache

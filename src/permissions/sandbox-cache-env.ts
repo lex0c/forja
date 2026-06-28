@@ -73,6 +73,11 @@ export const CACHE_ENV_MAP: Readonly<Record<string, readonly CacheEnvEntry[]>> =
   // Dart/Flutter: `dart pub` / `flutter pub` honor PUB_CACHE (host ~/.pub-cache; not XDG). Heavy
   // Flutter dep sets make persistence worth it — without the redirect they'd re-download every spawn.
   dart: [{ name: 'PUB_CACHE', subdir: 'pub-cache' }], // host: ~/.pub-cache (not XDG)
+  // .NET: DOTNET_CLI_HOME relocates the CLI's USER home (first-run sentinel, telemetry, `dotnet tool`
+  // global tools) away from ~/.dotnet — which may be the SDK INSTALL dir (dotnet-install.sh + PATH).
+  // REDIRECTING (vs masking ~/.dotnet with a tmpfs) keeps the SDK binary execable. It does NOT relocate
+  // the SDK itself (found via the dotnet apphost / DOTNET_ROOT). The NuGet PACKAGE cache is separate.
+  dotnet: [{ name: 'DOTNET_CLI_HOME', subdir: 'dotnet' }], // host: ~/.dotnet (not XDG; may be the SDK)
 };
 
 // Flatten into the concrete env to inject, given the Forja cache base
