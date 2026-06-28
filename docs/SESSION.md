@@ -142,7 +142,10 @@ the billed LLM fold run only when the pre-pass isn't enough.
 default-ON via `budget.compactionRelevance`). No provider call: score the
 middle's `tool_result` bodies by BM25 relevance to the goal + position-recency,
 keep the highest verbatim within a byte budget derived from the trigger, and
-replace the rest with `[tool_result elided: …]` pointers. The elided raw stays
+replace the rest with `[<label> elided: …]` pointers (the label names the tool
+when known). An exact-duplicate **dedup** pass runs first — collapsing identical
+repeated bodies (re-reads, re-run greps/tests) to a back-reference so the budget
+isn't spent on redundant copies, folded into the same `relevance` audit. The elided raw stays
 in the SQLite log and is reachable via `retrieve_context` (session view) — the
 elision is reversible. **Token-driven** (in the loop): pre-pass → re-estimate
 `promptTokens` → if back under threshold, **done, no LLM call**; else fall
