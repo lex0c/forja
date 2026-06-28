@@ -866,17 +866,19 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       // unsandboxed execution is opt-in per CLI invocation only.
       emitHostPassthrough: input.iKnowWhatImDoing === true,
       // Coarse network posture from `[sandbox] network` (default off via
-      // DEFAULT_NETWORK). When `on`, the planner upgrades exec:arbitrary calls
-      // to cwd-rw-net. Trust gate by PROVENANCE: a PROJECT-sourced `on` (a repo's
-      // own `.forja/config.toml`, attacker-controllable in a clone) requires the
-      // config's directory — the repo root (`projectConfigCwd`) — to be trusted;
-      // a USER-sourced `on` (~/.config/forja, the operator's own machine config)
-      // is honored WITHOUT repo trust (gating it would wrongly ignore the
-      // operator's global opt-in in repos that never supplied the setting).
-      // CLAUDE.md "Explicit trust". See PERMISSION_ENGINE.md §6.5.
-      networkAllowed:
-        sandboxLoaded.config.network === 'on' &&
-        (!sandboxLoaded.networkFromProject || isProjectConfigTrusted),
+      // DEFAULT_NETWORK): whether the dev-network feature is ON for this session.
+      // The planner grants egress to an UNMODELED build (the bump) only when this
+      // AND `dirTrusted` hold — trust is enforced UNIFORMLY at the planner, so
+      // egress requires a trusted dir regardless of which config layer set
+      // `network`: a hostile clone's project config can't self-enable egress, and
+      // even a global user `network = on` still needs the dir trusted (CLAUDE.md
+      // "Explicit trust"). See PERMISSION_ENGINE.md §6.5.
+      networkAllowed: sandboxLoaded.config.network === 'on',
+      // Trust of the config-supplying repo root, threaded so the planner can
+      // trust-gate BUILD egress (a modeled dep-manager's `net-egress`) the same
+      // way the posture is gated: an untrusted clone's `npm install` / `go build`
+      // lands cwd-rw (no egress), killing the clone-and-build exfil vector.
+      dirTrusted: isProjectConfigTrusted,
       // Slice 165 (review — Batch C sandbox observability). Forward
       // the trust marker so bootstrap can emit a
       // `sandbox.path_resolved` failure_event when the install isn't

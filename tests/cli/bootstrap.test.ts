@@ -370,9 +370,11 @@ describe('bootstrap', () => {
       db.close();
     });
 
-    test('USER-config network=on is honored in an UNtrusted repo (provenance)', async () => {
-      // network from the operator's OWN user config — NOT the repo — so the
-      // repo-root trust gate must NOT veto it (the untrusted repo never set it).
+    test('network=on (even USER config) in an UNtrusted repo → cwd-rw (egress uniformly trust-gated)', async () => {
+      // Build egress requires a TRUSTED dir regardless of which layer set
+      // `network` — a global user `network = on` does NOT grant egress in an
+      // untrusted repo (kills the drive-by exfil vector). The unknown binary
+      // stays cwd-rw despite the posture being on.
       const userCfg = userConfigPath(); // XDG_CONFIG_HOME=workdir → workdir/forja/config.toml
       if (userCfg === null) throw new Error('userConfigPath resolved to null');
       mkdirSync(dirname(userCfg), { recursive: true });
@@ -392,13 +394,14 @@ describe('bootstrap', () => {
       });
       expect(config.isCwdTrusted).toBe(false);
       const d = config.permissionEngine.check('bash', 'bash', { command: 'frobnicate' });
-      expect(d.sandboxProfile).toBe('cwd-rw-net');
+      expect(d.sandboxProfile).toBe('cwd-rw');
       db.close();
     });
 
-    test('a MODELED dep-manager (go) reaches cwd-rw-net with NO posture and NO trust', async () => {
-      // go is modeled with its own net-egress (proxy.golang.org), like npm/pip/cargo,
-      // so it installs deps out-of-box — no [sandbox] network, nothing trusted.
+    test('modeled dep-manager (go) in an UNtrusted dir → cwd-rw (build egress trust-gated)', async () => {
+      // go is modeled (own net-egress), but BUILD egress is trust-gated: an
+      // untrusted dir's `go build` lands cwd-rw (no network) — kills the
+      // clone-and-build exfil vector. Nothing trusted, no [sandbox] network.
       const trustPath = join(workdir, 'trusted_dirs.json');
       writeFileSync(trustPath, JSON.stringify({ directories: [] }));
       const { config, db } = await bootstrap({
@@ -412,6 +415,27 @@ describe('bootstrap', () => {
         sandboxAvailabilityOverride: availableSandbox,
       });
       expect(config.isCwdTrusted).toBe(false);
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'go build' });
+      expect(d.sandboxProfile).toBe('cwd-rw');
+      db.close();
+    });
+
+    test('modeled dep-manager (go) in a TRUSTED dir → cwd-rw-net (deps fetch, no posture needed)', async () => {
+      // Trusted dir: go's net-egress is honored → cwd-rw-net, with no [sandbox]
+      // network config (modeled, unlike the coarse posture which also needs on).
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      expect(config.isCwdTrusted).toBe(true);
       const d = config.permissionEngine.check('bash', 'bash', { command: 'go build' });
       expect(d.sandboxProfile).toBe('cwd-rw-net');
       db.close();

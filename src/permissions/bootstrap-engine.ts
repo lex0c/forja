@@ -82,10 +82,14 @@ export interface BootstrapPermissionEngineInput {
     // `--i-know-what-im-doing` opt-in. Default off ⇒ `host` stays pruned.
     emitHostPassthrough?: boolean;
     // Coarse network posture (`[sandbox] network = on`, project-wins, default
-    // off). Forwarded verbatim into EngineOptions.sandbox; the planner floors
-    // an `exec:arbitrary` call to cwd-rw-net when true so any unmodeled
-    // toolchain can fetch deps. See PERMISSION_ENGINE.md §6.5.
+    // off). Forwarded verbatim into EngineOptions.sandbox; the planner bumps an
+    // `exec:arbitrary` call to cwd-rw-net only when this AND `dirTrusted` BOTH
+    // hold (build egress is uniformly trust-gated). See PERMISSION_ENGINE.md §6.5.
     networkAllowed?: boolean;
+    // Trust of the directory being acted on (repo root). Forwarded into
+    // EngineOptions.sandbox; the planner trust-gates BUILD egress (a modeled
+    // dep-manager's `net-egress`) on it. Default off (fail-closed).
+    dirTrusted?: boolean;
     // Resolver's trust marker so bootstrap can emit a
     // `sandbox.path_resolved` failure_event when the sandbox tool
     // was resolved via $PATH (non-canonical install). Optional for

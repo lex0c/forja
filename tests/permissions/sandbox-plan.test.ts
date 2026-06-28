@@ -232,14 +232,26 @@ describe('selectSandboxProfile — exec:arbitrary floor + network posture', () =
     if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw');
   });
 
-  test('exec:arbitrary + networkAllowed → cwd-rw-net (deps can be fetched)', () => {
+  test('exec:arbitrary + networkAllowed + dirTrusted → cwd-rw-net (posture, trusted)', () => {
     const r = selectSandboxProfile({
       capabilities: caps('exec:arbitrary', 'read-fs:.'),
       hostExplicitlyAllowed: false,
       networkAllowed: true,
+      dirTrusted: true,
     });
     expect(r.kind).toBe('ok');
     if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw-net');
+  });
+
+  test('exec:arbitrary + networkAllowed but UNtrusted → cwd-rw (posture egress is trust-gated too)', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('exec:arbitrary', 'read-fs:.'),
+      hostExplicitlyAllowed: false,
+      networkAllowed: true,
+      dirTrusted: false,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw');
   });
 
   test('exec:arbitrary + networkAllowed:false stays cwd-rw (default offline)', () => {
@@ -299,6 +311,40 @@ describe('selectSandboxProfile — exec:arbitrary floor + network posture', () =
       expect(r.uncovered).toEqual(['exec', 'host-passthrough']);
       expect(r.uncovered).not.toContain('write-fs');
     }
+  });
+
+  // Trust-gate for BUILD egress: a modeled dep-manager is `exec:arbitrary +
+  // net-egress`. It reaches the network only in a TRUSTED dir.
+  test('exec:arbitrary + net-egress + dirTrusted → cwd-rw-net (trusted build fetches deps)', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('exec:arbitrary', 'net-egress:registry.npmjs.org', 'read-fs:.'),
+      hostExplicitlyAllowed: false,
+      dirTrusted: true,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw-net');
+  });
+
+  test('exec:arbitrary + net-egress + UNtrusted → cwd-rw (build egress dropped, no exfil)', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('exec:arbitrary', 'net-egress:registry.npmjs.org', 'read-fs:.'),
+      hostExplicitlyAllowed: false,
+      dirTrusted: false,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw');
+  });
+
+  // The discriminator: net-egress WITHOUT exec:arbitrary (curl/wget/git/ssh/gh —
+  // explicit, user-invoked net actions) is NOT trust-gated.
+  test('net-egress without exec:arbitrary is NOT trust-gated → cwd-rw-net even untrusted', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('net-egress:github.com', 'read-fs:.'),
+      hostExplicitlyAllowed: false,
+      dirTrusted: false,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw-net');
   });
 });
 

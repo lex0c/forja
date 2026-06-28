@@ -126,6 +126,14 @@ export interface SelectSandboxProfileOptions {
   // Omitted/false ⇒ off (unbounded exec stays `cwd-rw`, no network). See
   // PERMISSION_ENGINE.md §6.5.
   networkAllowed?: boolean;
+  // Trust of the directory being acted on (repo root). When an `exec:arbitrary`
+  // call (a build that runs arbitrary code) ALSO carries `net-egress` (a modeled
+  // dep-manager — npm/go/pip/…), egress is granted only if this is true: an
+  // UNtrusted dir's build lands `cwd-rw` (no network), killing the
+  // clone-and-build exfiltration vector. `net-egress` WITHOUT `exec:arbitrary`
+  // (curl/wget/git/ssh/gh — explicit net actions) is NOT gated. Omitted ⇒
+  // untrusted (fail-closed). See PERMISSION_ENGINE.md §6.5.
+  dirTrusted?: boolean;
 }
 
 export type SelectSandboxProfileResult =
@@ -168,16 +176,25 @@ export const selectSandboxProfile = (
     (cap) => cap.kind === 'exec' && cap.scope === 'arbitrary',
   );
 
-  // SELECTION set — `requiredKinds` plus the floor's `write-fs`. Kept SEPARATE
-  // from `requiredKinds` so the floor raises the chosen PROFILE WITHOUT leaking
-  // into the audit-facing `uncovered` report or anything derived from it; the
-  // resolved capability set the engine scores/envelope-gates is also untouched
-  // (PERMISSION_ENGINE.md §6.5). `write-fs` alone never makes a set
-  // unsatisfiable (cwd-rw covers it), so adding it here can never CAUSE a
-  // refuse — a refuse is always driven by a resolver-attributed kind.
-  const selectionKinds = hasUnboundedExec
-    ? new Set<CapabilityKind>([...requiredKinds, 'write-fs'])
-    : requiredKinds;
+  // SELECTION set — `requiredKinds` plus the floor's `write-fs`, minus any
+  // trust-gated egress. Kept SEPARATE from `requiredKinds` so neither the floor
+  // nor the trust-gate leaks into the audit-facing `uncovered` report or the
+  // resolved set the engine scores/envelope-gates (PERMISSION_ENGINE.md §6.5).
+  let selectionKinds: ReadonlySet<CapabilityKind> = requiredKinds;
+  if (hasUnboundedExec) {
+    const s = new Set<CapabilityKind>(requiredKinds);
+    // `write-fs` floor: an unbounded-exec call may write its cwd. (Never makes a
+    // set unsatisfiable — cwd-rw covers it — so the floor alone can't refuse.)
+    s.add('write-fs');
+    // Trust-gate BUILD egress: an `exec:arbitrary` call reaches the network only
+    // in a TRUSTED dir. Untrusted → drop `net-egress` so a modeled dep-manager
+    // (npm/go/pip/…) lands `cwd-rw` (no egress) not `cwd-rw-net`, killing the
+    // clone-and-build exfil vector (one confirm would otherwise grant full egress
+    // + broad host read). `net-egress` WITHOUT `exec:arbitrary` (curl/wget/git/
+    // ssh/gh — explicit, user-invoked net actions) is unaffected.
+    if (options.dirTrusted !== true) s.delete('net-egress');
+    selectionKinds = s;
+  }
 
   // `host` needs an explicit operator flag AND a host-passthrough
   // capability in the resolved set. Either missing prunes host
@@ -223,19 +240,26 @@ export const selectSandboxProfile = (
   // the most restrictive viable choice.
   const chosen = finalists[0] as SandboxProfile;
 
-  // Coarse network posture — a POST-selection bump, never a required kind.
-  // Egress is an OPERATOR decision (`[sandbox] network = on`, default off),
-  // never inferred per-binary. When the operator opted in AND an unbounded-exec
-  // call landed `cwd-rw`, upgrade it to `cwd-rw-net` so any toolchain
-  // (go/dotnet/composer/cargo/gem/…) can fetch deps without a per-language
-  // table. Doing this as a bump (instead of adding `net-egress` to the required
-  // set) means the posture can NEVER turn a viable plan into a refuse: an
-  // `exec:arbitrary + secret-access` call stays `home-rw` (no net) rather than
-  // refusing on the unsatisfiable {secret-access, net-egress} combo — enabling
-  // the network must not deny a command. `cwd-rw-net` ⊇ `cwd-rw`, so the bump
-  // is always valid. Modeled dep-managers (npm/pip/cargo) emit `net-egress`
-  // themselves and already land `cwd-rw-net` regardless of this posture.
-  if (hasUnboundedExec && options.networkAllowed === true && chosen === 'cwd-rw') {
+  // Coarse network posture — a POST-selection bump for UNMODELED toolchains
+  // (a user binary, `./gradlew`/`./mvnw` wrappers, swift/zig). Egress is an
+  // OPERATOR decision (`[sandbox] network = on`, default off), never inferred
+  // per-binary. Requires BOTH the posture on (`networkAllowed`) AND a TRUSTED
+  // dir (`dirTrusted`): an unbounded-exec call that landed `cwd-rw` is upgraded
+  // to `cwd-rw-net` only then. The `dirTrusted` half makes egress trust-gated
+  // UNIFORMLY — same as the modeled-dep-manager `net-egress` drop above — so an
+  // untrusted clone's build never reaches the network even with a global
+  // `network = on` (kills the drive-by exfil vector). Doing it as a bump (not a
+  // required kind) means it can NEVER turn a viable plan into a refuse:
+  // `exec:arbitrary + secret-access` stays `home-rw` instead of refusing on the
+  // unsatisfiable {secret-access, net-egress} combo. `cwd-rw-net` ⊇ `cwd-rw`, so
+  // the bump is always valid. Modeled dep-managers reach `cwd-rw-net` via their
+  // own `net-egress` (also dirTrusted-gated above), independent of this posture.
+  if (
+    hasUnboundedExec &&
+    options.networkAllowed === true &&
+    options.dirTrusted === true &&
+    chosen === 'cwd-rw'
+  ) {
     return { kind: 'ok', profile: 'cwd-rw-net' };
   }
   return { kind: 'ok', profile: chosen };

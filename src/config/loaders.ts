@@ -841,12 +841,6 @@ export interface LoadedSandboxConfig {
   userPath: string | null;
   projectPath: string;
   warnings: string[];
-  // True iff the PROJECT layer (`<repo>/.forja/config.toml`) supplied the
-  // effective `network` value. The network trust gate keys on this: a
-  // project-sourced `on` (attacker-controllable in a cloned repo) requires the
-  // repo root to be trusted; a user-sourced `on` (operator's own machine config)
-  // is honored without repo trust. Provenance for `[sandbox] network` only.
-  networkFromProject: boolean;
 }
 
 const parseSandboxLayer = (
@@ -941,10 +935,5 @@ export const loadSandboxConfig = (input: LoadSandboxConfigInput): LoadedSandboxC
   if (sharedTmp !== undefined) config.sharedTmp = sharedTmp;
   const network = projectResult.layer.network ?? userResult.layer.network;
   if (network !== undefined) config.network = network;
-  // Provenance for the trust gate: project-wins, so the project supplied the
-  // EFFECTIVE value iff it set the key. A user-only `network` is the operator's
-  // own machine decision and must NOT be vetoed by repo trust (the untrusted
-  // repo never supplied it). See `bootstrap.ts` networkAllowed.
-  const networkFromProject = projectResult.layer.network !== undefined;
-  return { config, userPath, projectPath, warnings, networkFromProject };
+  return { config, userPath, projectPath, warnings };
 };

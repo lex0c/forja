@@ -14,10 +14,13 @@
 #                                                        home-rw
 #   B. Host gate                                   (2)   eligible +
 #                                                        blocked
-#   C. exec:arbitrary floor + net posture          (2)   unmodeled binary
-#                                                        → cwd-rw (offline);
-#                                                        cwd-rw-net when
-#                                                        network_allowed
+#   C. exec:arbitrary floor + net posture +        (6)   unmodeled → cwd-rw;
+#      build-egress trust-gate                            posture+trusted →
+#                                                        cwd-rw-net, posture+
+#                                                        untrusted → cwd-rw;
+#                                                        modeled dep-manager
+#                                                        gated on dir_trusted;
+#                                                        curl-style net ungated
 #
 # Together these pin: (1) the per-kind capability table that decides
 # what each profile covers, (2) the tie-break order (most restrictive
@@ -128,16 +131,64 @@
   expect:
     sandbox_profile: "cwd-rw"
 
-- name: "sandbox select: exec:arbitrary + network_allowed → cwd-rw-net (deps fetchable)"
+- name: "sandbox select: exec:arbitrary + network_allowed + dir_trusted → cwd-rw-net (posture, trusted)"
   setup:
     # Coarse operator posture `[sandbox] network = on` (threaded as
-    # network_allowed). The exec:arbitrary floor then also requires net-egress,
-    # so the selector lands cwd-rw-net — any toolchain (go/dotnet/composer/…)
-    # can fetch deps without a per-language capability table. Egress is an
-    # operator axis, never inferred per-binary. (PERMISSION_ENGINE.md §6.5.)
+    # network_allowed), in a TRUSTED dir → an unmodeled exec:arbitrary call is
+    # bumped to cwd-rw-net. Egress is an operator axis AND trust-gated: the
+    # posture bump requires BOTH network_allowed AND dir_trusted. (§6.5.)
     sandbox_capabilities:
       - "exec:arbitrary"
       - "read-fs:."
     network_allowed: true
+    dir_trusted: true
+  expect:
+    sandbox_profile: "cwd-rw-net"
+
+- name: "sandbox select: exec:arbitrary + network_allowed but UNtrusted → cwd-rw (posture egress trust-gated)"
+  setup:
+    # Posture on but the dir is NOT trusted → the bump does not fire → cwd-rw.
+    # A global `network = on` does not grant egress to a build in an untrusted
+    # repo (kills the drive-by exfil vector). (PERMISSION_ENGINE.md §6.5.)
+    sandbox_capabilities:
+      - "exec:arbitrary"
+      - "read-fs:."
+    network_allowed: true
+    dir_trusted: false
+  expect:
+    sandbox_profile: "cwd-rw"
+
+- name: "sandbox select: modeled dep-manager (exec:arbitrary + net-egress) UNtrusted → cwd-rw (egress trust-gated)"
+  setup:
+    # A modeled dep-manager (npm/go/pip) resolves to exec:arbitrary + net-egress.
+    # In an UNtrusted dir the build's egress is dropped → cwd-rw (no network),
+    # killing the clone-and-build exfil vector. (PERMISSION_ENGINE.md §6.5.)
+    sandbox_capabilities:
+      - "exec:arbitrary"
+      - "net-egress:registry.npmjs.org"
+      - "read-fs:."
+    dir_trusted: false
+  expect:
+    sandbox_profile: "cwd-rw"
+
+- name: "sandbox select: modeled dep-manager + dir_trusted → cwd-rw-net (deps fetch, no posture)"
+  setup:
+    # Same caps, but the dir is TRUSTED → net-egress honored → cwd-rw-net.
+    sandbox_capabilities:
+      - "exec:arbitrary"
+      - "net-egress:registry.npmjs.org"
+      - "read-fs:."
+    dir_trusted: true
+  expect:
+    sandbox_profile: "cwd-rw-net"
+
+- name: "sandbox select: net-egress WITHOUT exec:arbitrary (curl/git) is NOT trust-gated → cwd-rw-net"
+  setup:
+    # Explicit, user-invoked net (curl/wget/git/ssh) emits net-egress but NOT
+    # exec:arbitrary → not gated → cwd-rw-net even untrusted.
+    sandbox_capabilities:
+      - "net-egress:github.com"
+      - "read-fs:."
+    dir_trusted: false
   expect:
     sandbox_profile: "cwd-rw-net"
