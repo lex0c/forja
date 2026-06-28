@@ -66,7 +66,7 @@ invariants (errors never elided, replay-safe). Closed 2026-06-28 — see `docs/B
 **Spec:** light `CONTEXT_TUNING §12` note (dedup as part of the relevance pass +
 pointer wording) — optional follow-up, not blocking.
 
-## Slice H3 — Verification-gate · **spec-PR FIRST**, then code
+## Slice H3 — Verification-gate · ✅ DONE · spec-PR first, then code
 
 "Measure twice" at claim-time: before accepting a final answer, if code was edited
 without fresh passing verify evidence, re-inject a nudge and continue the loop.
@@ -80,11 +80,12 @@ verify-commands. Never parse the model's prose.
 
 | Task | Status | Description |
 |---|---|---|
-| **H3.1** | ☐ todo | Spec-PR: amend `STATE_MACHINE §3.1/§3.2` — add an opt-in deterministic `no_tool_use → generating` (`verify_gate`) transition, distinct from `critique_running` (LLM, opt-in, unimplemented — only migration `031-critique-runs.ts`). Define trigger (`verify.commands` non-empty + code mutated without evidence), `max_attempts` (default 2), exhaustion behavior (accept as `done` + `verify_gate_exhausted` audit signal, or a new `ExitReason`). Design: **nudge-only** (don't auto-run — make the model run it). |
-| **H3.2** | ☐ todo | Config `verify.commands` (opt-in list, e.g. `["bun run typecheck","bun test"]`). Empty → gate off. Touches the 5 config-flag surfaces (`HarnessConfig`+Source, `BootstrapInput`+resolution, loaders, init-config-template). |
-| **H3.3** | ☐ todo | Loop: accumulate a per-run `Set<string>` of mutated code paths from settled successful `FILE_WRITER_TOOLS` results (reuse the set at `recap/projection.ts:37-41`; extract `input.path`); track whether a bash call whose `command` matches a declared verify-command exited 0 after the last mutation. |
-| **H3.4** | ☐ todo | Loop: at the finalize branch (`loop.ts:3310-3327`), before `finish('done')`, if (code mutated) ∧ (no fresh evidence) ∧ (attempts<max): suppress the answer, append it + a synthetic nudge naming the declared commands (reuse `turn-append.ts` + the `buildSynthesisMessages` pattern, `exhaustion-synthesis.ts:52-67`), increment a counter, `continue`. On exhaustion: `finish('done')` + audit signal. If a new `ExitReason` lands: update `harness/types.ts` + both `Record<ExitReason,…>` (`loop.ts:175,200`) + the `evals/loader.ts` allowlist. |
-| **H3.5** | ☐ todo | Tests: trigger→suppress→continue; no-op with empty config; no trigger when verify ran & passed; exhaustion accepts with signal; deterministic mutated-paths set. |
+| **H3.1** | ✅ done | Spec: `STATE_MACHINE §3.2.1` (authored + reviewed before code) — opt-in deterministic `verify_gate_block`/`verify_gate_pass` transitions out of `no_tool_use` (sibling of the opt-in critique, checked first), trigger, nudge-only invariant, `max_attempts`=2, exhaustion accepts (no new terminal state / ExitReason). |
+| **H3.2** | ✅ done | Config `[verify] commands` (opt-in; empty/absent → gate off) threaded loaders → types → bootstrap → run/repl, fail-soft like `[sandbox]`, warnings on the same banner. Omitted from the comment-free init scaffold. No `*Source` (not a governance toggle). |
+| **H3.3** | ✅ done | `src/harness/verify-gate.ts` (pure): track `everMutated` + verified-since-last-mutation; deterministic command match (prefix on the bash `command`, &&/;/\|\|-aware). The loop folds each settled tool in via `recordToolForVerify` (right after the `tool_finished` emit). |
+| **H3.4** | ✅ done | Loop finalize (`no_tool_use`): before `finish('done')`, if `unsatisfiedVerifyCommands` non-empty ∧ attempts<MAX → append `verifyGateNudge` as a system-source user turn + `continue`; else accept. Subtle fix: bash exit-0 is `!failed && exitCode===undefined` (invokeTool surfaces only non-zero). |
+| **H3.5** | ✅ done | `verify-gate` unit suite + loop integration (off → no re-nudge; blocks+re-nudges+accepts after max) + `loadVerifyConfig` loader suite. 2764 harness/cli/config tests green; typecheck + Biome clean. |
+| **H3.6** | ☐ follow-up | **Deferred (code-behind-spec):** the structured `verify_gate_exhausted` audit **event** + TUI rendering. Adding a `HarnessEvent` variant pulls in the exhaustive switches (`tui/state.ts` `: never`, `harness-adapter.ts`) + a UI decision — a separate deliberate step. Gate behavior is complete; spec describes the event as the target. |
 
 ## Dependency graph
 

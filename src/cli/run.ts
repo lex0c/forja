@@ -783,6 +783,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       effortConfigWarnings,
       auditConfigWarnings,
       sandboxConfigWarnings,
+      verifyConfigWarnings,
       permissionState,
       permissionRefusingReason,
       permissionChain,
@@ -898,6 +899,11 @@ export const run = async (options: RunOptions): Promise<number> => {
       }
       for (const w of sandboxConfigWarnings) {
         errSink(`forja: sandbox config: ${w}\n`);
+      }
+      // [verify].commands warnings — a malformed gate config silently leaves the
+      // claim-time verification OFF, so surface the typo instead of hiding it.
+      for (const w of verifyConfigWarnings) {
+        errSink(`forja: verify config: ${w}\n`);
       }
     }
 

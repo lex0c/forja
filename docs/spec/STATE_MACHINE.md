@@ -433,7 +433,7 @@ Cada step (uma iteração do loop) tem máquina própria.
         ┌─────────┴──────────┐
         ↓                    ↓
    [tool_use_proposed]   [no_tool_use]
-        ↓ permission           ↓ critique_optional
+        ↓ permission           ↓ verify?/critique?
    ┌────┴────┐             [persist]
    ↓         ↓                 ↓
 [denied]  [allowed]          [done*]
@@ -457,7 +457,7 @@ Cada step (uma iteração do loop) tem máquina própria.
 | `executing` | `tool_calls.status='running'` | tool em runtime (com AbortSignal) | sim (graceful 5s + SIGKILL) |
 | `tool_complete` | `tool_calls.status='done'` | tool retornou (sucesso ou erro estruturado) | n/a (rapidíssimo) |
 | `observing` | tool result na content do step | tool_result no contexto; loop volta a generating se necessário (multi-tool) | sim |
-| `no_tool_use` | output completo sem tool_use; aguarda critique opt-in | step quase terminal | sim |
+| `no_tool_use` | output completo sem tool_use; aguarda **verify-gate determinístico (opt-in)** + critique opt-in | step quase terminal | sim |
 | `critique_running` | critique LLM call ativa (opt-in `critique.mode`) | critic revisando output | sim (cancel critique; persist sem revisão) |
 | `persist` | output buffer indo pra `messages` | commit de transação SQLite | não (atomic; ≤ms) |
 | `done` * | step completo; row em `messages` final | terminal | n/a |
@@ -477,11 +477,30 @@ Cada step (uma iteração do loop) tem máquina própria.
 | `tool_observed` | tool_complete → observing | Harness |
 | `post_tool_hook` | observing → done (fire-and-forget) | Harness |
 | `multi_tool_continue` | observing → tool_use_proposed (next tool in same step) | Harness |
+| `verify_gate_block` | no_tool_use → generating (se `verify.commands` ≠ ∅ ∧ run mutou arquivo sem evidência de verify passando ∧ attempts < max) | Harness |
+| `verify_gate_pass` | no_tool_use → persist (gate satisfeito, desligado, ou attempts esgotados) | Harness |
 | `critique_start` | no_tool_use → critique_running (se opt-in) | Harness |
 | `critique_complete` | critique_running → persist (se OK) ou re-generating (se redo) | Critic |
 | `commit` | persist → done | SQLite |
 | `interrupt` | qualquer → step_interrupted | Ctrl+C / Esc Esc |
 | `error_persistent` | qualquer → step_error | Failure handler |
+
+### 3.2.1 Verify gate (determinístico, opt-in)
+
+Ao atingir `no_tool_use`, **antes** do critique e do `persist`, um gate determinístico opt-in roda. Existe porque a premissa-raiz ("meça duas vezes, corte uma") vale também no *claim-time*: aceitar uma resposta final que editou código sem rodar a verificação é cortar sem medir. É uma re-entrada opt-in `no_tool_use → generating`, **irmã** do `critique_optional` (checada antes dele), e **não** um estado de dwell novo (a decisão é instantânea).
+
+**Gatilho** (todas as condições):
+- `verify.commands` (config, opt-in) é **não-vazio** — vazio ⇒ gate desligado (default);
+- o run mutou **≥ 1 arquivo** via `write_file` / `edit_file` / `git_apply_patch` (tool_call settled + sucesso; o path sai de `input.path`);
+- **nem todos** os `verify.commands` rodaram com **exit 0 após a última mutação** (match por prefixo no `command` do `bash` — dado estruturado, não prosa).
+
+**Ação:** suprime a resposta, anexa um turn `user` sintético nomeando os comandos faltantes, e transiciona `no_tool_use → generating` (`verify_gate_block`). O modelo então roda os comandos (gated por permissions) e re-emite. Bound: `max_attempts = 2` por completion.
+
+**Exaustão:** atingido `max_attempts`, o gate **aceita** a resposta (`→ persist → done`) e emite um sinal de audit `verify_gate_exhausted`. O gate é um **nudge**, não uma trava dura — não prende o modelo num loop nem cria estado terminal ou `ExitReason` novo.
+
+**Invariantes:**
+- **Nunca auto-executa** os `verify.commands` — quem roda é o modelo, via tool call gated por permission (no-auto). O gate só *mede* e *empurra*.
+- **100% determinístico**: paths de mutação reais (não inferidos), exit-code real de `bash`, comandos declarados em config. Distinto do `critique` (LLM, §3.2) e do removido `ProjectVerifier` (regex sobre prosa, que não distinguia asserção de menção — a classe de falha que este design evita por construção).
 
 ### 3.3 Multi-tool-use loop interno
 

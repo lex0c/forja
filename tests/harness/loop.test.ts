@@ -164,6 +164,7 @@ const buildConfig = (
       maxCostUsd: number;
     }>;
     capsOverride?: Partial<Provider['capabilities']>;
+    verify?: { commands: string[] };
   } = {},
 ) => {
   const handle = mockProvider(script, options.capsOverride);
@@ -182,6 +183,7 @@ const buildConfig = (
       ...(options.signal !== undefined ? { signal: options.signal } : {}),
       ...(options.softStopSignal !== undefined ? { softStopSignal: options.softStopSignal } : {}),
       ...(options.budget !== undefined ? { budget: options.budget } : {}),
+      ...(options.verify !== undefined ? { verify: options.verify } : {}),
     },
   };
 };
@@ -3402,5 +3404,105 @@ describe('post-persist contract (per-response footer refresh)', () => {
     expect(costUpdates).toBe(0);
     // Still one cue per response, with the response's row queryable.
     expect(cueObserved).toEqual([10, 20]);
+  });
+});
+
+describe('runAgent — claim-time verify gate (STATE_MACHINE §3.2.1)', () => {
+  // Named `edit_file` so the gate counts it as a mutation (it keys on tool NAME
+  // ∈ FILE_WRITER_TOOLS); writes:false keeps it allowed under the strict default
+  // policy without permission setup (the gate never reads metadata.writes).
+  const stubEdit: Tool = {
+    name: 'edit_file',
+    description: 'stub edit',
+    inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+    metadata: { category: 'misc', writes: false, idempotent: false },
+    async execute() {
+      return { ok: true };
+    },
+  };
+
+  test('off by default: no verify.commands → a mutated run finishes without re-nudging', async () => {
+    const { config, handle } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 't1', name: 'edit_file', input: { path: 'a.ts' } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'done — edited the file.', stop_reason: 'end_turn' },
+      ],
+      { extraTools: [stubEdit], budget: { maxSteps: 10 } },
+    );
+    const result = await runAgent(config);
+    expect(result.status).toBe('done');
+    expect(handle.requests.length).toBe(2); // gate off → no extra generation
+  });
+
+  test('blocks an unverified edit, re-nudges, and accepts after max attempts', async () => {
+    const { config, handle } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 't1', name: 'edit_file', input: { path: 'a.ts' } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'all done.', stop_reason: 'end_turn' }, // attempt 1 → nudge
+        { text: 'really done.', stop_reason: 'end_turn' }, // attempt 2 → nudge
+        { text: 'final.', stop_reason: 'end_turn' }, // exhausted → accept
+      ],
+      { extraTools: [stubEdit], budget: { maxSteps: 10 }, verify: { commands: ['bun test'] } },
+    );
+    const result = await runAgent(config);
+    expect(result.status).toBe('done');
+    // 4 generations: edit, then two blocked answers that re-generated, then accept.
+    expect(handle.requests.length).toBe(4);
+    // The nudge naming the unverified command was injected as a user turn the
+    // re-generation saw.
+    const laterMsgs = handle.requests[2]?.messages ?? [];
+    const nudged = laterMsgs.some(
+      (m) =>
+        m.role === 'user' &&
+        (typeof m.content === 'string'
+          ? m.content.includes('bun test')
+          : m.content.some((b) => b.type === 'text' && b.text.includes('bun test'))),
+    );
+    expect(nudged).toBe(true);
+  });
+
+  test('a passing verify (foreground bash exit 0) satisfies the gate — no re-nudge', async () => {
+    // exit_code 0 → invokeTool surfaces inv.exitCode as undefined (readNonZeroExit),
+    // which the gate reads as "passed". Pins that end-to-end coupling.
+    const stubBashOk: Tool = {
+      name: 'bash',
+      description: 'stub bash, exits 0',
+      inputSchema: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command'],
+      },
+      metadata: { category: 'misc', writes: false, idempotent: false },
+      async execute() {
+        return { exit_code: 0, stdout: '', stderr: '' };
+      },
+    };
+    const { config, handle } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 't1', name: 'edit_file', input: { path: 'a.ts' } }],
+          stop_reason: 'tool_use',
+        },
+        {
+          tool_uses: [{ id: 't2', name: 'bash', input: { command: 'bun test' } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'done — tests pass.', stop_reason: 'end_turn' },
+      ],
+      {
+        extraTools: [stubEdit, stubBashOk],
+        budget: { maxSteps: 10 },
+        verify: { commands: ['bun test'] },
+      },
+    );
+    const result = await runAgent(config);
+    expect(result.status).toBe('done');
+    expect(handle.requests.length).toBe(3); // edit, verify, answer — gate satisfied, no extra
   });
 });

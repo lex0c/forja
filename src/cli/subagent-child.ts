@@ -2,6 +2,7 @@ import {
   DEFAULT_CACHE_PERSISTENCE,
   DEFAULT_SHARED_TMP,
   loadSandboxConfig,
+  loadVerifyConfig,
 } from '../config/loaders.ts';
 import { type HarnessEvent, type HarnessResult, runAgent } from '../harness/index.ts';
 import type { RunBudget } from '../harness/types.ts';
@@ -1198,6 +1199,17 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // projection — and so the principal's `--no-recap` is honored
       // for children by construction (RECAP §3.3).
       recapEnabled: false,
+      // [verify] config thread-through (STATE_MACHINE §3.2.1) so a SUBAGENT that
+      // edits files gates its OWN claims. Without this, delegating edits to a
+      // subagent would bypass the gate entirely — the principal never sees the
+      // write (`task` is not a file-writer) and the child had no verify config.
+      // Same project-config anchor as the [sandbox] thread above.
+      verify: {
+        commands:
+          loadVerifyConfig({
+            cwd: resolveRepoRoot(opts.memoryCwd !== undefined ? opts.memoryCwd : session.cwd),
+          }).config.commands ?? [],
+      },
       toolRegistry: childRegistry,
       // The grandchild's whitelist (when this child task()s a
       // worker) validates against `rootToolRegistry`, NOT

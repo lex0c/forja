@@ -914,3 +914,86 @@ export const loadSandboxConfig = (input: LoadSandboxConfigInput): LoadedSandboxC
   if (sharedTmp !== undefined) config.sharedTmp = sharedTmp;
   return { config, userPath, projectPath, warnings };
 };
+
+// ─── [verify] — claim-time verification gate (STATE_MACHINE §3.2.1) ──────────
+// Opt-in. `commands` is the list of shell commands the agent must have run with
+// exit 0 (after its last file edit) before a final answer is accepted. Empty or
+// absent → gate OFF (the default). Mirrors [sandbox]'s string-array fail-soft: a
+// malformed `commands` (not a list, or no usable string entries) leaves the
+// field unset so the CONSUMER applies the empty default and the gate stays off —
+// never enable a half-parsed gate over a typo.
+
+export interface VerifyConfigKeys {
+  // Omitted when no layer declared `commands`; the consumer applies `[]`. A
+  // LITERAL empty array is preserved (gate explicitly off).
+  commands?: string[];
+}
+
+export interface LoadedVerifyConfig {
+  config: VerifyConfigKeys;
+  userPath: string | null;
+  projectPath: string;
+  warnings: string[];
+}
+
+const parseVerifyLayer = (
+  path: string | null,
+  source: string,
+): { layer: VerifyConfigKeys; warnings: string[] } => {
+  const layer: VerifyConfigKeys = {};
+  const warnings: string[] = [];
+  const section = loadTomlSection(path, 'verify', source);
+  if (section.kind === 'absent' || section.kind === 'no-section') return { layer, warnings };
+  if (section.kind === 'invalid') {
+    warnings.push(section.warning);
+    return { layer, warnings };
+  }
+  const s = section.section;
+  if (s.commands !== undefined) {
+    const raw = s.commands;
+    if (!Array.isArray(raw)) {
+      warnings.push(
+        `${source} config (${path}): [verify].commands must be a list of strings; ignoring`,
+      );
+    } else {
+      // Keep only non-empty string entries; warn on any dropped.
+      const cmds: string[] = [];
+      let dropped = 0;
+      for (const entry of raw) {
+        if (typeof entry === 'string' && entry.trim().length > 0) cmds.push(entry.trim());
+        else dropped += 1;
+      }
+      if (dropped > 0) {
+        warnings.push(
+          `${source} config (${path}): [verify].commands dropped ${dropped} non-string/empty entr${dropped === 1 ? 'y' : 'ies'}`,
+        );
+      }
+      // Tri-state, fail-soft: a literal `[]` disables the gate explicitly; a
+      // list with usable entries sets them; an all-dropped list leaves the field
+      // unset (→ consumer default, gate off) so a typo can't half-enable it.
+      if (raw.length === 0) layer.commands = [];
+      else if (cmds.length > 0) layer.commands = cmds;
+    }
+  }
+  return { layer, warnings };
+};
+
+export interface LoadVerifyConfigInput {
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+}
+
+export const loadVerifyConfig = (input: LoadVerifyConfigInput): LoadedVerifyConfig => {
+  const env = input.env ?? process.env;
+  const userPath = userConfigPath(env);
+  const projectPath = projectConfigPath(input.cwd);
+  const userResult = parseVerifyLayer(userPath, 'user');
+  const projectResult = parseVerifyLayer(projectPath, 'project');
+  const warnings = [...userResult.warnings, ...projectResult.warnings];
+  // project wins; undefined leaves the consumer to apply the empty default. An
+  // explicit `[]` is a real value, so check `!== undefined`, not truthiness.
+  const resolved = projectResult.layer.commands ?? userResult.layer.commands;
+  const config: VerifyConfigKeys = {};
+  if (resolved !== undefined) config.commands = resolved;
+  return { config, userPath, projectPath, warnings };
+};

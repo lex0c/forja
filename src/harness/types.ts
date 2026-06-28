@@ -1306,6 +1306,12 @@ export interface HarnessConfig {
   // working without populating it; default-undefined skips the
   // built-in trigger entirely (same as `runGcOnStop = false`).
   auditRetention?: import('../audit/config-loader.ts').RetentionConfig;
+  // Claim-time verification gate (STATE_MACHINE §3.2.1). Opt-in: `commands` is
+  // the list of shell commands that must have run with exit 0 (after the run's
+  // last file edit) before a tool-call-free final answer is accepted; otherwise
+  // the harness suppresses the answer, nudges the model to run them, and
+  // re-generates (bounded). Absent or empty `commands` → gate OFF (default).
+  verify?: { commands: string[] };
 }
 
 // Producer-facing args for `confirmMemoryWrite`. Mirrors

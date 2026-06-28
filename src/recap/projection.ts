@@ -28,17 +28,9 @@ import {
   type RecapTimelineEvent,
 } from './types.ts';
 
-// Set of tool names treated as "writes a file at a known path".
-// Bash is `writes:true` (CONTRACTS §2.6.3 pessimism) but the path
-// it writes is unknowable from input — surfaced under commands_run
-// instead. git_apply_patch is single-file and carries the target in
-// `input.path` (same shape as write_file/edit_file), so its writes
-// belong here too — omitting it drops every patched file from the recap.
-const FILE_WRITER_TOOLS: ReadonlySet<string> = new Set([
-  'write_file',
-  'edit_file',
-  'git_apply_patch',
-]);
+// Tool names that write a file at a known path (`input.path`) — shared with the
+// deterministic recap summary and the verify gate so the set can't drift.
+import { FILE_WRITER_TOOLS } from '../tools/file-writer-tools.ts';
 
 // Bash family. Every shell call shows up under commands_run; the
 // foreground/background variant doesn't matter for category
