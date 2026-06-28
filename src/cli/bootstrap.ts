@@ -839,6 +839,19 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // and CLI checkpoint --undo emits `checkpoint_reverted`.
   const outcomeSink = createSqliteOutcomeSink({ db });
   const failureSink = createSqliteFailureSink({ db, outcomeSink });
+  // Resolve trust EARLY (consumed below by the sandbox network posture AND the
+  // system-prompt composition). Fail-closed: no trust storage / dir absent → false.
+  const trustPath =
+    input.trustListPathOverride !== undefined ? input.trustListPathOverride : trustListPath();
+  const isCwdTrusted = trustPath !== null && isTrusted(trustPath, cwd);
+  // The sandbox NETWORK posture gates on the trust of the directory that SUPPLIED
+  // the [sandbox] config — `projectConfigCwd` (the repo root, where the project
+  // `.forja/config.toml` lives), NOT the invocation cwd. Trust is exact-path
+  // (`isTrusted` = list membership), so gating on cwd would let an operator who
+  // trusts only `/repo/subdir` activate a `network = "on"` shipped by an UNtrusted
+  // `/repo/.forja/config.toml`. Gating on the config's own directory closes that
+  // bypass (CLAUDE.md "Explicit trust").
+  const isProjectConfigTrusted = trustPath !== null && isTrusted(trustPath, projectConfigCwd);
   const permResult = await bootstrapPermissionEngine({
     cwd,
     home,
@@ -860,6 +873,20 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       // is selected. Unlike gate 1, there is no policy-file equivalent:
       // unsandboxed execution is opt-in per CLI invocation only.
       emitHostPassthrough: input.iKnowWhatImDoing === true,
+      // Coarse network posture from `[sandbox] network` (default off via
+      // DEFAULT_NETWORK): whether the dev-network feature is ON for this session.
+      // The planner grants egress to an UNMODELED build (the bump) only when this
+      // AND `dirTrusted` hold — trust is enforced UNIFORMLY at the planner, so
+      // egress requires a trusted dir regardless of which config layer set
+      // `network`: a hostile clone's project config can't self-enable egress, and
+      // even a global user `network = on` still needs the dir trusted (CLAUDE.md
+      // "Explicit trust"). See PERMISSION_ENGINE.md §6.5.
+      networkAllowed: sandboxLoaded.config.network === 'on',
+      // Trust of the config-supplying repo root, threaded so the planner can
+      // trust-gate BUILD egress (a modeled dep-manager's `net-egress`) the same
+      // way the posture is gated: an untrusted clone's `npm install` / `go build`
+      // lands cwd-rw (no egress), killing the clone-and-build exfil vector.
+      dirTrusted: isProjectConfigTrusted,
       // Slice 165 (review — Batch C sandbox observability). Forward
       // the trust marker so bootstrap can emit a
       // `sandbox.path_resolved` failure_event when the install isn't
@@ -905,17 +932,11 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   permissionEngine.addSessionAllow('read_file', fetchSpillGlob);
   permissionEngine.addSessionAllow('grep', fetchSpillGlob);
 
-  // Resolve cwd trust state EARLY so the system-prompt composition
-  // (project pointer, below) can gate on it. Originally this lived
-  // after the prompt assembly because no upstream surface needed
-  // it; the project_pointer section needs the flag at compose
-  // time, so we lift it. Failing-closed semantics unchanged: any
-  // path that resolves to "no trust storage" or "cwd absent from
-  // list" yields `false`, which suppresses the pointer (and any
-  // other downstream gate that consults `isCwdTrusted`).
-  const trustPath =
-    input.trustListPathOverride !== undefined ? input.trustListPathOverride : trustListPath();
-  const isCwdTrusted = trustPath !== null && isTrusted(trustPath, cwd);
+  // `trustPath` / `isCwdTrusted` were resolved earlier (just before the
+  // permission-engine bootstrap) so the sandbox network posture could gate on
+  // trust. The system-prompt composition below (project_pointer) and other
+  // downstream gates consult the same `isCwdTrusted` flag. Fail-closed
+  // semantics unchanged.
 
   let resolvedSystemPrompt: string | undefined;
   let resolvedSystemSegments: SystemSegment[] | undefined;

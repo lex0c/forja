@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { type Capability, parseCapability } from '../../src/permissions/capabilities.ts';
+import { type Capability, netEgress, parseCapability } from '../../src/permissions/capabilities.ts';
 import { SANDBOX_PROFILE_ORDER, selectSandboxProfile } from '../../src/permissions/sandbox-plan.ts';
 
 const caps = (...ss: string[]): Capability[] => ss.map(parseCapability);
@@ -207,6 +207,182 @@ describe('selectSandboxProfile — tie-break order', () => {
     });
     expect(r.kind).toBe('ok');
     if (r.kind === 'ok') expect(r.profile).toBe('ro');
+  });
+});
+
+describe('selectSandboxProfile — exec:arbitrary floor + network posture', () => {
+  // The bug: an unmodeled binary resolves to exec:arbitrary (+ read-fs:cwd)
+  // with no write-fs; without the floor the selector picks `ro` and every
+  // write hits EROFS. The floor requires write-fs for exec:arbitrary → cwd-rw.
+  test('exec:arbitrary alone is floored to cwd-rw (never ro)', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('exec:arbitrary'),
+      hostExplicitlyAllowed: false,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw');
+  });
+
+  test('exec:arbitrary + read-fs:cwd (the real unmodeled-binary shape) → cwd-rw', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('exec:arbitrary', 'read-fs:.'),
+      hostExplicitlyAllowed: false,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw');
+  });
+
+  test('exec:arbitrary + networkAllowed + dirTrusted → cwd-rw-net (posture, trusted)', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('exec:arbitrary', 'read-fs:.'),
+      hostExplicitlyAllowed: false,
+      networkAllowed: true,
+      dirTrusted: true,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw-net');
+  });
+
+  test('exec:arbitrary + networkAllowed but UNtrusted → cwd-rw (posture egress is trust-gated too)', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('exec:arbitrary', 'read-fs:.'),
+      hostExplicitlyAllowed: false,
+      networkAllowed: true,
+      dirTrusted: false,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw');
+  });
+
+  test('exec:arbitrary + networkAllowed:false stays cwd-rw (default offline)', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('exec:arbitrary'),
+      hostExplicitlyAllowed: false,
+      networkAllowed: false,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw');
+  });
+
+  // Negative cases — the floor and the posture are scoped to exec:arbitrary.
+  test('exec:shell does NOT trip the floor — stays ro even with networkAllowed', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('exec:shell'),
+      hostExplicitlyAllowed: false,
+      networkAllowed: true,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('ro');
+  });
+
+  test('networkAllowed alone does NOT grant net to a pure read (no unbounded exec)', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('read-fs:/etc/hosts'),
+      hostExplicitlyAllowed: false,
+      networkAllowed: true,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('ro');
+  });
+
+  // The network posture is a POST-selection bump, never a required kind — so
+  // turning it on must NEVER turn a viable plan into a refuse. exec:arbitrary +
+  // secret-access (needs home-rw) + networkAllowed stays home-rw (no net),
+  // instead of refusing on the unsatisfiable {secret-access, net-egress} combo.
+  test('exec:arbitrary + secret-access + networkAllowed → home-rw (network never denies)', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('exec:arbitrary', 'secret-access:~/.config/forja'),
+      hostExplicitlyAllowed: false,
+      networkAllowed: true,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('home-rw');
+  });
+
+  // The refuse `uncovered` report is resolver-honest: the floor's synthetic
+  // write-fs must NOT appear (it raises the profile, not the audited set).
+  test('refuse uncovered list excludes the floor-injected write-fs', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('exec:arbitrary', 'host-passthrough'),
+      hostExplicitlyAllowed: false, // host pruned (no flag) → refuse
+    });
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.uncovered).toEqual(['exec', 'host-passthrough']);
+      expect(r.uncovered).not.toContain('write-fs');
+    }
+  });
+
+  // Trust-gate for BUILD egress: a modeled dep-manager is `exec:arbitrary +
+  // net-egress`. It reaches the network only in a TRUSTED dir.
+  test('exec:arbitrary + net-egress + dirTrusted → cwd-rw-net (trusted build fetches deps)', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('exec:arbitrary', 'net-egress:registry.npmjs.org', 'read-fs:.'),
+      hostExplicitlyAllowed: false,
+      dirTrusted: true,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw-net');
+  });
+
+  test('exec:arbitrary + net-egress + UNtrusted → cwd-rw (build egress dropped, no exfil)', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('exec:arbitrary', 'net-egress:registry.npmjs.org', 'read-fs:.'),
+      hostExplicitlyAllowed: false,
+      dirTrusted: false,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw');
+  });
+
+  // The discriminator: plain net-egress WITHOUT exec:arbitrary (curl/wget/git —
+  // user-invoked net actions) never reaches the trust-gate branch.
+  test('net-egress without exec:arbitrary is NOT trust-gated → cwd-rw-net even untrusted', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('net-egress:github.com', 'read-fs:.'),
+      hostExplicitlyAllowed: false,
+      dirTrusted: false,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw-net');
+  });
+
+  // EXPLICIT egress exemption: `ssh host <cmd>` carries exec:arbitrary (remote
+  // command) AND net-egress, but marks the egress explicit → NOT trust-gated, so
+  // it still connects in an untrusted dir (regression: it was wrongly stripped to
+  // cwd-rw, breaking ssh, when the gate keyed only on exec:arbitrary + net-egress).
+  test('exec:arbitrary + EXPLICIT net-egress (ssh) is NOT trust-gated → cwd-rw-net even untrusted', () => {
+    const r = selectSandboxProfile({
+      capabilities: [
+        parseCapability('exec:arbitrary'),
+        netEgress('example.com', true),
+        parseCapability('read-fs:.'),
+      ],
+      hostExplicitlyAllowed: false,
+      dirTrusted: false,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw-net');
+  });
+
+  // MIXED call: the bash resolver unions caps, so `ssh host uptime && npm install`
+  // carries BOTH an explicit (ssh) and an incidental (npm) net-egress. The one
+  // explicit egress must NOT un-gate the incidental build egress — the exemption
+  // holds only when EVERY egress is explicit. Fail-closed: the whole plan drops to
+  // cwd-rw (npm cannot fetch+exfil; ssh also loses net in this untrusted dir).
+  test('exec:arbitrary + EXPLICIT + INCIDENTAL net-egress (ssh && npm) UNtrusted → cwd-rw (no un-gate)', () => {
+    const r = selectSandboxProfile({
+      capabilities: [
+        parseCapability('exec:arbitrary'),
+        netEgress('example.com', true), // ssh — explicit
+        netEgress('registry.npmjs.org'), // npm — incidental
+        parseCapability('read-fs:.'),
+      ],
+      hostExplicitlyAllowed: false,
+      dirTrusted: false,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw');
   });
 });
 

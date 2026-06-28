@@ -240,6 +240,17 @@ export interface EngineOptions {
     hostExplicitlyAllowed: boolean;
     required: boolean;
     emitHostPassthrough?: boolean;
+    // Coarse network posture (`[sandbox] network = on`). Threaded from
+    // bootstrap; the planner BUMPS an `exec:arbitrary` call cwd-rw → cwd-rw-net
+    // only when this AND `dirTrusted` BOTH hold (necessary, not sufficient —
+    // build egress is uniformly trust-gated). Default off. Planner-scoped: does
+    // not touch `resolvedCapabilities`. See sandbox-plan.ts.
+    networkAllowed?: boolean;
+    // Trust of the directory being acted on (repo root). Gates BUILD egress: a
+    // modeled dep-manager (`exec:arbitrary` + `net-egress`) only reaches the
+    // network in a trusted dir — untrusted builds land cwd-rw. Default off
+    // (fail-closed). See sandbox-plan.ts.
+    dirTrusted?: boolean;
   };
   // Optional grants snapshot provider. Engine calls
   // `listActive(Date.now())` on each `check()` so long-running
@@ -2171,6 +2182,13 @@ export const createPermissionEngine = (
       const planResult = selectSandboxProfile({
         capabilities: planCapabilities,
         hostExplicitlyAllowed: sandboxOptions.hostExplicitlyAllowed,
+        // exactOptionalPropertyTypes: only forward when set (undefined ⇒ off).
+        ...(sandboxOptions.networkAllowed !== undefined
+          ? { networkAllowed: sandboxOptions.networkAllowed }
+          : {}),
+        ...(sandboxOptions.dirTrusted !== undefined
+          ? { dirTrusted: sandboxOptions.dirTrusted }
+          : {}),
       });
       sandboxStage = sandboxPlanStageEntry(planResult);
       if (planResult.kind === 'refuse') {

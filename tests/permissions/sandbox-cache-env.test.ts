@@ -8,7 +8,18 @@ import {
 
 // The map holds ONLY the holdouts that ignore $XDG_CACHE_HOME; everything
 // XDG-compliant rides the XDG_CACHE_HOME catch-all in buildCacheRedirectEnv.
-const HOLDOUTS = ['npm', 'pnpm', 'bun', 'go', 'nuget', 'gradle', 'maven'];
+const HOLDOUTS = [
+  'npm',
+  'pnpm',
+  'bun',
+  'go',
+  'nuget',
+  'gradle',
+  'maven',
+  'dart',
+  'dotnet',
+  'cargo',
+];
 // These MUST NOT be in the map — they honor XDG_CACHE_HOME.
 const XDG_COVERED_VARS = [
   'GOCACHE',
@@ -79,6 +90,9 @@ describe('sandbox-cache-env: buildCacheRedirectEnv', () => {
     expect(env.NUGET_PACKAGES).toBe(`${base}/nuget`);
     expect(env.GRADLE_USER_HOME).toBe(`${base}/gradle`);
     expect(env.BUN_INSTALL_CACHE_DIR).toBe(`${base}/bun`);
+    expect(env.PUB_CACHE).toBe(`${base}/pub-cache`);
+    expect(env.DOTNET_CLI_HOME).toBe(`${base}/dotnet`);
+    expect(env.CARGO_HOME).toBe(`${base}/cargo`);
   });
 
   test('XDG-covered tools get NO dedicated var (they follow XDG_CACHE_HOME)', () => {

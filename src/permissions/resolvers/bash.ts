@@ -39,6 +39,7 @@ import type { Capability } from '../capabilities.ts';
 import {
   deleteFs,
   exec,
+  formatCapability,
   gitWrite,
   netEgress,
   netIngress,
@@ -2879,7 +2880,11 @@ const cmdSsh: CommandResolver = (_positional, tokens, ctx) => {
   const atIdx = target.lastIndexOf('@');
   const host = atIdx === -1 ? target : target.slice(atIdx + 1);
 
-  const caps: Capability[] = [netEgress(host || '*'), readFs(resolveArg('~/.ssh', ctx))];
+  // EXPLICIT egress: ssh is a user-invoked network tool. Marking it exempts the
+  // egress from the build-egress trust-gate (sandbox-plan.ts) — `ssh host <cmd>`
+  // also pushes exec:arbitrary (remote command) below, which would otherwise
+  // make it indistinguishable from a dep-manager build and strip its network.
+  const caps: Capability[] = [netEgress(host || '*', true), readFs(resolveArg('~/.ssh', ctx))];
 
   // Slice 174: explicit file reads from `-F` / `-i` / `-S` (control
   // socket path; ssh creates AND reads it).
@@ -3268,6 +3273,32 @@ const cmdCargo: CommandResolver = (positional, tokens, ctx) => {
   };
 };
 
+// Modeled dependency managers — the finite, well-known set of package managers,
+// the same category npm/yarn/pnpm/bun/pip/cargo are already modeled in. A
+// build/install run executes arbitrary code (build scripts, plugins), reads the
+// project, writes its output UNDER cwd (covered by the `exec:arbitrary`→cwd-rw
+// floor, §6.5), and fetches deps from a KNOWN registry. Emitting
+// `net-egress(<registry>)` lands the call in `cwd-rw-net` automatically — these
+// install deps WITHOUT the coarse `[sandbox] network` posture, exactly like
+// npm/pip/cargo. The host list is the tool's default registry endpoint(s); the
+// actual egress is full (cwd-rw-net has no per-host kernel filter), so the hosts
+// feed the audit/score/confirm row, not a firewall.
+//
+// Conservative + uniform: every invocation gets the build shape, including
+// read-only subcommands (`go version`, `dotnet --info`). Over-granting net to a
+// no-net subcommand is harmless — `cwd-rw-net` only makes egress AVAILABLE, and
+// the confirm still fires (exec:arbitrary is never repo-confined). UNKNOWN
+// binaries (`./local-tool`, `./gradlew`/`./mvnw` wrappers — relative paths) are
+// deliberately NOT here: they ride the floor + the coarse posture. This is a
+// bounded data table (the ~handful of mainstream registries), NOT the unbounded
+// per-binary modeling the floor exists to avoid.
+const depManagerResolver =
+  (hosts: readonly string[]): CommandResolver =>
+  (_positional, _tokens, ctx) => ({
+    capabilities: [exec('arbitrary'), readFs(ctx.cwd), ...hosts.map((h) => netEgress(h))],
+    confidence: 'medium',
+  });
+
 const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, CommandResolver>([
   ['ls', cmdRead],
   ['cat', cmdRead],
@@ -3411,6 +3442,31 @@ const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, Comm
   ['rsync', cmdRsync],
   ['make', cmdMake],
   ['cargo', cmdCargo],
+  // Dependency managers modeled like npm/pip/cargo so they install deps without
+  // the coarse `[sandbox] network` posture (net-egress → cwd-rw-net). Wrappers
+  // (`./gradlew`, `./mvnw`) are relative paths → unmodeled → floor + posture.
+  ['go', depManagerResolver(['proxy.golang.org', 'sum.golang.org'])],
+  ['dotnet', depManagerResolver(['api.nuget.org'])],
+  ['composer', depManagerResolver(['repo.packagist.org', 'packagist.org'])],
+  ['mvn', depManagerResolver(['repo.maven.apache.org'])],
+  ['gradle', depManagerResolver(['plugins.gradle.org', 'repo.maven.apache.org'])],
+  ['gem', depManagerResolver(['rubygems.org'])],
+  ['bundle', depManagerResolver(['rubygems.org'])],
+  ['bundler', depManagerResolver(['rubygems.org'])],
+  // Python alt managers (pip is above): all fetch from PyPI.
+  ['uv', depManagerResolver(['pypi.org'])],
+  ['poetry', depManagerResolver(['pypi.org'])],
+  ['pipenv', depManagerResolver(['pypi.org'])],
+  // Dart/Flutter: pub.dev (+ Flutter pulls engine artifacts from Google storage).
+  ['dart', depManagerResolver(['pub.dev'])],
+  ['flutter', depManagerResolver(['pub.dev', 'storage.googleapis.com'])],
+  // NOT modeled: `swift` (swiftpm) and `zig` (build.zig.zon) fetch from ARBITRARY
+  // git/tarball URLs — no central registry to scope to. Modeling them would mean
+  // `net-egress('*')` = full egress, in ANY repo, WITHOUT the trust gate (a resolver
+  // cap isn't trust-gated) — the worst combo for a tool that reaches anywhere, with
+  // zero scoping benefit. They stay unmodeled → the floor gives cwd-rw (offline
+  // builds of cached deps work) and FETCHING deps goes through the trust-gated
+  // `[sandbox] network = on` posture, which is the right control for unbounded egress.
 ]);
 
 // ─── AST walk ──────────────────────────────────────────────
@@ -4667,15 +4723,17 @@ const analyzeCommand = (
   // cwd-scope escape (symlink resolving outside cwd) — tracked separately
   // from escalate-tier so it can route to Conservative (see the return).
   let cwdEscaped = false;
-  // Operand caps for the registry-miss (Conservative) branch. The per-arg
-  // loop classifies escalate-tier positional paths but the unknown-command
-  // branch returned only redirect caps — so under mode:bypass (where the
-  // §11 protected-path floor scans resolved caps and is the ONLY check
-  // that still fires) `sed -i /etc/hosts` / `frobnicate --out=/etc/x`
-  // reached the floor with no write-fs and were silently allowed despite
-  // the escalate-tier operand. Collect those operands here and ride them
-  // onto that branch. Known commands ignore this — their handler emits the
-  // precise positional caps (adding argCaps there would just duplicate).
+  // Escalate-tier operand caps. The per-arg loop classifies escalate-tier
+  // positional paths; under mode:bypass / degraded / host (where the §11
+  // protected-path floor scans resolved caps and is the ONLY check that still
+  // fires) a write to a protected zone MUST surface a write-fs cap or it is
+  // silently allowed (`sed -i /etc/hosts`, `frobnicate --out=/etc/x`, and now
+  // `go build -o ~/.ssh/x`). These ride onto BOTH the registry-miss branch AND
+  // the modeled-command branch (deduped below) — a GENERIC modeled resolver
+  // (e.g. the dep-manager resolver for go/dotnet/mvn) emits exec/read/net but
+  // does NOT parse per-tool output flags, so without this its protected write
+  // operand would be dropped. Dedupe against the handler's own caps so a
+  // precise-modeling handler (cp/sed/…) doesn't double-count.
   const argCaps: Capability[] = [];
   if (!isPureOutputCommand(name)) {
     const targets = protectedTargets(ctx.home, ctx.cwd);
@@ -4797,6 +4855,14 @@ const analyzeCommand = (
   let finalConf: 'high' | 'medium' | 'low' = result.confidence;
   if (escalated || redir.escalated) finalConf = 'low';
 
+  // Escalate-tier operand write-fs that the handler did NOT already emit (a
+  // generic modeled resolver like the dep-manager one doesn't parse output
+  // flags). Deduped against the handler + redirect caps so a precise handler
+  // (cp/sed/…) doesn't double-count. Keeps the §11 protected-path floor honest
+  // for modeled commands under mode:bypass / degraded / host.
+  const handlerCapKeys = new Set([...result.capabilities, ...redir.caps].map(formatCapability));
+  const extraArgCaps = argCaps.filter((c) => !handlerCapKeys.has(formatCapability(c)));
+
   // A cwd-scope escape (a lexical-inside-cwd path whose canonical realpath
   // lands outside cwd, via a symlink) routes to Conservative — NOT merely
   // low confidence. The emitted cap is still the lexical `<cwd>/link`, so
@@ -4808,14 +4874,14 @@ const analyzeCommand = (
   // (`wc -l src/**/*.ts`) keeps `kind: ok` and still auto-approves.
   if (cwdEscaped || redir.cwdEscaped) {
     return {
-      caps: [...result.capabilities, ...redir.caps],
+      caps: [...result.capabilities, ...redir.caps, ...extraArgCaps],
       confidence: 'low',
       conservative: 'cwd-scope escape: a path resolves outside the cwd via a symlink',
     };
   }
 
   return {
-    caps: [...result.capabilities, ...redir.caps],
+    caps: [...result.capabilities, ...redir.caps, ...extraArgCaps],
     confidence: finalConf,
   };
 };
@@ -4942,15 +5008,42 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
   const allCaps: Capability[] = [exec('shell'), ...orphanRedir.caps, ...loopWordCaps];
   let aggregateConf: 'high' | 'medium' | 'low' = 'high';
   let conservativeReason: string | null = null;
+  // Does any sub-command run LOCAL arbitrary code without being an explicit
+  // network tool (exec:arbitrary but NO explicitEgress of its own)? Tracked
+  // PER-COMMAND — the aggregate `allCaps` flattens attribution, so the planner
+  // cannot tell ssh's remote exec from `./local-tool`'s local exec. A single
+  // sandbox profile covers the WHOLE shell, so net granted for an explicit-egress
+  // command (ssh) would reach such a local exec (`ssh host uptime && ./local-tool`).
+  let hasLocalArbitraryExec = false;
   for (const shape of commands) {
     const result = analyzeCommand(shape, ctx);
     if ('refuse' in result) {
       return { kind: 'refuse', reason: result.refuse };
     }
+    const cmdArbitrary = result.caps.some((c) => c.kind === 'exec' && c.scope === 'arbitrary');
+    const cmdExplicitNet = result.caps.some(
+      (c) => c.kind === 'net-egress' && c.explicitEgress === true,
+    );
+    if (cmdArbitrary && !cmdExplicitNet) hasLocalArbitraryExec = true;
     allCaps.push(...result.caps);
     if (result.conservative !== undefined) conservativeReason ??= result.conservative;
     if (result.confidence === 'low') aggregateConf = 'low';
     else if (result.confidence === 'medium' && aggregateConf === 'high') aggregateConf = 'medium';
+  }
+
+  // Fail closed for a MIXED shell: when a local arbitrary exec is present, the
+  // explicit-egress exemption is unsafe (the shared profile's net would reach
+  // that local exec), so demote every explicit net-egress to incidental. The
+  // planner's build-egress trust-gate then strips it in an untrusted dir → the
+  // whole plan drops to cwd-rw (ssh loses net too: run it on its own line, or
+  // trust the dir). A pure explicit-net shell (`ssh a && ssh b`) keeps the mark.
+  if (hasLocalArbitraryExec) {
+    for (let i = 0; i < allCaps.length; i++) {
+      const c = allCaps[i];
+      if (c !== undefined && c.kind === 'net-egress' && c.explicitEgress === true) {
+        allCaps[i] = netEgress(c.scope ?? '*');
+      }
+    }
   }
 
   // An ORPHAN redirect — one not attached to any command, e.g. the

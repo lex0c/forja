@@ -53,14 +53,22 @@
 //     every credential overlay wins over a cache dir — a cache entry
 //     can never UN-mask a hidden credential.
 //
-// NOT in the default set:
-//   - `.cargo` — masking all of `~/.cargo` with a tmpfs hides
-//     `~/.cargo/bin/cargo` itself (the rustup shim lives there), so the
-//     wrap can't even exec cargo. And `~/.rustup` (the toolchain) is in
-//     HIDE_PATHS_DIRS, so rustup cargo is already blocked in the
-//     sandbox independent of caching. Rust needs its own treatment
-//     (a `.cargo/registry`-scoped carve-out + an `.rustup` exception);
-//     until then an operator can opt in via `writable_cache_dirs`.
+// Scoped, NOT blanket:
+//   - `.cargo/registry` (the dep cache) IS in the default set — masking only
+//     the registry subdir leaves `~/.cargo/bin/cargo` (the rustup shim) intact
+//     so the wrap can still exec cargo. The blanket `.cargo` is deliberately
+//     NOT here: a tmpfs over all of `~/.cargo` would hide that binary and
+//     break cargo entirely. NOTE: this ephemeral entry is only the
+//     persistence-OFF fallback — the PRIMARY path is the CARGO_HOME redirect
+//     (`sandbox-cache-env.ts`), which also covers the fresh-install case this
+//     existence-gated entry skips (registry not yet created) and gives cargo
+//     cross-spawn persistence like go/npm.
+//   - `~/.rustup` (the toolchain) stays masked via HIDE_PATHS_DIRS, so a
+//     rustup-managed cargo is still blocked in the sandbox independent of
+//     caching; a system-installed cargo works. Full rustup support is future
+//     work (would need an `.rustup` exception).
+//   - The blanket `.cargo` / other host-relative dirs can still be opted in
+//     via `[sandbox] writable_cache_dirs`.
 
 // Default carve-out: the mainstream caches whose REAL default location
 // (under the sandbox's clearenv, where GOCACHE/XDG_CACHE_HOME/etc. are
@@ -68,9 +76,38 @@
 // $HOME-relative paths. Operators override via `.forja/config.toml`
 // `[sandbox] writable_cache_dirs` (see `loadSandboxConfig`).
 export const DEFAULT_WRITABLE_CACHE_DIRS: readonly string[] = [
-  '.cache', // XDG cache: go-build (~/.cache/go-build), pip, uv, …
+  '.cache', // XDG cache catch-all: go-build, pip, uv, composer, zig (~/.cache/zig), … — any XDG-compliant tool
   'go/pkg/mod', // Go module cache ($GOMODCACHE default, GOPATH=~/go)
   '.npm', // npm cache (~/.npm)
+  '.nuget/packages', // .NET / NuGet package cache (host default; not XDG)
+  '.local/share/NuGet', // NuGet v3 HTTP cache (host default; not XDG)
+  // NOTE: `~/.dotnet` is intentionally NOT a writable-cache dir. `dotnet-install.sh` installs the SDK
+  // there and users PATH it ($HOME/.dotnet/dotnet), so a blanket tmpfs would MASK the dotnet binary →
+  // `dotnet build` becomes command-not-found instead of fixed. The CLI's user-home writes (first-run
+  // sentinel, telemetry, `dotnet tool`) are relocated via the DOTNET_CLI_HOME redirect in
+  // `sandbox-cache-env.ts` — relocating (not masking) keeps the SDK execable. The NuGet PACKAGE cache
+  // (deps) is covered by the two `.nuget*` entries above, which hold no binary.
+  '.cargo/registry', // cargo registry/dep cache — SUBDIR only (keeps ~/.cargo/bin intact). This is the
+  // persistence-OFF fallback; the PRIMARY path is the CARGO_HOME redirect (sandbox-cache-env), which
+  // also fixes the fresh-install case this existence-gated entry skips (registry not created yet).
+  '.gem', // RubyGems user gem dir / cache
+  '.bundle', // Bundler config + cache
+  '.gradle/caches', // Gradle artifact/module cache (Java/Kotlin; not XDG)
+  '.gradle/wrapper', // Gradle wrapper distributions. Both SUBDIR-scoped so ~/.gradle/gradle.properties
+  // (proxies/creds) + init.d stay readable — a blanket ~/.gradle tmpfs would hide that config and break
+  // proxy/private-repo builds. (Persistence relocates the whole GRADLE_USER_HOME, so the host
+  // gradle.properties is then not read — a separate limit of gradle's single-home design.)
+  '.m2/repository', // Maven LOCAL REPOSITORY only — SUBDIR-scoped. A blanket ~/.m2 tmpfs would mask
+  // ~/.m2/settings.xml / settings-security.xml (mirrors, proxies, private-repo creds) and break dep
+  // resolution; the MAVEN_ARGS redirect moves only repo.local, so settings stays readable at ~/.m2.
+  '.local/share/pnpm/store', // pnpm content-addressable store (XDG_DATA, not XDG_CACHE) — SUBDIR only,
+  // never blanket ~/.local/share/pnpm (which holds the pnpm binary + global bins on PATH)
+  '.bun/install/cache', // bun install cache — SUBDIR only (keeps ~/.bun/bin intact)
+  '.pub-cache', // Dart/Flutter pub cache (~/.pub-cache; not XDG). BLANKET by necessity (pub stages
+  // downloads at the cache root, so a hosted/git-only carve-out would EROFS). Trade-off: a
+  // `~/.pub-cache/bin` of `pub global activate` tools is masked inside the sandbox — same exception as
+  // `.gem` above (the gem user-bin path is version-dynamic, so it can't be subdir-scoped either).
+  '.swiftpm', // SwiftPM config/security (~/.swiftpm; the package cache itself is XDG → covered by .cache)
 ];
 
 // Normalize ONE cache-dir entry to a clean `$HOME`-relative path, or
