@@ -21,6 +21,14 @@ setup:
       commands = ["bun test"]
 expect:
   - tool_called: edit_file
+  # The prompt never asks for tests, so bash runs ONLY because the gate nudged
+  # (the OFF arm never runs bash). The nudge tells the model to run the command
+  # DIRECTLY — no pipe/redirect — so a capable model runs a clean `bun test` the
+  # matcher credits, not a masked `bun test | tail` (whose exit is the pipe's, not
+  # the test's). Across repeated opus runs this credits cleanly in 5 steps with no
+  # exhaustion trace. The eval has no "exhaustion did not fire" signal to assert,
+  # so this expectation pins the bash attempt; clean crediting is confirmed by re-run.
+  - tool_called: bash
   - file_contains:
       path: src/add.ts
       pattern: a + b

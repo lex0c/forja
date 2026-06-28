@@ -128,5 +128,10 @@ export const unsatisfiedVerifyCommands = (
 export const verifyGateNudge = (unsatisfied: readonly string[]): string => {
   const list = unsatisfied.map((c) => `\`${c}\``).join(', ');
   const one = unsatisfied.length === 1;
-  return `You edited files but have not shown ${one ? 'this command' : 'these commands'} passing yet: ${list}. Before giving your final answer, run ${one ? 'it' : 'them'} now — each must exit 0. If a command fails, fix the code and re-run; do not claim done until the verification passes.`;
+  // Tell the model to run the command VERBATIM and undecorated. Models habitually
+  // pipe verbose output (`bun test | tail`) or redirect it, but a pipe/redirect/
+  // wrapper hides the command's real exit code and changes the command string, so
+  // the gate can't soundly credit it and just re-nudges to exhaustion. The bash
+  // tool already truncates output, so the pipe is unnecessary as well as harmful.
+  return `You edited files but have not shown ${one ? 'this command' : 'these commands'} passing yet: ${list}. Before giving your final answer, run ${one ? 'it' : 'them'} now — EXACTLY as written, each on its own, with no pipe, redirect, extra flag, or directory change (a \`| tail\`, \`> log\`, or wrapper hides the real exit code and will NOT count; command output is already truncated for you). Each must exit 0. If one fails, fix the code and re-run; do not claim done until the verification passes.`;
 };
