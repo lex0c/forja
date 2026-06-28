@@ -91,8 +91,19 @@ export const recordToolForVerify = (
     state.verifiedSinceLastMutation.clear();
     return true;
   }
-  // A foreground bash that ran and exited 0 (no tool error, no non-zero code).
-  if (toolName === FOREGROUND_BASH && !failed && nonZeroExit === undefined) {
+  // A foreground bash that ran and exited 0 (no tool error, no non-zero code)
+  // AND ran at the DEFAULT cwd. An explicit cwd override is not credited: the
+  // declared command is matched as a whole string with no notion of directory,
+  // so `bun test` run in a subpackage (cwd: "packages/foo") would accept a
+  // narrower suite than the operator's root-level `bun test`. A directory
+  // requirement must live IN the command (`cd packages/foo && bun test`) so it
+  // becomes part of the matched evidence; a bare command counts only at default.
+  if (
+    toolName === FOREGROUND_BASH &&
+    !failed &&
+    nonZeroExit === undefined &&
+    input?.cwd === undefined
+  ) {
     const command = typeof input?.command === 'string' ? input.command : '';
     for (const declared of commands) {
       if (matchesVerifyCommand(command, declared)) state.verifiedSinceLastMutation.add(declared);

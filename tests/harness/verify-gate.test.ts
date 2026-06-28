@@ -129,6 +129,24 @@ describe('verify-gate accounting', () => {
     recordToolForVerify(s, CMDS, 'bash_background', { command: 'bun test' }, false, undefined);
     expect(unsatisfiedVerifyCommands(s, CMDS)).toEqual(CMDS);
   });
+
+  test('a verify command run with an explicit cwd override is NOT credited', () => {
+    const s = createVerifyState();
+    recordToolForVerify(s, CMDS, 'edit_file', { path: 'a.ts' }, false, undefined);
+    // Same command string, but in a subpackage → must not satisfy the root gate.
+    recordToolForVerify(
+      s,
+      CMDS,
+      'bash',
+      { command: 'bun test', cwd: 'packages/foo' },
+      false,
+      undefined,
+    );
+    expect(unsatisfiedVerifyCommands(s, CMDS)).toEqual(CMDS); // still all unsatisfied
+    // Run at the DEFAULT cwd (no override) → credited.
+    recordToolForVerify(s, CMDS, 'bash', { command: 'bun test' }, false, undefined);
+    expect(unsatisfiedVerifyCommands(s, CMDS)).toEqual(['bun run typecheck']);
+  });
 });
 
 describe('verifyGateNudge', () => {
