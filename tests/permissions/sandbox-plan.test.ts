@@ -364,6 +364,26 @@ describe('selectSandboxProfile — exec:arbitrary floor + network posture', () =
     expect(r.kind).toBe('ok');
     if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw-net');
   });
+
+  // MIXED call: the bash resolver unions caps, so `ssh host uptime && npm install`
+  // carries BOTH an explicit (ssh) and an incidental (npm) net-egress. The one
+  // explicit egress must NOT un-gate the incidental build egress — the exemption
+  // holds only when EVERY egress is explicit. Fail-closed: the whole plan drops to
+  // cwd-rw (npm cannot fetch+exfil; ssh also loses net in this untrusted dir).
+  test('exec:arbitrary + EXPLICIT + INCIDENTAL net-egress (ssh && npm) UNtrusted → cwd-rw (no un-gate)', () => {
+    const r = selectSandboxProfile({
+      capabilities: [
+        parseCapability('exec:arbitrary'),
+        netEgress('example.com', true), // ssh — explicit
+        netEgress('registry.npmjs.org'), // npm — incidental
+        parseCapability('read-fs:.'),
+      ],
+      hostExplicitlyAllowed: false,
+      dirTrusted: false,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw');
+  });
 });
 
 describe('selectSandboxProfile — uncovered list', () => {
