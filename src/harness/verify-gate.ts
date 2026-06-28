@@ -32,30 +32,34 @@ export const createVerifyState = (): VerifyState => ({
 // UX nudge, not the permission engine; it makes no allow/deny decision).
 const collapseWs = (s: string): string => s.trim().split(/\s+/).join(' ');
 
-// Shell operators that separate independent commands in a one-liner. Used to
-// pull `bun test` out of `cd x && bun test` or `setup; bun test`.
-const COMMAND_SEPARATORS = ['&&', '||', ';', '|', '\n'];
+// `&&` is the ONLY sound segment separator. The gate trusts the bash tool's
+// OVERALL exit code; only `&&` makes that code faithfully reflect a segment.
+// In `A && B` an exit 0 means every command ran and exited 0 (POSIX
+// short-circuit), so a declared command appearing as any `&&` conjunct did
+// pass. The other operators MASK a segment's exit from the overall code:
+// `bun test || true` / `bun test; true` / `bun test | cat` all exit 0 even
+// when `bun test` failed or was skipped. So they are NOT separators here.
+const CONJUNCTION_SEPARATOR = '&&';
 
-// True when `bashCommand` actually RAN `declared` (exit-0 handled by the
-// caller). Matched EXACTLY (no prefix): either the whole ws-collapsed command
+// True when `bashCommand` actually RAN `declared` (the exit-0 check is the
+// caller's). Matched EXACTLY (no prefix): either the whole ws-collapsed command
 // equals the declared command (so a declared compound like `lint && test` is
-// matched when run verbatim), or one of its separator-split segments equals it
-// (so `cd x && bun test` credits a declared `bun test`). Exact-only is the safe
-// choice for a verification gate — prefix/substring matching let a mere mention
-// in a quoted string (`git commit -m "...; bun test"`) or a no-op sibling
-// (`bun test --help`) satisfy the gate without the tests ever running. The cost
-// is that the model must run the declared command without a leading wrapper
-// (`CI=1`, `time`); the nudge names the exact command, and the bound caps the
-// retries. Operates on the structured `command` tool arg, never on model prose.
+// matched when run verbatim — and an operator who declares a self-masking
+// command like `bun test || true` owns that choice), or the declared command
+// equals one `&&` conjunct (so `cd x && bun test` credits a declared
+// `bun test`). Exact-only + `&&`-only is the safe choice for a verification
+// gate: prefix/substring matching would let a mention in a quoted string
+// (`git commit -m "...; bun test"`) or a no-op sibling (`bun test --help`)
+// satisfy it, and a masking operator (see above) would credit a command whose
+// failure was swallowed. The cost is that the model must run the declared
+// command without a leading wrapper (`CI=1`, `time`) or a masking suffix; the
+// nudge names the exact command, and the bound caps the retries. Operates on
+// the structured `command` tool arg, never on model prose.
 export const matchesVerifyCommand = (bashCommand: string, declared: string): boolean => {
   const target = collapseWs(declared);
   if (target.length === 0) return false;
   if (collapseWs(bashCommand) === target) return true;
-  let segments = [bashCommand];
-  for (const sep of COMMAND_SEPARATORS) {
-    segments = segments.flatMap((s) => s.split(sep));
-  }
-  return segments.some((seg) => collapseWs(seg) === target);
+  return bashCommand.split(CONJUNCTION_SEPARATOR).some((seg) => collapseWs(seg) === target);
 };
 
 // Fold one settled tool call into the verify state. A successful file write

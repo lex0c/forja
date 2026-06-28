@@ -9,17 +9,26 @@ import {
 
 const CMDS = ['bun run typecheck', 'bun test'];
 
-describe('matchesVerifyCommand (exact, separator-aware)', () => {
-  test('matches the whole command, a chained/piped/newline segment, and a declared compound', () => {
+describe('matchesVerifyCommand (exact, &&-only)', () => {
+  test('matches the whole command, an && conjunct, and a declared compound (ws-collapsed)', () => {
     expect(matchesVerifyCommand('bun test', 'bun test')).toBe(true);
     expect(matchesVerifyCommand('bun    test', 'bun test')).toBe(true); // ws-collapse
-    expect(matchesVerifyCommand('cd app && bun test', 'bun test')).toBe(true); // && segment
-    expect(matchesVerifyCommand('setup; bun test', 'bun test')).toBe(true); // ; segment
-    expect(matchesVerifyCommand('lint || bun test', 'bun test')).toBe(true); // || segment
-    expect(matchesVerifyCommand('cd app\nbun test', 'bun test')).toBe(true); // newline segment
-    expect(matchesVerifyCommand('seed | bun test', 'bun test')).toBe(true); // pipe segment
+    expect(matchesVerifyCommand('cd app && bun test', 'bun test')).toBe(true); // && conjunct
+    expect(matchesVerifyCommand('lint && bun test && echo ok', 'bun test')).toBe(true); // mid &&-chain
     // A declared COMPOUND matches when run verbatim (whole-command equality).
     expect(matchesVerifyCommand('bun run lint && bun test', 'bun run lint && bun test')).toBe(true);
+  });
+
+  test('does NOT credit a MASKED declared command — only && is sound', () => {
+    // The bash tool's overall exit code can be 0 even though `bun test` itself
+    // failed or never ran; crediting these would let the gate pass unverified.
+    expect(matchesVerifyCommand('bun test || true', 'bun test')).toBe(false); // failure swallowed
+    expect(matchesVerifyCommand('bun test; true', 'bun test')).toBe(false); // exit is `true`'s
+    expect(matchesVerifyCommand('bun test | cat', 'bun test')).toBe(false); // exit is `cat`'s
+    expect(matchesVerifyCommand('lint || bun test', 'bun test')).toBe(false); // bun test may be skipped
+    expect(matchesVerifyCommand('cd app\nbun test', 'bun test')).toBe(false); // newline = sequential, can mask
+    expect(matchesVerifyCommand('setup; bun test', 'bun test')).toBe(false); // ; sequential
+    expect(matchesVerifyCommand('seed | bun test', 'bun test')).toBe(false); // piped
   });
 
   test('EXACT only — no prefix/substring (the false-positives that would defeat the gate)', () => {
