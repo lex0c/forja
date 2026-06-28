@@ -92,10 +92,14 @@ export const DEFAULT_WRITABLE_CACHE_DIRS: readonly string[] = [
   // also fixes the fresh-install case this existence-gated entry skips (registry not created yet).
   '.gem', // RubyGems user gem dir / cache
   '.bundle', // Bundler config + cache
-  '.gradle', // Gradle user home (Java/Kotlin; not XDG). Ephemeral tmpfs is SAFE even though the
-  // persistent redirect steers GRADLE_USER_HOME elsewhere: a FRESH EMPTY .gradle has no init.d/*.gradle
-  // scripts to run, so no cross-build contamination (unlike the shared persistent path).
-  '.m2', // Maven local repo (Java; not XDG; artifacts only, no executable hooks)
+  '.gradle/caches', // Gradle artifact/module cache (Java/Kotlin; not XDG)
+  '.gradle/wrapper', // Gradle wrapper distributions. Both SUBDIR-scoped so ~/.gradle/gradle.properties
+  // (proxies/creds) + init.d stay readable — a blanket ~/.gradle tmpfs would hide that config and break
+  // proxy/private-repo builds. (Persistence relocates the whole GRADLE_USER_HOME, so the host
+  // gradle.properties is then not read — a separate limit of gradle's single-home design.)
+  '.m2/repository', // Maven LOCAL REPOSITORY only — SUBDIR-scoped. A blanket ~/.m2 tmpfs would mask
+  // ~/.m2/settings.xml / settings-security.xml (mirrors, proxies, private-repo creds) and break dep
+  // resolution; the MAVEN_ARGS redirect moves only repo.local, so settings stays readable at ~/.m2.
   '.local/share/pnpm/store', // pnpm content-addressable store (XDG_DATA, not XDG_CACHE) — SUBDIR only,
   // never blanket ~/.local/share/pnpm (which holds the pnpm binary + global bins on PATH)
   '.bun/install/cache', // bun install cache — SUBDIR only (keeps ~/.bun/bin intact)

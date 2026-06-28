@@ -16,8 +16,9 @@ describe('DEFAULT_WRITABLE_CACHE_DIRS', () => {
       '.cargo/registry',
       '.gem',
       '.bundle',
-      '.gradle',
-      '.m2',
+      '.gradle/caches',
+      '.gradle/wrapper',
+      '.m2/repository',
       '.local/share/pnpm/store',
       '.bun/install/cache',
       '.pub-cache',
@@ -27,17 +28,22 @@ describe('DEFAULT_WRITABLE_CACHE_DIRS', () => {
       expect(dir.startsWith('/')).toBe(false);
       expect(dir.includes('..')).toBe(false);
     }
-    // Cache dirs are subdir-SCOPED when the blanket dir holds a binary AND a clean
-    // static cache subdir exists (cargo/pnpm/bun → the binary stays execable). Where
-    // the cache layout forces a blanket mount (`.gem`'s user-bin path is version-
-    // dynamic; `.pub-cache` stages at the root), the dir is masked whole and any
-    // user-installed tool bins under it are intentionally hidden inside the sandbox.
+    // Cache dirs are subdir-SCOPED, not blanket, whenever the home dir ALSO holds
+    // something the sandbox must not hide: a binary / PATH bins (cargo/pnpm/bun) OR
+    // build config the toolchain needs (~/.m2/settings.xml, ~/.gradle/gradle.properties
+    // — mirrors/proxies/private-repo creds). Where the cache layout forces a blanket
+    // mount (`.gem`'s user-bin path is version-dynamic; `.pub-cache` stages at the
+    // root), the dir is masked whole and any user tool bins under it are hidden.
     expect(DEFAULT_WRITABLE_CACHE_DIRS).toContain('.cargo/registry');
     expect(DEFAULT_WRITABLE_CACHE_DIRS).not.toContain('.cargo'); // keeps ~/.cargo/bin
     expect(DEFAULT_WRITABLE_CACHE_DIRS).toContain('.local/share/pnpm/store');
     expect(DEFAULT_WRITABLE_CACHE_DIRS).not.toContain('.local/share/pnpm'); // keeps pnpm bin + global bins
     expect(DEFAULT_WRITABLE_CACHE_DIRS).toContain('.bun/install/cache');
     expect(DEFAULT_WRITABLE_CACHE_DIRS).not.toContain('.bun'); // keeps ~/.bun/bin
+    expect(DEFAULT_WRITABLE_CACHE_DIRS).toContain('.m2/repository');
+    expect(DEFAULT_WRITABLE_CACHE_DIRS).not.toContain('.m2'); // keeps ~/.m2/settings.xml readable
+    expect(DEFAULT_WRITABLE_CACHE_DIRS).toContain('.gradle/caches');
+    expect(DEFAULT_WRITABLE_CACHE_DIRS).not.toContain('.gradle'); // keeps ~/.gradle/gradle.properties
     // ~/.dotnet may be the SDK install (dotnet-install.sh + PATH=$HOME/.dotnet); masking it would hide
     // the dotnet binary. Relocated via the DOTNET_CLI_HOME redirect (sandbox-cache-env) instead.
     expect(DEFAULT_WRITABLE_CACHE_DIRS).not.toContain('.dotnet');
