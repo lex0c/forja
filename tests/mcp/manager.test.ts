@@ -55,12 +55,19 @@ interface FakeSpec {
   connectError?: Error;
 }
 const fakeClientFactory = (spec: FakeSpec) => {
-  const stats = { made: 0, connects: 0, closes: 0, calls: 0 };
+  const stats = {
+    made: 0,
+    connects: 0,
+    closes: 0,
+    calls: 0,
+    lastConnectSignal: undefined as AbortSignal | undefined,
+  };
   const makeClient = (_cfg: McpStdioConfig): McpClient => {
     stats.made += 1;
     return {
-      async connect() {
+      async connect(signal) {
         stats.connects += 1;
+        stats.lastConnectSignal = signal;
         if (spec.connectError) throw spec.connectError;
         return { protocolVersion: '2024-11-05', serverVersion: '1.0.0' };
       },
@@ -363,5 +370,21 @@ describe('McpManager: code-review hardening', () => {
     await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/manifest_drift/);
     await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/manifest_drift/);
     expect(fake.stats.connects).toBe(1); // pinned — did not reconnect on the 2nd call
+  });
+
+  test('init threads a bounded handshake signal into connect (no unbounded hang)', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(fake.stats.connects).toBe(1);
+    // Was `undefined` before the fix — init now bounds the handshake so a
+    // wedged server can't hang bootstrap.
+    expect(fake.stats.lastConnectSignal).toBeInstanceOf(AbortSignal);
   });
 });

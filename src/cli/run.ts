@@ -784,6 +784,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       auditConfigWarnings,
       sandboxConfigWarnings,
       verifyConfigWarnings,
+      mcpConfigWarnings,
       permissionState,
       permissionRefusingReason,
       permissionChain,
@@ -905,6 +906,11 @@ export const run = async (options: RunOptions): Promise<number> => {
       for (const w of verifyConfigWarnings) {
         errSink(`forja: verify config: ${w}\n`);
       }
+      // mcp.toml + manager.init() warnings — a skipped/denied/drifted server is
+      // otherwise an invisible missing tool. (MCP.md §9.3 / FAILURE_MODES §15.)
+      for (const w of mcpConfigWarnings) {
+        errSink(`forja: mcp config: ${w}\n`);
+      }
     }
 
     // Resume-mode (headless): full/summary hydrate the WHOLE log (and summary
@@ -1003,6 +1009,16 @@ export const run = async (options: RunOptions): Promise<number> => {
       // that may construct a HarnessConfig without a broker.
       if (cfg.broker !== undefined) {
         await cfg.broker.close();
+      }
+      // MCP stdio clients (MCP.md §1.7): disconnect all before storage close.
+      // Guarded so a surprise throw can't skip closeDb (cleanup is per-client
+      // fail-soft, but defense in depth).
+      if (cfg.mcpManager !== undefined) {
+        try {
+          await cfg.mcpManager.cleanup();
+        } catch {
+          // Swallow — teardown must not skip closeDb on a stubborn server.
+        }
       }
       closeDb(db);
     }

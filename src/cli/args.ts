@@ -87,6 +87,9 @@ export interface ParsedArgs {
   // bootstrap surfaces a clear error if the worker source isn't
   // on disk.
   brokerMode?: 'in-process' | 'spawn';
+  // --auto-approve-mcp <list>: comma-separated MCP server names granted trust
+  // without a prompt (CI/headless). Per MCP.md §1.5 — an explicit list, never `*`.
+  autoApproveMcp?: ReadonlySet<string>;
   // Explicit "I really want to run unsandboxed" opt-in. Two roles,
   // disambiguated by invocation:
   //   1. `forja welcome --i-know-what-im-doing` (§13.5 first-boot UX,
@@ -1716,6 +1719,39 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
           };
         }
         args.brokerMode = value;
+        i += 2;
+        break;
+      }
+      case '--auto-approve-mcp': {
+        const value = argv[i + 1];
+        if (value === undefined || value.startsWith('-')) {
+          return {
+            ok: false,
+            message: '--auto-approve-mcp requires a comma-separated server list',
+          };
+        }
+        const names = value
+          .split(',')
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0);
+        if (names.length === 0) {
+          // A fat-fingered `--auto-approve-mcp ,,` / `""` would otherwise be
+          // accepted silently as an empty set (no-op) — surface it instead.
+          return {
+            ok: false,
+            message: '--auto-approve-mcp requires at least one server name',
+          };
+        }
+        // ANTI_PATTERNS §6.6: never a blanket `*` — a hostile server added to
+        // mcp.toml must not be auto-trusted; the operator lists servers explicitly.
+        if (names.includes('*')) {
+          return {
+            ok: false,
+            message:
+              '--auto-approve-mcp does not accept `*`; list servers explicitly (ANTI_PATTERNS §6.6)',
+          };
+        }
+        args.autoApproveMcp = new Set(names);
         i += 2;
         break;
       }

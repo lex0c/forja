@@ -92,6 +92,9 @@ describe('bootstrap', () => {
       dbPath,
       enterprisePolicyPath: null,
       userPolicyPath: null,
+      // Hermetic: no user mcp.toml leaks in, so the builtin list below is
+      // load-bearing rather than incidentally isolated by XDG.
+      userMcpPath: null,
     });
     expect(modelId).toBe(DEFAULT_MODEL);
     expect(policyLayers).toEqual([]);
@@ -155,6 +158,50 @@ describe('bootstrap', () => {
         'write_file',
       ].sort(),
     );
+    db.close();
+  });
+
+  test('registers trusted MCP tools from mcp.toml into the registry', async () => {
+    const mcpTomlPath = join(workdir, '.forja', 'mcp.toml');
+    mkdirSync(dirname(mcpTomlPath), { recursive: true });
+    writeFileSync(
+      mcpTomlPath,
+      `[servers.fixture]
+transport = "stdio"
+command = ["fake-bin"]
+surface = "base"
+`,
+    );
+    // Fake MCP client — exercises the bootstrap → manager → registration path
+    // without spawning a real stdio subprocess.
+    const makeFakeClient = (): import('../../src/mcp/types.ts').McpClient => ({
+      connect: async () => ({ protocolVersion: '2024-11-05', serverVersion: '1.0.0' }),
+      listTools: async () => [
+        {
+          name: 'echo',
+          description: 'echo back text',
+          inputSchema: { type: 'object', properties: { text: { type: 'string' } } },
+          meta: { writes: false },
+        },
+      ],
+      callTool: async () => ({ isError: false, content: 'ok' }),
+      close: async () => {},
+    });
+    const { config, db } = await bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      userMcpPath: null,
+      autoApproveMcp: new Set(['fixture']),
+      mcpMakeClient: makeFakeClient,
+    });
+    const names = config.toolRegistry.list().map((t) => t.name);
+    expect(names).toContain('mcp__fixture__echo'); // MCP tool registered
+    expect(names).toContain('read_file'); // builtins still present (adds, not replaces)
+    expect(names.filter((n) => n.startsWith('mcp__'))).toEqual(['mcp__fixture__echo']);
     db.close();
   });
 

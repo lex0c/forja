@@ -55,6 +55,7 @@ export const operatorBootstrapFlags = (args: ParsedArgs): Partial<BootstrapInput
   ...(args.iKnowWhatImDoing === true ? { iKnowWhatImDoing: true } : {}),
   ...(args.autonomous === true ? { approvalPosture: 'autonomous' as const } : {}),
   ...(args.brokerMode !== undefined ? { brokerMode: args.brokerMode } : {}),
+  ...(args.autoApproveMcp !== undefined ? { autoApproveMcp: args.autoApproveMcp } : {}),
   ...(args.memoryVerifyLlm !== undefined ? { memorySemanticVerify: args.memoryVerifyLlm } : {}),
   ...(args.memoryConflictLlm !== undefined ? { memoryConflictDetect: args.memoryConflictLlm } : {}),
   ...(args.memoryOverrideLlm !== undefined ? { memoryOverrideDetect: args.memoryOverrideLlm } : {}),

@@ -694,6 +694,17 @@ export const executeCase = async (
       };
       result = await runAgent(cfg);
     } finally {
+      // Disconnect any live MCP stdio clients before closing the per-case DB —
+      // the executor runs many cases per process, so a leaked child would
+      // corrupt later cases. `config` (not the inner `cfg`) is in scope here;
+      // both carry the same manager.
+      if (config.mcpManager !== undefined) {
+        try {
+          await config.mcpManager.cleanup();
+        } catch {
+          // Swallow — must not skip closeDb (which would corrupt later cases).
+        }
+      }
       closeDb(db);
     }
   } catch (e) {

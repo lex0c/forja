@@ -136,6 +136,18 @@ const dedupeWireName = (base: string, taken: (name: string) => boolean): string 
   return base; // exhausted — register() will throw and the caller warns
 };
 
+// Bound the handshake (connect + tools/list) so a wedged or hostile server
+// can't hang the agent. This matters most at init(), which is on the bootstrap
+// critical path with no operator to Ctrl-C; it also caps a mid-session
+// lazy-connect. Combined with the session AbortSignal where one exists. The
+// actual tools/call is NOT bounded here (a long tool is legitimate; per-call
+// budget is a later slice).
+const MCP_HANDSHAKE_TIMEOUT_MS = 30_000;
+const handshakeSignal = (sessionSignal?: AbortSignal): AbortSignal => {
+  const timeout = AbortSignal.timeout(MCP_HANDSHAKE_TIMEOUT_MS);
+  return sessionSignal === undefined ? timeout : AbortSignal.any([sessionSignal, timeout]);
+};
+
 export const createMcpManager = (deps: McpManagerDeps): McpManager => {
   const { db, registry, config } = deps;
   const makeClient = deps.makeClient ?? createStdioMcpClient;
@@ -178,8 +190,9 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       const client = makeClient(rt.config.transport);
       setState(rt, 'handshaking');
       try {
-        const info = await client.connect(ctx.signal);
-        const liveTools = await client.listTools(ctx.signal);
+        const sig = handshakeSignal(ctx.signal);
+        const info = await client.connect(sig);
+        const liveTools = await client.listTools(sig);
         const liveHash = hashManifest(
           canonicalizeManifest({
             server,
@@ -291,8 +304,9 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
     const client = makeClient(rt.config.transport);
     setState(rt, 'handshaking');
     try {
-      const info = await client.connect();
-      const tools = await client.listTools();
+      const sig = handshakeSignal();
+      const info = await client.connect(sig);
+      const tools = await client.listTools(sig);
       const canonical = canonicalizeManifest({
         server: name,
         protocolVersion: info.protocolVersion,

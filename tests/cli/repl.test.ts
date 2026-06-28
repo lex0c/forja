@@ -171,6 +171,7 @@ const makeBootstrapStub = (
     auditConfigWarnings: [] as readonly string[],
     sandboxConfigWarnings: [] as readonly string[],
     verifyConfigWarnings: [] as readonly string[],
+    mcpConfigWarnings: [] as readonly string[],
     permissionState: 'ready',
     permissionChain: { ok: true, rows: 0, current_rotation_id: 0, quarantined: false },
     installIdentity: { install_id: 'test-fixture', created_at_ms: 0 },

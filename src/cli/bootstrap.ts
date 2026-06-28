@@ -31,6 +31,9 @@ import {
   resolveHookPaths,
   resolveHookShell,
 } from '../hooks/index.ts';
+import { loadMcpConfig } from '../mcp/config.ts';
+import { type McpInitReport, type McpManager, createMcpManager } from '../mcp/manager.ts';
+import type { ConfirmMcpTrust, McpClient, McpStdioConfig } from '../mcp/types.ts';
 import {
   computeSharedFingerprint,
   createMemoryRegistry,
@@ -176,6 +179,13 @@ export interface BootstrapInput {
   // the permission-layer test seams above.
   userAgentsDir?: string | null;
   projectAgentsDir?: string | null;
+  // Test seam for the mcp.toml user layer. Mirrors userPolicyPath /
+  // userAgentsDir: `null` disables the user layer (keeps a developer's real
+  // ~/.config/forja/mcp.toml out of a test's bootstrap), absent = default.
+  userMcpPath?: string | null;
+  // --auto-approve-mcp <list>: MCP servers granted trust without a prompt
+  // (CI/headless). Threaded into the MCP manager's `autoApprove`.
+  autoApproveMcp?: ReadonlySet<string>;
   // Test seam for trust-list discovery. Mirrors the REPL's
   // `trustListPathOverride`:
   //   - undefined → use `trustListPath()` (production default)
@@ -287,6 +297,15 @@ export interface BootstrapInput {
     mode: import('../memory/index.ts').SharedTrustModalMode;
     corpusFiles: readonly { name: string; bytes: number }[];
   }) => Promise<'yes' | 'no' | 'cancel'>;
+  // Interactive MCP manifest-trust callback (the askMcpTrust modal). The REPL
+  // adapter that supplies it lands in a follow-up slice; until then it is
+  // undefined everywhere ⇒ the MCP manager fails closed (deny unless the
+  // server is in autoApproveMcp), the safe intermediate state.
+  confirmMcpTrust?: ConfirmMcpTrust;
+  // Test seam: inject a fake MCP client factory so a test can exercise the
+  // bootstrap → manager → registration path without spawning a real stdio
+  // subprocess. Production leaves it absent (the SDK stdio adapter is used).
+  mcpMakeClient?: (cfg: McpStdioConfig) => McpClient;
 }
 
 // §13.7 sandbox-enforcement snapshot — captured at bootstrap time so
@@ -407,6 +426,10 @@ export interface BootstrapResult {
   // dropped non-string entries, surfaced on the same stderr banner so an
   // operator whose gate config was silently ignored sees why.
   verifyConfigWarnings: readonly string[];
+  // Warnings from the mcp.toml loader + manager.init() — bad server entries,
+  // handshake failures, unreadable cached manifests — surfaced on the stderr
+  // banner so an operator whose MCP server was skipped sees why.
+  mcpConfigWarnings: readonly string[];
   // Final state of the permission engine after bootstrap walked
   // init → loading-policy → validating-chain → ready/refusing.
   // When this is `refusing`, the engine is a deny-everything stub
@@ -1550,6 +1573,37 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // collide with the parent repo's.
   const bgLogDir = join(cwd, projectDirName(), 'bg');
 
+  // MCP client subsystem (MCP.md). Built broker-style: eager here (no
+  // sessionId needed); trusted MCP tools register into `toolRegistry` BEFORE
+  // the HarnessConfig literal below, so they're on the wire from turn 1.
+  // `loadMcpConfig` + `manager.init()` are fail-soft for the EXPECTED failures
+  // (bad entries / handshake failures → warnings), but `init()` does
+  // unguarded DB writes, so a runtime SQLite fault (or the mcpMakeClient test
+  // seam) can still throw — this block sits AFTER the system-prompt try-block
+  // that owns `closeDb(db)`, so wrap it to close the handle on a throw.
+  // Headless (no confirmMcpTrust) fails closed unless a server is in
+  // autoApproveMcp.
+  let mcpManager: McpManager;
+  let mcpInit: McpInitReport;
+  try {
+    const mcpConfig = loadMcpConfig({
+      cwd,
+      ...(input.userMcpPath !== undefined ? { userPathOverride: input.userMcpPath } : {}),
+    });
+    mcpManager = createMcpManager({
+      db,
+      registry: toolRegistry,
+      config: mcpConfig,
+      ...(input.confirmMcpTrust !== undefined ? { confirmTrust: input.confirmMcpTrust } : {}),
+      ...(input.autoApproveMcp !== undefined ? { autoApprove: input.autoApproveMcp } : {}),
+      ...(input.mcpMakeClient !== undefined ? { makeClient: input.mcpMakeClient } : {}),
+    });
+    mcpInit = await mcpManager.init();
+  } catch (e) {
+    closeDb(db);
+    throw e;
+  }
+
   // (`trustPath` and `isCwdTrusted` resolved above the try-block
   // so the project-context section can gate on them at prompt-
   // assembly time; both are still consumed below — memory_write
@@ -1602,6 +1656,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     cwd,
     bgLogDir,
     broker,
+    mcpManager,
     userPrompt: input.prompt,
     // Checkpoints (M3 §12): enabled for every CLI run by default
     // so users get `--undo` for free.
@@ -1798,6 +1853,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     auditConfigWarnings: auditLoaded.warnings,
     sandboxConfigWarnings: sandboxLoaded.warnings,
     verifyConfigWarnings: verifyLoaded.warnings,
+    mcpConfigWarnings: mcpInit.warnings,
     permissionState: permResult.state,
     ...(permResult.refusingReason !== undefined
       ? { permissionRefusingReason: permResult.refusingReason }
