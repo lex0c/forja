@@ -1200,10 +1200,14 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // for children by construction (RECAP §3.3).
       recapEnabled: false,
       // [verify] config thread-through (STATE_MACHINE §3.2.1) so a SUBAGENT that
-      // edits files gates its OWN claims. Without this, delegating edits to a
-      // subagent would bypass the gate entirely — the principal never sees the
-      // write (`task` is not a file-writer) and the child had no verify config.
-      // Same project-config anchor as the [sandbox] thread above.
+      // edits files gates its OWN claims, instead of a delegated edit bypassing
+      // the gate entirely (the principal never sees the write — `task` is not a
+      // file-writer — and the child would otherwise have no verify config).
+      // NOTE this only gates the subagent WHEN it can run the declared command:
+      // a capability-narrowed child (no `bash`, the command denied, or a divergent
+      // repo root) cannot satisfy its gate, so it exhausts and accepts with only
+      // a child-process stderr trace the parent does not surface (docs/VERIFY.md
+      // §4 — delegated verification). Same project-config anchor as [sandbox] above.
       verify: {
         commands:
           loadVerifyConfig({
