@@ -463,6 +463,54 @@ describe('bootstrap', () => {
       expect(d.sandboxProfile).toBe('cwd-rw-net');
       db.close();
     });
+
+    test('MIXED explicit-egress + local arbitrary exec (ssh && frobnicate) UNtrusted → cwd-rw', async () => {
+      // A single sandbox profile covers the whole shell, so net granted for ssh's
+      // explicit egress would reach the co-present local exec (frobnicate). The
+      // resolver demotes the explicit egress when a local arbitrary exec is
+      // present → the gate strips net → cwd-rw (frobnicate gets no network).
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [] }));
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      expect(config.isCwdTrusted).toBe(false);
+      const d = config.permissionEngine.check('bash', 'bash', {
+        command: 'ssh host uptime && frobnicate',
+      });
+      expect(d.sandboxProfile).toBe('cwd-rw');
+      db.close();
+    });
+
+    test('pure explicit-net shell (ssh a && ssh b) UNtrusted → cwd-rw-net (exemption survives)', async () => {
+      // No local arbitrary exec → the explicit-egress exemption holds for the
+      // whole compound; both ssh connect even untrusted.
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [] }));
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      expect(config.isCwdTrusted).toBe(false);
+      const d = config.permissionEngine.check('bash', 'bash', {
+        command: 'ssh host uptime && ssh other date',
+      });
+      expect(d.sandboxProfile).toBe('cwd-rw-net');
+      db.close();
+    });
   });
 
   test('honors --model override', async () => {

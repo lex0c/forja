@@ -5008,15 +5008,42 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
   const allCaps: Capability[] = [exec('shell'), ...orphanRedir.caps, ...loopWordCaps];
   let aggregateConf: 'high' | 'medium' | 'low' = 'high';
   let conservativeReason: string | null = null;
+  // Does any sub-command run LOCAL arbitrary code without being an explicit
+  // network tool (exec:arbitrary but NO explicitEgress of its own)? Tracked
+  // PER-COMMAND — the aggregate `allCaps` flattens attribution, so the planner
+  // cannot tell ssh's remote exec from `./local-tool`'s local exec. A single
+  // sandbox profile covers the WHOLE shell, so net granted for an explicit-egress
+  // command (ssh) would reach such a local exec (`ssh host uptime && ./local-tool`).
+  let hasLocalArbitraryExec = false;
   for (const shape of commands) {
     const result = analyzeCommand(shape, ctx);
     if ('refuse' in result) {
       return { kind: 'refuse', reason: result.refuse };
     }
+    const cmdArbitrary = result.caps.some((c) => c.kind === 'exec' && c.scope === 'arbitrary');
+    const cmdExplicitNet = result.caps.some(
+      (c) => c.kind === 'net-egress' && c.explicitEgress === true,
+    );
+    if (cmdArbitrary && !cmdExplicitNet) hasLocalArbitraryExec = true;
     allCaps.push(...result.caps);
     if (result.conservative !== undefined) conservativeReason ??= result.conservative;
     if (result.confidence === 'low') aggregateConf = 'low';
     else if (result.confidence === 'medium' && aggregateConf === 'high') aggregateConf = 'medium';
+  }
+
+  // Fail closed for a MIXED shell: when a local arbitrary exec is present, the
+  // explicit-egress exemption is unsafe (the shared profile's net would reach
+  // that local exec), so demote every explicit net-egress to incidental. The
+  // planner's build-egress trust-gate then strips it in an untrusted dir → the
+  // whole plan drops to cwd-rw (ssh loses net too: run it on its own line, or
+  // trust the dir). A pure explicit-net shell (`ssh a && ssh b`) keeps the mark.
+  if (hasLocalArbitraryExec) {
+    for (let i = 0; i < allCaps.length; i++) {
+      const c = allCaps[i];
+      if (c !== undefined && c.kind === 'net-egress' && c.explicitEgress === true) {
+        allCaps[i] = netEgress(c.scope ?? '*');
+      }
+    }
   }
 
   // An ORPHAN redirect — one not attached to any command, e.g. the
