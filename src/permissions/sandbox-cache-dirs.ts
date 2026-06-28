@@ -58,7 +58,11 @@
 //     the registry subdir leaves `~/.cargo/bin/cargo` (the rustup shim) intact
 //     so the wrap can still exec cargo. The blanket `.cargo` is deliberately
 //     NOT here: a tmpfs over all of `~/.cargo` would hide that binary and
-//     break cargo entirely.
+//     break cargo entirely. NOTE: this ephemeral entry is only the
+//     persistence-OFF fallback — the PRIMARY path is the CARGO_HOME redirect
+//     (`sandbox-cache-env.ts`), which also covers the fresh-install case this
+//     existence-gated entry skips (registry not yet created) and gives cargo
+//     cross-spawn persistence like go/npm.
 //   - `~/.rustup` (the toolchain) stays masked via HIDE_PATHS_DIRS, so a
 //     rustup-managed cargo is still blocked in the sandbox independent of
 //     caching; a system-installed cargo works. Full rustup support is future
@@ -83,7 +87,9 @@ export const DEFAULT_WRITABLE_CACHE_DIRS: readonly string[] = [
   // sentinel, telemetry, `dotnet tool`) are relocated via the DOTNET_CLI_HOME redirect in
   // `sandbox-cache-env.ts` — relocating (not masking) keeps the SDK execable. The NuGet PACKAGE cache
   // (deps) is covered by the two `.nuget*` entries above, which hold no binary.
-  '.cargo/registry', // cargo registry/dep cache — SUBDIR only (keeps ~/.cargo/bin intact)
+  '.cargo/registry', // cargo registry/dep cache — SUBDIR only (keeps ~/.cargo/bin intact). This is the
+  // persistence-OFF fallback; the PRIMARY path is the CARGO_HOME redirect (sandbox-cache-env), which
+  // also fixes the fresh-install case this existence-gated entry skips (registry not created yet).
   '.gem', // RubyGems user gem dir / cache
   '.bundle', // Bundler config + cache
   '.gradle', // Gradle user home (Java/Kotlin; not XDG). Ephemeral tmpfs is SAFE even though the
