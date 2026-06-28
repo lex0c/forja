@@ -30,6 +30,7 @@ import type {
   ProviderMessage,
   ProviderToolDef,
   ProviderToolResultBlock,
+  StreamEvent,
 } from '../providers/index.ts';
 import { resolveProviderFromId } from '../providers/resolve.ts';
 import { estimatePromptTokens } from '../providers/tokens.ts';
@@ -3144,6 +3145,27 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           ...(config.seedInEval !== undefined ? { seed_in_eval: config.seedInEval } : {}),
         };
 
+        // Verify-gate output buffering. If the gate is armed entering this turn
+        // (code mutated, a declared verify-command still unsatisfied, retries
+        // left), a tool-call-free answer THIS turn will be suppressed by the
+        // gate below — but the provider streams its `text_delta`s live, so a
+        // one-shot renderer would print the rejected claim before the gate
+        // fires. Hold this turn's answer text out of the live event stream and
+        // either flush it (turn isn't suppressed) or drop it (gate suppresses).
+        // Buffers only the render EVENTS — `collected` still captures the full
+        // text, so history/persistence are unaffected.
+        const verifyArmed =
+          verifyCommands.length > 0 &&
+          verifyAttempts < MAX_VERIFY_ATTEMPTS &&
+          unsatisfiedVerifyCommands(verifyState, verifyCommands).length > 0;
+        const bufferedAnswer: StreamEvent[] = [];
+        const flushBufferedAnswer = (): void => {
+          for (const ev of bufferedAnswer) {
+            safeEmit(config.onEvent, { type: 'provider_event', event: ev });
+          }
+          bufferedAnswer.length = 0;
+        };
+
         let collected: Awaited<ReturnType<typeof collectStep>>;
         try {
           // Wrap the provider stream so the combined abort signal (user +
@@ -3171,7 +3193,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               ),
               signal,
             ),
-            (ev) => safeEmit(config.onEvent, { type: 'provider_event', event: ev }),
+            (ev) => {
+              // Hold the answer text when armed; every other event (tool deltas,
+              // stream errors, usage) still streams live.
+              if (verifyArmed && ev.kind === 'text_delta') {
+                bufferedAnswer.push(ev);
+                return;
+              }
+              safeEmit(config.onEvent, { type: 'provider_event', event: ev });
+            },
           );
         } catch (e) {
           // The provider request was sent (and likely billed for input
@@ -3292,6 +3322,25 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // models never emit it).
         emitCostUpdate(turnCostUsd);
         safeEmit(config.onEvent, { type: 'usage_persisted' });
+
+        // Resolve the buffered answer text (only non-empty when `verifyArmed`).
+        // Flush it now UNLESS the verify gate is about to suppress THIS turn —
+        // i.e. the gate is reached (no earlier terminal exit) and its condition
+        // holds: a tool-call-free, settled answer with the gate still armed.
+        // When that is true the buffer rides to the gate's `continue`, which
+        // drops it; in EVERY other outcome (errors, caps, tool calls, accept)
+        // the text streams normally. This predicate MUST mirror the early-exit
+        // checks between here and the gate (errors / cost cap / max_tokens /
+        // context-window) so a preempting return never silently drops the text.
+        const gateWillSuppress =
+          verifyArmed &&
+          collected.errors.length === 0 &&
+          costCapDetailIfExceeded() === null &&
+          collected.tool_uses.length === 0 &&
+          collected.stop_reason !== 'max_tokens' &&
+          collected.stop_reason !== 'model_context_window_exceeded' &&
+          endsWithSettledAnswer(ctx.getMessages());
+        if (!gateWillSuppress) flushBufferedAnswer();
 
         // Stream errors (normalizer-level: malformed tool_use args, orphan
         // tool_use_stop, etc.) mean the provider produced output we couldn't

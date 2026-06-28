@@ -3505,4 +3505,52 @@ describe('runAgent — claim-time verify gate (STATE_MACHINE §3.2.1)', () => {
     expect(result.status).toBe('done');
     expect(handle.requests.length).toBe(3); // edit, verify, answer — gate satisfied, no extra
   });
+
+  test('a suppressed (gated) answer is never streamed — only the verified answer reaches onEvent', async () => {
+    // The gate suppresses the unverified claim in HISTORY, but the provider
+    // streams its text_delta live; without buffering a one-shot renderer would
+    // print the rejected claim. The buffered text must not reach config.onEvent.
+    const stubBashOk: Tool = {
+      name: 'bash',
+      description: 'stub bash, exits 0',
+      inputSchema: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command'],
+      },
+      metadata: { category: 'misc', writes: false, idempotent: false },
+      async execute() {
+        return { exit_code: 0, stdout: '', stderr: '' };
+      },
+    };
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const { config } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 't1', name: 'edit_file', input: { path: 'a.ts' } }],
+          stop_reason: 'tool_use',
+        },
+        // Tool-call-free answer while `bun test` is still owed → gate suppresses.
+        { text: 'UNVERIFIED-CLAIM', stop_reason: 'end_turn' },
+        {
+          tool_uses: [{ id: 't2', name: 'bash', input: { command: 'bun test' } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'VERIFIED-ANSWER', stop_reason: 'end_turn' }, // gate satisfied → shown
+      ],
+      {
+        extraTools: [stubEdit, stubBashOk],
+        budget: { maxSteps: 12 },
+        verify: { commands: ['bun test'] },
+      },
+    );
+    const result = await runAgent({ ...config, onEvent: (e) => events.push(e) });
+    expect(result.status).toBe('done');
+    let streamed = '';
+    for (const e of events) {
+      if (e.type === 'provider_event' && e.event.kind === 'text_delta') streamed += e.event.text;
+    }
+    expect(streamed).not.toContain('UNVERIFIED-CLAIM'); // buffered, then dropped by the gate
+    expect(streamed).toContain('VERIFIED-ANSWER'); // streamed after verification
+  });
 });
