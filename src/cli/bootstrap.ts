@@ -831,6 +831,15 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // and CLI checkpoint --undo emits `checkpoint_reverted`.
   const outcomeSink = createSqliteOutcomeSink({ db });
   const failureSink = createSqliteFailureSink({ db, outcomeSink });
+  // Resolve cwd trust EARLY. The sandbox network posture (below) gates on it so
+  // an UNTRUSTED directory's `.forja/config.toml` cannot self-enable egress — a
+  // freshly-cloned hostile repo shipping `[sandbox] network = "on"` must not
+  // grant its unmodeled binaries network access (CLAUDE.md "Explicit trust").
+  // The system-prompt composition further down also consults it. Fail-closed:
+  // no trust storage / cwd absent from the list → false.
+  const trustPath =
+    input.trustListPathOverride !== undefined ? input.trustListPathOverride : trustListPath();
+  const isCwdTrusted = trustPath !== null && isTrusted(trustPath, cwd);
   const permResult = await bootstrapPermissionEngine({
     cwd,
     home,
@@ -852,6 +861,14 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       // is selected. Unlike gate 1, there is no policy-file equivalent:
       // unsandboxed execution is opt-in per CLI invocation only.
       emitHostPassthrough: input.iKnowWhatImDoing === true,
+      // Coarse network posture from `[sandbox] network` (default off via
+      // DEFAULT_NETWORK). When `on`, the planner upgrades exec:arbitrary calls
+      // to cwd-rw-net so any toolchain can fetch deps without a per-language
+      // table. Defense-in-depth: requires BOTH the operator opt-in AND a
+      // TRUSTED cwd — the config resolves project-wins, so without the trust
+      // gate a cloned hostile repo could self-enable egress (CLAUDE.md
+      // "Explicit trust"). See PERMISSION_ENGINE.md §6.5.
+      networkAllowed: sandboxLoaded.config.network === 'on' && isCwdTrusted,
       // Slice 165 (review — Batch C sandbox observability). Forward
       // the trust marker so bootstrap can emit a
       // `sandbox.path_resolved` failure_event when the install isn't
@@ -897,17 +914,11 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   permissionEngine.addSessionAllow('read_file', fetchSpillGlob);
   permissionEngine.addSessionAllow('grep', fetchSpillGlob);
 
-  // Resolve cwd trust state EARLY so the system-prompt composition
-  // (project pointer, below) can gate on it. Originally this lived
-  // after the prompt assembly because no upstream surface needed
-  // it; the project_pointer section needs the flag at compose
-  // time, so we lift it. Failing-closed semantics unchanged: any
-  // path that resolves to "no trust storage" or "cwd absent from
-  // list" yields `false`, which suppresses the pointer (and any
-  // other downstream gate that consults `isCwdTrusted`).
-  const trustPath =
-    input.trustListPathOverride !== undefined ? input.trustListPathOverride : trustListPath();
-  const isCwdTrusted = trustPath !== null && isTrusted(trustPath, cwd);
+  // `trustPath` / `isCwdTrusted` were resolved earlier (just before the
+  // permission-engine bootstrap) so the sandbox network posture could gate on
+  // trust. The system-prompt composition below (project_pointer) and other
+  // downstream gates consult the same `isCwdTrusted` flag. Fail-closed
+  // semantics unchanged.
 
   let resolvedSystemPrompt: string | undefined;
   let resolvedSystemSegments: SystemSegment[] | undefined;

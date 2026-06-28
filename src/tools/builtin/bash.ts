@@ -35,7 +35,65 @@ export interface BashOutput {
   duration_ms: number;
   timed_out: boolean;
   truncated: boolean;
+  // Set ONLY when a non-zero exit smells like a SANDBOX restriction (EROFS on
+  // a write, or blocked egress) under a restrictive profile — a diagnosis that
+  // points the model/operator at the lever (write inside cwd, or set
+  // `[sandbox] network = on`). Absent for ordinary command failures and for
+  // host/unsandboxed runs. PURE annotation: the call is NOT re-run or
+  // re-confirmed (confirm is pre-execution; the profile is immutable). See
+  // PERMISSION_ENGINE.md §6.5.
+  sandbox_hint?: string;
 }
+
+// Substring markers of a kernel/sandbox denial surfacing in a child's stderr —
+// the OS-level text emitted when bwrap's read-only base or unshared network
+// blocks a syscall, distinct from an ordinary command error. Plain lower-cased
+// substring match, NOT regex: the policy/permissions surface is deliberately
+// regex-free (CLAUDE.md "No regex in policy/permissions"), and these are literal
+// markers. Conservative: only strong, unambiguous text (EROFS; DNS /
+// unreachable-network), never "connection refused" (a local service can refuse).
+const SANDBOX_EROFS_MARKER = 'read-only file system';
+const SANDBOX_NET_MARKERS: readonly string[] = [
+  'network is unreachable',
+  'could not resolve host',
+  'temporary failure in name resolution',
+  'name or service not known',
+  'getaddrinfo',
+];
+
+// Diagnose (NEVER remediate) a non-zero bash result that looks sandbox-caused.
+// Returns an actionable hint or undefined. `host`/unsandboxed (null/undefined)
+// runs are never the sandbox's doing → undefined. Messages are accurate PER
+// PROFILE (each has a different writable area), and the `[sandbox] network = on`
+// toggle only upgrades `cwd-rw` (the profile an exec:arbitrary call lands), so
+// the network hint is suggested ONLY there — proposing it for `ro`/`home-rw`
+// would point at a lever that changes nothing for those profiles.
+const classifySandboxDenial = (
+  stderr: string,
+  profile: string | null | undefined,
+): string | undefined => {
+  if (profile === undefined || profile === null || profile === 'host') return undefined;
+  const lower = stderr.toLowerCase();
+  if (lower.includes(SANDBOX_EROFS_MARKER)) {
+    if (profile === 'ro') {
+      // 'ro' = whole FS read-only (the call resolved no write capability) — there
+      // is NO writable area, so do NOT advise "write inside the working directory".
+      return "sandbox: this call resolved to no write capability, so the entire filesystem is read-only ('ro' profile). If the command legitimately writes, its write intent wasn't detected for this call.";
+    }
+    if (profile === 'home-rw') {
+      return "sandbox: a write was blocked (read-only file system) under 'home-rw' — the target is outside the writable area ($HOME).";
+    }
+    // cwd-rw / cwd-rw-net: the working directory is the writable area.
+    return `sandbox: a write was blocked (read-only file system) under '${profile}' — the target is OUTSIDE the writable working directory.`;
+  }
+  // Network: only `cwd-rw` is actually upgraded by `[sandbox] network = on` (the
+  // posture bumps an exec:arbitrary call's cwd-rw → cwd-rw-net). For `ro` /
+  // `home-rw` the toggle wouldn't change the plan, so don't suggest it there.
+  if (profile === 'cwd-rw' && SANDBOX_NET_MARKERS.some((m) => lower.includes(m))) {
+    return `sandbox: network egress is blocked under the 'cwd-rw' profile. To let this project fetch dependencies, set [sandbox] network = "on" in its .forja/config.toml (the directory must also be trusted).`;
+  }
+  return undefined;
+};
 
 // Pre-slice-82, this tool spawned bash directly via Bun.spawn. The
 // PERMISSION_ENGINE.md §13.7 broker work moved the spawn into a
@@ -230,7 +288,7 @@ export const bashTool: Tool<BashInput, BashOutput> = {
     const stdoutTruncated = response.stdoutTruncated === true;
     const stderrTruncated = response.stderrTruncated === true;
 
-    return {
+    const out: BashOutput = {
       stdout: response.stdout,
       stderr: response.stderr,
       exit_code: response.exitCode,
@@ -238,6 +296,13 @@ export const bashTool: Tool<BashInput, BashOutput> = {
       timed_out: false,
       truncated: stdoutTruncated || stderrTruncated,
     };
+    // Annotate (never remediate) a sandbox-caused failure so the model/operator
+    // sees the lever instead of an opaque EROFS / unreachable-network error.
+    if (response.exitCode !== 0) {
+      const hint = classifySandboxDenial(response.stderr, ctx.sandboxProfile);
+      if (hint !== undefined) out.sandbox_hint = hint;
+    }
+    return out;
   },
 };
 

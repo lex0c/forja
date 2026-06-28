@@ -6,16 +6,28 @@ import {
 } from '../../src/permissions/sandbox-cache-dirs.ts';
 
 describe('DEFAULT_WRITABLE_CACHE_DIRS', () => {
-  test('covers go-build/go-modules/npm/pip, all home-relative; excludes .cargo', () => {
-    expect(DEFAULT_WRITABLE_CACHE_DIRS).toEqual(['.cache', 'go/pkg/mod', '.npm']);
+  test('covers go/npm/pip/.NET/cargo/ruby caches, all home-relative; blanket .cargo + .rustup excluded', () => {
+    expect(DEFAULT_WRITABLE_CACHE_DIRS).toEqual([
+      '.cache',
+      'go/pkg/mod',
+      '.npm',
+      '.nuget/packages',
+      '.local/share/NuGet',
+      '.dotnet',
+      '.cargo/registry',
+      '.gem',
+      '.bundle',
+    ]);
     for (const dir of DEFAULT_WRITABLE_CACHE_DIRS) {
       expect(dir.startsWith('/')).toBe(false);
       expect(dir.includes('..')).toBe(false);
     }
-    // `.cargo` is deliberately NOT in the default: a tmpfs over ~/.cargo
-    // masks ~/.cargo/bin/cargo (the rustup shim) so the wrap can't exec
-    // cargo, and ~/.rustup is already in HIDE_PATHS_DIRS.
+    // The cargo carve-out is SCOPED to the registry subdir so ~/.cargo/bin/cargo
+    // (the rustup shim) stays execable: blanket `.cargo` would mask it.
+    expect(DEFAULT_WRITABLE_CACHE_DIRS).toContain('.cargo/registry');
     expect(DEFAULT_WRITABLE_CACHE_DIRS).not.toContain('.cargo');
+    // `~/.rustup` stays masked via HIDE_PATHS_DIRS — never a writable cache dir.
+    expect(DEFAULT_WRITABLE_CACHE_DIRS).not.toContain('.rustup');
   });
 });
 

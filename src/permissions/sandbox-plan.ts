@@ -119,6 +119,13 @@ export interface SelectSandboxProfileOptions {
   // the policy would otherwise allow it. Defense against accidental
   // passthrough.
   hostExplicitlyAllowed: boolean;
+  // Coarse network posture from `[sandbox] network` (default off). When true,
+  // an `exec:arbitrary` call is floored to `cwd-rw-net` (it additionally
+  // requires `net-egress`) so unmodeled toolchains can fetch dependencies.
+  // Egress is an operator-level axis, never inferred from the binary name.
+  // Omitted/false ⇒ off (unbounded exec stays `cwd-rw`, no network). See
+  // PERMISSION_ENGINE.md §6.5.
+  networkAllowed?: boolean;
 }
 
 export type SelectSandboxProfileResult =
@@ -133,10 +140,44 @@ export type SelectSandboxProfileResult =
 export const selectSandboxProfile = (
   options: SelectSandboxProfileOptions,
 ): SelectSandboxProfileResult => {
+  // Resolver-honest required kinds — EXACTLY what the capabilities carry. This
+  // set drives the refuse `uncovered` report (audit-facing), so it must reflect
+  // only the resolver's attribution, never the floor below.
   const requiredKinds = new Set<CapabilityKind>();
   for (const cap of options.capabilities) {
     requiredKinds.add(cap.kind);
   }
+
+  // Floor for unbounded exec. A capability that runs arbitrary program code
+  // (`exec:arbitrary` — an unmodeled binary, `sed`/`awk` classified by-effect,
+  // `find -exec` with an arbitrary inner, the `git` pager escape hatch, or a
+  // `python`/`node`/`ruby`/`perl` SCRIPT via cmdInterpreter) can, by
+  // definition, write its own working directory. Without this floor the call
+  // carries only `{exec, read-fs}` → the selector picks `ro` (whole FS
+  // read-only) and EVERY legitimate build/codegen/test write fails with EROFS
+  // ("read-only file system") — the exact bug that made `go build` /
+  // `dotnet build` / `./local-tool` unusable. Requiring `write-fs` prunes `ro`
+  // (it lacks write-fs) and lands `cwd-rw`.
+  //
+  // Keyed on scope `arbitrary` specifically: the `python`/`node` exec scopes
+  // exist in the union but have no emitter today (interpreters emit
+  // `exec:arbitrary`), so `arbitrary` is the sufficient and future-proof
+  // discriminator. `exec:shell` (the baseline every bash pipeline carries) and
+  // read-only commands do NOT trip the floor, so pure reads stay `ro`.
+  const hasUnboundedExec = options.capabilities.some(
+    (cap) => cap.kind === 'exec' && cap.scope === 'arbitrary',
+  );
+
+  // SELECTION set — `requiredKinds` plus the floor's `write-fs`. Kept SEPARATE
+  // from `requiredKinds` so the floor raises the chosen PROFILE WITHOUT leaking
+  // into the audit-facing `uncovered` report or anything derived from it; the
+  // resolved capability set the engine scores/envelope-gates is also untouched
+  // (PERMISSION_ENGINE.md §6.5). `write-fs` alone never makes a set
+  // unsatisfiable (cwd-rw covers it), so adding it here can never CAUSE a
+  // refuse — a refuse is always driven by a resolver-attributed kind.
+  const selectionKinds = hasUnboundedExec
+    ? new Set<CapabilityKind>([...requiredKinds, 'write-fs'])
+    : requiredKinds;
 
   // `host` needs an explicit operator flag AND a host-passthrough
   // capability in the resolved set. Either missing prunes host
@@ -151,7 +192,7 @@ export const selectSandboxProfile = (
     if (profile === 'host' && !hostEligible) continue;
     const allowed = PROFILE_ALLOWED_CAPABILITIES[profile];
     let covers = true;
-    for (const kind of requiredKinds) {
+    for (const kind of selectionKinds) {
       if (!allowed.has(kind)) {
         covers = false;
         break;
@@ -161,10 +202,10 @@ export const selectSandboxProfile = (
   }
 
   if (candidates.length === 0) {
-    // Surface every kind nothing covered (under the gated host
-    // rules) so the audit row carries actionable detail. We treat
-    // `requiredKinds` as the uncovered set when the ENTIRE plan
-    // refuses — every kind contributed to at least one rejection.
+    // Surface every kind nothing covered (under the gated host rules) so the
+    // audit row carries actionable detail. Reports `requiredKinds` (the
+    // resolver-honest set) — NOT the floored `selectionKinds` — so the audit
+    // names only what the binary actually requested.
     return {
       kind: 'refuse',
       reason: 'no_viable_sandbox',
@@ -181,5 +222,21 @@ export const selectSandboxProfile = (
   // from a left-to-right walk of the order, so finalists[0] is
   // the most restrictive viable choice.
   const chosen = finalists[0] as SandboxProfile;
+
+  // Coarse network posture — a POST-selection bump, never a required kind.
+  // Egress is an OPERATOR decision (`[sandbox] network = on`, default off),
+  // never inferred per-binary. When the operator opted in AND an unbounded-exec
+  // call landed `cwd-rw`, upgrade it to `cwd-rw-net` so any toolchain
+  // (go/dotnet/composer/cargo/gem/…) can fetch deps without a per-language
+  // table. Doing this as a bump (instead of adding `net-egress` to the required
+  // set) means the posture can NEVER turn a viable plan into a refuse: an
+  // `exec:arbitrary + secret-access` call stays `home-rw` (no net) rather than
+  // refusing on the unsatisfiable {secret-access, net-egress} combo — enabling
+  // the network must not deny a command. `cwd-rw-net` ⊇ `cwd-rw`, so the bump
+  // is always valid. Modeled dep-managers (npm/pip/cargo) emit `net-egress`
+  // themselves and already land `cwd-rw-net` regardless of this posture.
+  if (hasUnboundedExec && options.networkAllowed === true && chosen === 'cwd-rw') {
+    return { kind: 'ok', profile: 'cwd-rw-net' };
+  }
   return { kind: 'ok', profile: chosen };
 };

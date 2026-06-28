@@ -210,6 +210,98 @@ describe('selectSandboxProfile — tie-break order', () => {
   });
 });
 
+describe('selectSandboxProfile — exec:arbitrary floor + network posture', () => {
+  // The bug: an unmodeled binary resolves to exec:arbitrary (+ read-fs:cwd)
+  // with no write-fs; without the floor the selector picks `ro` and every
+  // write hits EROFS. The floor requires write-fs for exec:arbitrary → cwd-rw.
+  test('exec:arbitrary alone is floored to cwd-rw (never ro)', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('exec:arbitrary'),
+      hostExplicitlyAllowed: false,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw');
+  });
+
+  test('exec:arbitrary + read-fs:cwd (the real unmodeled-binary shape) → cwd-rw', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('exec:arbitrary', 'read-fs:.'),
+      hostExplicitlyAllowed: false,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw');
+  });
+
+  test('exec:arbitrary + networkAllowed → cwd-rw-net (deps can be fetched)', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('exec:arbitrary', 'read-fs:.'),
+      hostExplicitlyAllowed: false,
+      networkAllowed: true,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw-net');
+  });
+
+  test('exec:arbitrary + networkAllowed:false stays cwd-rw (default offline)', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('exec:arbitrary'),
+      hostExplicitlyAllowed: false,
+      networkAllowed: false,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw');
+  });
+
+  // Negative cases — the floor and the posture are scoped to exec:arbitrary.
+  test('exec:shell does NOT trip the floor — stays ro even with networkAllowed', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('exec:shell'),
+      hostExplicitlyAllowed: false,
+      networkAllowed: true,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('ro');
+  });
+
+  test('networkAllowed alone does NOT grant net to a pure read (no unbounded exec)', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('read-fs:/etc/hosts'),
+      hostExplicitlyAllowed: false,
+      networkAllowed: true,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('ro');
+  });
+
+  // The network posture is a POST-selection bump, never a required kind — so
+  // turning it on must NEVER turn a viable plan into a refuse. exec:arbitrary +
+  // secret-access (needs home-rw) + networkAllowed stays home-rw (no net),
+  // instead of refusing on the unsatisfiable {secret-access, net-egress} combo.
+  test('exec:arbitrary + secret-access + networkAllowed → home-rw (network never denies)', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('exec:arbitrary', 'secret-access:~/.config/forja'),
+      hostExplicitlyAllowed: false,
+      networkAllowed: true,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('home-rw');
+  });
+
+  // The refuse `uncovered` report is resolver-honest: the floor's synthetic
+  // write-fs must NOT appear (it raises the profile, not the audited set).
+  test('refuse uncovered list excludes the floor-injected write-fs', () => {
+    const r = selectSandboxProfile({
+      capabilities: caps('exec:arbitrary', 'host-passthrough'),
+      hostExplicitlyAllowed: false, // host pruned (no flag) → refuse
+    });
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.uncovered).toEqual(['exec', 'host-passthrough']);
+      expect(r.uncovered).not.toContain('write-fs');
+    }
+  });
+});
+
 describe('selectSandboxProfile — uncovered list', () => {
   test('uncovered names every kind in the requested set on refusal', () => {
     const r = selectSandboxProfile({

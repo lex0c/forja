@@ -266,3 +266,99 @@ describe('bashTool', () => {
     expect(out.error_code).toBe('tool.invalid_arg');
   });
 });
+
+describe('bashTool — sandbox_hint diagnosis', () => {
+  test('EROFS under ro profile → accurate hint (no false "write inside cwd" advice)', async () => {
+    const out = await bashTool.execute(
+      { command: 'echo "open out.txt: read-only file system" >&2 && exit 1' },
+      makeCtx({ cwd: dir, sandboxProfile: 'ro' }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.sandbox_hint).toBeDefined();
+    expect(out.sandbox_hint).toContain('no write capability');
+    // Under 'ro' the cwd is ALSO read-only — the hint must NOT advise writing there.
+    expect(out.sandbox_hint).not.toContain('working directory');
+  });
+
+  test('EROFS under home-rw → hint names $HOME as the writable area (not cwd)', async () => {
+    const out = await bashTool.execute(
+      { command: 'echo "/etc/x: read-only file system" >&2 && exit 1' },
+      makeCtx({ cwd: dir, sandboxProfile: 'home-rw' }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.sandbox_hint).toContain('$HOME');
+    expect(out.sandbox_hint).not.toContain('working directory');
+  });
+
+  test('network error under ro → NO hint (network=on does not change ro)', async () => {
+    const out = await bashTool.execute(
+      { command: 'echo "Could not resolve host: proxy.golang.org" >&2 && exit 1' },
+      makeCtx({ cwd: dir, sandboxProfile: 'ro' }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.sandbox_hint).toBeUndefined();
+  });
+
+  test('network error under home-rw → NO hint (the toggle only upgrades cwd-rw)', async () => {
+    const out = await bashTool.execute(
+      { command: 'echo "network is unreachable" >&2 && exit 1' },
+      makeCtx({ cwd: dir, sandboxProfile: 'home-rw' }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.sandbox_hint).toBeUndefined();
+  });
+
+  test('EROFS under cwd-rw → hint points at write OUTSIDE the working directory', async () => {
+    const out = await bashTool.execute(
+      { command: 'echo "/etc/x: read-only file system" >&2 && exit 1' },
+      makeCtx({ cwd: dir, sandboxProfile: 'cwd-rw' }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.sandbox_hint).toContain('OUTSIDE');
+  });
+
+  test('blocked DNS under cwd-rw → hint points at [sandbox] network = on', async () => {
+    const out = await bashTool.execute(
+      { command: 'echo "Could not resolve host: proxy.golang.org" >&2 && exit 1' },
+      makeCtx({ cwd: dir, sandboxProfile: 'cwd-rw' }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.sandbox_hint).toContain('network = "on"');
+  });
+
+  test('network error under cwd-rw-net → NO hint (profile already has egress)', async () => {
+    const out = await bashTool.execute(
+      { command: 'echo "network is unreachable" >&2 && exit 1' },
+      makeCtx({ cwd: dir, sandboxProfile: 'cwd-rw-net' }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.sandbox_hint).toBeUndefined();
+  });
+
+  test('EROFS text but exit 0 → NO hint (only non-zero exits are diagnosed)', async () => {
+    const out = await bashTool.execute(
+      { command: 'echo "read-only file system" >&2' },
+      makeCtx({ cwd: dir, sandboxProfile: 'ro' }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.sandbox_hint).toBeUndefined();
+  });
+
+  test('unsandboxed run (no profile) → NO hint even on EROFS text', async () => {
+    const out = await bashTool.execute(
+      { command: 'echo "read-only file system" >&2 && exit 1' },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.sandbox_hint).toBeUndefined();
+  });
+
+  test('ordinary failure (no denial signature) under ro → NO hint', async () => {
+    const out = await bashTool.execute(
+      { command: 'echo "some normal error" >&2 && exit 2' },
+      makeCtx({ cwd: dir, sandboxProfile: 'ro' }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.sandbox_hint).toBeUndefined();
+  });
+});

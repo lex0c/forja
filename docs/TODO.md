@@ -9,6 +9,64 @@ artifacts move to `docs/BACKLOG.md` and the entry here is trimmed.
 
 ---
 
+# ACTIVE — `feat/sandbox-dev-toolchains`
+
+**Branch off `develop`.** Goal: make the sandbox a usable dev environment for any language, **agnostically** — no per-language capability hardcode. Root cause: an unmodeled binary (`go`, `dotnet`, `composer`, `./user-bin`, `python script.py`) resolves to `exec('arbitrary')` with **no `write-fs`**; `selectSandboxProfile` then picks the most-restrictive `ro` (whole FS read-only) and every write fails with EROFS (`read-only file system`). `touch` works in the same dir because it's modeled (`write-fs` → `cwd-rw`) — the profile is per-command. Production-ready: planner + config + cache + diagnosis + tests + spec.
+
+**Design decision (agnostic, validated):** capabilities stay agnostic — `exec:arbitrary` ⇒ `cwd-rw` floor + a coarse operator network posture — **never** a per-tool capability table (whack-a-mole; never covers the user's own binary; maintenance treadmill). Hardcoding a capability for an arbitrary binary is an *assumption*, not a *measurement* — against "measure twice, cut once". Fine-grained resolution stays where effects are knowable (coreutils, git). Cache LOCATIONS extend the existing finite holdout list (not capability hardcode). This is the model Codex (`sandbox_mode=workspace-write` + `network_access`) and peers converge on.
+
+Order: Slice 0 (spec PR — must precede code) → Slice 1 (floor + cache; fixes the bug + offline dev) → Slice 2 (network posture; deps install) → Slice 3 (denial diagnosis).
+
+## Slice 0 — Spec PR (must precede code; CLAUDE.md)
+
+| Task | Status | Description |
+|---|---|---|
+| **T0.1** | ✅ | `docs/spec/PERMISSION_ENGINE.md` — §6.5 sandbox plan: documented the **`exec:arbitrary` → `cwd-rw` floor** + coarse `[sandbox] network` posture; updated the §5.2 Conservative-fallback block (`exec:shell`→`exec:arbitrary`, write-fs via floor not resolved cap, net-egress only under posture). |
+| **T0.2** | ✅ | `docs/spec/SECURITY_GUIDELINE.md` §8.1 + `docs/spec/AGENTIC_CLI.md` §9.2: documented `[sandbox] network` (`off`\|`on`, default `off`) + the floor. PT-BR (spec exception). |
+
+**Acceptance:** spec describes the floor + network posture before any code lands.
+
+## Slice 1 — `exec:arbitrary` floor + cache gaps (fixes the bug + all offline dev)
+
+| Task | Status | Description |
+|---|---|---|
+| **T1.1** | ✅ | `src/permissions/sandbox-plan.ts` — in `selectSandboxProfile`, after building `requiredKinds`: if any cap is `exec` with `scope === 'arbitrary'`, `requiredKinds.add('write-fs')` (prunes `ro` → `cwd-rw`). Add `networkAllowed?: boolean` to `SelectSandboxProfileOptions` (consumed in Slice 2). Keying on scope `arbitrary` keeps `exec:shell → ro` green (baseline of every pipeline; no over-grant to pure reads). Covers python/node/ruby/perl scripts too (`cmdInterpreter` emits `exec('arbitrary')`). |
+| **T1.2** | ✅ | `src/permissions/sandbox-cache-dirs.ts` — extend `DEFAULT_WRITABLE_CACHE_DIRS`: `.nuget/packages`, `.local/share/NuGet`, `.dotnet`, `.cargo/registry`, `.gem`, `.bundle`. Existence-gated tmpfs (runner already implements). `.rustup` stays masked (rustup cargo blocked — documented). |
+| **T1.3** | ✅ | Tests: `tests/permissions/sandbox-plan.test.ts` (`exec:arbitrary → cwd-rw`); conformance `tests/conformance/cases/sandbox_select.yaml` case; cache-dirs default-list test. |
+
+**Acceptance:** `go build`/`go test` (cached deps), `dotnet build` offline, `tsc`, `gcc`/`clang`/`cmake`, `python script.py`, `./user-bin` all write to cwd + cache. Original bug closed for offline builds. `exec:shell`/reads still `ro`.
+
+## Slice 2 — coarse `[sandbox] network` posture (deps install, agnostic)
+
+| Task | Status | Description |
+|---|---|---|
+| **T2.1** | ✅ | `src/config/loaders.ts` — `SandboxConfigKeys.network?: 'off'\|'on'`; `DEFAULT_NETWORK = 'off'`; parse/validate in `parseSandboxLayer`; project-wins resolution in `loadSandboxConfig`. |
+| **T2.2** | ✅ | Thread `networkAllowed` through the planner (NOT a runner global — so `decision.sandboxProfile` reflects reality): `EngineOptions.sandbox.networkAllowed` (`engine.ts`), passed at the `selectSandboxProfile` call (L2171); built in `bootstrap.ts` (`sandboxLoaded.config.network === 'on'`, beside `hostExplicitlyAllowed` ~L845). Floor extension: `hasUnboundedExec && networkAllowed` → `requiredKinds.add('net-egress')` → `cwd-rw-net`. **Finding:** subagents (`subagent-child.ts`) do NOT run the engine sandbox-plan stage (their `createPermissionEngine` passes no `sandbox` option), so the floor/posture reach the **main session only** today — parity is N/A until subagents gain the planner stage (see Deferred). |
+| **T2.3** | ✅ | Tests: `exec:arbitrary + networkAllowed → cwd-rw-net`; `…+ false → cwd-rw`; loaders parse (valid/invalid/default/project-wins). |
+
+**Acceptance:** with `[sandbox] network = "on"` in a project `.forja/config.toml`, `go mod download` / `dotnet restore` / `composer install` / `cargo build` (fetch) / `gem install` all reach the network — no per-language code. Confirm still fires (exec:arbitrary is conservative). Caveat (documented): granted egress = full inherited network (no per-host kernel filter today).
+
+## Slice 3 — sandbox-denial diagnosis (light, non-invasive)
+
+| Task | Status | Description |
+|---|---|---|
+| **T3.1** | ✅ | `src/tools/builtin/bash.ts` — when `exit_code !== 0`, `ctx.sandboxProfile` is restrictive (`ro`/`cwd-rw`), and stderr matches a denial signature (EROFS `/read-only file system/i`; network `/network is unreachable\|could not resolve host\|temporary failure in name resolution\|getaddrinfo\|name or service not known/i`), set a new optional `sandbox_hint?: string` on `BashOutput` pointing to the lever (write target outside cwd, or set `[sandbox] network = on`). No re-run, no re-confirm. |
+| **T3.2** | ✅ | Tests: hint classification (EROFS, network, none when profile already has net). |
+
+**Acceptance:** an opaque EROFS/network failure carries an actionable `sandbox_hint`. Honors "measure twice" (diagnosis, not speculative cut).
+
+**Deferred (not this branch):** escalation-on-failure (re-run with a wider profile) — net-new on 3 fronts (runtime-denial detection, post-execution interception, re-confirm-with-mutable-profile) and inverts core invariants (confirm is pre-execution; profile is decided once, immutable; the loop never intercepts a tool failure). Would need a `docs/spec/STATE_MACHINE.md` change. Also deferred: per-host egress allowlist (proxy/nftables); per-language dep-manager capability tables (explicit non-goal); **subagent sandbox-plan** (children don't run `selectSandboxProfile` today — the floor + network posture reach the main session only; bringing subagents under the planner is a separate slice).
+
+**Review hardening (post-implementation `/code-review`, max effort).** Six findings, all in this diff, all fixed:
+- 🔴 **Trust gate:** `[sandbox] network = on` resolves project-wins → a cloned hostile repo could self-enable egress. Now gated on `isCwdTrusted` (bootstrap.ts) — opt-in **AND** trusted dir. Tests in `tests/cli/bootstrap.test.ts`.
+- 🟠 **Network never denies:** the net posture is now a POST-selection bump (`cwd-rw`→`cwd-rw-net`), not a required `net-egress` kind — so `network=on` can't turn a viable `exec:arbitrary + secret-access` plan into a refuse (stays `home-rw`). Refuse `uncovered` now reports the resolver-honest set (no floor-injected `write-fs`). `sandbox-plan.ts`.
+- 🟠 **Accurate hints:** `classifySandboxDenial` messages are per-profile (no false "write in cwd" for `ro`; `$HOME` for `home-rw`); network hint suggested only for `cwd-rw` (the profile the toggle actually upgrades). `bash.ts`.
+- 🟡 **No regex in the sandbox-denial path** (CLAUDE.md): regexes replaced with lower-cased `.includes()` substring markers; removed the `SANDBOX_NETWORKED_PROFILES` second-source-of-truth. `bash.ts`.
+
+Cross-file finder found **zero** consumer/call-site regressions. Verification: typecheck + lint clean; ~4800 tests green (permissions/config/conformance/tools/cli).
+
+---
+
 # ACTIVE — `feat/memory-lifecycle-detectors`
 
 **Branch off `feat/retrieval`.** Goal: close the four automatic detectors spec'd in `docs/spec/MEMORY.md §6.5.2` and `docs/spec/EVICTION.md §5.1` — `verify_failed`, `user_override_repeated`, `conflict_detected`, `trust_revoked` — plus the upstream infrastructure they depend on. Production-ready: substrate + detectors + operator surfaces + audit + tests + docs.

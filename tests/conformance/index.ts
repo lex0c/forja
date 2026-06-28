@@ -143,6 +143,9 @@ export interface ConformanceCase {
     // Same engine-bypass pattern as intersection cases.
     sandbox_capabilities?: readonly string[];
     host_explicitly_allowed?: boolean;
+    // Coarse network posture (`[sandbox] network = on`). When true, an
+    // exec:arbitrary call is floored to cwd-rw-net (egress). Default false.
+    network_allowed?: boolean;
     // §7.2 hash chain cases (slice 33). When `audit_events` is
     // present, the case seeds an in-memory bun:sqlite-backed audit
     // sink with the listed emits, optionally applies `audit_tamper`
@@ -340,6 +343,7 @@ const runSandboxSelectCase = (c: ConformanceCase): CaseRunResult => {
   const result = selectSandboxProfile({
     capabilities,
     hostExplicitlyAllowed: c.setup.host_explicitly_allowed ?? false,
+    networkAllowed: c.setup.network_allowed ?? false,
   });
   if (c.expect.sandbox_profile !== undefined) {
     if (result.kind !== 'ok') {

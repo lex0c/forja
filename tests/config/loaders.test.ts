@@ -1414,3 +1414,85 @@ describe('loadSandboxConfig — [sandbox] cache_persistence + shared_tmp', () =>
     }
   });
 });
+
+describe('loadSandboxConfig — [sandbox] network', () => {
+  const writeProject = (cwd: string, toml: string): void => {
+    mkdirSync(join(cwd, '.forja'), { recursive: true });
+    writeFileSync(join(cwd, '.forja', 'config.toml'), toml);
+  };
+
+  test('absent → undefined (consumers apply DEFAULT_NETWORK = off), no warnings', () => {
+    const cwd = makeTempCwd();
+    try {
+      const r = loadSandboxConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.network).toBeUndefined();
+      expect(r.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('network = "on" is parsed', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProject(cwd, '[sandbox]\nnetwork = "on"\n');
+      const r = loadSandboxConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.network).toBe('on');
+      expect(r.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('network = "off" is preserved (explicit off, not collapsed)', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProject(cwd, '[sandbox]\nnetwork = "off"\n');
+      const r = loadSandboxConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.network).toBe('off');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('invalid value → ignored with warning (stays undefined → off)', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProject(cwd, '[sandbox]\nnetwork = "yes"\n');
+      const r = loadSandboxConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.network).toBeUndefined();
+      expect(r.warnings.length).toBe(1);
+      expect(r.warnings[0]).toContain('network');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('non-string (boolean) → ignored with warning', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProject(cwd, '[sandbox]\nnetwork = true\n');
+      const r = loadSandboxConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.network).toBeUndefined();
+      expect(r.warnings.length).toBe(1);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  // Project-wins + tri-state: an explicit project `off` beats a user `on`.
+  test('project explicit off beats user on', () => {
+    const home = mkdtempSync(join(tmpdir(), 'forja-sbx-net-home-'));
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(home, '.config', 'forja'), { recursive: true });
+      writeFileSync(join(home, '.config', 'forja', 'config.toml'), '[sandbox]\nnetwork = "on"\n');
+      writeProject(cwd, '[sandbox]\nnetwork = "off"\n');
+      const r = loadSandboxConfig({ cwd, env: { HOME: home } });
+      expect(r.config.network).toBe('off');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});

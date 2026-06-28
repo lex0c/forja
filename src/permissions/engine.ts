@@ -240,6 +240,11 @@ export interface EngineOptions {
     hostExplicitlyAllowed: boolean;
     required: boolean;
     emitHostPassthrough?: boolean;
+    // Coarse network posture (`[sandbox] network = on`). Threaded from
+    // bootstrap; when true an `exec:arbitrary` call is floored to cwd-rw-net
+    // so unmodeled toolchains can fetch deps. Default off. Planner-scoped:
+    // does not touch `resolvedCapabilities`. See sandbox-plan.ts.
+    networkAllowed?: boolean;
   };
   // Optional grants snapshot provider. Engine calls
   // `listActive(Date.now())` on each `check()` so long-running
@@ -2171,6 +2176,10 @@ export const createPermissionEngine = (
       const planResult = selectSandboxProfile({
         capabilities: planCapabilities,
         hostExplicitlyAllowed: sandboxOptions.hostExplicitlyAllowed,
+        // exactOptionalPropertyTypes: only forward when set (undefined ⇒ off).
+        ...(sandboxOptions.networkAllowed !== undefined
+          ? { networkAllowed: sandboxOptions.networkAllowed }
+          : {}),
       });
       sandboxStage = sandboxPlanStageEntry(planResult);
       if (planResult.kind === 'refuse') {

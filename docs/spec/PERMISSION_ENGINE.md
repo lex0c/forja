@@ -306,14 +306,14 @@ Conservative fallback (cmd desconhecido):
 ```
 Conservative {
   capabilities: [
-    exec:shell,
+    exec:arbitrary,           # binário não-modelado roda código não-limitado (não exec:shell — envelope que libera bash não cobre arbitrário)
     read-fs(<cwd>/**),
-    write-fs(<cwd>/**),
-    net-egress(*)             # se policy permite egress
   ],
   reason: "unknown_command:" + cmd
 }
 ```
+
+O cwd gravável vem do **floor `exec:arbitrary`** do sandbox plan (§6.5) — `exec:arbitrary` eleva o PROFILE para `cwd-rw`, sem injetar `write-fs` no conjunto resolvido (a auditoria reflete o que o resolver determinou). `net-egress` NÃO é emitido aqui; egress só quando o operador liga `[sandbox] network = on` (§6.5), que sobe o profile pra `cwd-rw-net`.
 
 Conservative força `confirm` (score component +0.15 por unknown_command). User pode aprovar uma vez ou registrar resolver custom.
 
@@ -663,6 +663,10 @@ if `host` ∈ candidates and other ∈ candidates:
 order = [ro, cwd-rw, cwd-rw-net, home-rw, host]
 return first profile in order from candidates
 ```
+
+**Floor `exec:arbitrary` (piso de escrita).** Antes do tie-break, se houver `exec:arbitrary` nos `resolved_caps` (binário não-modelado; `sed`/`awk` por efeito; `find -exec` arbitrário; pager do `git`; scripts `python`/`node`/`ruby`/`perl` via `cmdInterpreter`), a SELEÇÃO de profile passa a exigir `write-fs` — o que **poda `ro`** e aterrissa em `cwd-rw`. Razão: um processo que roda código não-limitado pode, por definição, escrever no próprio diretório de trabalho; mapeá-lo pro `ro` (fs inteiro read-only) garante EROFS em qualquer build/codegen/test legítimo. O `write-fs` do piso vive num conjunto de SELEÇÃO separado do `requiredKinds` resolvido: não entra no conjunto resolvido (score/envelope) NEM no `uncovered` reportado num refuse (que reflete só o que o resolver pediu) — o piso eleva o PROFILE, nunca a auditoria. E `write-fs` sozinho nunca torna um conjunto insatisfatível (cwd-rw o cobre), então o piso jamais CAUSA um refuse. `exec:shell` (baseline de toda pipeline) e comandos read-only NÃO disparam o piso, então leituras puras seguem `ro` (least-privilege preservado). Alinha com o "Conservative fallback" de §5.2, que já documenta cwd gravável para cmd desconhecido.
+
+**Postura de rede grossa `[sandbox] network` (off|on, default off).** Egress NÃO é inferido por binário — é decisão do operador. Quando ligado, um **bump pós-seleção** eleva `cwd-rw` → `cwd-rw-net` para chamadas com `exec:arbitrary` (NÃO é um `net-egress` exigido: por ser bump, NUNCA transforma um plano viável em refuse — um `exec:arbitrary + secret-access` continua `home-rw` sem rede em vez de negar; ligar a rede jamais nega um comando). Assim qualquer toolchain (go/dotnet/composer/cargo/gem/…) baixa dependências sem código por-linguagem, e a auditoria reflete a realidade (`cwd-rw-net`). **Requer trust:** o valor resolve project-wins, então `[sandbox] network = on` só vale se o cwd estiver TRUSTED — um repo clonado não-confiável NÃO auto-habilita egress (defesa em profundidade: opt-in do operador **E** diretório confiável; §9 SECURITY_GUIDELINE). Default `off`: builds offline rodam em `cwd-rw`. Os dep-managers já modelados (`npm`/`pip`/`cargo`) seguem emitindo `net-egress` por conta própria (independem da postura). O confirm continua disparando (`exec:arbitrary` é Conservative). Caveat: egress concedido = rede inteira herdada do pai (`cwd-rw-net` omite `unshare-net`); não há filtro por-host no kernel — o allowlist das caps serve pro confirm/score/auditoria. Filtro real (proxy/nftables) é evolução futura.
 
 `host` exige flag explícito do user **e** capability `host-passthrough` allowed em policy. Sem ambos → deny mesmo se outras condições baterem.
 

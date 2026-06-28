@@ -81,6 +81,11 @@ export interface BootstrapPermissionEngineInput {
     // (`hostExplicitlyAllowed`) is ALSO set. Sourced from the operator's
     // `--i-know-what-im-doing` opt-in. Default off ⇒ `host` stays pruned.
     emitHostPassthrough?: boolean;
+    // Coarse network posture (`[sandbox] network = on`, project-wins, default
+    // off). Forwarded verbatim into EngineOptions.sandbox; the planner floors
+    // an `exec:arbitrary` call to cwd-rw-net when true so any unmodeled
+    // toolchain can fetch deps. See PERMISSION_ENGINE.md §6.5.
+    networkAllowed?: boolean;
     // Resolver's trust marker so bootstrap can emit a
     // `sandbox.path_resolved` failure_event when the sandbox tool
     // was resolved via $PATH (non-canonical install). Optional for

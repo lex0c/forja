@@ -14,6 +14,10 @@
 #                                                        home-rw
 #   B. Host gate                                   (2)   eligible +
 #                                                        blocked
+#   C. exec:arbitrary floor + net posture          (2)   unmodeled binary
+#                                                        → cwd-rw (offline);
+#                                                        cwd-rw-net when
+#                                                        network_allowed
 #
 # Together these pin: (1) the per-kind capability table that decides
 # what each profile covers, (2) the tie-break order (most restrictive
@@ -106,3 +110,34 @@
     sandbox_uncovered:
       - "host-passthrough"
       - "read-fs"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group C — exec:arbitrary floor (unmodeled binary is never `ro`)
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "sandbox select: exec:arbitrary is floored to cwd-rw (unmodeled binary, never ro)"
+  setup:
+    # An unmodeled binary (go/dotnet/./local-tool) resolves to exec:arbitrary
+    # (+ read-fs:cwd) with NO write-fs. The set {exec, read-fs} alone would
+    # pick `ro` and every legitimate build/codegen write would EROFS. The
+    # exec:arbitrary floor requires write-fs → `ro` is pruned, cwd-rw wins.
+    # (PERMISSION_ENGINE.md §6.5; net-egress posture covered in unit tests.)
+    sandbox_capabilities:
+      - "exec:arbitrary"
+      - "read-fs:."
+  expect:
+    sandbox_profile: "cwd-rw"
+
+- name: "sandbox select: exec:arbitrary + network_allowed → cwd-rw-net (deps fetchable)"
+  setup:
+    # Coarse operator posture `[sandbox] network = on` (threaded as
+    # network_allowed). The exec:arbitrary floor then also requires net-egress,
+    # so the selector lands cwd-rw-net — any toolchain (go/dotnet/composer/…)
+    # can fetch deps without a per-language capability table. Egress is an
+    # operator axis, never inferred per-binary. (PERMISSION_ENGINE.md §6.5.)
+    sandbox_capabilities:
+      - "exec:arbitrary"
+      - "read-fs:."
+    network_allowed: true
+  expect:
+    sandbox_profile: "cwd-rw-net"

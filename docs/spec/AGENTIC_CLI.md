@@ -1475,6 +1475,8 @@ Sandbox é opcional no v1 (flag `--sandbox`), default no v2.
 
 **Persistência (default ON).** Por decisão do operador, dois carve-outs vêm LIGADOS por default (opt-out via `[sandbox] … = false`), trocando efemeridade por reuso sem tocar o host: `cache_persistence` (cache de deps num diretório dedicado `~/.cache/forja/cache`, redirecionado via `XDG_CACHE_HOME` catch-all + env vars dos toolchains não-XDG; recuperável com `agent cache clear`) e `shared_tmp` (`/tmp` persistente por sessão). Detalhe + invariante de ordem em `SECURITY_GUIDELINE.md §8.1`.
 
+**Rede (`[sandbox] network`, default off).** Egress é postura grossa do operador, não inferência por binário: `network = on` (project-wins, **gated por trust do cwd** — repo não-confiável não auto-habilita egress) eleva chamadas de binário não-modelado (`exec:arbitrary`) a `cwd-rw-net` pra instalar deps de qualquer linguagem; default `off` mantém builds offline em `cwd-rw`. Binário não-modelado nunca cai em `ro` — o planner aplica um floor `cwd-rw` (escreve no cwd), senão qualquer build/codegen legítimo daria EROFS. Detalhe em `PERMISSION_ENGINE.md §6.5` / `SECURITY_GUIDELINE.md §8.1`.
+
 ### 9.3 Output sanitization
 
 Output de tools que vai pro contexto passa por filtro:

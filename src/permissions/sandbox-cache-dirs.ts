@@ -53,14 +53,18 @@
 //     every credential overlay wins over a cache dir — a cache entry
 //     can never UN-mask a hidden credential.
 //
-// NOT in the default set:
-//   - `.cargo` — masking all of `~/.cargo` with a tmpfs hides
-//     `~/.cargo/bin/cargo` itself (the rustup shim lives there), so the
-//     wrap can't even exec cargo. And `~/.rustup` (the toolchain) is in
-//     HIDE_PATHS_DIRS, so rustup cargo is already blocked in the
-//     sandbox independent of caching. Rust needs its own treatment
-//     (a `.cargo/registry`-scoped carve-out + an `.rustup` exception);
-//     until then an operator can opt in via `writable_cache_dirs`.
+// Scoped, NOT blanket:
+//   - `.cargo/registry` (the dep cache) IS in the default set — masking only
+//     the registry subdir leaves `~/.cargo/bin/cargo` (the rustup shim) intact
+//     so the wrap can still exec cargo. The blanket `.cargo` is deliberately
+//     NOT here: a tmpfs over all of `~/.cargo` would hide that binary and
+//     break cargo entirely.
+//   - `~/.rustup` (the toolchain) stays masked via HIDE_PATHS_DIRS, so a
+//     rustup-managed cargo is still blocked in the sandbox independent of
+//     caching; a system-installed cargo works. Full rustup support is future
+//     work (would need an `.rustup` exception).
+//   - The blanket `.cargo` / other host-relative dirs can still be opted in
+//     via `[sandbox] writable_cache_dirs`.
 
 // Default carve-out: the mainstream caches whose REAL default location
 // (under the sandbox's clearenv, where GOCACHE/XDG_CACHE_HOME/etc. are
@@ -68,9 +72,15 @@
 // $HOME-relative paths. Operators override via `.forja/config.toml`
 // `[sandbox] writable_cache_dirs` (see `loadSandboxConfig`).
 export const DEFAULT_WRITABLE_CACHE_DIRS: readonly string[] = [
-  '.cache', // XDG cache: go-build (~/.cache/go-build), pip, uv, …
+  '.cache', // XDG cache: go-build (~/.cache/go-build), pip, uv, composer, …
   'go/pkg/mod', // Go module cache ($GOMODCACHE default, GOPATH=~/go)
   '.npm', // npm cache (~/.npm)
+  '.nuget/packages', // .NET / NuGet package cache (host default; not XDG)
+  '.local/share/NuGet', // NuGet v3 HTTP cache (host default; not XDG)
+  '.dotnet', // dotnet CLI first-run sentinel + telemetry (write here EROFSes otherwise)
+  '.cargo/registry', // cargo registry/dep cache — SUBDIR only (keeps ~/.cargo/bin intact)
+  '.gem', // RubyGems user gem dir / cache
+  '.bundle', // Bundler config + cache
 ];
 
 // Normalize ONE cache-dir entry to a clean `$HOME`-relative path, or

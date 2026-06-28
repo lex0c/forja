@@ -279,6 +279,67 @@ describe('bootstrap', () => {
     });
   });
 
+  // [sandbox] network = on must require a TRUSTED cwd: the value resolves
+  // project-wins, so without the trust gate a cloned hostile repo shipping
+  // `network = "on"` in its own .forja/config.toml would self-enable egress for
+  // every unmodeled binary (CLAUDE.md "Explicit trust").
+  describe('[sandbox] network posture gated by cwd trust', () => {
+    const availableSandbox = {
+      available: true as const,
+      tool: 'bwrap' as const,
+      path: '/usr/bin/bwrap',
+      trustLevel: 'canonical' as const,
+      reason: '',
+      trustWarnings: [] as readonly string[],
+    };
+    const writeNetworkOn = (): void => {
+      mkdirSync(join(workdir, '.forja'), { recursive: true });
+      writeFileSync(join(workdir, '.forja', 'config.toml'), '[sandbox]\nnetwork = "on"\n');
+    };
+
+    test('network=on + TRUSTED cwd → exec:arbitrary lands cwd-rw-net (deps fetchable)', async () => {
+      writeNetworkOn();
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      expect(config.isCwdTrusted).toBe(true);
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'go build' });
+      expect(d.sandboxProfile).toBe('cwd-rw-net');
+      db.close();
+    });
+
+    test('network=on + UNTRUSTED cwd → NO egress; exec:arbitrary stays cwd-rw', async () => {
+      writeNetworkOn();
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: ['/other/path'] }));
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      expect(config.isCwdTrusted).toBe(false);
+      // The hostile repo's own config.toml must NOT self-enable egress — the
+      // write floor still applies (cwd-rw) but the network bump does not fire.
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'go build' });
+      expect(d.sandboxProfile).toBe('cwd-rw');
+      db.close();
+    });
+  });
+
   test('honors --model override', async () => {
     const { modelId, db } = await bootstrap({
       prompt: 'hi',
