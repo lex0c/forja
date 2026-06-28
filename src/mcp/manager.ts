@@ -482,6 +482,16 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         servers.push({ name: server.name, state: rt.state, tools: rt.registeredNames.length });
       }
 
+      // AUDIT §1.5: an mcp_servers row is STATE — removed once the server leaves
+      // config. Sweep orphans here (the append-only-forever manifest history
+      // stays, so a re-added server re-uses its cached grant). Compared against
+      // ALL configured names (incl. disabled), so toggling `disabled` keeps the
+      // row.
+      const configNames = new Set(config.servers.map((s) => s.name));
+      for (const row of listServers(db)) {
+        if (!configNames.has(row.name)) deleteServer(db, row.name);
+      }
+
       return { registered, servers, warnings };
     },
 

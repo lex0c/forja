@@ -388,3 +388,50 @@ describe('McpManager: code-review hardening', () => {
     expect(fake.stats.lastConnectSignal).toBeInstanceOf(AbortSignal);
   });
 });
+
+describe('McpManager: stale-row sweep (AUDIT §1.5)', () => {
+  test('init removes mcp_servers rows for servers no longer in config (history survives)', async () => {
+    // A row + granted manifest from a prior session for a server now GONE.
+    insertServer(db, {
+      name: 'gone',
+      transport: 'stdio',
+      command: '["x"]',
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    seedTrusted(db, 'gone', [toolDef('q')]);
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]), // only 'db' is configured now
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(getServer(db, 'gone')).toBeNull(); // orphan STATE row swept
+    expect(latestTrustedManifest(db, 'gone')).not.toBeNull(); // history is forever
+    expect(getServer(db, 'db')).not.toBeNull(); // configured server kept
+  });
+
+  test('a disabled server keeps its row (still in config, just off)', async () => {
+    insertServer(db, {
+      name: 'db',
+      transport: 'stdio',
+      command: '["fake-bin"]',
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ enabled: false })]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(getServer(db, 'db')).not.toBeNull(); // disabled ≠ removed from config
+  });
+});
