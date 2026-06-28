@@ -72,7 +72,7 @@
 // $HOME-relative paths. Operators override via `.forja/config.toml`
 // `[sandbox] writable_cache_dirs` (see `loadSandboxConfig`).
 export const DEFAULT_WRITABLE_CACHE_DIRS: readonly string[] = [
-  '.cache', // XDG cache: go-build (~/.cache/go-build), pip, uv, composer, …
+  '.cache', // XDG cache catch-all: go-build, pip, uv, composer, zig (~/.cache/zig), … — any XDG-compliant tool
   'go/pkg/mod', // Go module cache ($GOMODCACHE default, GOPATH=~/go)
   '.npm', // npm cache (~/.npm)
   '.nuget/packages', // .NET / NuGet package cache (host default; not XDG)
@@ -81,6 +81,18 @@ export const DEFAULT_WRITABLE_CACHE_DIRS: readonly string[] = [
   '.cargo/registry', // cargo registry/dep cache — SUBDIR only (keeps ~/.cargo/bin intact)
   '.gem', // RubyGems user gem dir / cache
   '.bundle', // Bundler config + cache
+  '.gradle', // Gradle user home (Java/Kotlin; not XDG). Ephemeral tmpfs is SAFE even though the
+  // persistent redirect steers GRADLE_USER_HOME elsewhere: a FRESH EMPTY .gradle has no init.d/*.gradle
+  // scripts to run, so no cross-build contamination (unlike the shared persistent path).
+  '.m2', // Maven local repo (Java; not XDG; artifacts only, no executable hooks)
+  '.local/share/pnpm/store', // pnpm content-addressable store (XDG_DATA, not XDG_CACHE) — SUBDIR only,
+  // never blanket ~/.local/share/pnpm (which holds the pnpm binary + global bins on PATH)
+  '.bun/install/cache', // bun install cache — SUBDIR only (keeps ~/.bun/bin intact)
+  '.pub-cache', // Dart/Flutter pub cache (~/.pub-cache; not XDG). BLANKET by necessity (pub stages
+  // downloads at the cache root, so a hosted/git-only carve-out would EROFS). Trade-off: a
+  // `~/.pub-cache/bin` of `pub global activate` tools is masked inside the sandbox — same exception as
+  // `.gem` above (the gem user-bin path is version-dynamic, so it can't be subdir-scoped either).
+  '.swiftpm', // SwiftPM config/security (~/.swiftpm; the package cache itself is XDG → covered by .cache)
 ];
 
 // Normalize ONE cache-dir entry to a clean `$HOME`-relative path, or

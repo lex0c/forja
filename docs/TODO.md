@@ -65,6 +65,8 @@ Order: Slice 0 (spec PR — must precede code) → Slice 1 (floor + cache; fixes
 
 Cross-file finder found **zero** consumer/call-site regressions. Verification: typecheck + lint clean; ~4800 tests green (permissions/config/conformance/tools/cli).
 
+**Cache completeness (gaps closed, post-review).** Extended `DEFAULT_WRITABLE_CACHE_DIRS` so every mainstream toolchain has a writable cache **regardless of the `cache_persistence` flag** (the ephemeral carve-out is the fallback when persistence is off): `.gradle`, `.m2` (JVM/Java/Kotlin), `.local/share/pnpm/store`, `.bun/install/cache` (JS — SUBDIR-scoped so the pnpm/bun binaries + PATH bins stay execable), `.pub-cache` (Dart/Flutter — shared by both), `.swiftpm` (Swift). Added a `dart` → `PUB_CACHE` entry to `CACHE_ENV_MAP` so heavy Flutter dep sets persist across spawns (not just ephemeral). **Zig** needs nothing — its cache is `~/.cache/zig` (XDG → already under the `.cache` carve-out + the `XDG_CACHE_HOME` catch-all), a clean demonstration of the agnostic design. Scoping invariant locked in tests: subdir-only whenever the blanket dir holds a binary/PATH bins (cargo/pnpm/bun); `.rustup` stays masked. Tests updated (cache-dirs + cache-env); sandbox-runner unaffected (consumes the list dynamically).
+
 ---
 
 # ACTIVE — `feat/memory-lifecycle-detectors`

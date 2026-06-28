@@ -70,6 +70,9 @@ export const CACHE_ENV_MAP: Readonly<Record<string, readonly CacheEnvEntry[]>> =
   // only, no executable hooks).
   gradle: [{ name: 'GRADLE_USER_HOME', subdir: 'gradle' }], // host: ~/.gradle (not XDG)
   maven: [{ name: 'MAVEN_ARGS', subdir: 'maven' }], // host: ~/.m2/repository — 3.9+ only, not XDG
+  // Dart/Flutter: `dart pub` / `flutter pub` honor PUB_CACHE (host ~/.pub-cache; not XDG). Heavy
+  // Flutter dep sets make persistence worth it — without the redirect they'd re-download every spawn.
+  dart: [{ name: 'PUB_CACHE', subdir: 'pub-cache' }], // host: ~/.pub-cache (not XDG)
 };
 
 // Flatten into the concrete env to inject, given the Forja cache base

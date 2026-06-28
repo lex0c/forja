@@ -6,7 +6,7 @@ import {
 } from '../../src/permissions/sandbox-cache-dirs.ts';
 
 describe('DEFAULT_WRITABLE_CACHE_DIRS', () => {
-  test('covers go/npm/pip/.NET/cargo/ruby caches, all home-relative; blanket .cargo + .rustup excluded', () => {
+  test('covers go/node/python/.NET/rust/ruby/jvm/dart/swift caches, all home-relative; binaries never masked', () => {
     expect(DEFAULT_WRITABLE_CACHE_DIRS).toEqual([
       '.cache',
       'go/pkg/mod',
@@ -17,15 +17,28 @@ describe('DEFAULT_WRITABLE_CACHE_DIRS', () => {
       '.cargo/registry',
       '.gem',
       '.bundle',
+      '.gradle',
+      '.m2',
+      '.local/share/pnpm/store',
+      '.bun/install/cache',
+      '.pub-cache',
+      '.swiftpm',
     ]);
     for (const dir of DEFAULT_WRITABLE_CACHE_DIRS) {
       expect(dir.startsWith('/')).toBe(false);
       expect(dir.includes('..')).toBe(false);
     }
-    // The cargo carve-out is SCOPED to the registry subdir so ~/.cargo/bin/cargo
-    // (the rustup shim) stays execable: blanket `.cargo` would mask it.
+    // Cache dirs are subdir-SCOPED when the blanket dir holds a binary AND a clean
+    // static cache subdir exists (cargo/pnpm/bun → the binary stays execable). Where
+    // the cache layout forces a blanket mount (`.gem`'s user-bin path is version-
+    // dynamic; `.pub-cache` stages at the root), the dir is masked whole and any
+    // user-installed tool bins under it are intentionally hidden inside the sandbox.
     expect(DEFAULT_WRITABLE_CACHE_DIRS).toContain('.cargo/registry');
-    expect(DEFAULT_WRITABLE_CACHE_DIRS).not.toContain('.cargo');
+    expect(DEFAULT_WRITABLE_CACHE_DIRS).not.toContain('.cargo'); // keeps ~/.cargo/bin
+    expect(DEFAULT_WRITABLE_CACHE_DIRS).toContain('.local/share/pnpm/store');
+    expect(DEFAULT_WRITABLE_CACHE_DIRS).not.toContain('.local/share/pnpm'); // keeps pnpm bin + global bins
+    expect(DEFAULT_WRITABLE_CACHE_DIRS).toContain('.bun/install/cache');
+    expect(DEFAULT_WRITABLE_CACHE_DIRS).not.toContain('.bun'); // keeps ~/.bun/bin
     // `~/.rustup` stays masked via HIDE_PATHS_DIRS — never a writable cache dir.
     expect(DEFAULT_WRITABLE_CACHE_DIRS).not.toContain('.rustup');
   });
