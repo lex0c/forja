@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { relevanceElideMiddle } from '../../src/harness/compaction-relevance.ts';
+import { dedupElideMiddle, relevanceElideMiddle } from '../../src/harness/compaction-relevance.ts';
 import type { ProviderContentBlock, ProviderMessage } from '../../src/providers/index.ts';
 
 // Pure scorer for the relevance compaction strategy. The contract:
@@ -148,5 +148,97 @@ describe('relevanceElideMiddle', () => {
     expect(blocks[0]).toBe(textBlock); // same reference, untouched
     expect(blocks[1]).toBe(toolUseBlock);
     expect(out.elidedCount).toBe(1); // the irrelevant tool_result still got pointered
+  });
+
+  test('excludeIds makes a tool_result ineligible (never scored, never elided)', () => {
+    const middle = [
+      userBlocks([toolResult('keep', IRRELEVANT)]),
+      userBlocks([toolResult('drop', IRRELEVANT)]),
+    ];
+    // Budget 0 → both would normally be elided; excluding 'keep' spares it.
+    // This is the guard the dedup→relevance fold relies on (a dedup-pointered
+    // id is never re-elided by the relevance pass, whatever its pointer size).
+    const out = relevanceElideMiddle(middle, {
+      goalText: GOAL,
+      verbatimBudgetBytes: 0,
+      excludeIds: new Set(['keep']),
+    });
+    expect(out.elidedIds).toEqual(['drop']);
+    expect(trAt(out.middle[0])).toBe(IRRELEVANT); // excluded → verbatim
+    expect(isElided(trAt(out.middle[1]))).toBe(true);
+  });
+});
+
+describe('dedupElideMiddle', () => {
+  test('pointers earlier identical bodies and keeps the latest verbatim', () => {
+    const body = big('the same grep output emitted three times');
+    const middle = [
+      userBlocks([toolResult('a', body)]),
+      userBlocks([toolResult('b', body)]),
+      userBlocks([toolResult('c', body)]),
+    ];
+    const out = dedupElideMiddle(middle);
+    expect(out.elidedCount).toBe(2);
+    expect(out.elidedIds).toEqual(['a', 'b']); // document order, all but the last
+    expect(out.freedBytes).toBe(2 * Buffer.byteLength(body, 'utf8'));
+    expect(trAt(out.middle[0])).toContain('duplicate of an identical later call');
+    expect(trAt(out.middle[1])).toContain('duplicate of an identical later call');
+    expect(trAt(out.middle[0])).toContain('retrieve_context');
+    expect(trAt(out.middle[2])).toBe(body); // latest kept verbatim
+  });
+
+  test('never deduplicates an error result', () => {
+    const body = big('identical error text');
+    const middle = [
+      userBlocks([toolResult('e1', body, true)]),
+      userBlocks([toolResult('e2', body, true)]),
+    ];
+    const out = dedupElideMiddle(middle);
+    expect(out.elidedCount).toBe(0);
+    expect(out.middle).toBe(middle); // untouched → same reference
+  });
+
+  test('distinct bodies are a no-op (same reference returned)', () => {
+    const middle = [
+      userBlocks([toolResult('a', big('first distinct body'))]),
+      userBlocks([toolResult('b', big('second distinct body'))]),
+    ];
+    const out = dedupElideMiddle(middle);
+    expect(out.elidedCount).toBe(0);
+    expect(out.middle).toBe(middle);
+  });
+
+  test('identical bodies under the min-elide floor are left alone', () => {
+    const small = 'tiny'; // well under the 200B floor
+    const middle = [userBlocks([toolResult('a', small)]), userBlocks([toolResult('b', small)])];
+    const out = dedupElideMiddle(middle);
+    expect(out.elidedCount).toBe(0);
+    expect(out.middle).toBe(middle);
+  });
+
+  test('is deterministic / clock-free (same input → same partition)', () => {
+    const body = big('repeated body');
+    const make = (): ProviderMessage[] => [
+      userBlocks([toolResult('a', body)]),
+      userBlocks([toolResult('b', body)]),
+    ];
+    const first = dedupElideMiddle(make());
+    const second = dedupElideMiddle(make());
+    expect(first.elidedIds).toEqual(second.elidedIds);
+    expect(first.freedBytes).toBe(second.freedBytes);
+  });
+
+  test('pointer names the tool when the block carries a name', () => {
+    const body = big('read the same file twice');
+    const named = (id: string): ProviderContentBlock => ({
+      type: 'tool_result',
+      tool_use_id: id,
+      name: 'read_file',
+      content: body,
+    });
+    const middle = [userBlocks([named('a')]), userBlocks([named('b')])];
+    const out = dedupElideMiddle(middle);
+    expect(trAt(out.middle[0])).toContain('[read_file result elided:');
+    expect(trAt(out.middle[0])).toContain('duplicate of an identical later call');
   });
 });

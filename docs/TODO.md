@@ -50,21 +50,21 @@ items, all single-path-safe (the engine is one-tool-one-path —
 
 **Spec:** optional failure-mode note in `CODE_GENERATION §8`. Non-blocking.
 
-## Slice H2 — Output-reduction wins (compaction) · no migration
+## Slice H2 — Output-reduction wins (compaction) · ✅ DONE · no migration
 
 Hits Forja's #1 cost lever (tool-results in history). The relevance pass already
 exists, pure/clock-free (`compaction-relevance.ts:92`), honoring `OUTPUT_POLICY §0`
-invariants (errors never elided, replay-safe).
+invariants (errors never elided, replay-safe). Closed 2026-06-28 — see `docs/BACKLOG.md`.
 
 | Task | Status | Description |
 |---|---|---|
-| **H2.1** | ☐ todo | Back-reference dedup: new pure `dedupElideMiddle(middle)` in `compaction-relevance.ts` — hash each `tool_result` body (non-error, > `DEFAULT_MIN_ELIDE_BYTES`); keep the latest-by-position identical copy verbatim, pointer earlier identical ones (`[tool_result identical to a later call — deduplicated; recover via retrieve_context (session view)]`). Clock-free → replay-safe. Reuse the eligibility guards (`is_error` never; re-check on rewrite, `compaction-relevance.ts:173-176`). |
-| **H2.2** | ☐ todo | Wire dedup as a pre-pass in `SessionContext.relevanceElide` (`session-context.ts:350`), before `relevanceElideMiddle`. Fold `freedBytes`/`elidedIds` into the existing `relevance` strategy result. **No migration / no new strategy** — `compaction_events` already has `freed_bytes`+`elided_ids` (`compaction-events.ts:17,22`) and `COMPACTION_STRATEGIES` already includes `'relevance'` (`compaction.ts:74`). |
-| **H2.3** | ☐ todo | Tool-name stub: enrich the two elision pointers to embed the tool name (already on the block — cf. `compaction.ts:251` uses `block.name ?? '?'`): `compaction-relevance.ts:182` (relevance) and `compaction.ts:211` (`fallbackElide`). E.g. `[read_file result elided: N bytes — low goal-relevance; recover via retrieve_context]`. |
-| **H2.4** | ☐ todo | Tests: dedup determinism (same input → same partition), identical bodies elided except the latest, error never deduped, stub wording. |
+| **H2.1** | ✅ done | `dedupElideMiddle(middle)` in `compaction-relevance.ts` — group `tool_result` bodies by content (non-error, > `DEFAULT_MIN_ELIDE_BYTES`); keep the latest-by-position copy verbatim, pointer earlier identical ones (`[… identical to a later call (N bytes) — deduplicated; recover via retrieve_context]`). Pure / clock-free → replay-safe; re-asserts the eligibility guards on rewrite. |
+| **H2.2** | ✅ done | Wired as a pre-pass in `SessionContext.relevanceElide` before `relevanceElideMiddle`; both fold into one `relevance` result (counts/freed bytes sum, ids concatenate). No migration / no new strategy. |
+| **H2.3** | ✅ done | Tool-name stub: the relevance pointer (`compaction-relevance.ts`) and the `fallbackElide` pointer (`compaction.ts`) embed `block.name` when present (`[read_file result elided: …]`); nameless blocks keep the `tool_result` wording. |
+| **H2.4** | ✅ done | 7 new tests (dedup unit suite + `relevanceElide` pre-pass); one existing relevance test switched to distinct bodies. typecheck + Biome clean. |
 
 **Spec:** light `CONTEXT_TUNING §12` note (dedup as part of the relevance pass +
-pointer wording).
+pointer wording) — optional follow-up, not blocking.
 
 ## Slice H3 — Verification-gate · **spec-PR FIRST**, then code
 

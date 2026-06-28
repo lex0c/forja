@@ -389,7 +389,12 @@ describe('SessionContext: relevanceElide', () => {
     ctx.appendUser('refactor the auth token validation', null);
     for (let i = 0; i < turns; i++) {
       ctx.appendAssistant(toolUse(`t${i}`), noUsage, null);
-      ctx.appendToolResults(toolResult(`t${i}`, big('lorem ipsum filler content unrelated')), null);
+      // Distinct bodies per turn so this stays a RELEVANCE/budget test — the
+      // dedup pre-pass (which collapses identical bodies) is a no-op here.
+      ctx.appendToolResults(
+        toolResult(`t${i}`, big(`lorem ipsum filler content unrelated ${i}`)),
+        null,
+      );
     }
     return ctx;
   };
@@ -411,15 +416,42 @@ describe('SessionContext: relevanceElide', () => {
     expect(msgs.length).toBe(before); // structure intact — only bodies shrank
     expect(msgs[0]).toEqual({ role: 'user', content: 'refactor the auth token validation' });
     // The most recent tool_result sits in the preserved tail → verbatim.
-    expect(trContent(msgs[msgs.length - 1])).toBe(big('lorem ipsum filler content unrelated'));
+    expect(trContent(msgs[msgs.length - 1])).toBe(big('lorem ipsum filler content unrelated 5'));
+    // Pointer names the tool (fixture sets name='read_file') — the tool-name
+    // stub from H2.3, so the next turn knows WHAT was elided.
     const anyPointer = msgs.some(
       (m) =>
         typeof m.content !== 'string' &&
         m.content.some(
-          (b) => b.type === 'tool_result' && b.content.startsWith('[tool_result elided:'),
+          (b) => b.type === 'tool_result' && b.content.startsWith('[read_file result elided:'),
         ),
     );
     expect(anyPointer).toBe(true);
+  });
+
+  test('dedup pre-pass collapses identical repeated bodies, keeping the latest', () => {
+    // The same body emitted on four turns (e.g. re-reading one file). Even with
+    // a budget large enough that relevance alone would keep them all, the dedup
+    // pre-pass collapses the earlier middle copies to a back-reference.
+    const ctx = SessionContext.createFresh(db, sessionId);
+    ctx.appendUser('refactor the auth token validation', null);
+    const dup = big('the exact same file contents read on every turn');
+    for (let i = 0; i < 4; i++) {
+      ctx.appendAssistant(toolUse(`d${i}`), noUsage, null);
+      ctx.appendToolResults(toolResult(`d${i}`, dup), null);
+    }
+    const res = ctx.relevanceElide({ verbatimBudgetBytes: 1_000_000, preserveTail: 1 });
+    expect(res).not.toBeNull();
+    const msgs = ctx.getMessages();
+    const deduped = msgs.filter(
+      (m) =>
+        typeof m.content !== 'string' &&
+        m.content.some(
+          (b) => b.type === 'tool_result' && b.content.includes('duplicate of an identical'),
+        ),
+    );
+    expect(deduped.length).toBeGreaterThan(0); // earlier identical copies pointered
+    expect(trContent(msgs[msgs.length - 1])).toBe(dup); // latest copy stays verbatim
   });
 
   test('queryHint (working-state focus) steers relevance over the recency pick', () => {

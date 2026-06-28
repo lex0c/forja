@@ -7,7 +7,11 @@ import {
   listMessageTailBySession,
   retractMessage,
 } from '../storage/repos/messages.ts';
-import { type RelevanceElideResult, relevanceElideMiddle } from './compaction-relevance.ts';
+import {
+  type RelevanceElideResult,
+  dedupElideMiddle,
+  relevanceElideMiddle,
+} from './compaction-relevance.ts';
 import {
   type CompactionOptions,
   type CompactionResult,
@@ -347,10 +351,28 @@ export class SessionContext {
       opts.queryHint !== undefined && opts.queryHint.length > 0
         ? `${goalText(goal)}\n${opts.queryHint}`
         : goalText(goal);
-    const result = relevanceElideMiddle(middle, {
+    // Cheap exact-duplicate pre-pass before the relevance fold: outputs that
+    // appear verbatim more than once (re-reads, re-run greps/tests) collapse to
+    // a back-reference, so the relevance budget isn't spent on redundant copies.
+    // Both passes are pure/clock-free, so replay reproduces the same partition.
+    const deduped = dedupElideMiddle(middle);
+    const relevance = relevanceElideMiddle(deduped.middle, {
       goalText: query,
       verbatimBudgetBytes: opts.verbatimBudgetBytes,
+      // Never re-elide what dedup already pointered, so the two passes' id-sets
+      // stay disjoint regardless of the dedup pointer's length.
+      excludeIds: new Set(deduped.elidedIds),
     });
+    // Fold both passes into one `relevance` result — no new strategy / no
+    // migration: counts + freed bytes sum, elided ids concatenate. The sets are
+    // disjoint BY CONSTRUCTION (relevance was told to exclude the dedup ids).
+    const result: RelevanceElideResult = {
+      middle: relevance.middle,
+      elidedCount: deduped.elidedCount + relevance.elidedCount,
+      keptCount: relevance.keptCount,
+      freedBytes: deduped.freedBytes + relevance.freedBytes,
+      elidedIds: [...deduped.elidedIds, ...relevance.elidedIds],
+    };
     if (result.elidedCount > 0) {
       const tail = this.messages.slice(tailStart);
       this.messages.length = 0;
