@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { type Capability, parseCapability } from '../../src/permissions/capabilities.ts';
+import { type Capability, netEgress, parseCapability } from '../../src/permissions/capabilities.ts';
 import { SANDBOX_PROFILE_ORDER, selectSandboxProfile } from '../../src/permissions/sandbox-plan.ts';
 
 const caps = (...ss: string[]): Capability[] => ss.map(parseCapability);
@@ -335,11 +335,29 @@ describe('selectSandboxProfile — exec:arbitrary floor + network posture', () =
     if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw');
   });
 
-  // The discriminator: net-egress WITHOUT exec:arbitrary (curl/wget/git/ssh/gh —
-  // explicit, user-invoked net actions) is NOT trust-gated.
+  // The discriminator: plain net-egress WITHOUT exec:arbitrary (curl/wget/git —
+  // user-invoked net actions) never reaches the trust-gate branch.
   test('net-egress without exec:arbitrary is NOT trust-gated → cwd-rw-net even untrusted', () => {
     const r = selectSandboxProfile({
       capabilities: caps('net-egress:github.com', 'read-fs:.'),
+      hostExplicitlyAllowed: false,
+      dirTrusted: false,
+    });
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') expect(r.profile).toBe('cwd-rw-net');
+  });
+
+  // EXPLICIT egress exemption: `ssh host <cmd>` carries exec:arbitrary (remote
+  // command) AND net-egress, but marks the egress explicit → NOT trust-gated, so
+  // it still connects in an untrusted dir (regression: it was wrongly stripped to
+  // cwd-rw, breaking ssh, when the gate keyed only on exec:arbitrary + net-egress).
+  test('exec:arbitrary + EXPLICIT net-egress (ssh) is NOT trust-gated → cwd-rw-net even untrusted', () => {
+    const r = selectSandboxProfile({
+      capabilities: [
+        parseCapability('exec:arbitrary'),
+        netEgress('example.com', true),
+        parseCapability('read-fs:.'),
+      ],
       hostExplicitlyAllowed: false,
       dirTrusted: false,
     });

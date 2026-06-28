@@ -2879,7 +2879,11 @@ const cmdSsh: CommandResolver = (_positional, tokens, ctx) => {
   const atIdx = target.lastIndexOf('@');
   const host = atIdx === -1 ? target : target.slice(atIdx + 1);
 
-  const caps: Capability[] = [netEgress(host || '*'), readFs(resolveArg('~/.ssh', ctx))];
+  // EXPLICIT egress: ssh is a user-invoked network tool. Marking it exempts the
+  // egress from the build-egress trust-gate (sandbox-plan.ts) — `ssh host <cmd>`
+  // also pushes exec:arbitrary (remote command) below, which would otherwise
+  // make it indistinguishable from a dep-manager build and strip its network.
+  const caps: Capability[] = [netEgress(host || '*', true), readFs(resolveArg('~/.ssh', ctx))];
 
   // Slice 174: explicit file reads from `-F` / `-i` / `-S` (control
   // socket path; ssh creates AND reads it).

@@ -186,13 +186,22 @@ export const selectSandboxProfile = (
     // `write-fs` floor: an unbounded-exec call may write its cwd. (Never makes a
     // set unsatisfiable — cwd-rw covers it — so the floor alone can't refuse.)
     s.add('write-fs');
+    // EXEMPTION from the trust-gate below: egress that is the command's EXPLICIT
+    // purpose (an explicit network tool — ssh/curl/scp, `Capability.explicitEgress`)
+    // is the operation itself, not incidental build fetch. `ssh host <cmd>` ALSO
+    // carries `exec:arbitrary` (the remote command) and would otherwise look
+    // identical to a dep-manager build and lose its network — so it is never
+    // stripped. (Plain curl/wget/git carry net-egress WITHOUT `exec:arbitrary`
+    // and don't reach this branch at all.)
+    const hasExplicitEgress = options.capabilities.some(
+      (cap) => cap.kind === 'net-egress' && cap.explicitEgress === true,
+    );
     // Trust-gate BUILD egress: an `exec:arbitrary` call reaches the network only
-    // in a TRUSTED dir. Untrusted → drop `net-egress` so a modeled dep-manager
-    // (npm/go/pip/…) lands `cwd-rw` (no egress) not `cwd-rw-net`, killing the
-    // clone-and-build exfil vector (one confirm would otherwise grant full egress
-    // + broad host read). `net-egress` WITHOUT `exec:arbitrary` (curl/wget/git/
-    // ssh/gh — explicit, user-invoked net actions) is unaffected.
-    if (options.dirTrusted !== true) s.delete('net-egress');
+    // in a TRUSTED dir. Untrusted → drop INCIDENTAL `net-egress` so a modeled
+    // dep-manager (npm/go/pip/…) lands `cwd-rw` (no egress) not `cwd-rw-net`,
+    // killing the clone-and-build exfil vector (one confirm would otherwise grant
+    // full egress + broad host read).
+    if (options.dirTrusted !== true && !hasExplicitEgress) s.delete('net-egress');
     selectionKinds = s;
   }
 

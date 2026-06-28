@@ -97,6 +97,17 @@ export interface Capability {
   // identical capability strings — chain hash determinism depends
   // on it.
   scope: string | null;
+  // OPTIONAL planner hint, meaningful ONLY for `net-egress`. When true, the
+  // egress is the command's EXPLICIT, user-invoked purpose (an explicit network
+  // tool — `ssh host <cmd>`, curl, scp), NOT egress incidental to a local build.
+  // The sandbox build-egress trust-gate (sandbox-plan.ts) strips incidental
+  // egress in an untrusted dir but EXEMPTS explicit egress, so an `ssh host cmd`
+  // — which ALSO carries `exec:arbitrary` for the remote command, and would
+  // otherwise look identical to a dep-manager build — still connects untrusted.
+  // In-memory ONLY: not part of `formatCapability` / the chain hash / policy
+  // matching (those key on `kind:scope`). Default (omitted) ⇒ gateable
+  // (fail-closed: a forgotten mark over-restricts, never leaks egress).
+  explicitEgress?: boolean;
 }
 
 export const isCapabilityKind = (s: string): s is CapabilityKind => ALL_KINDS.has(s);
@@ -648,7 +659,12 @@ export const exec = (cls: 'shell' | 'python' | 'node' | 'arbitrary'): Capability
   kind: 'exec',
   scope: cls,
 });
-export const netEgress = (host: string): Capability => ({ kind: 'net-egress', scope: host });
+export const netEgress = (host: string, explicitEgress?: boolean): Capability => ({
+  kind: 'net-egress',
+  scope: host,
+  // Conditional spread: never set `explicitEgress: undefined` (exactOptionalPropertyTypes).
+  ...(explicitEgress ? { explicitEgress: true } : {}),
+});
 export const netIngress = (port: string): Capability => ({ kind: 'net-ingress', scope: port });
 export const secretAccess = (store: string): Capability => ({
   kind: 'secret-access',

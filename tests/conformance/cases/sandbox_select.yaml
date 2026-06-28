@@ -184,8 +184,12 @@
 
 - name: "sandbox select: net-egress WITHOUT exec:arbitrary (curl/git) is NOT trust-gated → cwd-rw-net"
   setup:
-    # Explicit, user-invoked net (curl/wget/git/ssh) emits net-egress but NOT
-    # exec:arbitrary → not gated → cwd-rw-net even untrusted.
+    # Plain explicit net (curl/wget/git/scp) emits net-egress but NOT
+    # exec:arbitrary → never reaches the gate → cwd-rw-net even untrusted.
+    # (`ssh host <cmd>` DOES carry exec:arbitrary but marks its egress explicit
+    # — Capability.explicitEgress — so it's also exempt; that flag-level path is
+    # covered by sandbox-plan.test.ts + bootstrap.test.ts, not the string-based
+    # conformance harness.)
     sandbox_capabilities:
       - "net-egress:github.com"
       - "read-fs:."

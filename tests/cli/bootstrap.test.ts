@@ -440,6 +440,29 @@ describe('bootstrap', () => {
       expect(d.sandboxProfile).toBe('cwd-rw-net');
       db.close();
     });
+
+    test('explicit network tool (ssh remote cmd) in an UNtrusted dir → cwd-rw-net (egress NOT stripped)', async () => {
+      // `ssh host <cmd>` carries exec:arbitrary (remote command) AND net-egress,
+      // but its egress is the command's explicit purpose (marked explicitEgress)
+      // → exempt from the build-egress trust-gate. Regression guard: an untrusted
+      // repo must still let ssh connect, not collapse to cwd-rw.
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [] }));
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      expect(config.isCwdTrusted).toBe(false);
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'ssh host uptime' });
+      expect(d.sandboxProfile).toBe('cwd-rw-net');
+      db.close();
+    });
   });
 
   test('honors --model override', async () => {
