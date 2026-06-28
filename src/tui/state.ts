@@ -258,6 +258,7 @@ export interface ConfirmState {
     | 'permission'
     | 'trust'
     | 'shared-trust'
+    | 'mcp-trust'
     | 'memory-write'
     | 'memory-user-scope'
     | 'memory-action'
@@ -2132,6 +2133,94 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             // hitting Enter without reading chooses "No, revoke" —
             // safer outcome for a corpus that just changed under
             // their feet (or that they haven't reviewed).
+            selectedIndex: options.length - 1,
+            hints: ['Enter to confirm', 'Esc to cancel'],
+            queueDepth: 0,
+          },
+        },
+        permanent: [],
+      };
+    }
+
+    case 'mcp-trust:ask': {
+      // MCP server manifest-trust modal (MCP.md §1.5). Trust authorizes TWO
+      // things: spawning the server's `command` (arbitrary local code — the
+      // real risk) and exposing its declared tools to the model. 'first-visit'
+      // = never-seen manifest hash; 'drift' = a previously-trusted server whose
+      // hash (tools or command) changed.
+      const options: ConfirmOption[] = [
+        {
+          key: '1',
+          label:
+            event.mode === 'first-visit'
+              ? 'Yes, I trust this server'
+              : 'Yes, I trust the updated server',
+          value: 'yes',
+        },
+        { key: '2', label: 'No, do not run it', value: 'no' },
+      ];
+
+      // SECURITY (mirrors the shared-trust P0/F1 hardening): server name,
+      // command, and every tool name/description come from an UNTRUSTED server
+      // manifest (or a config a hostile commit could edit). Sanitize each
+      // before display so a `\x1b[2J\x1b[H…` payload can't repaint/forge the
+      // modal.
+      const safeServer = sanitizeOneLineForDisplay(event.server);
+      const safeCommand = sanitizeOneLineForDisplay(event.command);
+
+      const MAX_LIST = 8;
+      const visible = event.tools.slice(0, MAX_LIST);
+      const overflow = event.tools.length - visible.length;
+
+      const previewLines: PreviewLine[] = [`server:  ${safeServer}`, `command: ${safeCommand}`, ''];
+      if (event.mode === 'first-visit') {
+        previewLines.push(
+          'An MCP server wants to run the command above and expose these tools',
+          'to the model. Trusting it AUTHORIZES RUNNING THAT BINARY. Review the',
+          'tools it declares before confirming:',
+        );
+      } else {
+        previewLines.push(
+          'A previously-trusted MCP server changed (its command or tool set).',
+          'Trusting again RE-AUTHORIZES running the command above. Review the',
+          'current tools before confirming:',
+        );
+      }
+      previewLines.push('');
+
+      if (visible.length === 0) {
+        previewLines.push('(the server declares no tools)');
+      } else {
+        for (const t of visible) {
+          previewLines.push(
+            `  ${sanitizeOneLineForDisplay(t.name)} — ${sanitizeOneLineForDisplay(t.description)}`,
+          );
+        }
+        if (overflow > 0) {
+          previewLines.push(`  …and ${overflow} more tool${overflow === 1 ? '' : 's'} not shown`);
+        }
+      }
+      previewLines.push('');
+      previewLines.push(`manifest hash: ${sanitizeOneLineForDisplay(event.manifestHash)}`);
+      previewLines.push('');
+      previewLines.push('If you trust: the server runs on next use; its tools become callable.');
+      previewLines.push('If you decline: the server is not run and its tools stay hidden.');
+
+      return {
+        state: {
+          ...state,
+          modal: {
+            promptId: event.promptId,
+            flavor: 'mcp-trust',
+            title:
+              event.mode === 'first-visit'
+                ? 'MCP server trust (first visit):'
+                : 'MCP server trust (changed):',
+            subject: null,
+            preview: previewLines,
+            question: null,
+            options,
+            // Conservative default (last) = "No, do not run it".
             selectedIndex: options.length - 1,
             hints: ['Enter to confirm', 'Esc to cancel'],
             queueDepth: 0,

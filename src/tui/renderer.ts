@@ -110,6 +110,7 @@ const HOLD_BYPASS: ReadonlySet<UIEvent['type']> = new Set([
   'permission:ask',
   'trust:ask',
   'shared-trust:ask',
+  'mcp-trust:ask',
   'history-clear:ask',
   'memory:write:ask',
   'memory:action:ask',

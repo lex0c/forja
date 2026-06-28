@@ -2707,6 +2707,100 @@ describe('state immutability', () => {
   });
 });
 
+describe('mcp-trust:ask reducer', () => {
+  const mcpTrustEvent = (overrides: {
+    mode: 'first-visit' | 'drift';
+    server?: string;
+    command?: string;
+    tools?: readonly { name: string; description: string }[];
+    manifestHash?: string;
+  }): UIEvent => ({
+    type: 'mcp-trust:ask',
+    ts: 1,
+    promptId: 'm1',
+    server: overrides.server ?? 'postgres',
+    command: overrides.command ?? 'mcp-server-postgres --dsn $X',
+    mode: overrides.mode,
+    tools: overrides.tools ?? [{ name: 'query', description: 'run a query' }],
+    manifestHash: overrides.manifestHash ?? 'abc123',
+  });
+
+  test('first-visit shows the spawn-this-binary prose, the command, and the tools', () => {
+    const r = applyEvent(createInitialState(), mcpTrustEvent({ mode: 'first-visit' }));
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    expect(modal.flavor).toBe('mcp-trust');
+    expect(modal.title).toBe('MCP server trust (first visit):');
+    const text = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+    expect(text).toContain('AUTHORIZES RUNNING THAT BINARY');
+    expect(text).toContain('mcp-server-postgres'); // the command (risk surface) is shown
+    expect(text).toContain('query — run a query'); // tool inventory
+    expect(modal.options[0]?.label).toBe('Yes, I trust this server');
+  });
+
+  test('drift shows the re-authorize prose + label', () => {
+    const r = applyEvent(createInitialState(), mcpTrustEvent({ mode: 'drift' }));
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    expect(modal.title).toBe('MCP server trust (changed):');
+    const text = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+    expect(text).toContain('RE-AUTHORIZES');
+    expect(modal.options[0]?.label).toBe('Yes, I trust the updated server');
+  });
+
+  test('conservative default points at "No, do not run it" in BOTH modes', () => {
+    // A regression flipping the drift modal's default to index 0 would
+    // rubber-stamp a re-authorization of a CHANGED binary — so check both.
+    for (const mode of ['first-visit', 'drift'] as const) {
+      const r = applyEvent(createInitialState(), mcpTrustEvent({ mode }));
+      const modal = r.state.modal;
+      if (modal === null) throw new Error('expected modal');
+      expect(modal.selectedIndex).toBe(modal.options.length - 1);
+      expect(modal.options[modal.selectedIndex]?.value).toBe('no');
+    }
+  });
+
+  test('a server declaring no tools renders the explicit empty line', () => {
+    const r = applyEvent(createInitialState(), mcpTrustEvent({ mode: 'first-visit', tools: [] }));
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    const text = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+    expect(text).toContain('(the server declares no tools)');
+  });
+
+  test('ANSI escapes + CR/LF/TAB in the untrusted strings are stripped/collapsed', () => {
+    const evil = '\x1b[2J\x1b[H\x1b]0;PWNED\x07';
+    const r = applyEvent(
+      createInitialState(),
+      mcpTrustEvent({
+        mode: 'first-visit',
+        server: `${evil}srv`,
+        command: `${evil}evil-bin`,
+        // CR/LF/TAB in a tool name would break the bounded one-row-per-tool
+        // layout if not collapsed to spaces.
+        tools: [{ name: 'a\r\nb\tc', description: `${evil}d` }],
+      }),
+    );
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    const text = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+    expect(text).not.toContain('\x1b');
+    expect(text).not.toContain('\x07');
+    expect(text).not.toContain('\r'); // the join uses \n only; a raw \r would be the tool name's
+    expect(text).not.toContain('\t');
+    expect(text).toContain('evil-bin'); // printable portion survives
+  });
+
+  test('caps the tool inventory with an overflow line', () => {
+    const tools = Array.from({ length: 12 }, (_, i) => ({ name: `t${i}`, description: 'd' }));
+    const r = applyEvent(createInitialState(), mcpTrustEvent({ mode: 'first-visit', tools }));
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    const text = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+    expect(text).toContain('…and 4 more tools not shown'); // 12 − 8 cap
+  });
+});
+
 describe('shared-trust:ask reducer (P0/F1 + P1/M2-rel)', () => {
   // Helpers to drive the reducer with a minimal `shared-trust:ask`
   // event. The flavor's full contract: title, options, preview

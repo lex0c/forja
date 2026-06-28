@@ -23,6 +23,7 @@
 // One modal at a time. Concurrent `ask*` calls queue; the queue
 // drains FIFO when a prior modal resolves.
 
+import type { McpTrustAnswer, McpTrustRequest } from '../mcp/types.ts';
 import type { PolicyLayer } from '../permissions/index.ts';
 import type { Bus } from './bus.ts';
 import type { UIEvent } from './events.ts';
@@ -204,6 +205,15 @@ const SHARED_TRUST_OPTIONS: readonly ConfirmOption[] = [
   { key: '2', label: 'No, revoke trust', value: 'no' },
 ];
 
+// MCP manifest-trust flavor (MCP.md §1.5). Two options; cancel is the
+// Esc/timeout outcome. Conservative-default (last) = "do not run it" — an
+// operator hitting Enter without reading errs toward NOT spawning an untrusted
+// binary, the safe outcome.
+const MCP_TRUST_OPTIONS: readonly ConfirmOption[] = [
+  { key: '1', label: 'Yes, I trust this server', value: 'yes' },
+  { key: '2', label: 'No, do not run it', value: 'no' },
+];
+
 // History-clear flavor (HISTORY.md §2.3). Kept in sync with the
 // reducer's `history-clear:ask` ConfirmState construction.
 const HISTORY_CLEAR_OPTIONS: readonly ConfirmOption[] = [
@@ -338,6 +348,10 @@ export interface ModalManager {
     args: SharedTrustAskArgs,
     opts?: ConfirmAskOptions,
   ) => Promise<SharedTrustAnswer>;
+  // MCP server manifest-trust modal (MCP.md §1.5). Reuses the McpTrustRequest
+  // the manager already builds (server + spawned command + tool inventory +
+  // manifest hash). Answer maps: yes → grant + register, no/cancel → deny.
+  askMcpTrust: (req: McpTrustRequest, opts?: ConfirmAskOptions) => Promise<McpTrustAnswer>;
   // History-clear flavor (HISTORY.md §2.3). Surfaces the entry count
   // and project root so the modal can render blast radius up front.
   askHistoryClear: (
@@ -808,6 +822,22 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           corpusFiles: args.corpusFiles,
         }),
         SHARED_TRUST_OPTIONS,
+        opts?.timeoutMs,
+        opts?.signal,
+      ),
+    askMcpTrust: (req, opts) =>
+      enqueueConfirm<McpTrustAnswer>(
+        (promptId) => ({
+          type: 'mcp-trust:ask',
+          ts: now(),
+          promptId,
+          server: req.server,
+          command: req.command,
+          mode: req.mode,
+          tools: req.tools,
+          manifestHash: req.manifestHash,
+        }),
+        MCP_TRUST_OPTIONS,
         opts?.timeoutMs,
         opts?.signal,
       ),

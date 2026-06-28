@@ -447,6 +447,23 @@ export type SharedTrustAskEvent = BaseEvent & {
   corpusFiles: readonly { name: string; bytes: number }[];
 };
 
+// MCP server manifest-trust modal (MCP.md §1.5). Trusting authorizes SPAWNING
+// the server's `command` (arbitrary local code — the real risk) plus exposing
+// its declared tools to the model. The strings (server / command / tool
+// names+descriptions) flow from an untrusted server manifest (or a config a
+// hostile commit could edit), so the reducer sanitizes them at its boundary.
+export type McpTrustAskEvent = BaseEvent & {
+  type: 'mcp-trust:ask';
+  promptId: string;
+  server: string;
+  command: string;
+  // 'first-visit': never-seen manifest hash. 'drift': previously-trusted
+  // server whose hash (tools or command) changed.
+  mode: import('../mcp/types.ts').McpTrustMode;
+  tools: readonly { name: string; description: string }[];
+  manifestHash: string;
+};
+
 // `scope` mirrors `MemoryScope` from `src/memory/types.ts`. We re-declare
 // instead of importing so the TUI layer doesn't depend on memory's
 // internal types — but the values must stay in sync. If memory adds a
@@ -931,6 +948,7 @@ export type UIEvent =
   | ClarifyAskEvent
   | TrustAskEvent
   | SharedTrustAskEvent
+  | McpTrustAskEvent
   | MemoryWriteAskEvent
   | ResumeModeAskEvent
   | MemoryUserScopeAskEvent

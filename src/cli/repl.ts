@@ -621,6 +621,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
             { path: a.path, mode: a.mode, corpusFiles: a.corpusFiles },
             { timeoutMs: 5 * 60 * 1000 },
           ),
+        // MCP manifest-trust modal — thin adapter, same 5-minute fail-closed
+        // window as the cwd / shared-corpus trust modals.
+        confirmMcpTrust: (req) => modalManager.askMcpTrust(req, { timeoutMs: 5 * 60 * 1000 }),
       } satisfies BootstrapInput));
   } catch (e) {
     const msg = e instanceof Error ? e.message || e.name || String(e) : String(e);
