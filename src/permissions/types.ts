@@ -6,7 +6,11 @@
 // section.
 import type { SandboxProfile } from './sandbox-plan.ts';
 
-export type PolicyCategory = 'fs.read' | 'fs.write' | 'bash' | 'web.fetch' | 'misc';
+// 'mcp' gates tools imported from an MCP server (the `mcp__<server>__<tool>`
+// wire form). stdio MCP is a LOCAL subprocess, so it is NOT egress and is
+// deliberately absent from `categoryIsEgress` below; the remote (sse/http)
+// transport will add a distinct egress-bearing category when it lands.
+export type PolicyCategory = 'fs.read' | 'fs.write' | 'bash' | 'web.fetch' | 'misc' | 'mcp';
 
 // Categories that send bytes OUT of the machine to an operator-unconfined
 // destination. Egress is special-cased by the autonomous posture: a

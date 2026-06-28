@@ -1,0 +1,134 @@
+// Shared MCP contracts. This module is the low-level type vocabulary for
+// the subsystem and imports NEITHER the @modelcontextprotocol/sdk NOR the
+// permission engine — so it can be consumed everywhere (storage, config,
+// factory, manager) without dragging the SDK or a policy dependency in.
+//
+// The single SDK boundary is src/mcp/client.ts, which implements the
+// `McpClient` interface declared here. Per-transport adapters (stdio now;
+// sse/http in slice 2) all satisfy this same interface.
+
+import type { ProviderToolInputSchema } from '../providers/types.ts';
+
+// Where a server declaration came from — drives precedence (local >
+// project > user) and the audit `source` column. Matches the AUDIT §1.5
+// vocabulary.
+export type McpServerSource = 'user' | 'project_shared' | 'project_local';
+
+// v1 ships stdio only; slice 2 widens this union to 'sse' | 'http'.
+export type McpTransportKind = 'stdio';
+
+export interface McpStdioConfig {
+  transport: 'stdio';
+  // argv[0], $VAR-RESOLVED — what is actually spawned.
+  command: string;
+  args?: readonly string[];
+  // The ORIGINAL, $VAR-UNRESOLVED argv ([command, ...args]) as written in
+  // mcp.toml. Persisted to mcp_servers.command (redacted — never the resolved
+  // secret value, AUDIT §1.5) and used for the command-change trust check +
+  // the trust-modal command display. The binary the operator authorizes.
+  rawArgv: readonly string[];
+  // Extra env merged onto the minimal spawn env (PATH/HOME/USER/MCP_*).
+  // Values may be `$VAR` references resolved from the agent session env.
+  env?: Readonly<Record<string, string>>;
+  // Working directory for the spawned server; defaults to the session cwd.
+  cwd?: string;
+}
+
+export interface McpServerConfig {
+  // [a-z0-9_]; validated by the loader. Becomes the `<server>` half of
+  // every `mcp__<server>__<tool>` wire name.
+  name: string;
+  // `disabled = true` in config flips this off; disabled servers are not
+  // connected and their tools never register.
+  enabled: boolean;
+  // Whether the server's tools sit on the base model surface or behind
+  // `tool_search` (the Forja-native lazy surface). Default 'deferred'.
+  surface: 'base' | 'deferred';
+  transport: McpStdioConfig;
+  source: McpServerSource;
+}
+
+// The 8-state lifecycle machine (STATE_MACHINE §6.5). The transition
+// table lives in src/mcp/state.ts; the persisted column is in mcp_servers.
+export type McpServerState =
+  | 'disconnected'
+  | 'handshaking'
+  | 'trust_pending'
+  | 'trusted'
+  | 'active'
+  | 'degraded'
+  | 'denied'
+  | 'error';
+
+// `_meta.agentic_cli.*` — the server's self-declared, NON-authoritative
+// hints (MCP.md §3.1). The harness decides policy; these only tune
+// defaults. `category` is a raw string here (not a PolicyCategory) so this
+// module stays decoupled from the permission engine — the tool-factory
+// validates it against the real category set and falls back to 'mcp'.
+export interface McpToolMeta {
+  category?: string;
+  writes?: boolean;
+  network?: boolean;
+  parallel_safe?: boolean;
+  deferred?: boolean;
+  idempotent?: boolean;
+}
+
+// One tool as parsed from a `tools/list` response (namespace NOT yet
+// applied — `name` is the server-local name). `inputSchema` is normalized
+// to a `{ type: 'object', ... }` shape by the client adapter.
+export interface McpManifestTool {
+  name: string;
+  description: string;
+  inputSchema: ProviderToolInputSchema;
+  meta: McpToolMeta;
+}
+
+// A normalized manifest ready to hash / persist. Tools are sorted by name
+// (see src/mcp/manifest.ts).
+export interface CanonicalManifest {
+  server: string;
+  protocolVersion: string;
+  serverVersion: string | null;
+  tools: readonly McpManifestTool[];
+}
+
+// Result of a `tools/call`, with content blocks flattened to text. The
+// manager maps `isError` to a Forja `toolError`.
+export interface McpCallResult {
+  isError: boolean;
+  content: string;
+  structured?: unknown;
+}
+
+// The thin SDK abstraction. src/mcp/client.ts is the ONLY implementer;
+// everything else depends on this interface. All methods accept an
+// AbortSignal so a session cancel / hard budget aborts an in-flight call.
+export interface McpClient {
+  // Spawn + `initialize` handshake. Returns the negotiated protocol +
+  // declared server version.
+  connect(signal?: AbortSignal): Promise<{ protocolVersion: string; serverVersion: string | null }>;
+  listTools(signal?: AbortSignal): Promise<McpManifestTool[]>;
+  callTool(tool: string, args: unknown, signal?: AbortSignal): Promise<McpCallResult>;
+  close(): Promise<void>;
+}
+
+// Trust prompt vocabulary. 'first-visit' = never-seen manifest hash;
+// 'drift' = a previously-trusted server whose manifest hash changed.
+export type McpTrustMode = 'first-visit' | 'drift';
+
+export interface McpTrustRequest {
+  server: string;
+  // The command + args being spawned — the REAL risk surface. The modal
+  // must show this: trust = "I authorize running this binary."
+  command: string;
+  mode: McpTrustMode;
+  tools: ReadonlyArray<{ name: string; description: string }>;
+  manifestHash: string;
+}
+
+export type McpTrustAnswer = 'yes' | 'no' | 'cancel';
+
+// Operator confirmation callback. Absent in headless contexts ⇒
+// fail-closed (deny) unless the server is in --auto-approve-mcp.
+export type ConfirmMcpTrust = (req: McpTrustRequest) => Promise<McpTrustAnswer>;

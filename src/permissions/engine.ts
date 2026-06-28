@@ -1251,7 +1251,10 @@ const policySectionFor = (
   category: PolicyCategory,
 ): keyof PolicyToolsSection | undefined => {
   if (category === 'bash') return 'bash';
-  if (category === 'misc') return undefined;
+  // 'misc' and 'mcp' have no per-tool policy section in v1 — both resolve to
+  // an engine-internal default-allow in the dispatch below (operator per-tool
+  // MCP rules are a later slice).
+  if (category === 'misc' || category === 'mcp') return undefined;
   // A tool may SHARE another's policy section (declared in
   // FS_TOOL_TRAITS). `git` shares `read_file` — an operator who grants
   // file reads thereby governs git's reads with one allow/deny list,
@@ -2482,6 +2485,21 @@ export const createPermissionEngine = (
         decision = {
           kind: 'allow',
           reason: 'misc category: no gate applied',
+          source: { layer: 'default' },
+        };
+        break;
+      case 'mcp':
+        // MCP tools clear two gates before reaching here: the per-manifest-
+        // hash trust prompt (the server + its whole tool set was approved)
+        // and the deterministic risk score (the `mcp_tool` feature adds
+        // supply-chain weight, which the approval-gate below can still
+        // upgrade to confirm). So the category-level default is allow;
+        // operator per-tool MCP rules (deny/confirm specific
+        // mcp__<server>__<tool> patterns) are a later slice. No policy
+        // section is consulted (policySectionFor returns undefined for 'mcp').
+        decision = {
+          kind: 'allow',
+          reason: 'mcp category: trusted-manifest tool, default allow',
           source: { layer: 'default' },
         };
         break;

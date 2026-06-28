@@ -8,6 +8,7 @@
 // `index.ts → resolver-files → registry.ts` flows top-down cleanly.
 
 import type { Capability } from '../capabilities.ts';
+import { isMcpToolName } from '../mcp-naming.ts';
 
 export type ResolverConfidence = 'high' | 'medium' | 'low';
 
@@ -74,14 +75,27 @@ export const conservativeFallback = (toolName: string): ResolverResult => ({
   reason: `no resolver registered for tool '${toolName}'`,
 });
 
+// MCP tools (`mcp__<server>__<tool>`) carry dynamic, server-supplied names,
+// so they cannot be pre-registered by exact name. Their effects are
+// remote/opaque (a JSON-RPC call into a trusted server subprocess), so they
+// resolve to NO statically-known local capabilities at HIGH confidence — NOT
+// the conservative fallback, which would force a confirm on every call and
+// defeat the "allow a trusted-manifest MCP tool by default" posture
+// (PERMISSION dispatch case 'mcp'). The real controls are the per-manifest-
+// hash trust gate, the `mcp_tool` risk weight (name-based, still applies),
+// and the stdio sandbox. The `mcp__` prefix predicate is shared with the risk
+// scorer + tool-factory via `permissions/mcp-naming.ts` so the three can't drift.
 export const resolveCapabilities = (
   toolName: string,
   args: Record<string, unknown>,
   ctx: ResolverContext,
 ): ResolverResult => {
   const resolver = REGISTRY.get(toolName);
-  if (resolver === undefined) return conservativeFallback(toolName);
-  return resolver(args, ctx);
+  if (resolver !== undefined) return resolver(args, ctx);
+  if (isMcpToolName(toolName)) {
+    return { kind: 'ok', capabilities: [], confidence: 'high' };
+  }
+  return conservativeFallback(toolName);
 };
 
 // Test seam: clears the registry. Used by unit tests that want to
