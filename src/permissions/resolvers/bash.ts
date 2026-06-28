@@ -3268,6 +3268,32 @@ const cmdCargo: CommandResolver = (positional, tokens, ctx) => {
   };
 };
 
+// Modeled dependency managers — the finite, well-known set of package managers,
+// the same category npm/yarn/pnpm/bun/pip/cargo are already modeled in. A
+// build/install run executes arbitrary code (build scripts, plugins), reads the
+// project, writes its output UNDER cwd (covered by the `exec:arbitrary`→cwd-rw
+// floor, §6.5), and fetches deps from a KNOWN registry. Emitting
+// `net-egress(<registry>)` lands the call in `cwd-rw-net` automatically — these
+// install deps WITHOUT the coarse `[sandbox] network` posture, exactly like
+// npm/pip/cargo. The host list is the tool's default registry endpoint(s); the
+// actual egress is full (cwd-rw-net has no per-host kernel filter), so the hosts
+// feed the audit/score/confirm row, not a firewall.
+//
+// Conservative + uniform: every invocation gets the build shape, including
+// read-only subcommands (`go version`, `dotnet --info`). Over-granting net to a
+// no-net subcommand is harmless — `cwd-rw-net` only makes egress AVAILABLE, and
+// the confirm still fires (exec:arbitrary is never repo-confined). UNKNOWN
+// binaries (`./local-tool`, `./gradlew`/`./mvnw` wrappers — relative paths) are
+// deliberately NOT here: they ride the floor + the coarse posture. This is a
+// bounded data table (the ~handful of mainstream registries), NOT the unbounded
+// per-binary modeling the floor exists to avoid.
+const depManagerResolver =
+  (hosts: readonly string[]): CommandResolver =>
+  (_positional, _tokens, ctx) => ({
+    capabilities: [exec('arbitrary'), readFs(ctx.cwd), ...hosts.map((h) => netEgress(h))],
+    confidence: 'medium',
+  });
+
 const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, CommandResolver>([
   ['ls', cmdRead],
   ['cat', cmdRead],
@@ -3411,6 +3437,31 @@ const COMMAND_TABLE: ReadonlyMap<string, CommandResolver> = new Map<string, Comm
   ['rsync', cmdRsync],
   ['make', cmdMake],
   ['cargo', cmdCargo],
+  // Dependency managers modeled like npm/pip/cargo so they install deps without
+  // the coarse `[sandbox] network` posture (net-egress → cwd-rw-net). Wrappers
+  // (`./gradlew`, `./mvnw`) are relative paths → unmodeled → floor + posture.
+  ['go', depManagerResolver(['proxy.golang.org', 'sum.golang.org'])],
+  ['dotnet', depManagerResolver(['api.nuget.org'])],
+  ['composer', depManagerResolver(['repo.packagist.org', 'packagist.org'])],
+  ['mvn', depManagerResolver(['repo.maven.apache.org'])],
+  ['gradle', depManagerResolver(['plugins.gradle.org', 'repo.maven.apache.org'])],
+  ['gem', depManagerResolver(['rubygems.org'])],
+  ['bundle', depManagerResolver(['rubygems.org'])],
+  ['bundler', depManagerResolver(['rubygems.org'])],
+  // Python alt managers (pip is above): all fetch from PyPI.
+  ['uv', depManagerResolver(['pypi.org'])],
+  ['poetry', depManagerResolver(['pypi.org'])],
+  ['pipenv', depManagerResolver(['pypi.org'])],
+  // Dart/Flutter: pub.dev (+ Flutter pulls engine artifacts from Google storage).
+  ['dart', depManagerResolver(['pub.dev'])],
+  ['flutter', depManagerResolver(['pub.dev', 'storage.googleapis.com'])],
+  // NOT modeled: `swift` (swiftpm) and `zig` (build.zig.zon) fetch from ARBITRARY
+  // git/tarball URLs — no central registry to scope to. Modeling them would mean
+  // `net-egress('*')` = full egress, in ANY repo, WITHOUT the trust gate (a resolver
+  // cap isn't trust-gated) — the worst combo for a tool that reaches anywhere, with
+  // zero scoping benefit. They stay unmodeled → the floor gives cwd-rw (offline
+  // builds of cached deps work) and FETCHING deps goes through the trust-gated
+  // `[sandbox] network = on` posture, which is the right control for unbounded egress.
 ]);
 
 // ─── AST walk ──────────────────────────────────────────────

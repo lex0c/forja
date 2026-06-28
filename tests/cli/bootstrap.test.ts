@@ -314,7 +314,7 @@ describe('bootstrap', () => {
         sandboxAvailabilityOverride: availableSandbox,
       });
       expect(config.isCwdTrusted).toBe(true);
-      const d = config.permissionEngine.check('bash', 'bash', { command: 'go build' });
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'frobnicate' });
       expect(d.sandboxProfile).toBe('cwd-rw-net');
       db.close();
     });
@@ -336,7 +336,7 @@ describe('bootstrap', () => {
       expect(config.isCwdTrusted).toBe(false);
       // The hostile repo's own config.toml must NOT self-enable egress — the
       // write floor still applies (cwd-rw) but the network bump does not fire.
-      const d = config.permissionEngine.check('bash', 'bash', { command: 'go build' });
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'frobnicate' });
       expect(d.sandboxProfile).toBe('cwd-rw');
       db.close();
     });
@@ -365,7 +365,7 @@ describe('bootstrap', () => {
       // The cwd IS trusted — yet egress stays off because the config's directory
       // (the repo root) is not. Gating on cwd would wrongly flip this to cwd-rw-net.
       expect(config.isCwdTrusted).toBe(true);
-      const d = config.permissionEngine.check('bash', 'bash', { command: 'go build' });
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'frobnicate' });
       expect(d.sandboxProfile).toBe('cwd-rw');
       db.close();
     });
@@ -380,6 +380,27 @@ describe('bootstrap', () => {
       // Deliberately NO project [sandbox] network (do not call writeNetworkOn()).
       const trustPath = join(workdir, 'trusted_dirs.json');
       writeFileSync(trustPath, JSON.stringify({ directories: ['/other/path'] })); // repo untrusted
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      expect(config.isCwdTrusted).toBe(false);
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'frobnicate' });
+      expect(d.sandboxProfile).toBe('cwd-rw-net');
+      db.close();
+    });
+
+    test('a MODELED dep-manager (go) reaches cwd-rw-net with NO posture and NO trust', async () => {
+      // go is modeled with its own net-egress (proxy.golang.org), like npm/pip/cargo,
+      // so it installs deps out-of-box — no [sandbox] network, nothing trusted.
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [] }));
       const { config, db } = await bootstrap({
         prompt: 'hi',
         cwd: workdir,

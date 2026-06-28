@@ -454,6 +454,32 @@ describe('bash resolver — simple commands', () => {
     }
   });
 
+  test('modeled dep-managers emit net-egress(registry) → reach cwd-rw-net like npm (no posture needed)', () => {
+    const cases: ReadonlyArray<[string, string]> = [
+      ['go build ./...', 'net-egress:proxy.golang.org'],
+      ['go mod download', 'net-egress:sum.golang.org'],
+      ['dotnet restore', 'net-egress:api.nuget.org'],
+      ['composer install', 'net-egress:repo.packagist.org'],
+      ['mvn package', 'net-egress:repo.maven.apache.org'],
+      ['gradle build', 'net-egress:plugins.gradle.org'],
+      ['gem install rails', 'net-egress:rubygems.org'],
+      ['bundle install', 'net-egress:rubygems.org'],
+      ['uv sync', 'net-egress:pypi.org'],
+      ['poetry install', 'net-egress:pypi.org'],
+      ['dart pub get', 'net-egress:pub.dev'],
+      ['flutter pub get', 'net-egress:pub.dev'],
+    ];
+    for (const [command, host] of cases) {
+      const r = resolveCapabilities('bash', { command }, CTX);
+      expect(r.kind).toBe('ok');
+      if (r.kind === 'ok') {
+        const s = capStrings(r.capabilities).sort();
+        expect(s).toContain('exec:arbitrary');
+        expect(s).toContain(host);
+      }
+    }
+  });
+
   test('chmod produces write-fs of target (mode is NOT a bogus path)', () => {
     const r = resolveCapabilities('bash', { command: 'chmod 755 ./script.sh' }, CTX);
     expect(r.kind).toBe('ok');
