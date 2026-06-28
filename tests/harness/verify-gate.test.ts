@@ -62,6 +62,24 @@ describe('verify-gate accounting', () => {
     expect(unsatisfiedVerifyCommands(s, CMDS)).toEqual([]);
   });
 
+  test('returns TRUE only on a fresh mutation that re-arms the gate', () => {
+    const s = createVerifyState();
+    // A successful write re-arms (the caller resets the per-cycle nudge budget).
+    expect(recordToolForVerify(s, CMDS, 'edit_file', { path: 'a.ts' }, false, undefined)).toBe(
+      true,
+    );
+    // A passing verify command does NOT re-arm.
+    expect(recordToolForVerify(s, CMDS, 'bash', { command: 'bun test' }, false, undefined)).toBe(
+      false,
+    );
+    // A FAILED write does not re-arm.
+    expect(recordToolForVerify(s, CMDS, 'edit_file', { path: 'a.ts' }, true, undefined)).toBe(
+      false,
+    );
+    // Gate off → never re-arms.
+    expect(recordToolForVerify(s, [], 'edit_file', { path: 'a.ts' }, false, undefined)).toBe(false);
+  });
+
   test('mutation without verify → all commands unsatisfied', () => {
     const s = createVerifyState();
     recordToolForVerify(s, CMDS, 'edit_file', { path: 'a.ts' }, false, undefined);

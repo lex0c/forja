@@ -3553,4 +3553,79 @@ describe('runAgent — claim-time verify gate (STATE_MACHINE §3.2.1)', () => {
     expect(streamed).not.toContain('UNVERIFIED-CLAIM'); // buffered, then dropped by the gate
     expect(streamed).toContain('VERIFIED-ANSWER'); // streamed after verification
   });
+
+  test('a new edit re-arms the gate with a fresh nudge budget (attempts reset)', async () => {
+    // Two edit cycles, model never runs the verify. With the per-cycle reset,
+    // each edit's claim gets the full MAX_VERIFY_ATTEMPTS (2) before accepting;
+    // WITHOUT the reset the run-wide counter would exhaust after edit A and
+    // accept edit B's first claim with no nudge (5 generations, not 7).
+    const { config, handle } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 't1', name: 'edit_file', input: { path: 'a.ts' } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'a1', stop_reason: 'end_turn' }, // cycle A: nudge (attempt 1)
+        { text: 'a2', stop_reason: 'end_turn' }, // cycle A: nudge (attempt 2)
+        {
+          tool_uses: [{ id: 't2', name: 'edit_file', input: { path: 'b.ts' } }],
+          stop_reason: 'tool_use',
+        }, // re-arm → reset
+        { text: 'b1', stop_reason: 'end_turn' }, // cycle B: nudge (attempt 1, only because reset)
+        { text: 'b2', stop_reason: 'end_turn' }, // cycle B: nudge (attempt 2)
+        { text: 'b3', stop_reason: 'end_turn' }, // cycle B: exhausted → accept
+      ],
+      { extraTools: [stubEdit], budget: { maxSteps: 12 }, verify: { commands: ['bun test'] } },
+    );
+    const result = await runAgent(config);
+    expect(result.status).toBe('done');
+    // All 7 steps consumed: edit B's cycle was NOT starved by edit A's nudges.
+    expect(handle.requests.length).toBe(7);
+  });
+
+  test('a provider error after partial text flushes the buffered answer (gate armed)', async () => {
+    const base = mockProvider([]).provider;
+    let calls = 0;
+    const provider: Provider = {
+      ...base,
+      async *generate(): AsyncGenerator<StreamEvent> {
+        calls += 1;
+        if (calls === 1) {
+          // Edit arms the gate, so the next turn's text is buffered.
+          yield { kind: 'start', message_id: 'm1' };
+          yield { kind: 'tool_use_start', id: 't1', name: 'edit_file' };
+          yield { kind: 'tool_use_stop', id: 't1', final_args: { path: 'a.ts' } };
+          yield { kind: 'stop', reason: 'tool_use' };
+          return;
+        }
+        // Partial text, then the provider throws mid-stream.
+        yield { kind: 'start', message_id: 'm2' };
+        yield { kind: 'text_delta', text: 'PARTIAL-BEFORE-ERROR' };
+        throw new Error('provider exploded mid-stream');
+      },
+    };
+    const registry = createToolRegistry();
+    registry.register(echoTool);
+    registry.register(stubEdit);
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const result = await runAgent({
+      provider,
+      toolRegistry: registry,
+      permissionEngine: createPermissionEngine(policy({}), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+      budget: { maxSteps: 10 },
+      verify: { commands: ['bun test'] },
+      onEvent: (e) => events.push(e),
+    });
+    expect(result.reason).toBe('providerError');
+    let streamed = '';
+    for (const e of events) {
+      if (e.type === 'provider_event' && e.event.kind === 'text_delta') streamed += e.event.text;
+    }
+    // The partial text was buffered (gate armed) then flushed in the catch —
+    // not silently swallowed by the buffering.
+    expect(streamed).toContain('PARTIAL-BEFORE-ERROR');
+  });
 });

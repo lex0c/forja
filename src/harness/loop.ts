@@ -3204,6 +3204,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             },
           );
         } catch (e) {
+          // collectStep threw, so this turn produced no settled answer the gate
+          // could suppress — flush any answer text buffered for the verify gate
+          // (partial text the provider streamed before the error) so it isn't
+          // silently swallowed by the buffering. No-op unless the gate was armed.
+          flushBufferedAnswer();
           // The provider request was sent (and likely billed for input
           // tokens) before the throw. Always flip the aggregate flag —
           // even if we recover partial usage, totals are by definition
@@ -3901,14 +3906,22 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // Verify-gate accounting (STATE_MACHINE §3.2.1): fold this settled tool
           // into the run's mutation/verification evidence so the claim-time gate
           // at no_tool_use is deterministic. No-op when the gate is off.
-          recordToolForVerify(
-            verifyState,
-            verifyCommands,
-            tu.name,
-            tu.input,
-            inv.failed,
-            inv.exitCode,
-          );
+          // A fresh mutation re-arms the gate (starts a new verification cycle),
+          // so reset the per-cycle nudge budget — otherwise a later edit inherits
+          // attempts spent on an earlier one and, once the run-wide count hits the
+          // max, every subsequent post-edit claim is accepted with only a warning.
+          if (
+            recordToolForVerify(
+              verifyState,
+              verifyCommands,
+              tu.name,
+              tu.input,
+              inv.failed,
+              inv.exitCode,
+            )
+          ) {
+            verifyAttempts = 0;
+          }
           // Persist the dispatch-rewrite audit row now that invokeTool
           // created the tool_calls row that the FK points at. Skipped
           // when invokeTool returned an empty toolCallId (unknown

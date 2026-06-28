@@ -61,6 +61,11 @@ export const matchesVerifyCommand = (bashCommand: string, declared: string): boo
 // records that command as verified-since-the-last-mutation. No-op when the gate
 // is off (no declared commands).
 //
+// Returns TRUE iff this call recorded a fresh mutation that RE-ARMS the gate (a
+// new edit starts a new verification cycle). The caller resets the per-cycle
+// nudge budget on a re-arm so a later edit isn't starved of nudges by attempts
+// spent on an earlier one.
+//
 // KNOWN BLIND SPOT: only the structured writers in FILE_WRITER_TOOLS count as a
 // mutation. A file edited THROUGH bash (`sed -i`, `> file`, `git apply`, `tee`)
 // is not tracked (bash's write path is unknowable from its input — same reason
@@ -79,12 +84,12 @@ export const recordToolForVerify = (
   // exit (`readNonZeroExit`), so a foreground bash that EXITED 0 is exactly
   // `!failed && nonZeroExit === undefined`; a non-zero exit carries the code.
   nonZeroExit: number | undefined,
-): void => {
-  if (commands.length === 0) return;
+): boolean => {
+  if (commands.length === 0) return false;
   if (!failed && FILE_WRITER_TOOLS.has(toolName)) {
     state.everMutated = true;
     state.verifiedSinceLastMutation.clear();
-    return;
+    return true;
   }
   // A foreground bash that ran and exited 0 (no tool error, no non-zero code).
   if (toolName === FOREGROUND_BASH && !failed && nonZeroExit === undefined) {
@@ -93,6 +98,7 @@ export const recordToolForVerify = (
       if (matchesVerifyCommand(command, declared)) state.verifiedSinceLastMutation.add(declared);
     }
   }
+  return false;
 };
 
 // The declared commands NOT yet verified since the last mutation — the gate's
