@@ -56,8 +56,24 @@ As the whole command, the declared command's exit code *is* the tool's exit code
 
 ## 4. Known limits
 
+- **Verify state is per-run, not persisted across resume.** The mutation /
+  verified-since tracking lives in memory for the duration of one `runAgent`; a
+  resumed session (`resumeFromSessionId`) starts it fresh (`everMutated` false).
+  So an edit made in a session that is interrupted *before* verifying, then
+  resumed, is not gated on resume unless the resumed run edits again — the gate
+  scopes to "this run's edits", and the resumed run has none on record. Narrow
+  (needs edit-without-verify → interrupt → claim with no further edits) and
+  consistent with the rest of Forja's in-memory runtime state, but it means the
+  gate's guarantee does not span a resume boundary. Rehydrating `everMutated`
+  from the resumed history would be a feature, not a fix.
+- **A tool-call-free turn with no answer text isn't a claim, so it isn't gated.**
+  The gate only fires on a SETTLED answer (`endsWithSettledAnswer`); an empty /
+  reasoning-only final turn falls through to `done`. Pathological (the model
+  edited then said nothing, returning an empty response) but it leaves that
+  turn's edit unverified.
 - **Bash-driven edits are a blind spot.** Only the three structured writers count as an edit. A file changed through `bash` (`sed -i`, `> file`, `git apply`, `tee`) is not tracked — `bash`'s write path is unknowable from its input (the same reason recap files it under commands_run, not filesWritten). Detecting bash writes deterministically isn't feasible without command/prose heuristics, which this design avoids. The encouraged edit path — the structured tools — is covered.
 - **Exact match is strict** (see §3). A model that habitually wraps the command (`CI=1 bun test`) will be nudged until it runs the bare form, then accepted on exhaustion.
+- **Only the answer text is buffered before suppression**, not reasoning. A suppressed turn's `thinking_delta` still streams live, so a TUI reasoning panel can show the rejected turn's thinking (the plain one-shot renderer does not render thinking, so its transcript stays clean).
 - **No structured audit event yet.** A block is visible in the message log (the nudge is a persisted turn); exhaustion leaves a stderr line. The structured `verify_gate_exhausted` event + its TUI rendering is a tracked follow-up (`docs/TODO.md` H3.6).
 
 ---
