@@ -19,6 +19,7 @@ import {
   loadProvidersConfig,
   loadRecapConfig,
   loadSandboxConfig,
+  loadVerifyConfig,
 } from '../config/loaders.ts';
 import { persistModelPin } from '../config/writer.ts';
 import { createSqliteFailureSink } from '../failures/index.ts';
@@ -402,6 +403,10 @@ export interface BootstrapResult {
   // was silently ignored (and is now wondering why their build still
   // can't write its cache) sees why, on the same stderr banner.
   sandboxConfigWarnings: readonly string[];
+  // Warnings from the `[verify] commands` loader — a non-list value or
+  // dropped non-string entries, surfaced on the same stderr banner so an
+  // operator whose gate config was silently ignored sees why.
+  verifyConfigWarnings: readonly string[];
   // Final state of the permission engine after bootstrap walked
   // init → loading-policy → validating-chain → ready/refusing.
   // When this is `refusing`, the engine is a deny-everything stub
@@ -583,6 +588,9 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // the carve-out. Warnings surface via the same stderr banner as the
   // other config loaders.
   const sandboxLoaded = loadSandboxConfig({ cwd: projectConfigCwd });
+  // [verify] — claim-time verification gate (STATE_MACHINE §3.2.1). Opt-in;
+  // empty/absent `commands` → gate off. Warnings surface via the same banner.
+  const verifyLoaded = loadVerifyConfig({ cwd: projectConfigCwd });
   setWritableCacheDirsOverride(sandboxLoaded.config.writableCacheDirs);
   // Opt-in persistent dedicated cache (`[sandbox] cache_persistence`). Set
   // the same module-level override the runner reads, so every spawn site
@@ -1635,6 +1643,9 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     // resolved config regardless so the loop has the retention
     // windows ready if/when the operator flips run_gc_on_stop.
     auditRetention: auditLoaded.config,
+    // [verify] config thread-through (STATE_MACHINE §3.2.1). Apply the empty
+    // default here (gate off) when the loader left `commands` unset.
+    verify: { commands: verifyLoaded.config.commands ?? [] },
     // Budget resolution: project/user [budget] config layers merged
     // first (per-key, project winning over user via loader's own
     // merge), then CLI input.budget on top. Harness applies
@@ -1786,6 +1797,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     effortConfigWarnings: effortLoaded.warnings,
     auditConfigWarnings: auditLoaded.warnings,
     sandboxConfigWarnings: sandboxLoaded.warnings,
+    verifyConfigWarnings: verifyLoaded.warnings,
     permissionState: permResult.state,
     ...(permResult.refusingReason !== undefined
       ? { permissionRefusingReason: permResult.refusingReason }

@@ -937,3 +937,106 @@ export const loadSandboxConfig = (input: LoadSandboxConfigInput): LoadedSandboxC
   if (network !== undefined) config.network = network;
   return { config, userPath, projectPath, warnings };
 };
+
+// ─── [verify] — claim-time verification gate (STATE_MACHINE §3.2.1) ──────────
+// Opt-in. `commands` is the list of shell commands the agent must have run with
+// exit 0 (after its last file edit) before a final answer is accepted. Empty or
+// absent → gate OFF (the default). Mirrors [sandbox]'s string-array fail-soft: a
+// malformed `commands` (not a list, or no usable string entries) leaves the
+// field unset so the CONSUMER applies the empty default and the gate stays off —
+// never enable a half-parsed gate over a typo.
+
+export interface VerifyConfigKeys {
+  // Omitted when no layer declared `commands`; the consumer applies `[]`. A
+  // LITERAL empty array is preserved (gate explicitly off).
+  commands?: string[];
+}
+
+export interface LoadedVerifyConfig {
+  config: VerifyConfigKeys;
+  userPath: string | null;
+  projectPath: string;
+  warnings: string[];
+}
+
+// `commands` resolves to undefined in TWO distinct cases — ABSENT (the key isn't
+// there) and DECLARED-BUT-INVALID (present, but a non-array or an all-dropped
+// list). `hadCommands` disambiguates them so a malformed PROJECT value can
+// shadow an inherited USER gate instead of silently resurrecting it: the
+// fail-soft contract is "a malformed value leaves the gate off", and a project
+// typo must not turn the user's gate back on.
+interface PartialVerifyLayer extends VerifyConfigKeys {
+  hadCommands: boolean;
+}
+
+const parseVerifyLayer = (
+  path: string | null,
+  source: string,
+): { layer: PartialVerifyLayer; warnings: string[] } => {
+  const layer: PartialVerifyLayer = { hadCommands: false };
+  const warnings: string[] = [];
+  const section = loadTomlSection(path, 'verify', source);
+  if (section.kind === 'absent' || section.kind === 'no-section') return { layer, warnings };
+  if (section.kind === 'invalid') {
+    warnings.push(section.warning);
+    return { layer, warnings };
+  }
+  const s = section.section;
+  if (s.commands !== undefined) {
+    // The key is present — the layer DECLARED commands, valid or not. This is
+    // what lets an invalid project value shadow the user layer below.
+    layer.hadCommands = true;
+    const raw = s.commands;
+    if (!Array.isArray(raw)) {
+      warnings.push(
+        `${source} config (${path}): [verify].commands must be a list of strings; ignoring`,
+      );
+    } else {
+      // Keep only non-empty string entries; warn on any dropped.
+      const cmds: string[] = [];
+      let dropped = 0;
+      for (const entry of raw) {
+        if (typeof entry === 'string' && entry.trim().length > 0) cmds.push(entry.trim());
+        else dropped += 1;
+      }
+      if (dropped > 0) {
+        warnings.push(
+          `${source} config (${path}): [verify].commands dropped ${dropped} non-string/empty entr${dropped === 1 ? 'y' : 'ies'}`,
+        );
+      }
+      // Tri-state, fail-soft: a literal `[]` disables the gate explicitly; a
+      // list with usable entries sets them; an all-dropped list leaves the field
+      // unset (→ consumer default, gate off) so a typo can't half-enable it.
+      if (raw.length === 0) layer.commands = [];
+      else if (cmds.length > 0) layer.commands = cmds;
+    }
+  }
+  return { layer, warnings };
+};
+
+export interface LoadVerifyConfigInput {
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+}
+
+export const loadVerifyConfig = (input: LoadVerifyConfigInput): LoadedVerifyConfig => {
+  const env = input.env ?? process.env;
+  const userPath = userConfigPath(env);
+  const projectPath = projectConfigPath(input.cwd);
+  const userResult = parseVerifyLayer(userPath, 'user');
+  const projectResult = parseVerifyLayer(projectPath, 'project');
+  const warnings = [...userResult.warnings, ...projectResult.warnings];
+  // Project wins, but distinguish ABSENT from DECLARED-BUT-INVALID: if the
+  // project layer declared `commands` at all (`hadCommands`), it OWNS the
+  // decision — even when its value was malformed and resolved to undefined, so
+  // the gate stays off rather than falling back to (resurrecting) the user's
+  // commands over a project typo. Only an absent project layer inherits the user
+  // value (which itself is undefined when the user value was invalid). An
+  // explicit project `[]` is a real value that already wins via this path.
+  const resolved = projectResult.layer.hadCommands
+    ? projectResult.layer.commands
+    : userResult.layer.commands;
+  const config: VerifyConfigKeys = {};
+  if (resolved !== undefined) config.commands = resolved;
+  return { config, userPath, projectPath, warnings };
+};

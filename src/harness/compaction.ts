@@ -16,6 +16,7 @@ import {
 import { hashPromptContent } from '../storage/repos/prompt-versions.ts';
 import { abortableIterable } from './abortable.ts';
 import { CollectStepError, collectStep } from './collect.ts';
+import { elisionPointer, toolResultLabel } from './compaction-relevance.ts';
 
 // Compaction shrinks the in-memory conversation history when the
 // provider's prompt is approaching its context window. AGENTIC_CLI §6
@@ -205,10 +206,11 @@ const fallbackElide = (block: ProviderContentBlock): ProviderContentBlock => {
     // Tool args/output get replaced with a pointer so the model
     // still sees that the call happened (and against which
     // tool_use_id) but not the body. is_error is preserved so the
-    // model knows whether the call succeeded.
+    // model knows whether the call succeeded. The pointer names the
+    // tool (when known) so the next turn knows WHAT was elided.
     return {
       ...block,
-      content: `[tool_result elided: ${sizeBytes} bytes — compaction fallback; recover via retrieve_context (session view)]`,
+      content: elisionPointer(toolResultLabel(block.name), sizeBytes, 'compaction fallback'),
     };
   }
   if (block.type === 'text') {

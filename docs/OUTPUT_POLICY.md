@@ -139,11 +139,19 @@ lives in [`SESSION.md`](./SESSION.md) (the compaction pipeline); the summary her
 - **What.** Before the *billed* LLM compaction, cheaply pointer-elide
   low-goal-relevance `tool_result` bodies in the **middle** span (goal message
   and the preserved tail are kept verbatim).
+- **Dedup pre-pass.** Before scoring, an exact-duplicate pass
+  (`dedupElideMiddle`) collapses identical repeated bodies (re-reads, re-run
+  greps/tests): the latest copy stays verbatim and the earlier ones become a
+  back-reference (`… duplicate of an identical later call …`), so the relevance
+  budget isn't spent on redundant copies. Pure/clock-free; folds into the same
+  `relevance` audit (no new strategy). The relevance pass is told to skip the
+  dedup'd ids, so the two passes' elided-id sets stay disjoint.
 - **Scoring.** BM25 of each body against the goal text, blended with
   position-based recency (`score = 0.75·relevance + 0.25·recency`; recency by
   *index among eligible*, not timestamp → clock-free → replay-safe). Greedy keep,
   highest score first, within `verbatimBudgetBytes`; the rest are pointered with
-  `[tool_result elided: N bytes — low goal-relevance; recover via retrieve_context …]`.
+  `[<label> elided: N bytes — low goal-relevance; recover via retrieve_context …]`
+  (`<label>` names the tool when known — `read_file result` — else `tool_result`).
 - **Eligibility.** Only `tool_result` blocks, **non-error** (errors are
   load-bearing verbatim, spec §0.4), above a minimum size. The guards are
   re-applied on rewrite, not just keyed by `tool_use_id`, so a duplicated id can

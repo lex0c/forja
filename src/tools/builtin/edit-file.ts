@@ -169,6 +169,38 @@ interface NearMatch {
   text?: string;
 }
 
+// Build a NearMatch, echoing the located text only when it fits the cap.
+const nearMatch = (startLine: number, endLine: number, text: string): NearMatch => ({
+  start_line: startLine,
+  end_line: endLine,
+  ...(text.length <= NEAR_MATCH_TEXT_CAP ? { text } : {}),
+});
+
+// Scan the haystack for line-spans whose every line equals the needle under a
+// custom per-line normalizer. Returns 0-based start indices. The whitespace
+// rung and the extended rungs all locate spans through this — `normalize` is
+// the only thing that varies (trim, trim+NFC, …).
+const findSpans = (
+  hayLines: string[],
+  needleNorm: string[],
+  normalize: (line: string) => string,
+): number[] => {
+  const n = needleNorm.length;
+  const starts: number[] = [];
+  if (n === 0 || n > hayLines.length) return starts;
+  for (let s = 0; s + n <= hayLines.length; s++) {
+    let match = true;
+    for (let k = 0; k < n; k++) {
+      if (normalize(hayLines[s + k] ?? '') !== needleNorm[k]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) starts.push(s);
+  }
+  return starts;
+};
+
 type FallbackResult =
   | { kind: 'applied'; content: string }
   | { kind: 'unsafe'; near: NearMatch }
@@ -189,37 +221,128 @@ const whitespaceFallback = (current: string, oldStr: string, newStr: string): Fa
   // line in the file — refuse to fall back on it.
   if (needleLines.every((l) => l.trim() === '')) return { kind: 'none' };
   const needleTrim = needleLines.map((l) => trimSpacesTabs(l));
-  const starts: number[] = [];
-  for (let s = 0; s + n <= hayLines.length; s++) {
-    let match = true;
-    for (let k = 0; k < n; k++) {
-      if (trimSpacesTabs(hayLines[s + k] ?? '') !== needleTrim[k]) {
-        match = false;
-        break;
-      }
-    }
-    if (match) starts.push(s);
-  }
+  const starts = findSpans(hayLines, needleTrim, trimSpacesTabs);
   if (starts.length === 0) return { kind: 'none' };
   if (starts.length > 1) return { kind: 'multiple', lines: starts.slice(0, 8).map((s) => s + 1) };
   const s = starts[0] ?? 0;
   const span = hayLines.slice(s, s + n);
   const shift = uniformShift(span, needleLines);
-  if (shift === null) {
-    const text = span.join('\n');
-    return {
-      kind: 'unsafe',
-      near: {
-        start_line: s + 1,
-        end_line: s + n,
-        ...(text.length <= NEAR_MATCH_TEXT_CAP ? { text } : {}),
-      },
-    };
-  }
+  if (shift === null) return { kind: 'unsafe', near: nearMatch(s + 1, s + n, span.join('\n')) };
   const newLines = newStr.split('\n').map((l) => applyShift(l, shift));
   const content = [...hayLines.slice(0, s), ...newLines, ...hayLines.slice(s + n)].join('\n');
   return { kind: 'applied', content };
 };
+
+type ExtendedResult =
+  | { kind: 'applied'; content: string }
+  | { kind: 'unsafe'; near: NearMatch }
+  | { kind: 'escape_drift'; near: NearMatch }
+  | { kind: 'block_anchor'; near: NearMatch }
+  | { kind: 'none' };
+
+// Extended match rungs + targeted diagnostics — run ONLY after the whitespace
+// rung (`whitespaceFallback`) found nothing, so existing whitespace behavior is
+// untouched. Three escalating, conservative steps:
+//
+//   1. NFC rung: the only drift is Unicode normalization form (composed vs
+//      decomposed). Auto-apply at the SAME safety bar as the whitespace rung —
+//      a unique span with one uniform indent shift — re-indenting new_string to
+//      the file. A unique span with NON-uniform indent returns an `unsafe`
+//      near-match (the same actionable error the whitespace rung gives), not a
+//      silent fall-through to the generic miss.
+//   2. Escape-drift: the model over-escaped quotes (`\'`/`\"`) where the file
+//      has bare ones — a tool-call serialization artifact. If de-escaping makes
+//      old_string uniquely match, point the model at the region. We do NOT
+//      auto-fix: a literal backslash-quote might be intended.
+//   3. Block-anchor: the first and last needle lines bound a SAME-LENGTH region
+//      whose interior drifted. Locate it for an actionable error; never
+//      auto-apply the unverified middle.
+const extendedMatch = (current: string, oldStr: string, newStr: string): ExtendedResult => {
+  const needleLines = oldStr.split('\n');
+  const hayLines = current.split('\n');
+  const n = needleLines.length;
+  if (n === 0 || n > hayLines.length) return { kind: 'none' };
+  if (needleLines.every((l) => l.trim() === '')) return { kind: 'none' };
+
+  // (1) NFC rung — trim + Unicode NFC on both sides.
+  const nfc = (line: string): string => trimSpacesTabs(line).normalize('NFC');
+  const nfcStarts = findSpans(
+    hayLines,
+    needleLines.map((l) => nfc(l)),
+    nfc,
+  );
+  if (nfcStarts.length === 1) {
+    const s = nfcStarts[0] ?? 0;
+    const span = hayLines.slice(s, s + n);
+    const shift = uniformShift(span, needleLines);
+    if (shift !== null) {
+      const newLines = newStr.split('\n').map((l) => applyShift(l, shift));
+      const content = [...hayLines.slice(0, s), ...newLines, ...hayLines.slice(s + n)].join('\n');
+      return { kind: 'applied', content };
+    }
+    // Unique near-match but non-uniform indent — surface the region (parity
+    // with the whitespace rung) instead of falling through to a generic miss.
+    return { kind: 'unsafe', near: nearMatch(s + 1, s + n, span.join('\n')) };
+  }
+
+  // (2) Escape-drift — de-escape `\'`/`\"` and see if THAT uniquely matches
+  // (modulo the whitespace rung's trim).
+  const deEscaped = oldStr.replaceAll("\\'", "'").replaceAll('\\"', '"');
+  if (deEscaped !== oldStr) {
+    const deLines = deEscaped.split('\n').map((l) => trimSpacesTabs(l));
+    const deStarts = findSpans(hayLines, deLines, trimSpacesTabs);
+    if (deStarts.length === 1) {
+      const s = deStarts[0] ?? 0;
+      return {
+        kind: 'escape_drift',
+        near: nearMatch(s + 1, s + n, hayLines.slice(s, s + n).join('\n')),
+      };
+    }
+  }
+
+  // (3) Block-anchor — first + last needle lines each match exactly one hay
+  // line, bounding a region the same length as the needle (interior drift).
+  if (n >= 3) {
+    const firstNorm = trimSpacesTabs(needleLines[0] ?? '');
+    const lastNorm = trimSpacesTabs(needleLines[n - 1] ?? '');
+    if (firstNorm !== '' && lastNorm !== '') {
+      const firstHits: number[] = [];
+      const lastHits: number[] = [];
+      for (let i = 0; i < hayLines.length; i++) {
+        const t = trimSpacesTabs(hayLines[i] ?? '');
+        if (t === firstNorm) firstHits.push(i);
+        if (t === lastNorm) lastHits.push(i);
+      }
+      if (firstHits.length === 1 && lastHits.length === 1) {
+        const s = firstHits[0] ?? 0;
+        const e = lastHits[0] ?? 0;
+        if (e - s + 1 === n) {
+          return {
+            kind: 'block_anchor',
+            near: nearMatch(s + 1, e + 1, hayLines.slice(s, e + 1).join('\n')),
+          };
+        }
+      }
+    }
+  }
+
+  return { kind: 'none' };
+};
+
+// Build the canonical "old_string not found" error for edit `index` — one
+// source for the code + message so the not-found paths (whitespace
+// unsafe/multiple, NFC unsafe, escape drift, block anchor, generic miss)
+// can't drift apart. Only the hint and the near-match details vary.
+const oldStringNotFoundError = (
+  index: number,
+  pathLabel: string,
+  hint: string,
+  details?: Record<string, unknown>,
+): ToolError =>
+  toolError(ERROR_CODES.oldStringNotFound, `edits[${index}].old_string not found in ${pathLabel}`, {
+    hint,
+    ...(details !== undefined ? { details } : {}),
+  });
 
 // Apply one edit to `current`. Returns the post-edit content + the
 // replacement count (and whether a whitespace-tolerant fallback was
@@ -267,38 +390,72 @@ const applyEdit = (
       if (fb.kind === 'unsafe') {
         return {
           ok: false,
-          error: toolError(
-            ERROR_CODES.oldStringNotFound,
-            `edits[${index}].old_string not found in ${pathLabel}`,
-            {
-              hint: `A near-match (differs only in whitespace, but not by a single uniform indent shift) is at lines ${fb.near.start_line}-${fb.near.end_line}. Copy that exact text into old_string.`,
-              details: { near_match: fb.near },
-            },
+          error: oldStringNotFoundError(
+            index,
+            pathLabel,
+            `A near-match (differs only in whitespace, but not by a single uniform indent shift) is at lines ${fb.near.start_line}-${fb.near.end_line}. Copy that exact text into old_string.`,
+            { near_match: fb.near },
           ),
         };
       }
       if (fb.kind === 'multiple') {
         return {
           ok: false,
-          error: toolError(
-            ERROR_CODES.oldStringNotFound,
-            `edits[${index}].old_string not found in ${pathLabel}`,
-            {
-              hint: `Whitespace-insensitive near-matches start at lines ${fb.lines.join(', ')}. Add surrounding context and use the file's exact text.`,
-              details: { near_match_lines: fb.lines },
-            },
+          error: oldStringNotFoundError(
+            index,
+            pathLabel,
+            `Whitespace-insensitive near-matches start at lines ${fb.lines.join(', ')}. Add surrounding context and use the file's exact text.`,
+            { near_match_lines: fb.lines },
+          ),
+        };
+      }
+      // Whitespace rung found nothing — try the extended rungs (NFC
+      // auto-apply) and targeted diagnostics (NFC unsafe, escape drift,
+      // block anchor) before the generic not-found below.
+      const ext = extendedMatch(current, edit.old_string, edit.new_string);
+      if (ext.kind === 'applied') {
+        return { ok: true, content: ext.content, replacements: 1, whitespace_tolerant: true };
+      }
+      if (ext.kind === 'unsafe') {
+        return {
+          ok: false,
+          error: oldStringNotFoundError(
+            index,
+            pathLabel,
+            `A near-match (differs by Unicode normalization and non-uniform indentation) is at lines ${ext.near.start_line}-${ext.near.end_line}. Copy that exact text into old_string.`,
+            { near_match: ext.near },
+          ),
+        };
+      }
+      if (ext.kind === 'escape_drift') {
+        return {
+          ok: false,
+          error: oldStringNotFoundError(
+            index,
+            pathLabel,
+            `A region at lines ${ext.near.start_line}-${ext.near.end_line} matches once over-escaped quotes (\\' or \\") are removed — your old_string escaped quotes the file does not. Copy the file's exact text (bare quotes).`,
+            { near_match: ext.near, escape_drift: true },
+          ),
+        };
+      }
+      if (ext.kind === 'block_anchor') {
+        return {
+          ok: false,
+          error: oldStringNotFoundError(
+            index,
+            pathLabel,
+            `Your first and last lines match a same-length block at lines ${ext.near.start_line}-${ext.near.end_line}, but the interior text differs. Copy that block verbatim into old_string.`,
+            { near_match: ext.near, block_anchor: true },
           ),
         };
       }
     }
     return {
       ok: false,
-      error: toolError(
-        ERROR_CODES.oldStringNotFound,
-        `edits[${index}].old_string not found in ${pathLabel}`,
-        {
-          hint: 'Read the file first to confirm the exact text and indentation. In a batch, the search runs against the result of previous edits — an earlier edit may have removed the text you expected to find.',
-        },
+      error: oldStringNotFoundError(
+        index,
+        pathLabel,
+        'Read the file first to confirm the exact text and indentation. In a batch, the search runs against the result of previous edits — an earlier edit may have removed the text you expected to find.',
       ),
     };
   }

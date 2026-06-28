@@ -1044,6 +1044,10 @@ describe('invokeTool', () => {
       );
       expect(inv.failed).toBe(false);
       expect(receivedArgs).toEqual({ path: 'mutated.txt' });
+      // The result exposes the EXECUTED args (post-hook), so consumers that
+      // reason about what ran — the verify gate — match the rewritten command,
+      // not the model's pre-hook args.
+      expect(inv.effectiveArgs).toEqual({ path: 'mutated.txt' });
     });
 
     test('slice 178 (hardening M4): successful updatedInput records hook approval row with hash diff', async () => {

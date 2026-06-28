@@ -60,7 +60,7 @@ export const compactCommand: SlashCommand = {
       }
       const relevanceNote =
         result.relevanceElidedCount > 0
-          ? ` Relevance pre-pass pointered ${result.relevanceElidedCount} tool_result(s) (${result.relevanceFreedBytes}B freed, recoverable via retrieve_context).`
+          ? ` Pre-pass pointered ${result.relevanceElidedCount} tool_result(s) (dedup + relevance; ${result.relevanceFreedBytes}B freed, recoverable via retrieve_context).`
           : '';
       return {
         kind: 'ok',

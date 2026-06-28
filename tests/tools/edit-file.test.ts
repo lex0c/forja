@@ -680,3 +680,117 @@ describe('editFileTool — display diff', () => {
     expect(diffs[0]?.removed).toBe(1);
   });
 });
+
+describe('editFileTool extended match rungs + diagnostics', () => {
+  test('unicode NFC near-match auto-applies (composed vs decomposed)', async () => {
+    const path = join(dir, 'a.ts');
+    // Composed (NFC) vs decomposed (NFD) forms of the same accented char,
+    // built from numeric code points so the source stays ASCII and the two
+    // byte sequences genuinely differ -- exact + whitespace rungs miss, the
+    // NFC rung recovers it.
+    const composed = `caf${String.fromCharCode(0x00e9)}`; // U+00E9
+    const decomposed = `cafe${String.fromCharCode(0x0301)}`; // 'e' + combining acute U+0301
+    writeFileSync(path, `const name = '${composed}';\n`);
+    const out = await editFileTool.execute(
+      {
+        path,
+        edits: [{ old_string: `const name = '${decomposed}';`, new_string: "const name = 'tea';" }],
+      },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    // Flagged tolerant -- old_string drifted from the file's exact bytes.
+    expect(out.edits[0]?.whitespace_tolerant).toBe(true);
+    expect(readFileSync(path, 'utf-8')).toBe("const name = 'tea';\n");
+  });
+
+  test('NFC unique near-match with non-uniform indent is diagnosed, not silently missed', async () => {
+    const path = join(dir, 'a.ts');
+    const composed = `caf${String.fromCharCode(0x00e9)}`; // U+00E9
+    const decomposed = `cafe${String.fromCharCode(0x0301)}`; // 'e' + U+0301
+    // File: tab-indented + composed. old_string: space-indented (incompatible
+    // with the tab) + decomposed. NFC rung finds the unique line but uniformShift
+    // is null (tabs vs spaces), so it must surface the region, not fall through.
+    writeFileSync(path, `\tconst x = '${composed}';\n`);
+    const out = await editFileTool.execute(
+      { path, edits: [{ old_string: `    const x = '${decomposed}';`, new_string: 'y' }] },
+      makeCtx({ cwd: dir }),
+    );
+    if (!isToolError(out)) throw new Error('expected old_string_not_found');
+    expect(out.error_code).toBe('edit.old_string_not_found');
+    expect((out.details?.near_match as { start_line: number } | undefined)?.start_line).toBe(1);
+    expect(readFileSync(path, 'utf-8')).toBe(`\tconst x = '${composed}';\n`); // untouched
+  });
+
+  test('over-escaped quotes are diagnosed (escape drift), file untouched', async () => {
+    const path = join(dir, 'a.ts');
+    const file = 'const a = "hello";\n';
+    writeFileSync(path, file);
+    // old_string came through a layer that escaped the quotes (\") where the
+    // file has bare ones -- a near-miss the generic not-found would leave the
+    // model guessing about.
+    const out = await editFileTool.execute(
+      { path, edits: [{ old_string: 'const a = \\"hello\\";', new_string: 'const a = "world";' }] },
+      makeCtx({ cwd: dir }),
+    );
+    if (!isToolError(out)) throw new Error('expected old_string_not_found');
+    expect(out.error_code).toBe('edit.old_string_not_found');
+    expect(out.details?.escape_drift).toBe(true);
+    expect(out.details?.near_match).toEqual({
+      start_line: 1,
+      end_line: 1,
+      text: 'const a = "hello";',
+    });
+    expect(out.hint).toContain('quotes');
+    expect(readFileSync(path, 'utf-8')).toBe(file); // never auto-fixed
+  });
+
+  test('block-anchor: first+last lines bound a same-length region, interior drifted', async () => {
+    const path = join(dir, 'a.ts');
+    const file = ['function foo() {', '  doA();', '  doB();', '}', ''].join('\n');
+    writeFileSync(path, file);
+    // Same first/last lines + same line count, but the interior differs.
+    const oldString = ['function foo() {', '  doX();', '  doY();', '}'].join('\n');
+    const out = await editFileTool.execute(
+      { path, edits: [{ old_string: oldString, new_string: 'x' }] },
+      makeCtx({ cwd: dir }),
+    );
+    if (!isToolError(out)) throw new Error('expected old_string_not_found');
+    expect(out.error_code).toBe('edit.old_string_not_found');
+    expect(out.details?.block_anchor).toBe(true);
+    expect(out.details?.near_match).toEqual({
+      start_line: 1,
+      end_line: 4,
+      text: ['function foo() {', '  doA();', '  doB();', '}'].join('\n'),
+    });
+    expect(readFileSync(path, 'utf-8')).toBe(file); // interior unverified, untouched
+  });
+
+  test('a genuinely-missing single-line old_string still gets the generic not-found', async () => {
+    // No escapes, single line (block-anchor needs >=3), no NFC drift -- the
+    // extended rungs must NOT fabricate a diagnostic here.
+    const path = join(dir, 'a.ts');
+    writeFileSync(path, 'foo\n');
+    const out = await editFileTool.execute(
+      { path, edits: [{ old_string: 'bar', new_string: 'baz' }] },
+      makeCtx({ cwd: dir }),
+    );
+    if (!isToolError(out)) throw new Error('expected old_string_not_found');
+    expect(out.error_code).toBe('edit.old_string_not_found');
+    expect(out.details?.escape_drift).toBeUndefined();
+    expect(out.details?.block_anchor).toBeUndefined();
+  });
+});
+
+describe('editFileTool CRLF files', () => {
+  test('editing a CRLF file preserves the file line endings', async () => {
+    const path = join(dir, 'crlf.ts');
+    writeFileSync(path, 'a = 1;\r\nb = 2;\r\n');
+    const out = await editFileTool.execute(
+      { path, edits: [{ old_string: 'a = 1', new_string: 'a = 10' }] },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(readFileSync(path, 'utf-8')).toBe('a = 10;\r\nb = 2;\r\n');
+  });
+});

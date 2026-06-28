@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { relevanceElideMiddle } from '../../src/harness/compaction-relevance.ts';
+import { dedupElideMiddle, relevanceElideMiddle } from '../../src/harness/compaction-relevance.ts';
 import type { ProviderContentBlock, ProviderMessage } from '../../src/providers/index.ts';
 
 // Pure scorer for the relevance compaction strategy. The contract:
@@ -148,5 +148,188 @@ describe('relevanceElideMiddle', () => {
     expect(blocks[0]).toBe(textBlock); // same reference, untouched
     expect(blocks[1]).toBe(toolUseBlock);
     expect(out.elidedCount).toBe(1); // the irrelevant tool_result still got pointered
+  });
+
+  test('excludeIds makes a tool_result ineligible (never scored, never elided)', () => {
+    const middle = [
+      userBlocks([toolResult('keep', IRRELEVANT)]),
+      userBlocks([toolResult('drop', IRRELEVANT)]),
+    ];
+    // Budget 0 → both would normally be elided; excluding 'keep' spares it.
+    // This is the guard the dedup→relevance fold relies on (a dedup-pointered
+    // id is never re-elided by the relevance pass, whatever its pointer size).
+    const out = relevanceElideMiddle(middle, {
+      goalText: GOAL,
+      verbatimBudgetBytes: 0,
+      excludeIds: new Set(['keep']),
+    });
+    expect(out.elidedIds).toEqual(['drop']);
+    expect(trAt(out.middle[0])).toBe(IRRELEVANT); // excluded → verbatim
+    expect(isElided(trAt(out.middle[1]))).toBe(true);
+  });
+});
+
+describe('dedupElideMiddle', () => {
+  test('pointers earlier identical bodies and keeps the latest verbatim', () => {
+    const body = big('the same grep output emitted three times');
+    const middle = [
+      userBlocks([toolResult('a', body)]),
+      userBlocks([toolResult('b', body)]),
+      userBlocks([toolResult('c', body)]),
+    ];
+    const out = dedupElideMiddle(middle);
+    expect(out.elidedCount).toBe(2);
+    expect(out.elidedIds).toEqual(['a', 'b']); // document order, all but the last
+    expect(out.freedBytes).toBe(2 * Buffer.byteLength(body, 'utf8'));
+    expect(trAt(out.middle[0])).toContain('duplicate of an identical later call');
+    expect(trAt(out.middle[1])).toContain('duplicate of an identical later call');
+    expect(trAt(out.middle[0])).toContain('retrieve_context');
+    expect(trAt(out.middle[2])).toBe(body); // latest kept verbatim
+  });
+
+  test('never deduplicates an error result', () => {
+    const body = big('identical error text');
+    const middle = [
+      userBlocks([toolResult('e1', body, true)]),
+      userBlocks([toolResult('e2', body, true)]),
+    ];
+    const out = dedupElideMiddle(middle);
+    expect(out.elidedCount).toBe(0);
+    expect(out.middle).toBe(middle); // untouched → same reference
+  });
+
+  test('distinct bodies are a no-op (same reference returned)', () => {
+    const middle = [
+      userBlocks([toolResult('a', big('first distinct body'))]),
+      userBlocks([toolResult('b', big('second distinct body'))]),
+    ];
+    const out = dedupElideMiddle(middle);
+    expect(out.elidedCount).toBe(0);
+    expect(out.middle).toBe(middle);
+  });
+
+  test('identical bodies under the min-elide floor are left alone', () => {
+    const small = 'tiny'; // well under the 200B floor
+    const middle = [userBlocks([toolResult('a', small)]), userBlocks([toolResult('b', small)])];
+    const out = dedupElideMiddle(middle);
+    expect(out.elidedCount).toBe(0);
+    expect(out.middle).toBe(middle);
+  });
+
+  test('is deterministic / clock-free (same input → same partition)', () => {
+    const body = big('repeated body');
+    const make = (): ProviderMessage[] => [
+      userBlocks([toolResult('a', body)]),
+      userBlocks([toolResult('b', body)]),
+    ];
+    const first = dedupElideMiddle(make());
+    const second = dedupElideMiddle(make());
+    expect(first.elidedIds).toEqual(second.elidedIds);
+    expect(first.freedBytes).toBe(second.freedBytes);
+  });
+
+  test('pointer names the tool when the block carries a name', () => {
+    const body = big('read the same file twice');
+    const named = (id: string): ProviderContentBlock => ({
+      type: 'tool_result',
+      tool_use_id: id,
+      name: 'read_file',
+      content: body,
+    });
+    const middle = [userBlocks([named('a')]), userBlocks([named('b')])];
+    const out = dedupElideMiddle(middle);
+    expect(trAt(out.middle[0])).toContain('[read_file result elided:');
+    expect(trAt(out.middle[0])).toContain('duplicate of an identical later call');
+  });
+});
+
+// Free, deterministic A/B of the dedup pre-pass (dedup-OFF = relevance alone vs
+// dedup-ON = dedup → relevance with excludeIds) at the SAME budget. The honest
+// finding from this measurement: dedup is NOT a strict byte-Pareto win —
+// deduping renormalizes recency (recency is index-among-eligible), so the
+// surviving latest copy can gain top recency and be KEPT where relevance-alone
+// evicted every copy. What IS guaranteed and pinned here: (1) dedup itself is
+// information-neutral — every body it pointers has an identical twin still in
+// context — and (2) in the loose-budget regime it cuts the redundancy relevance
+// would otherwise keep, with no distinct information lost.
+describe('dedup + relevance — information-neutrality + loose-budget upside', () => {
+  const rawBytes = (m: ProviderMessage[]): number =>
+    m.reduce((acc, msg) => {
+      if (typeof msg.content === 'string') return acc;
+      return (
+        acc +
+        msg.content.reduce(
+          (a, b) => (b.type === 'tool_result' ? a + Buffer.byteLength(b.content, 'utf8') : a),
+          0,
+        )
+      );
+    }, 0);
+  const isPointer = (s: string): boolean =>
+    s.startsWith('[') && s.includes('recover via retrieve_context');
+  const distinctKept = (m: ProviderMessage[]): number => {
+    const s = new Set<string>();
+    for (const msg of m) {
+      if (typeof msg.content === 'string') continue;
+      for (const b of msg.content) {
+        if (b.type === 'tool_result' && !isPointer(b.content)) s.add(b.content);
+      }
+    }
+    return s.size;
+  };
+  const arms = (middle: ProviderMessage[], budget: number) => {
+    const off = relevanceElideMiddle(middle, { goalText: GOAL, verbatimBudgetBytes: budget });
+    const dd = dedupElideMiddle(middle);
+    const on = relevanceElideMiddle(dd.middle, {
+      goalText: GOAL,
+      verbatimBudgetBytes: budget,
+      excludeIds: new Set(dd.elidedIds),
+    });
+    return { off, on, onFreed: dd.freedBytes + on.freedBytes };
+  };
+  // Same body re-read on 4 turns, interleaved with 3 unique bodies → 4 distinct.
+  const dupHeavy = (dup: string): ProviderMessage[] => [
+    userBlocks([toolResult('a', dup)]),
+    userBlocks([toolResult('b', big('unique grep alpha path'))]),
+    userBlocks([toolResult('c', dup)]),
+    userBlocks([toolResult('d', big('unique config beta defaults'))]),
+    userBlocks([toolResult('e', dup)]),
+    userBlocks([toolResult('f', big('unique test gamma trace'))]),
+    userBlocks([toolResult('g', dup)]),
+  ];
+
+  test('loose budget: relevance keeps redundant copies; dedup frees them, no info lost', () => {
+    const middle = dupHeavy(big('the same file re-read each turn'));
+    const budget = rawBytes(middle) + 10_000; // loose → relevance evicts nothing
+    const { off, on, onFreed } = arms(middle, budget);
+    expect(off.freedBytes).toBe(0); // relevance keeps EVERYTHING, incl. 3 redundant copies
+    expect(onFreed).toBeGreaterThan(0); // dedup frees the redundancy
+    expect(distinctKept(on.middle)).toBe(distinctKept(off.middle)); // same distinct info
+    expect(distinctKept(on.middle)).toBe(4);
+  });
+
+  test('dedup is information-neutral: every pointered body has an identical twin still in context', () => {
+    const middle = dupHeavy(big('the same file re-read each turn'));
+    const dd = dedupElideMiddle(middle);
+    // Original content for each tool_use_id in the input.
+    const origById = new Map<string, string>();
+    for (const msg of middle) {
+      if (typeof msg.content === 'string') continue;
+      for (const b of msg.content)
+        if (b.type === 'tool_result') origById.set(b.tool_use_id, b.content);
+    }
+    // Bodies still present verbatim (non-pointer) after dedup.
+    const survivors = new Set<string>();
+    for (const msg of dd.middle) {
+      if (typeof msg.content === 'string') continue;
+      for (const b of msg.content)
+        if (b.type === 'tool_result' && !isPointer(b.content)) survivors.add(b.content);
+    }
+    expect(dd.elidedIds.length).toBeGreaterThan(0);
+    // The content of every pointered body is still in context (its later twin).
+    for (const id of dd.elidedIds) {
+      const original = origById.get(id);
+      expect(original).toBeDefined();
+      expect(survivors.has(original as string)).toBe(true);
+    }
   });
 });

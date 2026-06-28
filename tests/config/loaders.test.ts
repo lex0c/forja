@@ -10,6 +10,7 @@ import {
   loadProvidersConfig,
   loadRecapConfig,
   loadSandboxConfig,
+  loadVerifyConfig,
   projectConfigPath,
   userConfigPath,
 } from '../../src/config/loaders.ts';
@@ -1408,6 +1409,149 @@ describe('loadSandboxConfig — [sandbox] cache_persistence + shared_tmp', () =>
       writeProject(cwd, '[sandbox]\ncache_persistence = false\n');
       const r = loadSandboxConfig({ cwd, env: { HOME: home } });
       expect(r.config.cachePersistence).toBe(false);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('loadVerifyConfig — [verify] commands', () => {
+  const writeProject = (cwd: string, toml: string): void => {
+    mkdirSync(join(cwd, '.forja'), { recursive: true });
+    writeFileSync(join(cwd, '.forja', 'config.toml'), toml);
+  };
+
+  test('absent section → commands undefined (gate off), no warnings', () => {
+    const cwd = makeTempCwd();
+    try {
+      const r = loadVerifyConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.commands).toBeUndefined();
+      expect(r.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('valid list is kept (trimmed)', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProject(cwd, '[verify]\ncommands = ["bun run typecheck", "  bun test  "]\n');
+      const r = loadVerifyConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.commands).toEqual(['bun run typecheck', 'bun test']);
+      expect(r.warnings).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('explicit empty array is preserved (gate explicitly off)', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProject(cwd, '[verify]\ncommands = []\n');
+      const r = loadVerifyConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.commands).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('non-array value → falls back to DEFAULT (undefined) + warning', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProject(cwd, '[verify]\ncommands = "bun test"\n');
+      const r = loadVerifyConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.commands).toBeUndefined();
+      expect(r.warnings.length).toBe(1);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('non-string / empty entries are dropped with a warning; valid kept', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProject(cwd, '[verify]\ncommands = ["bun test", 42, "  "]\n');
+      const r = loadVerifyConfig({ cwd, env: { HOME: '/none' } });
+      expect(r.config.commands).toEqual(['bun test']);
+      expect(r.warnings.length).toBe(1);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('array with NO usable entries → DEFAULT (undefined), not empty-array', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProject(cwd, '[verify]\ncommands = [1, 2]\n');
+      const r = loadVerifyConfig({ cwd, env: { HOME: '/none' } });
+      // Not `[]` (reserved for a LITERAL empty array = explicitly off); a typo
+      // leaves the field unset so the consumer applies the empty default.
+      expect(r.config.commands).toBeUndefined();
+      expect(r.warnings.length).toBe(1);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  const writeUser = (home: string, toml: string): void => {
+    mkdirSync(join(home, '.config', 'forja'), { recursive: true });
+    writeFileSync(join(home, '.config', 'forja', 'config.toml'), toml);
+  };
+
+  test('project absent → inherits a valid USER gate', () => {
+    const home = mkdtempSync(join(tmpdir(), 'forja-verify-home-'));
+    const cwd = makeTempCwd();
+    try {
+      writeUser(home, '[verify]\ncommands = ["bun test"]\n');
+      const r = loadVerifyConfig({ cwd, env: { HOME: home } });
+      expect(r.config.commands).toEqual(['bun test']);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('malformed PROJECT commands shadows an inherited USER gate (no resurrection)', () => {
+    const home = mkdtempSync(join(tmpdir(), 'forja-verify-home-'));
+    const cwd = makeTempCwd();
+    try {
+      writeUser(home, '[verify]\ncommands = ["bun test"]\n');
+      // Project declares commands but the value is malformed (non-array).
+      writeProject(cwd, '[verify]\ncommands = "bun test"\n');
+      const r = loadVerifyConfig({ cwd, env: { HOME: home } });
+      // The project DECLARED (invalid) → it owns the decision → gate OFF, NOT the
+      // user's commands. A project typo must not turn the inherited gate back on.
+      expect(r.config.commands).toBeUndefined();
+      expect(r.warnings.length).toBe(1);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('all-dropped PROJECT array also shadows the USER gate', () => {
+    const home = mkdtempSync(join(tmpdir(), 'forja-verify-home-'));
+    const cwd = makeTempCwd();
+    try {
+      writeUser(home, '[verify]\ncommands = ["bun test"]\n');
+      writeProject(cwd, '[verify]\ncommands = [1, 2]\n'); // present but no usable entries
+      const r = loadVerifyConfig({ cwd, env: { HOME: home } });
+      expect(r.config.commands).toBeUndefined();
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('explicit project `[]` shadows the USER gate (explicitly off)', () => {
+    const home = mkdtempSync(join(tmpdir(), 'forja-verify-home-'));
+    const cwd = makeTempCwd();
+    try {
+      writeUser(home, '[verify]\ncommands = ["bun test"]\n');
+      writeProject(cwd, '[verify]\ncommands = []\n');
+      const r = loadVerifyConfig({ cwd, env: { HOME: home } });
+      expect(r.config.commands).toEqual([]);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
       rmSync(home, { recursive: true, force: true });

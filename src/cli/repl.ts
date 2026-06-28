@@ -650,6 +650,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     effortConfigWarnings,
     auditConfigWarnings,
     sandboxConfigWarnings,
+    verifyConfigWarnings,
     sandboxEnforcement,
     permissionState,
     permissionRefusingReason,
@@ -850,6 +851,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   }
   for (const w of sandboxConfigWarnings) {
     errSink(`forja: sandbox config: ${w}\n`);
+  }
+  // [verify].commands warnings — a malformed gate config silently leaves the
+  // claim-time verification OFF, so surface the typo instead of hiding it.
+  for (const w of verifyConfigWarnings) {
+    errSink(`forja: verify config: ${w}\n`);
   }
   // Shared-corpus trust probe outcome (S5/T5.2 + T5.3). Render a
   // single summary line so operators see what the modal decision

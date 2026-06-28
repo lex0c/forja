@@ -21,15 +21,8 @@ import type { DB } from '../../storage/db.ts';
 import { getSession } from '../../storage/repos/sessions.ts';
 import { RECAP_MINI_LIMITS, RECAP_MINI_SCHEMA_VERSION, type RecapMini } from './schema.ts';
 
-// Mirror of `FILE_WRITER_TOOLS` in src/recap/projection.ts. Kept
-// in sync by hand; the set is small and changes rarely. If a new
-// file-writing tool ships, both this file and projection.ts need
-// the entry. (git_apply_patch is single-file, keyed by input.path.)
-const FILE_WRITER_TOOLS: ReadonlySet<string> = new Set([
-  'write_file',
-  'edit_file',
-  'git_apply_patch',
-]);
+// File-writing tools, shared with projection.ts + the verify gate (one source).
+import { FILE_WRITER_TOOLS } from '../../tools/file-writer-tools.ts';
 
 // First user message content. Sessions almost always have at
 // least one (the original prompt); the rare race where the

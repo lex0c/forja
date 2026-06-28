@@ -30,6 +30,7 @@ import type {
   ProviderMessage,
   ProviderToolDef,
   ProviderToolResultBlock,
+  StreamEvent,
 } from '../providers/index.ts';
 import { resolveProviderFromId } from '../providers/resolve.ts';
 import { estimatePromptTokens } from '../providers/tokens.ts';
@@ -84,7 +85,11 @@ import {
   relevanceVerbatimBudgetBytes,
 } from './compaction.ts';
 import { resolveProviderEffort } from './effort.ts';
-import { type ExhaustionSynthesisResult, synthesizeOnExhaustion } from './exhaustion-synthesis.ts';
+import {
+  type ExhaustionSynthesisResult,
+  endsWithSettledAnswer,
+  synthesizeOnExhaustion,
+} from './exhaustion-synthesis.ts';
 import { invokeTool } from './invoke-tool.ts';
 import {
   type ProactiveRecallCacheEntry,
@@ -109,6 +114,13 @@ import {
   isRecapEnabled,
   resolveMaxOutputTokens,
 } from './types.ts';
+import {
+  MAX_VERIFY_ATTEMPTS,
+  createVerifyState,
+  recordToolForVerify,
+  unsatisfiedVerifyCommands,
+  verifyGateNudge,
+} from './verify-gate.ts';
 import { injectWorkingStateBlock } from './working-state-inject.ts';
 
 type TerminalSessionStatus = 'done' | 'interrupted' | 'exhausted' | 'error';
@@ -378,6 +390,26 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
 
   let steps = 0;
   let consecutiveErrors = 0;
+  // Claim-time verify gate (STATE_MACHINE §3.2.1). Opt-in: an empty
+  // `verify.commands` makes the gate a no-op. `verifyState` accumulates
+  // mutation + passing-verify-command evidence across the run; `verifyAttempts`
+  // bounds the re-nudge at `no_tool_use`.
+  const verifyCommands = config.verify?.commands ?? [];
+  const verifyState = createVerifyState();
+  let verifyAttempts = 0;
+  // A budget exhaustion (maxSteps synthesis / maxCostUsd) finishes with an
+  // answer in hand but no room to nudge for verification — trace an unverified
+  // edit so those exits aren't a silent bypass of the gate's guarantee, matching
+  // the no_tool_use exhaustion's accept-with-trace. No-op when the gate is off
+  // or the run verified / never mutated.
+  const traceUnverifiedAtExhaustion = (): void => {
+    const unsatisfied = unsatisfiedVerifyCommands(verifyState, verifyCommands);
+    if (unsatisfied.length > 0) {
+      console.error(
+        `forja: verify gate — budget exhausted with an unverified edit; not confirmed: ${unsatisfied.join(', ')}`,
+      );
+    }
+  };
   let sessionId = '';
   // Repo root for scope-chain resolution. `config.cwd` is the
   // invocation directory; an operator starting the CLI from a
@@ -2968,6 +3000,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               ? await finish('maxWallClockMs')
               : await finish('aborted', undefined, 'hard');
           }
+          // The synthesis emitted a final answer, but the run is out of steps so
+          // it cannot nudge for verification the way the no_tool_use gate does.
+          // Apply the gate's EXHAUSTION behavior here too (STATE_MACHINE §3.2.1):
+          // accept the answer but TRACE an unverified edit so a low /
+          // just-exhausted step budget isn't a silent bypass of the guarantee.
+          traceUnverifiedAtExhaustion();
           // The synthesis can be the FIRST turn to cross the hard cost cap; a
           // breach must surface as maxCostUsd, not be masked as step exhaustion.
           if (synth.costOverage !== null) return await finish('maxCostUsd', synth.costOverage);
@@ -3126,6 +3164,34 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           ...(config.seedInEval !== undefined ? { seed_in_eval: config.seedInEval } : {}),
         };
 
+        // Verify-gate output buffering. If the gate is armed entering this turn
+        // (code mutated, a declared verify-command still unsatisfied, retries
+        // left), a tool-call-free answer THIS turn will be suppressed by the
+        // gate below — but the provider streams its `text_delta`s live, so a
+        // one-shot renderer would print the rejected claim before the gate
+        // fires. Hold this turn's answer text out of the live event stream and
+        // either flush it (turn isn't suppressed) or drop it (gate suppresses).
+        // Buffers only the render EVENTS — `collected` still captures the full
+        // text, so history/persistence are unaffected.
+        const verifyArmed =
+          verifyCommands.length > 0 &&
+          verifyAttempts < MAX_VERIFY_ATTEMPTS &&
+          unsatisfiedVerifyCommands(verifyState, verifyCommands).length > 0;
+        const bufferedAnswer: StreamEvent[] = [];
+        const flushBufferedAnswer = (): void => {
+          for (const ev of bufferedAnswer) {
+            safeEmit(config.onEvent, { type: 'provider_event', event: ev });
+          }
+          bufferedAnswer.length = 0;
+        };
+        // Whether we're still holding this turn's answer text. Set false the
+        // moment a tool_use appears: a tool call means the turn is NOT a
+        // suppressible final answer, so the held preamble must flush BEFORE the
+        // tool's events (else the live render shows the tool card ahead of the
+        // text that preceded it, and the TUI orphans the block) and the rest of
+        // the turn streams live.
+        let holdingAnswer = verifyArmed;
+
         let collected: Awaited<ReturnType<typeof collectStep>>;
         try {
           // Wrap the provider stream so the combined abort signal (user +
@@ -3153,9 +3219,29 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               ),
               signal,
             ),
-            (ev) => safeEmit(config.onEvent, { type: 'provider_event', event: ev }),
+            (ev) => {
+              // A tool call settles that this turn is not a suppressible final
+              // answer: flush the held preamble BEFORE the tool's events (keeping
+              // the model's emission order) and stop holding for the rest of it.
+              if (holdingAnswer && ev.kind === 'tool_use_start') {
+                flushBufferedAnswer();
+                holdingAnswer = false;
+              }
+              // Hold the answer text while still possibly-suppressible; every
+              // other event (tool deltas, stream errors, usage) streams live.
+              if (holdingAnswer && ev.kind === 'text_delta') {
+                bufferedAnswer.push(ev);
+                return;
+              }
+              safeEmit(config.onEvent, { type: 'provider_event', event: ev });
+            },
           );
         } catch (e) {
+          // collectStep threw, so this turn produced no settled answer the gate
+          // could suppress — flush any answer text buffered for the verify gate
+          // (partial text the provider streamed before the error) so it isn't
+          // silently swallowed by the buffering. No-op unless the gate was armed.
+          flushBufferedAnswer();
           // The provider request was sent (and likely billed for input
           // tokens) before the throw. Always flip the aggregate flag —
           // even if we recover partial usage, totals are by definition
@@ -3275,6 +3361,25 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         emitCostUpdate(turnCostUsd);
         safeEmit(config.onEvent, { type: 'usage_persisted' });
 
+        // Resolve the buffered answer text (only non-empty when `verifyArmed`).
+        // Flush it now UNLESS the verify gate is about to suppress THIS turn —
+        // i.e. the gate is reached (no earlier terminal exit) and its condition
+        // holds: a tool-call-free, settled answer with the gate still armed.
+        // When that is true the buffer rides to the gate's `continue`, which
+        // drops it; in EVERY other outcome (errors, caps, tool calls, accept)
+        // the text streams normally. This predicate MUST mirror the early-exit
+        // checks between here and the gate (errors / cost cap / max_tokens /
+        // context-window) so a preempting return never silently drops the text.
+        const gateWillSuppress =
+          verifyArmed &&
+          collected.errors.length === 0 &&
+          costCapDetailIfExceeded() === null &&
+          collected.tool_uses.length === 0 &&
+          collected.stop_reason !== 'max_tokens' &&
+          collected.stop_reason !== 'model_context_window_exceeded' &&
+          endsWithSettledAnswer(ctx.getMessages());
+        if (!gateWillSuppress) flushBufferedAnswer();
+
         // Stream errors (normalizer-level: malformed tool_use args, orphan
         // tool_use_stop, etc.) mean the provider produced output we couldn't
         // structure correctly. The most common case is a malformed JSON
@@ -3296,7 +3401,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // for clean spend, not for surfacing already-broken turns.
         {
           const overage = costCapDetailIfExceeded();
-          if (overage !== null) return await finish('maxCostUsd', overage);
+          if (overage !== null) {
+            traceUnverifiedAtExhaustion();
+            return await finish('maxCostUsd', overage);
+          }
         }
 
         // No tool uses → check the stop_reason before declaring success.
@@ -3322,6 +3430,46 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             return await finish(
               'maxContextTokens',
               'provider stopped at the context window limit (model_context_window_exceeded); reduce input or rely on compaction',
+            );
+          }
+          // Claim-time verify gate (STATE_MACHINE §3.2.1). If the run mutated a
+          // file without all declared verify-commands passing AFTER the last
+          // edit, suppress this answer, nudge the model to run them, and
+          // re-generate — bounded by MAX_VERIFY_ATTEMPTS. Opt-in: an empty
+          // `verify.commands` makes `unsatisfiedVerify` empty ⇒ skipped.
+          // Deterministic: real mutation tracking + bash exit codes + declared
+          // commands, never model prose (the ProjectVerifier failure this avoids).
+          const unsatisfiedVerify = unsatisfiedVerifyCommands(verifyState, verifyCommands);
+          // Only gate a SETTLED answer (non-empty assistant text). An empty /
+          // reasoning-only turn is NOT mirrored into the live array (an empty
+          // assistant message is dropped), so its tail is the prior `user`
+          // turn — appending the nudge there would emit two consecutive `user`
+          // messages and the next request would 400. `endsWithSettledAnswer`
+          // ⇒ the tail is a real assistant answer, so the nudge keeps the
+          // assistant → user → assistant alternation. It is also the right
+          // semantics: the gate suppresses a CLAIM, and an empty turn is none.
+          if (
+            unsatisfiedVerify.length > 0 &&
+            verifyAttempts < MAX_VERIFY_ATTEMPTS &&
+            endsWithSettledAnswer(ctx.getMessages())
+          ) {
+            verifyAttempts += 1;
+            // Synthetic user nudge (system source, persisted for replay). The
+            // assistant answer stays in history; the model then runs the
+            // commands (gated by permissions) and re-emits its final answer.
+            ctx.appendUser(verifyGateNudge(unsatisfiedVerify), null, 'system');
+            continue;
+          }
+          // Gate satisfied, off, or exhausted — after MAX_VERIFY_ATTEMPTS nudges
+          // the gate accepts the answer (it is a nudge, not a hard trap).
+          if (unsatisfiedVerify.length > 0 && verifyAttempts >= MAX_VERIFY_ATTEMPTS) {
+            // Exhausted: accept the unverified claim but TRACE it (stderr is the
+            // log surface — stdout stays pure). The structured
+            // `verify_gate_exhausted` audit EVENT + TUI rendering is a deferred
+            // follow-up: adding a HarnessEvent variant pulls in the exhaustive
+            // event switches (`tui/state.ts` `: never`) — see docs/TODO.md H3.6.
+            console.error(
+              `forja: verify gate accepted an unverified answer after ${verifyAttempts} nudge(s); not confirmed: ${unsatisfiedVerify.join(', ')}`,
             );
           }
           return await finish('done');
@@ -3791,6 +3939,28 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ...(inv.exitCode !== undefined ? { exitCode: inv.exitCode } : {}),
             ...(inv.resultDetail !== undefined ? { resultDetail: inv.resultDetail } : {}),
           });
+          // Verify-gate accounting (STATE_MACHINE §3.2.1): fold this settled tool
+          // into the run's mutation/verification evidence so the claim-time gate
+          // at no_tool_use is deterministic. No-op when the gate is off.
+          // Use the EXECUTED args (`inv.effectiveArgs`) — a PreToolUse hook can
+          // rewrite a `bun test` call into another command that exits 0, and the
+          // gate must match what actually ran, not the model's pre-hook args.
+          // A fresh mutation re-arms the gate (starts a new verification cycle),
+          // so reset the per-cycle nudge budget — otherwise a later edit inherits
+          // attempts spent on an earlier one and, once the run-wide count hits the
+          // max, every subsequent post-edit claim is accepted with only a warning.
+          if (
+            recordToolForVerify(
+              verifyState,
+              verifyCommands,
+              tu.name,
+              inv.effectiveArgs ?? tu.input,
+              inv.failed,
+              inv.exitCode,
+            )
+          ) {
+            verifyAttempts = 0;
+          }
           // Persist the dispatch-rewrite audit row now that invokeTool
           // created the tool_calls row that the FK points at. Skipped
           // when invokeTool returned an empty toolCallId (unknown

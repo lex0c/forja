@@ -18,6 +18,7 @@
     "eval:regression": "bun run src/evals/cli.ts evals/regression --model anthropic/claude-haiku-4-5",
     "eval:skills": "bun run src/evals/cli.ts evals/skills --model anthropic/claude-opus-4-8",
     "eval:edit-format": "bun run src/evals/cli.ts evals/edit-format --model anthropic/claude-opus-4-8",
+    "eval:verify-gate": "bun run src/evals/cli.ts evals/verify-gate --model anthropic/claude-opus-4-8",
     "eval:tool-search": "bun run src/evals/cli.ts evals/tool-search --model anthropic/claude-opus-4-8",
     "eval:fetch-url": "bun run src/evals/cli.ts evals/fetch-url --model anthropic/claude-opus-4-8",
     "eval:long-horizon": "bun run src/evals/cli.ts evals/long-horizon --model anthropic/claude-opus-4-8",

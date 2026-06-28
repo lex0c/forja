@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from 'bun:test';
+import { beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import type { CollectedStep } from '../../src/harness/collect.ts';
 import { type AssistantUsage, type HarnessEvent, SessionContext } from '../../src/harness/index.ts';
 import { runAgent } from '../../src/harness/loop.ts';
@@ -164,6 +164,7 @@ const buildConfig = (
       maxCostUsd: number;
     }>;
     capsOverride?: Partial<Provider['capabilities']>;
+    verify?: { commands: string[] };
   } = {},
 ) => {
   const handle = mockProvider(script, options.capsOverride);
@@ -182,6 +183,7 @@ const buildConfig = (
       ...(options.signal !== undefined ? { signal: options.signal } : {}),
       ...(options.softStopSignal !== undefined ? { softStopSignal: options.softStopSignal } : {}),
       ...(options.budget !== undefined ? { budget: options.budget } : {}),
+      ...(options.verify !== undefined ? { verify: options.verify } : {}),
     },
   };
 };
@@ -3402,5 +3404,311 @@ describe('post-persist contract (per-response footer refresh)', () => {
     expect(costUpdates).toBe(0);
     // Still one cue per response, with the response's row queryable.
     expect(cueObserved).toEqual([10, 20]);
+  });
+});
+
+describe('runAgent — claim-time verify gate (STATE_MACHINE §3.2.1)', () => {
+  // Named `edit_file` so the gate counts it as a mutation (it keys on tool NAME
+  // ∈ FILE_WRITER_TOOLS); writes:false keeps it allowed under the strict default
+  // policy without permission setup (the gate never reads metadata.writes).
+  const stubEdit: Tool = {
+    name: 'edit_file',
+    description: 'stub edit',
+    inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+    metadata: { category: 'misc', writes: false, idempotent: false },
+    async execute() {
+      return { ok: true };
+    },
+  };
+
+  test('off by default: no verify.commands → a mutated run finishes without re-nudging', async () => {
+    const { config, handle } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 't1', name: 'edit_file', input: { path: 'a.ts' } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'done — edited the file.', stop_reason: 'end_turn' },
+      ],
+      { extraTools: [stubEdit], budget: { maxSteps: 10 } },
+    );
+    const result = await runAgent(config);
+    expect(result.status).toBe('done');
+    expect(handle.requests.length).toBe(2); // gate off → no extra generation
+  });
+
+  test('blocks an unverified edit, re-nudges, and accepts after max attempts', async () => {
+    const { config, handle } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 't1', name: 'edit_file', input: { path: 'a.ts' } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'all done.', stop_reason: 'end_turn' }, // attempt 1 → nudge
+        { text: 'really done.', stop_reason: 'end_turn' }, // attempt 2 → nudge
+        { text: 'final.', stop_reason: 'end_turn' }, // exhausted → accept
+      ],
+      { extraTools: [stubEdit], budget: { maxSteps: 10 }, verify: { commands: ['bun test'] } },
+    );
+    const result = await runAgent(config);
+    expect(result.status).toBe('done');
+    // 4 generations: edit, then two blocked answers that re-generated, then accept.
+    expect(handle.requests.length).toBe(4);
+    // The nudge naming the unverified command was injected as a user turn the
+    // re-generation saw.
+    const laterMsgs = handle.requests[2]?.messages ?? [];
+    const nudged = laterMsgs.some(
+      (m) =>
+        m.role === 'user' &&
+        (typeof m.content === 'string'
+          ? m.content.includes('bun test')
+          : m.content.some((b) => b.type === 'text' && b.text.includes('bun test'))),
+    );
+    expect(nudged).toBe(true);
+  });
+
+  test('a passing verify (foreground bash exit 0) satisfies the gate — no re-nudge', async () => {
+    // exit_code 0 → invokeTool surfaces inv.exitCode as undefined (readNonZeroExit),
+    // which the gate reads as "passed". Pins that end-to-end coupling.
+    const stubBashOk: Tool = {
+      name: 'bash',
+      description: 'stub bash, exits 0',
+      inputSchema: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command'],
+      },
+      metadata: { category: 'misc', writes: false, idempotent: false },
+      async execute() {
+        return { exit_code: 0, stdout: '', stderr: '' };
+      },
+    };
+    const { config, handle } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 't1', name: 'edit_file', input: { path: 'a.ts' } }],
+          stop_reason: 'tool_use',
+        },
+        {
+          tool_uses: [{ id: 't2', name: 'bash', input: { command: 'bun test' } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'done — tests pass.', stop_reason: 'end_turn' },
+      ],
+      {
+        extraTools: [stubEdit, stubBashOk],
+        budget: { maxSteps: 10 },
+        verify: { commands: ['bun test'] },
+      },
+    );
+    const result = await runAgent(config);
+    expect(result.status).toBe('done');
+    expect(handle.requests.length).toBe(3); // edit, verify, answer — gate satisfied, no extra
+  });
+
+  test('a suppressed (gated) answer is never streamed — only the verified answer reaches onEvent', async () => {
+    // The gate suppresses the unverified claim in HISTORY, but the provider
+    // streams its text_delta live; without buffering a one-shot renderer would
+    // print the rejected claim. The buffered text must not reach config.onEvent.
+    const stubBashOk: Tool = {
+      name: 'bash',
+      description: 'stub bash, exits 0',
+      inputSchema: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command'],
+      },
+      metadata: { category: 'misc', writes: false, idempotent: false },
+      async execute() {
+        return { exit_code: 0, stdout: '', stderr: '' };
+      },
+    };
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const { config } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 't1', name: 'edit_file', input: { path: 'a.ts' } }],
+          stop_reason: 'tool_use',
+        },
+        // Tool-call-free answer while `bun test` is still owed → gate suppresses.
+        { text: 'UNVERIFIED-CLAIM', stop_reason: 'end_turn' },
+        {
+          tool_uses: [{ id: 't2', name: 'bash', input: { command: 'bun test' } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'VERIFIED-ANSWER', stop_reason: 'end_turn' }, // gate satisfied → shown
+      ],
+      {
+        extraTools: [stubEdit, stubBashOk],
+        budget: { maxSteps: 12 },
+        verify: { commands: ['bun test'] },
+      },
+    );
+    const result = await runAgent({ ...config, onEvent: (e) => events.push(e) });
+    expect(result.status).toBe('done');
+    let streamed = '';
+    for (const e of events) {
+      if (e.type === 'provider_event' && e.event.kind === 'text_delta') streamed += e.event.text;
+    }
+    expect(streamed).not.toContain('UNVERIFIED-CLAIM'); // buffered, then dropped by the gate
+    expect(streamed).toContain('VERIFIED-ANSWER'); // streamed after verification
+  });
+
+  test('a new edit re-arms the gate with a fresh nudge budget (attempts reset)', async () => {
+    // Two edit cycles, model never runs the verify. With the per-cycle reset,
+    // each edit's claim gets the full MAX_VERIFY_ATTEMPTS (2) before accepting;
+    // WITHOUT the reset the run-wide counter would exhaust after edit A and
+    // accept edit B's first claim with no nudge (5 generations, not 7).
+    const { config, handle } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 't1', name: 'edit_file', input: { path: 'a.ts' } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'a1', stop_reason: 'end_turn' }, // cycle A: nudge (attempt 1)
+        { text: 'a2', stop_reason: 'end_turn' }, // cycle A: nudge (attempt 2)
+        {
+          tool_uses: [{ id: 't2', name: 'edit_file', input: { path: 'b.ts' } }],
+          stop_reason: 'tool_use',
+        }, // re-arm → reset
+        { text: 'b1', stop_reason: 'end_turn' }, // cycle B: nudge (attempt 1, only because reset)
+        { text: 'b2', stop_reason: 'end_turn' }, // cycle B: nudge (attempt 2)
+        { text: 'b3', stop_reason: 'end_turn' }, // cycle B: exhausted → accept
+      ],
+      { extraTools: [stubEdit], budget: { maxSteps: 12 }, verify: { commands: ['bun test'] } },
+    );
+    const result = await runAgent(config);
+    expect(result.status).toBe('done');
+    // All 7 steps consumed: edit B's cycle was NOT starved by edit A's nudges.
+    expect(handle.requests.length).toBe(7);
+  });
+
+  test('a provider error after partial text flushes the buffered answer (gate armed)', async () => {
+    const base = mockProvider([]).provider;
+    let calls = 0;
+    const provider: Provider = {
+      ...base,
+      async *generate(): AsyncGenerator<StreamEvent> {
+        calls += 1;
+        if (calls === 1) {
+          // Edit arms the gate, so the next turn's text is buffered.
+          yield { kind: 'start', message_id: 'm1' };
+          yield { kind: 'tool_use_start', id: 't1', name: 'edit_file' };
+          yield { kind: 'tool_use_stop', id: 't1', final_args: { path: 'a.ts' } };
+          yield { kind: 'stop', reason: 'tool_use' };
+          return;
+        }
+        // Partial text, then the provider throws mid-stream.
+        yield { kind: 'start', message_id: 'm2' };
+        yield { kind: 'text_delta', text: 'PARTIAL-BEFORE-ERROR' };
+        throw new Error('provider exploded mid-stream');
+      },
+    };
+    const registry = createToolRegistry();
+    registry.register(echoTool);
+    registry.register(stubEdit);
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const result = await runAgent({
+      provider,
+      toolRegistry: registry,
+      permissionEngine: createPermissionEngine(policy({}), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+      budget: { maxSteps: 10 },
+      verify: { commands: ['bun test'] },
+      onEvent: (e) => events.push(e),
+    });
+    expect(result.reason).toBe('providerError');
+    let streamed = '';
+    for (const e of events) {
+      if (e.type === 'provider_event' && e.event.kind === 'text_delta') streamed += e.event.text;
+    }
+    // The partial text was buffered (gate armed) then flushed in the catch —
+    // not silently swallowed by the buffering.
+    expect(streamed).toContain('PARTIAL-BEFORE-ERROR');
+  });
+
+  test('maxSteps exhaustion after an unverified edit traces the gate bypass', async () => {
+    // Low budget: the edit burns the only step, then the exhaustion-synthesis
+    // turn writes the final answer — a path that does NOT reach the no_tool_use
+    // gate. With an unverified edit it must still trace (accept-with-trace),
+    // not silently emit an unverified claim.
+    const errSpy = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const { config } = buildConfig(
+        [
+          {
+            tool_uses: [{ id: 't1', name: 'edit_file', input: { path: 'a.ts' } }],
+            stop_reason: 'tool_use',
+          },
+          { text: 'PARTIAL: edited a.ts; out of steps', stop_reason: 'end_turn' }, // synthesis turn
+        ],
+        { extraTools: [stubEdit], budget: { maxSteps: 1 }, verify: { commands: ['bun test'] } },
+      );
+      const result = await runAgent(config);
+      expect(result.reason).toBe('maxSteps');
+      const traced = errSpy.mock.calls.some(
+        (c) => String(c[0]).includes('verify gate') && String(c[0]).includes('bun test'),
+      );
+      expect(traced).toBe(true);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  test('an armed turn with a text preamble + tool_use streams the preamble BEFORE the tool events', async () => {
+    // The post-nudge happy path: edit, then "let me run the tests" + bash in one
+    // turn. The buffer must flush the preamble when the tool_use appears, not
+    // after the turn — else the live render shows the tool card ahead of its text.
+    const stubBashOk: Tool = {
+      name: 'bash',
+      description: 'stub bash, exits 0',
+      inputSchema: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command'],
+      },
+      metadata: { category: 'misc', writes: false, idempotent: false },
+      async execute() {
+        return { exit_code: 0, stdout: '', stderr: '' };
+      },
+    };
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const { config } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 't1', name: 'edit_file', input: { path: 'a.ts' } }],
+          stop_reason: 'tool_use',
+        },
+        // Armed turn: preamble text AND the verify tool_use together.
+        {
+          text: 'PREAMBLE-RUN-TESTS',
+          tool_uses: [{ id: 't2', name: 'bash', input: { command: 'bun test' } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'verified.', stop_reason: 'end_turn' },
+      ],
+      {
+        extraTools: [stubEdit, stubBashOk],
+        budget: { maxSteps: 12 },
+        verify: { commands: ['bun test'] },
+      },
+    );
+    const result = await runAgent({ ...config, onEvent: (e) => events.push(e) });
+    expect(result.status).toBe('done');
+    const idxText = events.findIndex(
+      (e) =>
+        e.type === 'provider_event' &&
+        e.event.kind === 'text_delta' &&
+        e.event.text.includes('PREAMBLE-RUN-TESTS'),
+    );
+    const idxTool = events.findIndex(
+      (e) =>
+        e.type === 'provider_event' && e.event.kind === 'tool_use_start' && e.event.name === 'bash',
+    );
+    expect(idxText).toBeGreaterThanOrEqual(0);
+    expect(idxTool).toBeGreaterThanOrEqual(0);
+    expect(idxText).toBeLessThan(idxTool); // preamble flushed before the bash tool_use event
   });
 });

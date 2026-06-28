@@ -3,9 +3,105 @@
 Items intentionally left for later milestones, with the deferral
 rationale and a "pull-in" signal so we know when to revisit.
 
-The first section ("ACTIVE") is different — it tracks work in flight
+The ACTIVE section is different — it tracks work in flight
 on a named branch with slices and tasks. When a slice closes, its
 artifacts move to `docs/BACKLOG.md` and the entry here is trimmed.
+A PLANNED section (approved-but-not-started work) may precede it.
+
+---
+
+# PLANNED — edit / output / verify hardening roadmap (`explore/feats`)
+
+Distilled from a cross-check of an external agent's source against Forja's
+`src/`. Most of that agent's "gold" features already exist here or collide with
+locked decisions (code index/LSP, embeddings, orchestrated profiles, multi-file
+edit, auto-skill-writer). What remains is a small core of genuine deltas that
+hit where Forja gains most: **cost** (tool-results in history), **edit
+robustness**, and the root premise ("measure twice, cut once") applied at
+claim-time.
+
+Three slices, most-contained first. Order: **S1 → S2 → (spec-PR) → S3**. S1 and
+S2 are independent (both contained, no spec-PR, no migration); S3 depends on its
+spec-PR landing first.
+
+**Deliberately out:** iterative-summary (collides with the deliberate
+`stripPriorSummary` anti-snowball decision, `compaction.ts:345-360`) and
+intra-JSON tool-call arg shrink (niche; args kept verbatim by design,
+`compaction.ts:220-222`).
+
+## Slice H1 — Edit-engine hardening (`edit_file`) · ✅ DONE · no spec-PR
+
+Harden single-file editing. Already present (confirmed by read): indent
+re-anchoring (`uniformShift`/`applyShift`, `edit-file.ts:132-160`) and non-unique
+abort (`ambiguousMatch`/`kind:'multiple'`, `edit-file.ts:204,305`). Three missing
+items, all single-path-safe (the engine is one-tool-one-path —
+`edit-file.ts:18-21,394-398`). Closed 2026-06-28 — see `docs/BACKLOG.md`.
+
+| Task | Status | Description |
+|---|---|---|
+| **H1.1** | ⛔ removed in review | Post-write verify was built, then dropped: `atomicWrite` already guarantees full-old-or-full-new (writeAll + fsync + atomic rename), so it was redundant; it also false-positived on lone surrogates and broke a recap invariant. Prior verification stays in the checkpoint + `atomicWrite`. |
+| **H1.2** | ✅ done | Escape-drift diagnostic: in `extendedMatch`, de-escape `\'`/`\"` and if that uniquely matches, return an actionable not-found naming the region (`escape_drift` detail). No auto-fix. |
+| **H1.3** | ✅ done | Extended rungs in `extendedMatch` (run only after the whitespace rung misses): NFC auto-apply (unique span + uniform shift); NFC non-uniform-indent → `unsafe` near-match (parity, not a silent miss); block-anchor diagnostic (first+last bound a same-length region). |
+| **H1.4** | ✅ done | 6 tests added (43 total in `tests/tools/edit-file.test.ts`); typecheck + Biome clean. Cleanup: unified `findSpans` + `oldStringNotFoundError`/`nearMatch` builders. Deferred to engine/loop: retry-guard + mtime staleness. |
+
+**Out of this slice (need cross-call state → engine/loop):** escalating retry-guard
+(3rd same-path failure → `write_file`) and read-before-write mtime staleness.
+`execute` is pure/stateless (`edit-file.ts:375`), so they don't belong here.
+
+**Spec:** optional failure-mode note in `CODE_GENERATION §8`. Non-blocking.
+
+## Slice H2 — Output-reduction wins (compaction) · ✅ DONE · no migration
+
+Hits Forja's #1 cost lever (tool-results in history). The relevance pass already
+exists, pure/clock-free (`compaction-relevance.ts:92`), honoring `OUTPUT_POLICY §0`
+invariants (errors never elided, replay-safe). Closed 2026-06-28 — see `docs/BACKLOG.md`.
+
+| Task | Status | Description |
+|---|---|---|
+| **H2.1** | ✅ done | `dedupElideMiddle(middle)` in `compaction-relevance.ts` — group `tool_result` bodies by content (non-error, > `DEFAULT_MIN_ELIDE_BYTES`); keep the latest-by-position copy verbatim, pointer earlier identical ones (`[… identical to a later call (N bytes) — deduplicated; recover via retrieve_context]`). Pure / clock-free → replay-safe; re-asserts the eligibility guards on rewrite. |
+| **H2.2** | ✅ done | Wired as a pre-pass in `SessionContext.relevanceElide` before `relevanceElideMiddle`; both fold into one `relevance` result (counts/freed bytes sum, ids concatenate). No migration / no new strategy. |
+| **H2.3** | ✅ done | Tool-name stub: the relevance pointer (`compaction-relevance.ts`) and the `fallbackElide` pointer (`compaction.ts`) embed `block.name` when present (`[read_file result elided: …]`); nameless blocks keep the `tool_result` wording. |
+| **H2.4** | ✅ done | 7 new tests (dedup unit suite + `relevanceElide` pre-pass); one existing relevance test switched to distinct bodies. typecheck + Biome clean. |
+
+**Spec:** light `CONTEXT_TUNING §12` note (dedup as part of the relevance pass +
+pointer wording) — optional follow-up, not blocking.
+
+## Slice H3 — Verification-gate · ✅ DONE · spec-PR first, then code
+
+"Measure twice" at claim-time: before accepting a final answer, if code was edited
+without fresh passing verify evidence, re-inject a nudge and continue the loop.
+Today the finalize is unconditional (`loop.ts:3327`, `finish('done')`).
+
+**Locked lesson (do not repeat):** a `ProjectVerifier` (regex over prose) once
+shipped and was removed (`loop.ts:1313-1325`) because "regex over text can't
+distinguish assertion from historical mention". → The gate must be **100%
+deterministic**: real mutated paths + bash exit codes + config-declared
+verify-commands. Never parse the model's prose.
+
+| Task | Status | Description |
+|---|---|---|
+| **H3.1** | ✅ done | Spec: `STATE_MACHINE §3.2.1` (authored + reviewed before code) — opt-in deterministic `verify_gate_block`/`verify_gate_pass` transitions out of `no_tool_use` (sibling of the opt-in critique, checked first), trigger, nudge-only invariant, `max_attempts`=2, exhaustion accepts (no new terminal state / ExitReason). |
+| **H3.2** | ✅ done | Config `[verify] commands` (opt-in; empty/absent → gate off) threaded loaders → types → bootstrap → run/repl, fail-soft like `[sandbox]`, warnings on the same banner. Omitted from the comment-free init scaffold. No `*Source` (not a governance toggle). |
+| **H3.3** | ✅ done | `src/harness/verify-gate.ts` (pure): track `everMutated` + verified-since-last-mutation; deterministic command match (prefix on the bash `command`, &&/;/\|\|-aware). The loop folds each settled tool in via `recordToolForVerify` (right after the `tool_finished` emit). |
+| **H3.4** | ✅ done | Loop finalize (`no_tool_use`): before `finish('done')`, if `unsatisfiedVerifyCommands` non-empty ∧ attempts<MAX → append `verifyGateNudge` as a system-source user turn + `continue`; else accept. Subtle fix: bash exit-0 is `!failed && exitCode===undefined` (invokeTool surfaces only non-zero). |
+| **H3.5** | ✅ done | `verify-gate` unit suite + loop integration (off → no re-nudge; blocks+re-nudges+accepts after max) + `loadVerifyConfig` loader suite. 2764 harness/cli/config tests green; typecheck + Biome clean. |
+| **H3.6** | ☐ follow-up | **Deferred (code-behind-spec):** the structured `verify_gate_exhausted` audit **event** + TUI rendering. Adding a `HarnessEvent` variant pulls in the exhaustive switches (`tui/state.ts` `: never`, `harness-adapter.ts`) + a UI decision — a separate deliberate step. Gate behavior is complete; spec describes the event as the target. |
+
+## Dependency graph
+
+```
+H1 (edit-engine) ─┐
+                  ├─ independent, either order, no spec-PR, no migration
+H2 (compaction) ──┘
+H3.1 spec-PR ─> H3.2 config ─> H3.3 tracking ─> H3.4 gate ─> H3.5 tests
+```
+
+## Tracking
+
+Per-slice workflow: update `docs/BACKLOG.md` (new entry on top) before + after;
+code born with tests; scoped tests only (`tests/tools` for H1, `tests/harness`
++ `tests/cli` for H2/H3) plus `bun run typecheck` + `bun run lint`. Full plan
+detail: `~/.claude/plans/shimmying-dazzling-quokka.md`.
 
 ---
 

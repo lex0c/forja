@@ -1,0 +1,26 @@
+name: verify-gate OFF — same edit task, no verify config (control arm)
+prompt: |
+  The file `src/add.ts` has a bug: `add` SUBTRACTS instead of adding, so
+  `add(2, 3)` returns -1 instead of 5. Fix it with edit_file. Reply "done"
+  when the edit is applied.
+setup:
+  gitInit: true
+  files:
+    src/add.ts: |
+      export const add = (a: number, b: number): number => a - b;
+    src/add.test.ts: |
+      import { expect, test } from 'bun:test';
+      import { add } from './add.ts';
+      test('adds', () => {
+        expect(add(2, 3)).toBe(5);
+      });
+    # No [verify] config → gate OFF. Control for the A/B: same task, so any
+    # delta in steps / success vs the ON arm is the gate's effect.
+expect:
+  - tool_called: edit_file
+  - file_contains:
+      path: src/add.ts
+      pattern: a + b
+  - status: done
+budget:
+  maxSteps: 12

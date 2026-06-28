@@ -45,6 +45,12 @@ export interface RelevanceElideOptions {
   // are not exposed here (add a param only when a caller actually needs
   // to vary one, rather than advertising knobs the wiring can't reach).
   verbatimBudgetBytes: number;
+  // tool_use_ids to treat as INELIGIBLE — never scored, never elided. The
+  // caller passes the ids a prior pass (dedup) already pointered, so this pass
+  // can't re-elide them even if that prior pointer happens to exceed the
+  // min-elide floor (a long tool name + size figure). Keeps the two passes'
+  // elided-id sets disjoint by construction, not by a size coincidence.
+  excludeIds?: ReadonlySet<string>;
 }
 
 // The audit view of a relevance pass — everything except the rebuilt
@@ -77,6 +83,20 @@ const DEFAULT_MIN_ELIDE_BYTES = 200;
 // by float round-off.
 const TIEBREAK_EPSILON = 1e-12;
 
+// Label a tool_result for an elision pointer — names the tool when known so the
+// next turn knows WHAT was dropped (`read_file result …`), else a generic
+// `tool_result`. Truthy check covers both an undefined and an empty-string name.
+export const toolResultLabel = (name: string | undefined): string =>
+  name ? `${name} result` : 'tool_result';
+
+// The canonical elision-pointer text. One builder so the marker token, the
+// byte-size report, and the recovery instruction (`retrieve_context`, the path
+// the model uses to read the body back) stay byte-identical across the
+// relevance, dedup, and fallback elision passes — only the `reason` clause
+// differs. The body stays in the audit log, so elision is reversible.
+export const elisionPointer = (label: string, bytes: number, reason: string): string =>
+  `[${label} elided: ${bytes} bytes — ${reason}; recover via retrieve_context (session view)]`;
+
 interface Entry {
   id: string; // tool_use_id — unique + stable, doubles as the BM25 doc id
   content: string;
@@ -104,6 +124,7 @@ export const relevanceElideMiddle = (
     if (typeof m.content === 'string') continue;
     for (const b of m.content) {
       if (b.type !== 'tool_result' || b.is_error === true) continue;
+      if (opts.excludeIds?.has(b.tool_use_id) === true) continue;
       const bytes = Buffer.byteLength(b.content, 'utf8');
       if (bytes <= minElide) continue;
       eligible.push({
@@ -179,7 +200,7 @@ export const relevanceElideMiddle = (
       touched = true;
       return {
         ...b,
-        content: `[tool_result elided: ${bytes} bytes — low goal-relevance; recover via retrieve_context (session view)]`,
+        content: elisionPointer(toolResultLabel(b.name), bytes, 'low goal-relevance'),
       };
     });
     return touched ? { ...m, content } : m;
@@ -192,4 +213,91 @@ export const relevanceElideMiddle = (
     freedBytes,
     elidedIds: [...elideIds],
   };
+};
+
+// The audit view of a dedup pass — the same fields the relevance pass reports
+// (minus keptCount), so the loop can fold both into one `relevance` event
+// without a new strategy or migration.
+export interface DedupElideResult {
+  middle: ProviderMessage[];
+  // Identical-body tool_results pointered (all but the latest of each group).
+  elidedCount: number;
+  // Bytes removed from the in-context middle (sum of pointered bodies).
+  freedBytes: number;
+  // tool_use_ids whose bodies were pointered.
+  elidedIds: string[];
+}
+
+// Pointer-elide EXACT-DUPLICATE tool_result bodies in the middle: when the same
+// output appears more than once (re-reading a file, re-running a grep/test),
+// keep the LATEST occurrence verbatim and replace the earlier identical ones
+// with a back-reference. Orthogonal to relevance — meant to run as a cheap
+// pre-pass so the relevance budget isn't spent keeping redundant copies.
+//
+// Same invariants as `relevanceElideMiddle`: errors are never elided
+// (OUTPUT_POLICY §0.4); sub-floor bodies (<= the min-elide size) are left
+// alone; and the decision is PURE + clock-free — grouping is by body content
+// and "latest" is by POSITION, never wall-clock — so the compaction replay
+// path reproduces the same partition without recording anything.
+export const dedupElideMiddle = (middle: ProviderMessage[]): DedupElideResult => {
+  const minElide = DEFAULT_MIN_ELIDE_BYTES;
+
+  // Group eligible tool_result positions by body content, in document order.
+  // Key is `${messageIndex}:${blockIndex}` so the rewrite can target the exact
+  // earlier instances without disturbing the kept (latest) one.
+  const positionsByContent = new Map<string, string[]>();
+  middle.forEach((m, mi) => {
+    if (typeof m.content === 'string') return;
+    m.content.forEach((b, bi) => {
+      if (b.type !== 'tool_result' || b.is_error === true) return;
+      if (Buffer.byteLength(b.content, 'utf8') <= minElide) return;
+      const arr = positionsByContent.get(b.content) ?? [];
+      arr.push(`${mi}:${bi}`);
+      positionsByContent.set(b.content, arr);
+    });
+  });
+
+  // Every position EXCEPT the last of each duplicated group becomes a pointer.
+  const pointer = new Set<string>();
+  for (const positions of positionsByContent.values()) {
+    if (positions.length < 2) continue;
+    for (let i = 0; i < positions.length - 1; i++) {
+      const pos = positions[i];
+      if (pos !== undefined) pointer.add(pos);
+    }
+  }
+  if (pointer.size === 0) {
+    return { middle, elidedCount: 0, freedBytes: 0, elidedIds: [] };
+  }
+
+  let elidedCount = 0;
+  let freedBytes = 0;
+  const elidedIds: string[] = [];
+  const newMiddle = middle.map((m, mi) => {
+    if (typeof m.content === 'string') return m;
+    let touched = false;
+    const content = m.content.map((b, bi) => {
+      if (!pointer.has(`${mi}:${bi}`)) return b;
+      // Re-assert the eligibility guards on the actual block (defense vs a
+      // shared/duplicated object): never pointer an error or a sub-floor body.
+      if (b.type !== 'tool_result' || b.is_error === true) return b;
+      const bytes = Buffer.byteLength(b.content, 'utf8');
+      if (bytes <= minElide) return b;
+      elidedCount++;
+      freedBytes += bytes;
+      elidedIds.push(b.tool_use_id);
+      touched = true;
+      return {
+        ...b,
+        content: elisionPointer(
+          toolResultLabel(b.name),
+          bytes,
+          'duplicate of an identical later call',
+        ),
+      };
+    });
+    return touched ? { ...m, content } : m;
+  });
+
+  return { middle: newMiddle, elidedCount, freedBytes, elidedIds };
 };
