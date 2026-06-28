@@ -831,15 +831,19 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // and CLI checkpoint --undo emits `checkpoint_reverted`.
   const outcomeSink = createSqliteOutcomeSink({ db });
   const failureSink = createSqliteFailureSink({ db, outcomeSink });
-  // Resolve cwd trust EARLY. The sandbox network posture (below) gates on it so
-  // an UNTRUSTED directory's `.forja/config.toml` cannot self-enable egress — a
-  // freshly-cloned hostile repo shipping `[sandbox] network = "on"` must not
-  // grant its unmodeled binaries network access (CLAUDE.md "Explicit trust").
-  // The system-prompt composition further down also consults it. Fail-closed:
-  // no trust storage / cwd absent from the list → false.
+  // Resolve trust EARLY (consumed below by the sandbox network posture AND the
+  // system-prompt composition). Fail-closed: no trust storage / dir absent → false.
   const trustPath =
     input.trustListPathOverride !== undefined ? input.trustListPathOverride : trustListPath();
   const isCwdTrusted = trustPath !== null && isTrusted(trustPath, cwd);
+  // The sandbox NETWORK posture gates on the trust of the directory that SUPPLIED
+  // the [sandbox] config — `projectConfigCwd` (the repo root, where the project
+  // `.forja/config.toml` lives), NOT the invocation cwd. Trust is exact-path
+  // (`isTrusted` = list membership), so gating on cwd would let an operator who
+  // trusts only `/repo/subdir` activate a `network = "on"` shipped by an UNtrusted
+  // `/repo/.forja/config.toml`. Gating on the config's own directory closes that
+  // bypass (CLAUDE.md "Explicit trust").
+  const isProjectConfigTrusted = trustPath !== null && isTrusted(trustPath, projectConfigCwd);
   const permResult = await bootstrapPermissionEngine({
     cwd,
     home,
@@ -864,11 +868,12 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       // Coarse network posture from `[sandbox] network` (default off via
       // DEFAULT_NETWORK). When `on`, the planner upgrades exec:arbitrary calls
       // to cwd-rw-net so any toolchain can fetch deps without a per-language
-      // table. Defense-in-depth: requires BOTH the operator opt-in AND a
-      // TRUSTED cwd — the config resolves project-wins, so without the trust
-      // gate a cloned hostile repo could self-enable egress (CLAUDE.md
-      // "Explicit trust"). See PERMISSION_ENGINE.md §6.5.
-      networkAllowed: sandboxLoaded.config.network === 'on' && isCwdTrusted,
+      // table. Defense-in-depth: requires BOTH the operator opt-in AND trust of
+      // the directory that SUPPLIED the config (`projectConfigCwd`, the repo
+      // root) — gating on cwd instead would let trusting a subdir activate a
+      // `network = "on"` from an untrusted repo-root `.forja/config.toml`
+      // (CLAUDE.md "Explicit trust"). See PERMISSION_ENGINE.md §6.5.
+      networkAllowed: sandboxLoaded.config.network === 'on' && isProjectConfigTrusted,
       // Slice 165 (review — Batch C sandbox observability). Forward
       // the trust marker so bootstrap can emit a
       // `sandbox.path_resolved` failure_event when the install isn't

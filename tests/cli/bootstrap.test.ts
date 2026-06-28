@@ -279,11 +279,12 @@ describe('bootstrap', () => {
     });
   });
 
-  // [sandbox] network = on must require a TRUSTED cwd: the value resolves
-  // project-wins, so without the trust gate a cloned hostile repo shipping
-  // `network = "on"` in its own .forja/config.toml would self-enable egress for
-  // every unmodeled binary (CLAUDE.md "Explicit trust").
-  describe('[sandbox] network posture gated by cwd trust', () => {
+  // [sandbox] network = on must require trust of the directory that SUPPLIED the
+  // config (the repo root where .forja/config.toml lives) — NOT the invocation
+  // cwd. Trust is exact-path, so gating on cwd would let a cloned hostile repo
+  // shipping `network = "on"` self-enable egress whenever the operator trusts any
+  // subdir under it (CLAUDE.md "Explicit trust").
+  describe('[sandbox] network posture gated by config-dir trust', () => {
     const availableSandbox = {
       available: true as const,
       tool: 'bwrap' as const,
@@ -334,6 +335,35 @@ describe('bootstrap', () => {
       expect(config.isCwdTrusted).toBe(false);
       // The hostile repo's own config.toml must NOT self-enable egress — the
       // write floor still applies (cwd-rw) but the network bump does not fire.
+      const d = config.permissionEngine.check('bash', 'bash', { command: 'go build' });
+      expect(d.sandboxProfile).toBe('cwd-rw');
+      db.close();
+    });
+
+    test('network=on, only a SUBDIR trusted (not the config-supplying repo root) → NO egress', async () => {
+      // The [sandbox] config lives at the repo root; trust must be checked THERE,
+      // not at the (trusted) cwd. Make workdir a git repo so resolveRepoRoot()
+      // maps the subdir cwd back to the root that supplies the config.
+      Bun.spawnSync({ cmd: ['git', 'init', workdir] });
+      writeNetworkOn(); // workdir/.forja/config.toml → network = "on"
+      const subdir = join(workdir, 'pkg');
+      mkdirSync(subdir, { recursive: true });
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      // Operator trusts ONLY the subdir they launched from — NOT the repo root.
+      writeFileSync(trustPath, JSON.stringify({ directories: [subdir] }));
+      const { config, db } = await bootstrap({
+        prompt: 'hi',
+        cwd: subdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+        sandboxAvailabilityOverride: availableSandbox,
+      });
+      // The cwd IS trusted — yet egress stays off because the config's directory
+      // (the repo root) is not. Gating on cwd would wrongly flip this to cwd-rw-net.
+      expect(config.isCwdTrusted).toBe(true);
       const d = config.permissionEngine.check('bash', 'bash', { command: 'go build' });
       expect(d.sandboxProfile).toBe('cwd-rw');
       db.close();
