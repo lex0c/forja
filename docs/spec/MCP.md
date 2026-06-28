@@ -12,7 +12,7 @@ Sem este doc, MCP fica como folclore espalhado por 7 docs — cada implementador
 
 1. **Server é não-confiável até prova em contrário.** Princípio 11 do `AGENTIC_CLI.md`. Trust é per-manifest-hash, não per-name.
 2. **Server declara tools, não policy.** MCP fornece capacidades; harness decide políticas (`SECURITY_GUIDELINE.md §5` invariant 9).
-3. **Namespacing explícito.** `mcp:<server>:<tool>` em todo audit, output, e UI. Sem ambiguidade com canônicos.
+3. **Namespacing explícito.** `mcp__<server>__<tool>` em todo audit, output, e UI. Sem ambiguidade com canônicos.
 4. **Failure visível.** Server caído ≠ tool ausente silenciosa; UI sinaliza, audit registra.
 5. **Hash do manifest é load-bearing.** Mudança de manifest = re-trust mandatório.
 6. **Lazy activation.** Server só conecta quando modelo efetivamente vai chamar uma tool; conexões pré-emptivas são waste.
@@ -68,7 +68,7 @@ Variáveis `$VAR` resolvem do env do agent (não do user shell genérico — env
 
 ### 1.3 Handshake
 
-Conexão lazy: harness não conecta até modelo efetivamente chamar `mcp:<name>:*`. Em `SessionStart`, harness apenas:
+Conexão lazy: harness não conecta até modelo efetivamente chamar `mcp__<name>__*`. Em `SessionStart`, harness apenas:
 
 1. Lê `mcp.toml`
 2. Para cada server **ativo** (não `disabled`): consulta `mcp_servers` em SQLite pra estado anterior
@@ -137,14 +137,14 @@ Headless / CI: trust prompt é **fail-closed** — se `--auto-approve-mcp` não 
 `tools/list` resposta vira `register` no Tool Registry com namespacing:
 
 ```
-mcp:postgres:query
-mcp:postgres:list_tables
-mcp:github:create_issue
+mcp__postgres__query
+mcp__postgres__list_tables
+mcp__github__create_issue
 ```
 
 Tools registradas com `visible_to_model: true` (se `trusted`) entram no `tool_schemas` cache breakpoint #2. Modelo as vê com nome completo namespaced.
 
-Quando modelo emite `tool_use` com `name: "mcp:postgres:query"`:
+Quando modelo emite `tool_use` com `name: "mcp__postgres__query"`:
 1. Harness valida input contra `inputSchema`
 2. Permission engine aplica policy (mesmas regras de tools canônicas)
 3. Se `disconnected`: handshake on-demand (transição para `active`)
@@ -209,7 +209,7 @@ Sandbox em SSE/HTTP servers: N/A (server roda fora; agente só faz HTTP). Trust 
 {
   "tools": [
     {
-      "name": "query",                     // sem namespace; harness adiciona "mcp:postgres:"
+      "name": "query",                     // sem namespace; harness adiciona "mcp__postgres__"
       "description": "Run a read-only SELECT against the configured database.",
       "inputSchema": {
         "type": "object",
@@ -283,8 +283,9 @@ Diff computed comparando manifest cacheado vs novo. Display em `UI.md` (TBD: com
 
 ### 4.1 Regras
 
-- Tools MCP **sempre** aparecem como `mcp:<server>:<tool>` no registry, audit, slash commands, output
-- `<server>` vem de `[servers.<name>]` em config; `<tool>` vem de `tools/list`
+- Tools MCP **sempre** aparecem como `mcp__<server>__<tool>` no registry, audit, slash commands, output
+- **Por que `__` e não `:`** — o nome vai *as-is* na wire da API (Anthropic/OpenAI exigem `^[a-zA-Z0-9_-]{1,64}$`; dois-pontos é rejeitado) e `:` colidiria com a gramática de capabilities `<kind>:<scope>` e com as regras de permissão `Bash(...)`/`Edit(...)`. Duplo-underscore é o separador seguro em todas as superfícies
+- `<server>` vem de `[servers.<name>]` em config; `<tool>` vem de `tools/list`; ambos sanitizados para o charset acima (colisão pós-sanitização resolvida por sufixo)
 - Colisão com tool canônica (`§2.6` em `CONTRACTS.md`): registro **rejeitado** com `mcp.namespace.shadow_canonical`
 - Colisão entre dois MCP servers: ambos sobrevivem (namespacing por server resolve); sem fallback
 

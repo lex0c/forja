@@ -1143,7 +1143,7 @@ Detalhes do subsistema em [`MEMORY.md`](./MEMORY.md). Markdown-based, escopo iso
 
 > **Autoridade detalhada:** [`MCP.md`](./MCP.md) — lifecycle, transport, manifest, namespacing, sandbox, budget, slash commands, observabilidade. Esta seção é overview.
 
-Cliente MCP nativo é a **única superfície declarada de extensão** do tool catalog v1 (`CONTRACTS.md §2.6.7`). Tools de servidores MCP aparecem no registry como `mcp:<server>:<tool>` — namespacing obrigatório, sem colisão com canônicos. Mesmas regras de permissão se aplicam. Servidores entram pelo trust prompt (§9.4) com hash do manifest gravado em `AUDIT.md §1.5`; mudança de manifest força re-trust.
+Cliente MCP nativo é a **única superfície declarada de extensão** do tool catalog v1 (`CONTRACTS.md §2.6.7`). Tools de servidores MCP aparecem no registry como `mcp__<server>__<tool>` — namespacing obrigatório, sem colisão com canônicos. Mesmas regras de permissão se aplicam. Servidores entram pelo trust prompt (§9.4) com hash do manifest gravado em `AUDIT.md §1.5`; mudança de manifest força re-trust.
 
 Transport: stdio (default), SSE, e streamable HTTP. Conexão é **lazy** — server só conecta quando modelo chama uma tool. Per-server budget e sandbox em `MCP.md §5, §2.3`. State machine completa em `STATE_MACHINE.md §6.5`. Contrato formal em `CONTRACTS.md §11`.
 

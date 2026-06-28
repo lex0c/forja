@@ -1258,9 +1258,9 @@ MCP é o **único caminho declarado** para extensão do tool catalog (`§2.6.7`)
 
 ### Namespacing:
 
-- Tools MCP aparecem no registry como `mcp:<server-name>:<tool-name>` (ex: `mcp:postgres:query`)
+- Tools MCP aparecem no registry como `mcp__<server-name>__<tool-name>` (ex: `mcp__postgres__query`)
 - Colisão com tool canônica do `§2.6` → tool MCP **rejeitada** ao registrar (server não pode shadow `read_file`, `bash`, etc); registro falha com `mcp.namespace.shadow_canonical`
-- Colisão entre dois servers → segundo registro vira `mcp:<server-name-2>:<tool-name>`; resolução por `server-name`, sem fallback ambíguo
+- Colisão entre dois servers → segundo registro vira `mcp__<server-name-2>__<tool-name>`; resolução por `server-name`, sem fallback ambíguo
 
 ### Versão: **v1**
 

@@ -578,11 +578,11 @@ Sessão típica não invalida cache MCP — eventos são raros (trust, manifest 
   read_file, grep, glob, edit_file, write_file, bash, ..., memory_search
 
   # MCP — alfabética por server name, depois por tool name dentro do server
-  mcp:github:create_issue
-  mcp:github:list_issues
-  mcp:postgres:explain_plan
-  mcp:postgres:list_tables
-  mcp:postgres:query
+  mcp__github__create_issue
+  mcp__github__list_issues
+  mcp__postgres__explain_plan
+  mcp__postgres__list_tables
+  mcp__postgres__query
 [/tool_schemas]
 ```
 
