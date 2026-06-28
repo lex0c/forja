@@ -959,11 +959,21 @@ export interface LoadedVerifyConfig {
   warnings: string[];
 }
 
+// `commands` resolves to undefined in TWO distinct cases — ABSENT (the key isn't
+// there) and DECLARED-BUT-INVALID (present, but a non-array or an all-dropped
+// list). `hadCommands` disambiguates them so a malformed PROJECT value can
+// shadow an inherited USER gate instead of silently resurrecting it: the
+// fail-soft contract is "a malformed value leaves the gate off", and a project
+// typo must not turn the user's gate back on.
+interface PartialVerifyLayer extends VerifyConfigKeys {
+  hadCommands: boolean;
+}
+
 const parseVerifyLayer = (
   path: string | null,
   source: string,
-): { layer: VerifyConfigKeys; warnings: string[] } => {
-  const layer: VerifyConfigKeys = {};
+): { layer: PartialVerifyLayer; warnings: string[] } => {
+  const layer: PartialVerifyLayer = { hadCommands: false };
   const warnings: string[] = [];
   const section = loadTomlSection(path, 'verify', source);
   if (section.kind === 'absent' || section.kind === 'no-section') return { layer, warnings };
@@ -973,6 +983,9 @@ const parseVerifyLayer = (
   }
   const s = section.section;
   if (s.commands !== undefined) {
+    // The key is present — the layer DECLARED commands, valid or not. This is
+    // what lets an invalid project value shadow the user layer below.
+    layer.hadCommands = true;
     const raw = s.commands;
     if (!Array.isArray(raw)) {
       warnings.push(
@@ -1013,9 +1026,16 @@ export const loadVerifyConfig = (input: LoadVerifyConfigInput): LoadedVerifyConf
   const userResult = parseVerifyLayer(userPath, 'user');
   const projectResult = parseVerifyLayer(projectPath, 'project');
   const warnings = [...userResult.warnings, ...projectResult.warnings];
-  // project wins; undefined leaves the consumer to apply the empty default. An
-  // explicit `[]` is a real value, so check `!== undefined`, not truthiness.
-  const resolved = projectResult.layer.commands ?? userResult.layer.commands;
+  // Project wins, but distinguish ABSENT from DECLARED-BUT-INVALID: if the
+  // project layer declared `commands` at all (`hadCommands`), it OWNS the
+  // decision — even when its value was malformed and resolved to undefined, so
+  // the gate stays off rather than falling back to (resurrecting) the user's
+  // commands over a project typo. Only an absent project layer inherits the user
+  // value (which itself is undefined when the user value was invalid). An
+  // explicit project `[]` is a real value that already wins via this path.
+  const resolved = projectResult.layer.hadCommands
+    ? projectResult.layer.commands
+    : userResult.layer.commands;
   const config: VerifyConfigKeys = {};
   if (resolved !== undefined) config.commands = resolved;
   return { config, userPath, projectPath, warnings };
