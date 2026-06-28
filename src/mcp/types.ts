@@ -63,8 +63,10 @@ export type McpServerState =
 // `_meta.agentic_cli.*` — the server's self-declared, NON-authoritative
 // hints (MCP.md §3.1). The harness decides policy; these only tune
 // defaults. `category` is a raw string here (not a PolicyCategory) so this
-// module stays decoupled from the permission engine — the tool-factory
-// validates it against the real category set and falls back to 'mcp'.
+// module stays decoupled from the permission engine. NOTE: in this version
+// the tool-factory IGNORES `category` and always assigns the 'mcp' category
+// (a server must not self-select a softer one, e.g. 'read'); the field is
+// still parsed + hashed, so a change re-prompts, but it never reaches policy.
 export interface McpToolMeta {
   category?: string;
   writes?: boolean;
@@ -123,7 +125,10 @@ export interface McpTrustRequest {
   // must show this: trust = "I authorize running this binary."
   command: string;
   mode: McpTrustMode;
-  tools: ReadonlyArray<{ name: string; description: string }>;
+  // `writes` mirrors the tool's effective checkpoint behavior (`meta.writes ??
+  // true`), so the modal can mark side-effecting tools the operator is about to
+  // authorize — surfacing a server's self-declared `writes:false`.
+  tools: ReadonlyArray<{ name: string; description: string; writes: boolean }>;
   manifestHash: string;
 }
 

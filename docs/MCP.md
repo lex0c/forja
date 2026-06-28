@@ -131,7 +131,9 @@ When a TTY operator is present, an unknown/changed manifest raises the `askMcpTr
 - the **tool inventory** (name + description, capped at 8 with an overflow line),
 - the **manifest hash**.
 
-Every string in the modal is sanitized at the render boundary (a hostile manifest can't repaint the terminal). The **conservative default is "No, do not run it"** — hitting Enter without reading declines. Esc / timeout / cancel all resolve to deny.
+Every string in the modal is sanitized at the render boundary (a hostile manifest can't repaint the terminal). The **conservative default is "No, do not run it"** — hitting Enter without reading declines. Esc / timeout / cancel all resolve to deny. Tools the server declares as writing are marked `[writes]` in the inventory so the operator can see which ones carry side effects.
+
+> **Limitation — `$VAR` in a command is trust over the *literal*.** Both the modal and the command-change re-trust use the **unresolved** argv. If a command contains a variable (e.g. `command = ["$MCP_BIN"]`), re-pointing that variable in the environment swaps the real binary **without** re-triggering trust, and the modal only ever shows the literal `$MCP_BIN`. Trusting such a server means trusting whatever the operator's environment resolves it to. Hashing the *resolved* command for change-detection is a deferred follow-up (§8); until then, prefer a literal executable for servers you don't fully control and keep `$VAR` for arguments/secrets, not the binary itself.
 
 ### 3.4 Headless: fail-closed
 
@@ -161,7 +163,7 @@ A server may attach non-authoritative hints under each tool's `_meta.agentic_cli
 
 | Hint | Effect if present | Default if absent |
 |---|---|---|
-| `category` | validated against the real category set, else `mcp` | `mcp` |
+| `category` | **ignored in this version** — every MCP tool gets the `mcp` category (a server can't self-select a softer one, e.g. `read`); still parsed + hashed, so a change re-prompts, but it never reaches policy | `mcp` |
 | `writes` | drives checkpointing | **`true`** (pessimistic — a write is checkpointed) |
 | `network` | informational | — |
 | `parallel_safe` | — | `false` (MCP calls are not parallel-batched) |
@@ -222,6 +224,7 @@ These are specified but intentionally out of the first MCP release; each is its 
 
 - **Remote transport** — SSE / streamable-HTTP behind the same `McpClient`, plus an egress permission category and bearer/OAuth auth.
 - **Sandbox** — wrapping the stdio child via the existing `buildBwrapArgv` machinery + a per-server network allowlist. Until then, a server runs with the agent's own privileges; **only declare servers whose binaries you trust.**
+- **Resolved-command change-detection** — hashing the `$VAR`-resolved argv (persisted as a hash, never plaintext) so a re-pointed `$MCP_BIN` re-triggers trust. Today change-detection compares only the unresolved literal (see the §3.3 limitation note).
 - **Per-server budget** — call / token-in / timeout caps and a `degraded`↔`active` auto-recovery loop.
 - **Per-tool MCP policy rules** — an operator policy section that can `confirm`/`deny`/`lock` a specific `mcp__<server>__<tool>` pattern. In this version trust is all-or-nothing at the server level and no `mcp` policy section is consulted.
 - **Live re-trust + registry hot-swap** — re-trusting a drifted server without restart needs `ToolRegistry.unregister` + a registry epoch the loop compares.

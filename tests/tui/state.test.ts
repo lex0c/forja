@@ -2712,7 +2712,7 @@ describe('mcp-trust:ask reducer', () => {
     mode: 'first-visit' | 'drift';
     server?: string;
     command?: string;
-    tools?: readonly { name: string; description: string }[];
+    tools?: readonly { name: string; description: string; writes: boolean }[];
     manifestHash?: string;
   }): UIEvent => ({
     type: 'mcp-trust:ask',
@@ -2721,7 +2721,7 @@ describe('mcp-trust:ask reducer', () => {
     server: overrides.server ?? 'postgres',
     command: overrides.command ?? 'mcp-server-postgres --dsn $X',
     mode: overrides.mode,
-    tools: overrides.tools ?? [{ name: 'query', description: 'run a query' }],
+    tools: overrides.tools ?? [{ name: 'query', description: 'run a query', writes: false }],
     manifestHash: overrides.manifestHash ?? 'abc123',
   });
 
@@ -2778,7 +2778,7 @@ describe('mcp-trust:ask reducer', () => {
         command: `${evil}evil-bin`,
         // CR/LF/TAB in a tool name would break the bounded one-row-per-tool
         // layout if not collapsed to spaces.
-        tools: [{ name: 'a\r\nb\tc', description: `${evil}d` }],
+        tools: [{ name: 'a\r\nb\tc', description: `${evil}d`, writes: false }],
       }),
     );
     const modal = r.state.modal;
@@ -2792,12 +2792,35 @@ describe('mcp-trust:ask reducer', () => {
   });
 
   test('caps the tool inventory with an overflow line', () => {
-    const tools = Array.from({ length: 12 }, (_, i) => ({ name: `t${i}`, description: 'd' }));
+    const tools = Array.from({ length: 12 }, (_, i) => ({
+      name: `t${i}`,
+      description: 'd',
+      writes: false,
+    }));
     const r = applyEvent(createInitialState(), mcpTrustEvent({ mode: 'first-visit', tools }));
     const modal = r.state.modal;
     if (modal === null) throw new Error('expected modal');
     const text = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
     expect(text).toContain('…and 4 more tools not shown'); // 12 − 8 cap
+  });
+
+  test('write tools are marked [writes]; read-only tools are not', () => {
+    const r = applyEvent(
+      createInitialState(),
+      mcpTrustEvent({
+        mode: 'first-visit',
+        tools: [
+          { name: 'mutate', description: 'changes things', writes: true },
+          { name: 'peek', description: 'reads things', writes: false },
+        ],
+      }),
+    );
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    const text = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+    expect(text).toContain('mutate [writes] — changes things');
+    expect(text).toContain('peek — reads things'); // no marker for the read-only tool
+    expect(text).not.toContain('peek [writes]');
   });
 });
 

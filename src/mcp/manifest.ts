@@ -59,3 +59,10 @@ export const canonicalManifestJson = (m: CanonicalManifest): string =>
   canonicalJson(hashPayload(m));
 
 export const hashManifest = (m: CanonicalManifest): string => sha256Hex(canonicalManifestJson(m));
+
+// Re-hash a stored `manifest_json` verbatim. The persisted string IS the
+// canonical input to `hashManifest`, so a granted row must satisfy
+// `hashManifestJson(row.manifest_json) === row.hash`; a mismatch means the
+// row was tampered (DB write) without updating the hash — the cached-trust
+// path uses this to reject such a row and re-handshake.
+export const hashManifestJson = (manifestJson: string): string => sha256Hex(manifestJson);

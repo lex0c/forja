@@ -460,7 +460,7 @@ export type McpTrustAskEvent = BaseEvent & {
   // 'first-visit': never-seen manifest hash. 'drift': previously-trusted
   // server whose hash (tools or command) changed.
   mode: import('../mcp/types.ts').McpTrustMode;
-  tools: readonly { name: string; description: string }[];
+  tools: readonly { name: string; description: string; writes: boolean }[];
   manifestHash: string;
 };
 

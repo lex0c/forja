@@ -2192,8 +2192,12 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         previewLines.push('(the server declares no tools)');
       } else {
         for (const t of visible) {
+          // Mark side-effecting tools so the operator sees which ones write —
+          // and, by omission, which the server claims are read-only (the
+          // `writes:false` it is asking them to trust).
+          const marker = t.writes ? ' [writes]' : '';
           previewLines.push(
-            `  ${sanitizeOneLineForDisplay(t.name)} — ${sanitizeOneLineForDisplay(t.description)}`,
+            `  ${sanitizeOneLineForDisplay(t.name)}${marker} — ${sanitizeOneLineForDisplay(t.description)}`,
           );
         }
         if (overflow > 0) {

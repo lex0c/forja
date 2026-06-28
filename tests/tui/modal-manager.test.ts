@@ -1124,7 +1124,7 @@ describe('askMcpTrust (mcp-trust:ask producer, MCP.md §1.5)', () => {
     server: 'postgres',
     command: 'mcp-server-postgres --dsn $X',
     mode: 'first-visit' as const,
-    tools: [{ name: 'query', description: 'run a query' }],
+    tools: [{ name: 'query', description: 'run a query', writes: false }],
     manifestHash: 'abc123',
   };
 
@@ -1137,7 +1137,7 @@ describe('askMcpTrust (mcp-trust:ask producer, MCP.md §1.5)', () => {
     expect(ask.server).toBe('postgres');
     expect(ask.command).toBe('mcp-server-postgres --dsn $X'); // the binary being authorized
     expect(ask.manifestHash).toBe('abc123');
-    expect(ask.tools).toEqual([{ name: 'query', description: 'run a query' }]);
+    expect(ask.tools).toEqual([{ name: 'query', description: 'run a query', writes: false }]);
   });
 
   test('hotkey "1" resolves "yes"', async () => {

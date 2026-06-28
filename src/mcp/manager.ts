@@ -37,7 +37,12 @@ import type { ToolRegistry } from '../tools/registry.ts';
 import type { ToolContext } from '../tools/types.ts';
 import { createStdioMcpClient } from './client.ts';
 import type { LoadedMcpConfig } from './config.ts';
-import { canonicalManifestJson, canonicalizeManifest, hashManifest } from './manifest.ts';
+import {
+  canonicalManifestJson,
+  canonicalizeManifest,
+  hashManifest,
+  hashManifestJson,
+} from './manifest.ts';
 import { isMcpTerminal, mcpTransition } from './state.ts';
 import { buildMcpTool, mcpWireName } from './tool-factory.ts';
 import type {
@@ -117,7 +122,12 @@ const parseCachedManifestTools = (json: string): McpManifestTool[] => {
         // tampered row can't register a tool with a null/array inputSchema.
         r.inputSchema !== null &&
         typeof r.inputSchema === 'object' &&
-        !Array.isArray(r.inputSchema)
+        !Array.isArray(r.inputSchema) &&
+        // `meta` is dereferenced by buildMetadata (`meta.writes`); a tampered
+        // row with meta missing/null/array would otherwise throw mid-register.
+        r.meta !== null &&
+        typeof r.meta === 'object' &&
+        !Array.isArray(r.meta)
       );
     });
   } catch {
@@ -221,6 +231,12 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
           last_error: null,
         });
       } catch (err) {
+        // Reap the child: connect() may have succeeded before the fault (e.g.
+        // listTools threw / aborted), so dropping `client` without closing
+        // would orphan the subprocess — and the model retries the tool call,
+        // leaking one child per retry. (A drift throw already closed above; a
+        // second close is a swallowed no-op.)
+        await client.close().catch(() => {});
         rt.client = null;
         rt.connected = false;
         // A drift throw already set 'degraded'; only a connect/list fault
@@ -373,7 +389,10 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       recordManifestDecision(db, {
         server_name: name,
         hash,
-        previous_hash: rt.trustedHash,
+        // The hash this decision supersedes: the latest already-granted
+        // manifest for this server (null on first trust). `rt.trustedHash` is
+        // still null here (set only after the grant), so query the store.
+        previous_hash: latestTrustedManifest(db, name)?.hash ?? null,
         manifest_json: manifestJson,
         protocol_version: info.protocolVersion,
         server_version: info.serverVersion,
@@ -390,7 +409,11 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         // The RAW (unresolved) command — never expose a resolved secret.
         command: rt.config.transport.rawArgv.join(' '),
         mode: forceReprompt || rt.trustedHash !== null ? 'drift' : 'first-visit',
-        tools: tools.map((t) => ({ name: t.name, description: t.description })),
+        tools: tools.map((t) => ({
+          name: t.name,
+          description: t.description,
+          writes: t.meta.writes ?? true,
+        })),
         manifestHash: hash,
       });
       const granted = answer === 'yes';
@@ -463,7 +486,21 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         const commandChanged = existing !== null && existing.command !== rawCommandJson;
 
         const cached = commandChanged ? null : latestTrustedManifest(db, server.name);
-        const cachedTools = cached !== null ? parseCachedManifestTools(cached.manifest_json) : [];
+        // Defense-in-depth (FAILURE_MODES §14.2): the stored manifest_json is
+        // the exact string that was hashed, so a granted row must re-hash to
+        // its own `hash`. A mismatch means the row was tampered (DB write)
+        // without updating the hash — reject the cache and re-handshake rather
+        // than register from downgraded tool metadata.
+        let cachedTools: McpManifestTool[] = [];
+        if (cached !== null) {
+          if (hashManifestJson(cached.manifest_json) === cached.hash) {
+            cachedTools = parseCachedManifestTools(cached.manifest_json);
+          } else {
+            warnings.push(
+              `mcp: cached manifest for '${server.name}' failed its hash check; re-handshaking`,
+            );
+          }
+        }
         if (cached !== null && cachedTools.length > 0) {
           // Steady state: register from cache, no connect (lazy).
           const { registered: n, warnings: w } = registerServerTools(rt, cachedTools);

@@ -45,21 +45,33 @@ const NAME_MAX = 40;
 // leaking the literal `$NAME` into an argv the server would choke on.
 const ENV_VAR_RE = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g;
 
+// A `${` NOT followed by a well-formed `NAME}` — an unclosed `${API_KEY`, an
+// empty `${}`, or a `${1X}`. The resolver leaves these literal (the spec
+// contract is "don't leak a half-reference into argv silently"), so flag them.
+const MALFORMED_BRACE_RE = /\$\{(?![A-Za-z_][A-Za-z0-9_]*\})/;
+
 const resolveEnvVars = (
   value: string,
   env: NodeJS.ProcessEnv,
   warnings: string[],
   ctx: string,
-): string =>
-  value.replace(ENV_VAR_RE, (_full, braced: string | undefined, bare: string | undefined) => {
-    const name = (braced ?? bare) as string;
-    const resolved = env[name];
-    if (resolved === undefined) {
-      warnings.push(`${ctx}: environment variable $${name} is not set; substituted empty string`);
-      return '';
-    }
-    return resolved;
-  });
+): string => {
+  if (MALFORMED_BRACE_RE.test(value)) {
+    warnings.push(`${ctx}: malformed brace reference (expected \${NAME}); left as-is`);
+  }
+  return value.replace(
+    ENV_VAR_RE,
+    (_full, braced: string | undefined, bare: string | undefined) => {
+      const name = (braced ?? bare) as string;
+      const resolved = env[name];
+      if (resolved === undefined) {
+        warnings.push(`${ctx}: environment variable $${name} is not set; substituted empty string`);
+        return '';
+      }
+      return resolved;
+    },
+  );
+};
 
 const asStringArray = (value: unknown): string[] | null => {
   if (!Array.isArray(value)) return null;
@@ -141,8 +153,19 @@ const parseServerEntry = (
     }
   }
 
-  if (typeof entry.cwd === 'string') {
-    stdio.cwd = resolveEnvVars(entry.cwd, env, warnings, `${where} cwd`);
+  if (entry.cwd !== undefined) {
+    if (typeof entry.cwd !== 'string') {
+      warnings.push(`${where}: 'cwd' must be a string; ignored`);
+    } else {
+      const resolvedCwd = resolveEnvVars(entry.cwd, env, warnings, `${where} cwd`);
+      // An unset `$VAR` resolves to '' — forwarding `cwd: ''` to the spawn is an
+      // invalid working directory (ENOENT); drop it (run in the session cwd).
+      if (resolvedCwd === '') {
+        warnings.push(`${where}: 'cwd' resolves to an empty path; ignored`);
+      } else {
+        stdio.cwd = resolvedCwd;
+      }
+    }
   }
 
   // Forja-native: which model surface the server's tools sit on. Default
@@ -157,6 +180,11 @@ const parseServerEntry = (
     }
   }
 
+  if (entry.disabled !== undefined && typeof entry.disabled !== 'boolean') {
+    // A quoted bool (`disabled = "true"`) is a common TOML slip; without this
+    // it would silently stay enabled, dropping the operator's disable intent.
+    warnings.push(`${where}: 'disabled' must be a boolean; treating as not disabled`);
+  }
   const disabled = entry.disabled === true;
 
   return { name, enabled: !disabled, surface, transport: stdio, source };

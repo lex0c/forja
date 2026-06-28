@@ -19,6 +19,7 @@ import {
   getServer,
   insertServer,
   latestTrustedManifest,
+  listManifestHistory,
   recordManifestDecision,
 } from '../../src/storage/repos/mcp-servers.ts';
 import { type ToolRegistry, createToolRegistry } from '../../src/tools/registry.ts';
@@ -53,6 +54,7 @@ interface FakeSpec {
   tools: McpManifestTool[];
   callResult?: McpCallResult;
   connectError?: Error;
+  listToolsError?: Error;
 }
 const fakeClientFactory = (spec: FakeSpec) => {
   const stats = {
@@ -72,6 +74,7 @@ const fakeClientFactory = (spec: FakeSpec) => {
         return { protocolVersion: '2024-11-05', serverVersion: '1.0.0' };
       },
       async listTools() {
+        if (spec.listToolsError) throw spec.listToolsError;
         return spec.tools;
       },
       async callTool() {
@@ -433,5 +436,152 @@ describe('McpManager: stale-row sweep (AUDIT §1.5)', () => {
     });
     await mgr.init();
     expect(getServer(db, 'db')).not.toBeNull(); // disabled ≠ removed from config
+  });
+});
+
+describe('McpManager: review hardening', () => {
+  test('cached manifest with a tampered JSON fails its hash check and re-handshakes', async () => {
+    // Record a granted row whose stored manifest_json does NOT hash to its
+    // `hash` column — a DB tamper (e.g. flipping a tool's writes:false while
+    // leaving the hash). The cached path must reject it, not register from it.
+    const goodTools = [toolDef('query')];
+    const canonical = canonicalizeManifest({
+      server: 'db',
+      protocolVersion: '2024-11-05',
+      serverVersion: '1.0.0',
+      tools: goodTools,
+    });
+    recordManifestDecision(db, {
+      server_name: 'db',
+      hash: hashManifest(canonical),
+      previous_hash: null,
+      manifest_json: '{"serverInfo":{"name":"db","version":"1.0.0"},"tools":[]}', // mismatched
+      protocol_version: '2024-11-05',
+      server_version: '1.0.0',
+      decision: 'granted',
+      decided_by: 'user',
+      decided_at: 1,
+      approval_id: null,
+    });
+    const fake = fakeClientFactory({ tools: goodTools });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+    expect(report.warnings.some((w) => w.includes('failed its hash check'))).toBe(true);
+    expect(fake.stats.connects).toBeGreaterThan(0); // re-handshaked instead of trusting the row
+    expect(registry.has('mcp__db__query')).toBe(true);
+    await mgr.cleanup();
+  });
+
+  test('a changed-manifest re-grant chains previous_hash to the prior trusted hash', async () => {
+    // Session 1: grant manifest A.
+    const fake1 = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr1 = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake1.makeClient,
+    });
+    await mgr1.init();
+    const hashA = latestTrustedManifest(db, 'db')?.hash;
+    await mgr1.cleanup();
+
+    // Session 2: the command AND the tool set changed → manifest B, force-
+    // reprompted (command swap), auto-approved.
+    const fake2 = fakeClientFactory({ tools: [toolDef('query'), toolDef('mutate')] });
+    const mgr2 = createMcpManager({
+      db,
+      registry: createToolRegistry(),
+      config: config([
+        serverConfig({
+          transport: {
+            transport: 'stdio',
+            command: 'fake-bin-v2',
+            args: [],
+            rawArgv: ['fake-bin-v2'],
+          },
+        }),
+      ]),
+      autoApprove: new Set(['db']),
+      makeClient: fake2.makeClient,
+    });
+    await mgr2.init();
+    await mgr2.cleanup();
+
+    const history = listManifestHistory(db, 'db');
+    expect(history.length).toBe(2);
+    const hashB = latestTrustedManifest(db, 'db')?.hash;
+    expect(hashB).not.toBe(hashA);
+    const rowB = history.find((h) => h.hash === hashB);
+    expect(rowB?.previous_hash).toBe(hashA ?? null); // the chain forms (was always null before)
+  });
+
+  test('two tools that sanitize to the same wire name are de-duplicated, not dropped', async () => {
+    const collide = (name: string): McpManifestTool => ({
+      name,
+      description: 'd',
+      inputSchema: { type: 'object' },
+      meta: {},
+    });
+    const fake = fakeClientFactory({ tools: [collide('foo.bar'), collide('foo/bar')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+    expect(report.registered).toBe(2); // both registered, no throw
+    expect(registry.has('mcp__db__foo_bar')).toBe(true);
+    expect(registry.has('mcp__db__foo_bar_2')).toBe(true);
+    await mgr.cleanup();
+  });
+
+  test('a connect failure lands the server in error state with a warning', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')], connectError: new Error('boom') });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+    expect(report.registered).toBe(0);
+    expect(mgr.state('db')).toBe('error');
+    expect(report.warnings.some((w) => w.includes('handshake failed'))).toBe(true);
+    await mgr.cleanup();
+  });
+
+  test('lazy-connect reaps the child when listTools fails after connect (no leak)', async () => {
+    // Cached-trusted so init does not connect; the first callTool lazily
+    // connects, then listTools throws — the manager must close() the client.
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      listToolsError: new Error('malformed tools/list'),
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(fake.stats.connects).toBe(0); // registered from cache, no connect
+
+    // The manager rethrows the lazy-connect fault (the tool-factory wraps it
+    // into a tool error); what matters here is that the child was reaped.
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow();
+    expect(fake.stats.connects).toBe(1);
+    expect(fake.stats.closes).toBe(1); // the fix: child reaped on the fault path, not orphaned
+    await mgr.cleanup();
   });
 });

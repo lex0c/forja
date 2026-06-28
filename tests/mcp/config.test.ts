@@ -231,3 +231,61 @@ describe('loadMcpConfig: fail-soft + empty', () => {
     expect(warnings.some((w) => w.toLowerCase().includes('parse'))).toBe(true);
   });
 });
+
+describe('loadMcpConfig: bad-type diagnostics (review hardening)', () => {
+  test('a non-boolean disabled warns and stays enabled (intent not silently dropped)', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.db]
+transport = "stdio"
+command = ["bin"]
+disabled = "true"
+`,
+    );
+    const { servers, warnings } = load();
+    expect(servers).toHaveLength(1);
+    expect(servers[0]?.enabled).toBe(true);
+    expect(warnings.some((w) => w.includes("'disabled' must be a boolean"))).toBe(true);
+  });
+
+  test('a cwd that resolves to empty ($UNSET) is dropped, not forwarded as cwd:""', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.db]
+transport = "stdio"
+command = ["bin"]
+cwd = "$WORKDIR"
+`,
+    );
+    const { servers, warnings } = load();
+    expect(servers[0]?.transport.cwd).toBeUndefined();
+    expect(warnings.some((w) => w.includes("'cwd' resolves to an empty path"))).toBe(true);
+  });
+
+  test('a non-string cwd warns and is ignored', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.db]
+transport = "stdio"
+command = ["bin"]
+cwd = 123
+`,
+    );
+    const { servers, warnings } = load();
+    expect(servers[0]?.transport.cwd).toBeUndefined();
+    expect(warnings.some((w) => w.includes("'cwd' must be a string"))).toBe(true);
+  });
+
+  test('a malformed brace reference (unclosed ${) warns instead of leaking silently', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.db]
+transport = "stdio"
+command = ["bin", "--token=\${DATABASE_URL"]
+`,
+    );
+    const { servers, warnings } = load();
+    expect(servers).toHaveLength(1);
+    expect(warnings.some((w) => w.includes('malformed brace reference'))).toBe(true);
+  });
+});

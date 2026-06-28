@@ -33,19 +33,22 @@ const asRecord = (v: unknown): Record<string, unknown> | null =>
 const asString = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
 const asBool = (v: unknown): boolean | undefined => (typeof v === 'boolean' ? v : undefined);
 
-// Minimal spawn env (MCP.md §2.1): PATH/HOME/USER + the operator's MCP_*
-// vars + the server's declared env. The server does NOT inherit the agent's
-// full environment (no API keys, no session secrets leak in).
-const buildSpawnEnv = (
+// Minimal spawn env (MCP.md §2.1): PATH/HOME/USER plus the server's own
+// declared `env` (from its mcp.toml entry, $VAR-resolved). The server does NOT
+// inherit the agent's environment — no API keys / session secrets leak in.
+//
+// We deliberately do NOT blanket-forward `MCP_*` vars: that would hand one
+// server's `MCP_<X>_TOKEN` to EVERY other (untrusted) server. A server gets
+// only the base + exactly what its own entry declares — the same
+// explicitly-shaped-env discipline every other Forja spawn site follows
+// (src/sanitize/env.ts).
+export const buildSpawnEnv = (
   declared: Readonly<Record<string, string>> | undefined,
 ): Record<string, string> => {
   const out: Record<string, string> = {};
   for (const key of ['PATH', 'HOME', 'USER']) {
     const v = process.env[key];
     if (v !== undefined) out[key] = v;
-  }
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith('MCP_') && v !== undefined) out[k] = v;
   }
   if (declared !== undefined) {
     for (const [k, v] of Object.entries(declared)) out[k] = v;
@@ -57,7 +60,7 @@ const buildSpawnEnv = (
 // shape the rest of the stack (and every provider's tool wire format)
 // requires. A server that omits or mis-shapes it gets an empty object
 // schema rather than breaking tool registration.
-const normalizeInputSchema = (raw: unknown): ProviderToolInputSchema => {
+export const normalizeInputSchema = (raw: unknown): ProviderToolInputSchema => {
   const rec = asRecord(raw);
   if (rec !== null && rec.type === 'object') return rec as ProviderToolInputSchema;
   return { type: 'object' };
@@ -66,7 +69,7 @@ const normalizeInputSchema = (raw: unknown): ProviderToolInputSchema => {
 // Pull the `_meta.agentic_cli.*` hints, narrowing each field. Anything
 // missing/ill-typed is simply absent (the factory then applies its
 // conservative defaults).
-const extractMeta = (rawMeta: unknown): McpToolMeta => {
+export const extractMeta = (rawMeta: unknown): McpToolMeta => {
   const meta = asRecord(rawMeta);
   const ns = meta === null ? null : asRecord(meta.agentic_cli);
   if (ns === null) return {};
@@ -88,7 +91,7 @@ const extractMeta = (rawMeta: unknown): McpToolMeta => {
 
 // Flatten the content block array to text (slice 1 is text-only; image /
 // embedded-resource blocks are dropped with the text preserved).
-const flattenContent = (content: unknown): string => {
+export const flattenContent = (content: unknown): string => {
   if (!Array.isArray(content)) return '';
   const parts: string[] = [];
   for (const block of content) {
