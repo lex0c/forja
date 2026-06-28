@@ -3906,6 +3906,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // Verify-gate accounting (STATE_MACHINE §3.2.1): fold this settled tool
           // into the run's mutation/verification evidence so the claim-time gate
           // at no_tool_use is deterministic. No-op when the gate is off.
+          // Use the EXECUTED args (`inv.effectiveArgs`) — a PreToolUse hook can
+          // rewrite a `bun test` call into another command that exits 0, and the
+          // gate must match what actually ran, not the model's pre-hook args.
           // A fresh mutation re-arms the gate (starts a new verification cycle),
           // so reset the per-cycle nudge budget — otherwise a later edit inherits
           // attempts spent on an earlier one and, once the run-wide count hits the
@@ -3915,7 +3918,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               verifyState,
               verifyCommands,
               tu.name,
-              tu.input,
+              inv.effectiveArgs ?? tu.input,
               inv.failed,
               inv.exitCode,
             )

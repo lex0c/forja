@@ -161,6 +161,13 @@ export interface InvokeToolResult {
   // `└─` connector (today: clarify's "<question> → <answer>"). Absent
   // for tools that don't set it.
   resultDetail?: string;
+  // The args the tool body ACTUALLY executed with — `input.args` unless a
+  // PreToolUse hook's `updatedInput` rewrote them. Consumers that reason about
+  // what RAN (the verify gate matches the executed `command`, not the model's
+  // pre-hook args, so a hook rewrite can't satisfy a verify-command the model
+  // never ran) must read this. Set on the success path; absent on failure paths
+  // (which the gate skips via `failed`).
+  effectiveArgs?: ToolArgs;
 }
 
 // A success result is "truncated" when the tool capped its own
@@ -1058,6 +1065,7 @@ export const invokeTool = async (
     durationMs: duration,
     failed: false,
     decision,
+    effectiveArgs,
     ...(readOutputTruncated(result) ? { outputTruncated: true } : {}),
     ...(exitCode !== undefined ? { exitCode } : {}),
     ...(resultDetail !== undefined ? { resultDetail } : {}),
