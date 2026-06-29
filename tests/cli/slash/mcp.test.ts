@@ -15,16 +15,24 @@ import { createModalManager } from '../../../src/tui/modal-manager.ts';
 
 let db: DB;
 
-const fakeManager = (status: McpServerStatus[]): McpManager =>
+interface FakeHooks {
+  revoke?: (name: string) => Promise<{ ok: boolean; reason?: string; tools: number }>;
+  reconnect?: (
+    name: string,
+  ) => Promise<{ ok: boolean; reason?: string; registered: number; warnings: string[] }>;
+}
+const fakeManager = (status: McpServerStatus[], hooks: FakeHooks = {}): McpManager =>
   ({
     init: async () => ({ registered: 0, servers: [], warnings: [] }),
     callTool: async () => ({ isError: false, content: '' }),
     state: (n: string) => status.find((s) => s.name === n)?.state ?? null,
     status: () => status,
+    revoke: hooks.revoke ?? (async () => ({ ok: true, tools: 0 })),
+    reconnect: hooks.reconnect ?? (async () => ({ ok: true, registered: 0, warnings: [] })),
     cleanup: async () => {},
   }) as unknown as McpManager;
 
-const buildCtx = (mgr?: McpManager): SlashContext => {
+const buildCtx = (mgr?: McpManager, isRunning = false): SlashContext => {
   const bus = createBus();
   const modalManager = createModalManager({ bus, focusStack: createFocusStack(), now: () => 0 });
   const baseConfig = {
@@ -39,7 +47,7 @@ const buildCtx = (mgr?: McpManager): SlashContext => {
     cumulative: { costUsd: 0, steps: 0, turns: 0 },
     now: () => 0,
     requestShutdown: () => {},
-    isRunning: () => false,
+    isRunning: () => isRunning,
     currentSessionId: () => null,
     replSessionIds: () => [],
     modelRegistry: createModelRegistry(),
@@ -187,5 +195,103 @@ describe('/mcp slash command (read-only)', () => {
     const text = r.notes?.join('\n') ?? '';
     expect(text).toContain('granted');
     expect(text).not.toContain('1970'); // localTimestamp(0) → '—'
+  });
+
+  test('revoke calls the manager and reports the removal', async () => {
+    let called = '';
+    const mgr = fakeManager([], {
+      revoke: async (n) => {
+        called = n;
+        return { ok: true, tools: 2 };
+      },
+    });
+    const r = await mcpCommand.exec(['revoke', 'db'], buildCtx(mgr));
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    expect(called).toBe('db');
+    const text = r.notes?.join('\n') ?? '';
+    expect(text).toContain('Revoked');
+    expect(text).toContain('2 tools');
+  });
+
+  test('revoke is refused mid-turn (must not touch the live registry)', async () => {
+    let called = false;
+    const mgr = fakeManager([], {
+      revoke: async () => {
+        called = true;
+        return { ok: true, tools: 0 };
+      },
+    });
+    const r = await mcpCommand.exec(['revoke', 'db'], buildCtx(mgr, true)); // a turn is running
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message).toContain('a turn is in flight');
+    expect(called).toBe(false); // gated BEFORE the manager call
+  });
+
+  test('reconnect calls the manager + surfaces its warnings', async () => {
+    const mgr = fakeManager([], {
+      reconnect: async () => ({ ok: true, registered: 3, warnings: ['mcp: heads up'] }),
+    });
+    const r = await mcpCommand.exec(['reconnect', 'db'], buildCtx(mgr));
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = r.notes?.join('\n') ?? '';
+    expect(text).toContain('Reconnected');
+    expect(text).toContain('3 tools');
+    expect(text).toContain('mcp: heads up');
+  });
+
+  test('revoke without a server name errors', async () => {
+    const r = await mcpCommand.exec(['revoke'], buildCtx(fakeManager([])));
+    expect(r.kind).toBe('error');
+  });
+
+  test('revoke without a manager (headless) errors', async () => {
+    const r = await mcpCommand.exec(['revoke', 'db'], buildCtx());
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message).toContain('not active');
+  });
+
+  test('a failed revoke surfaces the manager reason', async () => {
+    const mgr = fakeManager([], {
+      revoke: async () => ({ ok: false, reason: 'unknown server', tools: 0 }),
+    });
+    const r = await mcpCommand.exec(['revoke', 'nope'], buildCtx(mgr));
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message).toContain('unknown server');
+  });
+
+  test('reconnect is refused mid-turn (must not touch the live registry)', async () => {
+    let called = false;
+    const mgr = fakeManager([], {
+      reconnect: async () => {
+        called = true;
+        return { ok: true, registered: 0, warnings: [] };
+      },
+    });
+    const r = await mcpCommand.exec(['reconnect', 'db'], buildCtx(mgr, true));
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message).toContain('a turn is in flight');
+    expect(called).toBe(false);
+  });
+
+  test('a failed/denied reconnect is an ERROR (still revoked), not a green 0-tools note', async () => {
+    const mgr = fakeManager([], {
+      reconnect: async () => ({ ok: false, reason: 'denied', registered: 0, warnings: [] }),
+    });
+    const r = await mcpCommand.exec(['reconnect', 'db'], buildCtx(mgr));
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message).toContain('still revoked');
+    expect(r.message).toContain('denied');
+  });
+
+  test('reconnect without a manager (headless) errors', async () => {
+    const r = await mcpCommand.exec(['reconnect', 'db'], buildCtx());
+    expect(r.kind).toBe('error');
   });
 });

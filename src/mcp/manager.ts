@@ -104,6 +104,16 @@ export interface McpManager {
   // tool count) for /mcp + status views — the McpInitReport snapshot, queryable
   // after init.
   status(): McpServerStatus[];
+  // Operator revocation (`/mcp revoke`): deny the server, unregister its tools
+  // (the next turn's tool list drops them), and persist the revocation so a
+  // relaunch keeps it denied. Between-turns only.
+  revoke(server: string): Promise<{ ok: boolean; reason?: string; tools: number }>;
+  // Operator re-trust (`/mcp reconnect`): clear any revocation, reset the
+  // runtime, and re-run the trust handshake (re-prompting as needed) + re-
+  // register the tools. Between-turns only.
+  reconnect(
+    server: string,
+  ): Promise<{ ok: boolean; reason?: string; registered: number; warnings: string[] }>;
   cleanup(): Promise<void>;
 }
 
@@ -501,16 +511,6 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
 
       for (const server of config.servers) {
         if (!server.enabled) continue;
-        // Surface every unconfined server: it spawns with full host access +
-        // network (the modal shows it too, but headless / cached-trust paths
-        // never open one). Both opt-out and no-tool land on the host profile.
-        if (deps.sandbox !== undefined && resolveSandbox(server).profile === 'host') {
-          warnings.push(
-            resolveSandbox(server).status === 'opt-out'
-              ? `mcp: server '${server.name}' runs UNSANDBOXED (sandbox=false) — full host access + network`
-              : `mcp: server '${server.name}' will run UNSANDBOXED — no sandbox tool (bwrap/sandbox-exec) available`,
-          );
-        }
         const rt: ServerRuntime = {
           config: server,
           state: 'disconnected',
@@ -537,6 +537,28 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
             state: 'disconnected',
           });
         }
+        // Operator revoked this server (`/mcp revoke`, migration 082): stay
+        // denied until an explicit `/mcp reconnect` re-trusts. Do NOT re-register
+        // from the cached grant (which lives in the append-only history forever).
+        // Checked BEFORE the unsandboxed warning below — a revoked server never
+        // spawns, so warning about its host access every boot is just noise.
+        if (existing?.revoked_at != null) {
+          setState(rt, 'denied');
+          servers.push({ name: server.name, state: 'denied', tools: 0 });
+          continue;
+        }
+
+        // Surface every unconfined server: it spawns with full host access +
+        // network (the modal shows it too, but headless / cached-trust paths
+        // never open one). Both opt-out and no-tool land on the host profile.
+        if (deps.sandbox !== undefined && resolveSandbox(server).profile === 'host') {
+          warnings.push(
+            resolveSandbox(server).status === 'opt-out'
+              ? `mcp: server '${server.name}' runs UNSANDBOXED (sandbox=false) — full host access + network`
+              : `mcp: server '${server.name}' will run UNSANDBOXED — no sandbox tool (bwrap/sandbox-exec) available`,
+          );
+        }
+
         const commandChanged = existing !== null && existing.command !== rawCommandJson;
 
         const cached = commandChanged ? null : latestTrustedManifest(db, server.name);
@@ -580,7 +602,10 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       // row.
       const configNames = new Set(config.servers.map((s) => s.name));
       for (const row of listServers(db)) {
-        if (!configNames.has(row.name)) deleteServer(db, row.name);
+        // Keep a REVOKED row even when its server leaves config: the revocation
+        // must survive a config round-trip (remove + re-add), or the cached
+        // forever-grant would silently re-register it. Non-revoked orphans sweep.
+        if (!configNames.has(row.name) && row.revoked_at == null) deleteServer(db, row.name);
       }
 
       return { registered, servers, warnings };
@@ -598,6 +623,69 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         state: rt.state,
         tools: rt.registeredNames.length,
       }));
+    },
+
+    async revoke(server) {
+      if (getServer(db, server) === null) {
+        return { ok: false, reason: 'unknown server', tools: 0 };
+      }
+      const rt = runtime.get(server);
+      const tools = rt?.registeredNames.length ?? 0;
+      if (rt !== undefined) {
+        for (const wire of rt.registeredNames) registry.unregister(wire);
+        rt.registeredNames = [];
+        if (rt.client !== null) {
+          await rt.client.close().catch(() => {});
+          rt.client = null;
+          rt.connected = false;
+        }
+        rt.drifted = false;
+        // Set directly (not via setState): revoke is a deliberate operator
+        // override that must work from ANY state, including the terminal `error`
+        // sink that mcpTransition would reject.
+        rt.state = 'denied';
+      }
+      // Durable across relaunch (init skips the cached grant while revoked_at is
+      // set); also covers a configured-but-not-in-runtime (disabled) server.
+      patchServer(db, server, { state: 'denied', revoked_at: now() });
+      return { ok: true, tools };
+    },
+
+    async reconnect(server) {
+      const cfg = config.servers.find((s) => s.name === server && s.enabled);
+      if (cfg === undefined) {
+        return { ok: false, reason: 'unknown or disabled server', registered: 0, warnings: [] };
+      }
+      const old = runtime.get(server);
+      if (old !== undefined) {
+        for (const wire of old.registeredNames) registry.unregister(wire);
+        if (old.client !== null) await old.client.close().catch(() => {});
+      }
+      // Reset to a fresh runtime and force a re-trust (resolveFreshTrust re-
+      // handshakes, re-hashes, re-prompts, re-registers; it captures its own
+      // errors into the returned warnings + an error/denied state). The
+      // revocation is NOT cleared up-front — a FAILED or DENIED reconnect must
+      // stay revoked, or the next relaunch would silently re-register the server
+      // from the cached (forever) grant. Clear it only after a successful trust.
+      const rt: ServerRuntime = {
+        config: cfg,
+        state: 'disconnected',
+        trustedHash: null,
+        client: null,
+        connected: false,
+        drifted: false,
+        registeredNames: [],
+      };
+      runtime.set(server, rt);
+      const warnings: string[] = [];
+      const registered = await resolveFreshTrust(rt, warnings, true);
+      if (rt.state === 'trusted') {
+        patchServer(db, server, { revoked_at: null });
+        return { ok: true, registered, warnings };
+      }
+      // Re-denied or failed to connect: the server stays revoked + the result is
+      // NOT ok, so the operator sees the real outcome (not a green "0 tools").
+      return { ok: false, reason: rt.state, registered, warnings };
     },
 
     async cleanup() {

@@ -1,8 +1,10 @@
-// `/mcp` — operator visibility into MCP servers (MCP.md §7). Read-only in this
-// slice: `/mcp` lists every server with its live state + tool count, and
-// `/mcp show <server>` adds the spawned command, manifest hash, source layer,
-// last error, and the trust-decision history. Mutating subcommands
-// (revoke/reconnect/trust/logs) land in a later slice.
+// `/mcp` — operator control over MCP servers (MCP.md §7). `/mcp` lists every
+// server with its live state + tool count; `/mcp show <server>` adds the spawned
+// command, manifest hash, source layer, last error, and the trust-decision
+// history; `/mcp revoke <server>` denies + unregisters a server (durable across
+// relaunch); `/mcp reconnect <server>` re-trusts + re-registers it. The mutating
+// subcommands run BETWEEN turns (they hot-swap the live tool registry). `/mcp
+// logs` lands in a later slice.
 
 import { getServer, listManifestHistory, listServers } from '../../../storage/repos/mcp-servers.ts';
 import { localTimestamp } from '../../local-date.ts';
@@ -70,22 +72,89 @@ const handleList = (ctx: SlashContext): SlashResult => {
   return { kind: 'ok', notes: lines };
 };
 
+// The mutating subcommands hot-swap the LIVE tool registry. The harness reads
+// its config (incl. the registry) once at turn start, so a mid-turn mutation
+// half-applies to the running turn — gate to between-turns.
+const requireIdleManager = (
+  ctx: SlashContext,
+  verb: string,
+):
+  | { kind: 'error'; message: string }
+  | { mgr: NonNullable<SlashContext['baseConfig']['mcpManager']> } => {
+  const mgr = ctx.baseConfig.mcpManager;
+  if (mgr === undefined) {
+    return { kind: 'error', message: `/mcp ${verb}: MCP is not active in this session` };
+  }
+  if (ctx.isRunning()) {
+    return {
+      kind: 'error',
+      message: `/mcp ${verb}: a turn is in flight — run it between turns (it changes the live tool set)`,
+    };
+  }
+  return { mgr };
+};
+
+// A mutating subcommand holds the busy-lock for its whole (possibly async,
+// modal-bearing) duration via runExclusive, so a turn can't START mid-mutation
+// and snapshot a half-swapped registry. Falls back to a direct call in
+// headless/test contexts that don't wire runExclusive.
+const withExclusive = <T>(ctx: SlashContext, fn: () => Promise<T>): Promise<T> =>
+  ctx.runExclusive !== undefined ? ctx.runExclusive(() => fn()) : fn();
+
+const handleRevoke = async (ctx: SlashContext, name: string): Promise<SlashResult> => {
+  const gate = requireIdleManager(ctx, 'revoke');
+  if ('kind' in gate) return gate;
+  const r = await withExclusive(ctx, () => gate.mgr.revoke(name));
+  if (!r.ok) return { kind: 'error', message: `/mcp revoke: ${r.reason ?? 'failed'}` };
+  return {
+    kind: 'ok',
+    notes: [
+      `Revoked '${name}' — denied + ${r.tools} tool${r.tools === 1 ? '' : 's'} removed (persists across relaunch).`,
+      `Re-enable with /mcp reconnect ${name}.`,
+    ],
+  };
+};
+
+const handleReconnect = async (ctx: SlashContext, name: string): Promise<SlashResult> => {
+  const gate = requireIdleManager(ctx, 'reconnect');
+  if ('kind' in gate) return gate;
+  const r = await withExclusive(ctx, () => gate.mgr.reconnect(name));
+  if (!r.ok) {
+    // reason is the resulting state ('denied' / 'error') — a re-denied or
+    // unreachable server stays revoked, so say so instead of a green "0 tools".
+    return {
+      kind: 'error',
+      message: `/mcp reconnect '${name}': ${r.reason ?? 'failed'} — still revoked (server denied or unreachable)`,
+    };
+  }
+  return {
+    kind: 'ok',
+    notes: [
+      `Reconnected '${name}' — ${r.registered} tool${r.registered === 1 ? '' : 's'} registered.`,
+      ...r.warnings,
+    ],
+  };
+};
+
 export const mcpCommand: SlashCommand = {
   name: 'mcp',
-  description: 'Inspect MCP servers (state, tools, trust history)',
-  argHint: '[show <server>]',
+  description: 'Inspect + control MCP servers (show / revoke / reconnect)',
+  argHint: '[show|revoke|reconnect <server>]',
   exec: async (args, ctx): Promise<SlashResult> => {
     const sub = args[0];
     if (sub === undefined || sub === 'list') return handleList(ctx);
-    if (sub === 'show') {
+    if (sub === 'show' || sub === 'revoke' || sub === 'reconnect') {
       const name = args[1];
-      if (name === undefined)
-        return { kind: 'error', message: '/mcp show <server>: name required' };
-      return handleShow(ctx, name);
+      if (name === undefined) {
+        return { kind: 'error', message: `/mcp ${sub} <server>: name required` };
+      }
+      if (sub === 'show') return handleShow(ctx, name);
+      if (sub === 'revoke') return handleRevoke(ctx, name);
+      return handleReconnect(ctx, name);
     }
     return {
       kind: 'error',
-      message: `/mcp: unknown subcommand '${sub}' (try: /mcp list, /mcp show <server>)`,
+      message: `/mcp: unknown subcommand '${sub}' (try: /mcp list, /mcp show|revoke|reconnect <server>)`,
     };
   },
 };

@@ -765,3 +765,166 @@ describe('McpManager.status()', () => {
     await mgr.cleanup();
   });
 });
+
+describe('McpManager: revoke / reconnect (registry hot-swap)', () => {
+  test('revoke unregisters the tools, denies, and persists revoked_at', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query'), toolDef('list')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(registry.has('mcp__db__query')).toBe(true);
+
+    const r = await mgr.revoke('db');
+    expect(r).toEqual({ ok: true, tools: 2 });
+    expect(registry.has('mcp__db__query')).toBe(false); // unregistered (next turn drops them)
+    expect(registry.has('mcp__db__list')).toBe(false);
+    expect(mgr.state('db')).toBe('denied');
+    expect(getServer(db, 'db')?.revoked_at).not.toBeNull(); // durable
+    await mgr.cleanup();
+  });
+
+  test('a revoked server stays DENIED across a relaunch (init skips the cached grant)', async () => {
+    const f1 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m1 = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: f1.makeClient,
+    });
+    await m1.init();
+    await m1.revoke('db');
+    await m1.cleanup();
+
+    // Relaunch: a fresh registry + manager over the SAME db must NOT re-register
+    // the revoked server's tools from the cached (forever) grant.
+    const reg2 = createToolRegistry();
+    const f2 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m2 = createMcpManager({
+      db,
+      registry: reg2,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: f2.makeClient,
+    });
+    const report = await m2.init();
+    expect(report.registered).toBe(0);
+    expect(reg2.has('mcp__db__query')).toBe(false);
+    expect(m2.state('db')).toBe('denied');
+    expect(latestTrustedManifest(db, 'db')).not.toBeNull(); // the grant survives forever (durability builds on it)
+    expect(f2.stats.made).toBe(0); // never even spawned
+    await m2.cleanup();
+  });
+
+  test('reconnect clears the revocation and re-registers the tools', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    await mgr.revoke('db');
+    expect(registry.has('mcp__db__query')).toBe(false);
+
+    const r = await mgr.reconnect('db');
+    expect(r.ok).toBe(true);
+    expect(r.registered).toBe(1);
+    expect(registry.has('mcp__db__query')).toBe(true); // re-registered
+    expect(mgr.state('db')).toBe('trusted');
+    expect(getServer(db, 'db')?.revoked_at).toBeNull(); // revocation cleared
+    await mgr.cleanup();
+  });
+
+  test('a FAILED reconnect (server unreachable) stays revoked — revoked_at NOT cleared', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]); // init registers from cache (no connect)
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      connectError: new Error('ECONNREFUSED'),
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      // autoApprove so reconnect's resolveFreshTrust passes the fail-closed
+      // pre-check and actually ATTEMPTS the connect (which then fails).
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+      now: () => 999,
+    });
+    await mgr.init();
+    await mgr.revoke('db');
+    expect(getServer(db, 'db')?.revoked_at).toBe(999);
+
+    // reconnect hits the connect error → error state. The revocation must NOT be
+    // cleared, or the next relaunch silently re-registers from the cached grant.
+    const r = await mgr.reconnect('db');
+    expect(r.ok).toBe(false);
+    expect(mgr.state('db')).toBe('error');
+    expect(getServer(db, 'db')?.revoked_at).toBe(999); // still revoked
+    await mgr.cleanup();
+  });
+
+  test('revoke records revoked_at from the injected clock', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+      now: () => 12345,
+    });
+    await mgr.init();
+    await mgr.revoke('db');
+    expect(getServer(db, 'db')?.revoked_at).toBe(12345);
+    await mgr.cleanup();
+  });
+
+  test('a revoked server removed from config keeps its revocation (orphan sweep spares it)', async () => {
+    // Session 1: grant + revoke 'db'.
+    const f1 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m1 = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: f1.makeClient,
+    });
+    await m1.init();
+    await m1.revoke('db');
+    await m1.cleanup();
+
+    // Session 2: 'db' is GONE from config. The orphan sweep must NOT delete its
+    // revoked row (else a re-add would re-register from the cached grant).
+    const m2 = createMcpManager({ db, registry: createToolRegistry(), config: config([]) });
+    await m2.init();
+    expect(getServer(db, 'db')?.revoked_at).not.toBeNull(); // spared by the sweep
+    await m2.cleanup();
+  });
+
+  test('revoke of an unknown server fails', async () => {
+    const mgr = createMcpManager({ db, registry, config: config([]) });
+    expect(await mgr.revoke('nope')).toEqual({ ok: false, reason: 'unknown server', tools: 0 });
+    await mgr.cleanup();
+  });
+
+  test('reconnect of an unknown/disabled server fails', async () => {
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ enabled: false })]),
+    });
+    await mgr.init();
+    const r = await mgr.reconnect('db');
+    expect(r.ok).toBe(false);
+    await mgr.cleanup();
+  });
+});

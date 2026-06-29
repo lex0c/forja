@@ -79,6 +79,7 @@ import { migration078CompactionEventsModel } from './078-compaction-events-model
 import { migration079MessagesRetracted } from './079-messages-retracted.ts';
 import { migration080MemoryProvenanceProactive } from './080-memory-provenance-proactive.ts';
 import { migration081McpServers } from './081-mcp-servers.ts';
+import { migration082McpServerRevokedAt } from './082-mcp-server-revoked-at.ts';
 
 export interface Migration {
   id: number;
@@ -168,4 +169,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration079MessagesRetracted,
   migration080MemoryProvenanceProactive,
   migration081McpServers,
+  migration082McpServerRevokedAt,
 ];

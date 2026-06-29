@@ -366,6 +366,14 @@ Anti-pattern: server que muda manifest a cada minuto (ex: server "dynamic" que a
 
 Implementação compartilha pipeline com slash commands canônicos (`AGENTIC_CLI.md §2.5`). Output JSON via `--json` flag.
 
+**Modelo de revoke/reconnect (durabilidade + auditoria).** `revoke` é **durável**: precisa sobreviver a um relaunch, senão o `init` re-registra do grant cacheado (que vive no `mcp_manifest_history` append-only para sempre). A revogação é gravada como **estado** — uma coluna `revoked_at` (epoch-ms) na row mutável `mcp_servers`, NÃO uma decisão de manifesto — porque o `UNIQUE(server_name, hash)` do history proíbe uma 2ª decision row para o hash já concedido. Semântica:
+
+- `revoke`: `unregister` das tools do registry vivo (o próximo turno cai), `state = denied`, `revoked_at = now()`. O orphan-sweep do `init` **preserva** rows revogadas (sobrevive a um round-trip de config). As subcommands mutantes rodam **entre turnos** (gate `runExclusive`) — mutar o registry no meio de um turno entregaria um tool-set meio-aplicado.
+- `init`: enquanto `revoked_at` está setado, pula o cache e fica `denied` (não re-registra, não re-pergunta headless).
+- `reconnect`: reseta o runtime e força um re-trust (`resolveFreshTrust`); limpa `revoked_at` **somente após sucesso** (state `trusted`). Um reconnect negado/sem-conexão **continua revogado**.
+
+Limitação consciente: como a revogação é estado (não evento), após `revoke→reconnect` bem-sucedido não sobra registro durável de QUE/QUANDO foi revogado. Os valores `'revoked'`/`'superseded'` do enum `decision` ficam **reservados** para uma auditoria-de-revogações futura (exigiria relaxar o `UNIQUE` + lógica de "última decisão"). O grant em si nunca some (forever).
+
 ---
 
 ## 8. Failure modes (cross-ref)

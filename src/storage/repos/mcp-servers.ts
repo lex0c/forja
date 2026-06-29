@@ -33,6 +33,10 @@ export interface McpServerRow {
   server_version: string | null;
   last_connected_at: number | null;
   last_error: string | null;
+  // Epoch-ms of an operator `/mcp revoke` (migration 082); NULL when never
+  // revoked. `init` skips the cached grant while this is set; `/mcp reconnect`
+  // clears it on a fresh re-trust.
+  revoked_at: number | null;
   total_calls: number;
   total_tokens_in: number;
   audit_schema_version: number;
@@ -60,6 +64,7 @@ export interface McpServerPatch {
   server_version?: string | null;
   last_connected_at?: number | null;
   last_error?: string | null;
+  revoked_at?: number | null;
 }
 
 const SERVER_COLUMNS = [
@@ -74,6 +79,7 @@ const SERVER_COLUMNS = [
   'server_version',
   'last_connected_at',
   'last_error',
+  'revoked_at',
   'total_calls',
   'total_tokens_in',
   'audit_schema_version',
@@ -92,6 +98,7 @@ const PATCHABLE_COLUMNS = [
   'server_version',
   'last_connected_at',
   'last_error',
+  'revoked_at',
 ] as const;
 
 export const getServer = (db: DB, name: string): McpServerRow | null => {
