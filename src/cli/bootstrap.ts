@@ -33,7 +33,7 @@ import {
 } from '../hooks/index.ts';
 import { loadMcpConfig } from '../mcp/config.ts';
 import { type McpInitReport, type McpManager, createMcpManager } from '../mcp/manager.ts';
-import type { ConfirmMcpTrust, McpClient, McpStdioConfig } from '../mcp/types.ts';
+import type { ConfirmMcpTrust, McpClient, McpSandboxWrap, McpStdioConfig } from '../mcp/types.ts';
 import {
   computeSharedFingerprint,
   createMemoryRegistry,
@@ -1590,10 +1590,43 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       cwd,
       ...(input.userMcpPath !== undefined ? { userPathOverride: input.userMcpPath } : {}),
     });
+    // Sandbox wrap for spawned stdio servers (MCP.md §2.3). Reuses the bash
+    // sandbox machinery: `available` (boot detection) drives default-on + the
+    // modal status; the closure prefixes bwrap/sandbox-exec, anchoring the
+    // foreign-`.forja/` read-floor at the repo root and forwarding the per-run
+    // scoped tmpdir. `failClosed` = present-at-boot, so a mid-session tool loss
+    // throws (→ server error) rather than a silent unconfined spawn.
+    const mcpSandbox = {
+      available: sandboxAvail.available,
+      wrap: ({
+        profile,
+        cwd: serverCwd,
+        innerArgv,
+        env,
+        passthroughEnv,
+      }: Parameters<McpSandboxWrap>[0]) =>
+        maybeWrapSandboxArgv({
+          profile,
+          cwd: serverCwd,
+          // Reuse the already-resolved repo root + operator home (the latter has
+          // the passwd fallback for $HOME-unset CI/containers) rather than
+          // recomputing or letting the runner fall back to env.HOME.
+          projectRoot: projectConfigCwd,
+          home,
+          innerArgv,
+          env,
+          ...(sandboxTmpdirHandle.tmpdir !== undefined
+            ? { tmpdir: sandboxTmpdirHandle.tmpdir }
+            : {}),
+          ...(passthroughEnv !== undefined ? { passthroughEnv } : {}),
+          failClosed: sandboxAvail.available,
+        }),
+    };
     mcpManager = createMcpManager({
       db,
       registry: toolRegistry,
       config: mcpConfig,
+      sandbox: mcpSandbox,
       ...(input.confirmMcpTrust !== undefined ? { confirmTrust: input.confirmMcpTrust } : {}),
       ...(input.autoApproveMcp !== undefined ? { autoApprove: input.autoApproveMcp } : {}),
       ...(input.mcpMakeClient !== undefined ? { makeClient: input.mcpMakeClient } : {}),

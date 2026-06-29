@@ -2168,11 +2168,27 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       const safeServer = sanitizeOneLineForDisplay(event.server);
       const safeCommand = sanitizeOneLineForDisplay(event.command);
 
+      // Sandbox posture (MCP.md §2.3) — the containment the operator authorizes.
+      // The two unsandboxed states lead with a warning glyph (full host access).
+      const sandboxLine =
+        event.sandbox === 'sandboxed'
+          ? 'sandbox: ON (cwd-rw, no network)'
+          : event.sandbox === 'sandboxed-net'
+            ? 'sandbox: ON + network (allowlist advisory — NOT host-filtered)'
+            : event.sandbox === 'opt-out'
+              ? '⚠ sandbox: OFF (operator opt-out) — full host access'
+              : '⚠ sandbox: OFF (no sandbox tool available) — full host access';
+
       const MAX_LIST = 8;
       const visible = event.tools.slice(0, MAX_LIST);
       const overflow = event.tools.length - visible.length;
 
-      const previewLines: PreviewLine[] = [`server:  ${safeServer}`, `command: ${safeCommand}`, ''];
+      const previewLines: PreviewLine[] = [
+        `server:  ${safeServer}`,
+        `command: ${safeCommand}`,
+        sandboxLine,
+        '',
+      ];
       if (event.mode === 'first-visit') {
         previewLines.push(
           'An MCP server wants to run the command above and expose these tools',

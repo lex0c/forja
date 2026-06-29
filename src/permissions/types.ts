@@ -6,11 +6,22 @@
 // section.
 import type { SandboxProfile } from './sandbox-plan.ts';
 
-// 'mcp' gates tools imported from an MCP server (the `mcp__<server>__<tool>`
-// wire form). stdio MCP is a LOCAL subprocess, so it is NOT egress and is
-// deliberately absent from `categoryIsEgress` below; the remote (sse/http)
-// transport will add a distinct egress-bearing category when it lands.
-export type PolicyCategory = 'fs.read' | 'fs.write' | 'bash' | 'web.fetch' | 'misc' | 'mcp';
+// 'mcp' gates tools from an MCP server (the `mcp__<server>__<tool>` wire form)
+// that CANNOT reach the network — a server confined to the no-network sandbox
+// profile (`cwd-rw`, the default when a sandbox tool is present — MCP.md §2.3).
+// It is NOT egress. 'mcp.egress' is the category for any MCP server that CAN
+// reach the network: one GRANTED network (`[servers.<name>.network]`), one
+// running UNCONFINED (operator opt-out, or no sandbox tool — both inherit the
+// full host network), and the future remote (sse/http) transport. Network reach
+// ⇒ exfil risk ⇒ egress treatment (default confirm, never auto-approved).
+export type PolicyCategory =
+  | 'fs.read'
+  | 'fs.write'
+  | 'bash'
+  | 'web.fetch'
+  | 'misc'
+  | 'mcp'
+  | 'mcp.egress';
 
 // Categories that send bytes OUT of the machine to an operator-unconfined
 // destination. Egress is special-cased by the autonomous posture: a
@@ -21,7 +32,8 @@ export type PolicyCategory = 'fs.read' | 'fs.write' | 'bash' | 'web.fetch' | 'mi
 // (a POST/webhook tool, an MCP egress) must be added here, not re-pattern-
 // matched as `category === 'web.fetch'` at each guard site (which would
 // silently auto-approve the new category and reopen the exfil hole).
-export const categoryIsEgress = (category: PolicyCategory): boolean => category === 'web.fetch';
+export const categoryIsEgress = (category: PolicyCategory): boolean =>
+  category === 'web.fetch' || category === 'mcp.egress';
 
 export type PolicyMode = 'strict' | 'acceptEdits' | 'bypass';
 

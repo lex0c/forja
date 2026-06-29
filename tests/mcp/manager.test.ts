@@ -10,6 +10,8 @@ import type {
   McpCallResult,
   McpClient,
   McpManifestTool,
+  McpSandboxArg,
+  McpSandboxWrap,
   McpServerConfig,
   McpStdioConfig,
 } from '../../src/mcp/types.ts';
@@ -63,9 +65,11 @@ const fakeClientFactory = (spec: FakeSpec) => {
     closes: 0,
     calls: 0,
     lastConnectSignal: undefined as AbortSignal | undefined,
+    lastSandbox: undefined as McpSandboxArg | undefined,
   };
-  const makeClient = (_cfg: McpStdioConfig): McpClient => {
+  const makeClient = (_cfg: McpStdioConfig, sandbox?: McpSandboxArg): McpClient => {
     stats.made += 1;
+    stats.lastSandbox = sandbox;
     return {
       async connect(signal) {
         stats.connects += 1;
@@ -582,6 +586,153 @@ describe('McpManager: review hardening', () => {
     await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow();
     expect(fake.stats.connects).toBe(1);
     expect(fake.stats.closes).toBe(1); // the fix: child reaped on the fault path, not orphaned
+    await mgr.cleanup();
+  });
+});
+
+describe('McpManager: sandbox profile resolution (MCP.md §2.3)', () => {
+  // A spy wrap: the fake client never spawns, so we assert which profile the
+  // manager resolved + passed to makeClient (the actual bwrap exec is proven by
+  // the real-subprocess integration test).
+  const wrap: McpSandboxWrap = (a) => ['bwrap', a.profile, '--', ...a.innerArgv];
+
+  test('default-on: an available sandbox wraps a plain server as cwd-rw', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+      sandbox: { available: true, wrap },
+    });
+    await mgr.init();
+    expect(fake.stats.lastSandbox?.profile).toBe('cwd-rw');
+    await mgr.cleanup();
+  });
+
+  test('a server with network resolves to cwd-rw-net', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ network: { allowHosts: ['api.example.com'] } })]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+      sandbox: { available: true, wrap },
+    });
+    await mgr.init();
+    expect(fake.stats.lastSandbox?.profile).toBe('cwd-rw-net');
+    await mgr.cleanup();
+  });
+
+  test('sandbox=false opts out — no wrap passed (runs host)', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ sandbox: false })]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+      sandbox: { available: true, wrap },
+    });
+    await mgr.init();
+    expect(fake.stats.lastSandbox).toBeUndefined();
+    await mgr.cleanup();
+  });
+
+  test('no sandbox tool available → host + an UNSANDBOXED boot warning', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+      sandbox: { available: false, wrap },
+    });
+    const report = await mgr.init();
+    expect(fake.stats.lastSandbox).toBeUndefined();
+    expect(report.warnings.some((w) => w.includes('UNSANDBOXED'))).toBe(true);
+    await mgr.cleanup();
+  });
+
+  test('no sandbox dep wired → host, no warning (feature off, e.g. tests)', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+    expect(fake.stats.lastSandbox).toBeUndefined();
+    expect(report.warnings.some((w) => w.includes('UNSANDBOXED'))).toBe(false);
+    await mgr.cleanup();
+  });
+});
+
+describe('McpManager: network server → mcp.egress category (MCP.md §2.3)', () => {
+  test("a network-granted server's tools register under the egress category", async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('fetch')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ network: { allowHosts: ['api.example.com'] } })]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(registry.get('mcp__db__fetch')?.metadata.category).toBe('mcp.egress');
+    await mgr.cleanup();
+  });
+
+  test('a SANDBOXED plain (no-network) server stays in the mcp category', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+      // Available sandbox ⇒ cwd-rw (no network) ⇒ non-egress.
+      sandbox: { available: true, wrap: (a) => ['bwrap', a.profile, '--', ...a.innerArgv] },
+    });
+    await mgr.init();
+    expect(registry.get('mcp__db__query')?.metadata.category).toBe('mcp');
+    await mgr.cleanup();
+  });
+
+  test('an UNSANDBOXED server (no tool / opt-out) IS egress — it has full host network', async () => {
+    // No sandbox dep ⇒ host profile ⇒ the server can reach the network even
+    // with no [network] grant ⇒ egress (the finder-caught hole).
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(registry.get('mcp__db__query')?.metadata.category).toBe('mcp.egress');
+    await mgr.cleanup();
+  });
+
+  test('opt-out (sandbox=false) server IS egress + warns at boot', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ sandbox: false })]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+      sandbox: { available: true, wrap: (a) => ['bwrap', a.profile, '--', ...a.innerArgv] },
+    });
+    const report = await mgr.init();
+    expect(registry.get('mcp__db__query')?.metadata.category).toBe('mcp.egress');
+    expect(report.warnings.some((w) => w.includes('UNSANDBOXED (sandbox=false)'))).toBe(true);
     await mgr.cleanup();
   });
 });

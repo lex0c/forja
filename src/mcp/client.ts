@@ -15,6 +15,7 @@ import type {
   McpCallResult,
   McpClient,
   McpManifestTool,
+  McpSandboxArg,
   McpStdioConfig,
   McpToolMeta,
 } from './types.ts';
@@ -104,14 +105,32 @@ export const flattenContent = (content: unknown): string => {
   return parts.join('');
 };
 
-export const createStdioMcpClient = (cfg: McpStdioConfig): McpClient => {
+export const createStdioMcpClient = (cfg: McpStdioConfig, sandbox?: McpSandboxArg): McpClient => {
   let client: Client | null = null;
 
   return {
     async connect(signal) {
+      // When sandboxed (MCP.md §2.3), wrap the server's argv in bwrap /
+      // sandbox-exec. The wrap returns the inner argv unchanged on host /
+      // graceful-degrade and THROWS on fail-closed (tool present at boot, gone
+      // now). Done here, inside connect(), so the throw lands in the manager's
+      // connect try (→ error state / reaped child) rather than crashing boot.
+      const inner = [cfg.command, ...(cfg.args ?? [])];
+      const spawnArgv =
+        sandbox !== undefined && sandbox.profile !== 'host'
+          ? sandbox.wrap({
+              profile: sandbox.profile,
+              cwd: cfg.cwd ?? process.cwd(),
+              innerArgv: inner,
+              env: process.env,
+              // The server's declared env survives the sandbox's --clearenv.
+              ...(cfg.env !== undefined ? { passthroughEnv: { ...cfg.env } } : {}),
+            })
+          : inner;
+      const [spawnCommand = cfg.command, ...spawnArgs] = spawnArgv;
       const transport = new StdioClientTransport({
-        command: cfg.command,
-        args: cfg.args ? [...cfg.args] : [],
+        command: spawnCommand,
+        args: spawnArgs,
         env: buildSpawnEnv(cfg.env),
         ...(cfg.cwd !== undefined ? { cwd: cfg.cwd } : {}),
         // Capture the server's stderr instead of letting it bleed into the

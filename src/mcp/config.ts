@@ -187,7 +187,48 @@ const parseServerEntry = (
   }
   const disabled = entry.disabled === true;
 
-  return { name, enabled: !disabled, surface, transport: stdio, source };
+  // Sandbox posture (MCP.md §2.3): default-on when a sandbox tool is available;
+  // `false` is an explicit opt-out. A non-boolean warns and falls back to the
+  // default.
+  let sandbox: boolean | undefined;
+  if (entry.sandbox !== undefined) {
+    if (typeof entry.sandbox === 'boolean') {
+      sandbox = entry.sandbox;
+    } else {
+      warnings.push(`${where}: 'sandbox' must be a boolean; using the default (on when available)`);
+    }
+  }
+
+  // Network allowlist ([servers.<name>.network] allow_hosts). A non-empty list
+  // grants the server network — bwrap is all-or-nothing, so the hosts are
+  // advisory (surfaced in trust + audit), NOT kernel-enforced (MCP.md §2.3).
+  let network: { allowHosts: readonly string[] } | undefined;
+  if (entry.network !== undefined) {
+    if (
+      entry.network === null ||
+      typeof entry.network !== 'object' ||
+      Array.isArray(entry.network)
+    ) {
+      warnings.push(`${where}: 'network' must be a table; ignored`);
+    } else {
+      const hosts = asStringArray((entry.network as Record<string, unknown>).allow_hosts);
+      if (hosts === null) {
+        warnings.push(`${where}: 'network.allow_hosts' must be an array of strings; ignored`);
+      } else if (hosts.length > 0) {
+        network = { allowHosts: hosts };
+      }
+    }
+  }
+
+  return {
+    name,
+    enabled: !disabled,
+    surface,
+    transport: stdio,
+    source,
+    ...(sandbox !== undefined ? { sandbox } : {}),
+    ...(network !== undefined ? { network } : {}),
+  };
 };
 
 const parseLayer = (

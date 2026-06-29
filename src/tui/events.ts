@@ -460,6 +460,9 @@ export type McpTrustAskEvent = BaseEvent & {
   // 'first-visit': never-seen manifest hash. 'drift': previously-trusted
   // server whose hash (tools or command) changed.
   mode: import('../mcp/types.ts').McpTrustMode;
+  // Effective sandbox posture (MCP.md §2.3) — shown so the operator sees the
+  // containment of the server they're authorizing.
+  sandbox: import('../mcp/types.ts').McpSandboxStatus;
   tools: readonly { name: string; description: string; writes: boolean }[];
   manifestHash: string;
 };

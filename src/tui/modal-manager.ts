@@ -834,6 +834,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           server: req.server,
           command: req.command,
           mode: req.mode,
+          sandbox: req.sandbox,
           tools: req.tools,
           manifestHash: req.manifestHash,
         }),

@@ -87,6 +87,8 @@ Each server is a `[servers.<name>]` table. The **name** must match `^[a-z][a-z0-
 | `cwd` | no | Working directory for the child process. |
 | `surface` | no | `"base"` (always on the wire) or `"deferred"` (reached via `tool_search`). **Default `"deferred"`** so a many-tool server doesn't bloat the base surface. |
 | `disabled` | no | `true` to parse-but-skip the server (keeps its trust + state rows). Default enabled. |
+| `sandbox` | no | `false` runs the server **unconfined**. Omit (or `true`) → **sandboxed by default** when a sandbox tool (bwrap / sandbox-exec) is available (§7). |
+| `network` | no | A `[servers.<name>.network] allow_hosts = [...]` sub-table grants the server network. The host list is **advisory** (shown in the trust modal + audited), NOT kernel-enforced, and network-granted tools become **egress** (always confirmed, never auto-approved). |
 
 **`$VAR` / `${VAR}`** in `command`, `env` values, and `cwd` are resolved from the agent session environment. An **unset** variable substitutes an empty string and warns (rather than leaking a literal `$VAR` into the argv). Keep secrets in the environment (and the server entry in the gitignored `mcp.local.toml`) — never inline them.
 
@@ -177,7 +179,7 @@ MCP tools sit in a dedicated **`mcp` policy category**. No policy section is con
 - the **risk engine still runs** — the `mcp_tool` supply-chain weight can tip a risky call into a score-confirm before it executes,
 - `writes: true` still forces a **checkpoint** before the call.
 
-`mcp` is **not** an egress category — a stdio server is a local subprocess. (A remote transport, when it lands, gets its own egress category that defaults to `confirm`.) Per-tool MCP policy rules — an operator denying/confirming a specific `mcp__<server>__<tool>` pattern — are a later slice (§8); in this version trust is all-or-nothing at the server level.
+A plain stdio server's `mcp` category is **not** egress (a local subprocess). But a server **granted network** (`[servers.<name>.network]`, §7) uses the **`mcp.egress`** category instead: it defaults to **confirm** and is never auto-approved under the autonomous posture — once a server can reach the network, its tools can exfil, so each call is seen. (A remote transport reuses `mcp.egress` when it lands.) Per-tool MCP policy rules — an operator denying/confirming a specific `mcp__<server>__<tool>` pattern — are a later slice (§8); in this version trust is all-or-nothing at the server level.
 
 ---
 
@@ -213,6 +215,7 @@ Two tables (migration `081-mcp-servers.ts`, repo `repos/mcp-servers.ts`):
 
 - **Warnings** from config parsing and trust (`server 'x' redefined…`, `transport 'sse' not supported yet…`, `environment variable $Y is not set…`) surface on the startup banner.
 - **A denied or drifted server** currently requires a config edit (or `--auto-approve-mcp`) and a restart to re-trust — there is no in-session re-trust command in this version (§8).
+- **Sandbox.** When a sandbox tool (Linux `bwrap`, macOS `sandbox-exec`) is present, every stdio server is confined **by default** — host filesystem read-only, the cwd read-write, no network — unless you set `sandbox = false` or grant `network`. The trust modal shows the effective posture; a server that can't be sandboxed (no tool, or your opt-out) is flagged **UNSANDBOXED**. If a tool was present at boot and later vanishes, the server fails closed rather than running exposed. bwrap network is all-or-nothing — `allow_hosts` is advisory, not kernel-enforced (§8), and a network-granted server's tools are treated as egress (always confirmed).
 - **Secrets** belong in the environment + the gitignored `mcp.local.toml`. The persisted command and the trust modal both use the unresolved argv, so a `$VAR` secret is never written to the DB or shown on screen.
 - **End-to-end proof.** `tests/mcp/real-subprocess.test.ts` drives the real SDK adapter against `evals/mcp/fixtures/echo-server.ts` (a real stdio server) — the happy path, the headless fail-closed path, and the cached-grant path — so the whole stack is exercised over real pipes in CI without a model in the loop.
 
@@ -223,7 +226,7 @@ Two tables (migration `081-mcp-servers.ts`, repo `repos/mcp-servers.ts`):
 These are specified but intentionally out of the first MCP release; each is its own slice when its ecosystem need is real:
 
 - **Remote transport** — SSE / streamable-HTTP behind the same `McpClient`, plus an egress permission category and bearer/OAuth auth.
-- **Sandbox** — wrapping the stdio child via the existing `buildBwrapArgv` machinery + a per-server network allowlist. Until then, a server runs with the agent's own privileges; **only declare servers whose binaries you trust.**
+- **Per-host network filtering + ulimits** — the sandbox (§7) confines the filesystem and toggles network on/off, but bwrap network is all-or-nothing: the `allow_hosts` list is advisory, not kernel-enforced (per-host filtering via proxy/nftables is future), and the CPU/memory/file ulimits in the spec are not yet applied. Treat a network-granted server's reach as "the whole network".
 - **Resolved-command change-detection** — hashing the `$VAR`-resolved argv (persisted as a hash, never plaintext) so a re-pointed `$MCP_BIN` re-triggers trust. Today change-detection compares only the unresolved literal (see the §3.3 limitation note).
 - **Per-server budget** — call / token-in / timeout caps and a `degraded`↔`active` auto-recovery loop.
 - **Per-tool MCP policy rules** — an operator policy section that can `confirm`/`deny`/`lock` a specific `mcp__<server>__<tool>` pattern. In this version trust is all-or-nothing at the server level and no `mcp` policy section is consulted.

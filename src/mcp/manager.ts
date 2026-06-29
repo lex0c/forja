@@ -50,6 +50,10 @@ import type {
   McpCallResult,
   McpClient,
   McpManifestTool,
+  McpSandboxArg,
+  McpSandboxProfile,
+  McpSandboxStatus,
+  McpSandboxWrap,
   McpServerConfig,
   McpServerState,
   McpStdioConfig,
@@ -66,7 +70,11 @@ export interface McpManagerDeps {
   autoApprove?: ReadonlySet<string>;
   // Injectable client factory (tests pass a fake; production uses the SDK
   // stdio adapter).
-  makeClient?: (cfg: McpStdioConfig) => McpClient;
+  makeClient?: (cfg: McpStdioConfig, sandbox?: McpSandboxArg) => McpClient;
+  // Sandbox wrap for spawned servers (MCP.md §2.3). `available` is the boot-time
+  // tool detection (drives default-on + the modal status); `wrap` produces the
+  // bwrap/sandbox-exec argv. Absent ⇒ no sandboxing (every server runs host).
+  sandbox?: { available: boolean; wrap: McpSandboxWrap };
   // Injectable clock for decided_at / last_connected_at.
   now?: () => number;
 }
@@ -161,6 +169,31 @@ const handshakeSignal = (sessionSignal?: AbortSignal): AbortSignal => {
 export const createMcpManager = (deps: McpManagerDeps): McpManager => {
   const { db, registry, config } = deps;
   const makeClient = deps.makeClient ?? createStdioMcpClient;
+
+  // Resolve a server's effective sandbox posture (MCP.md §2.3): default-ON when
+  // a tool is available; `sandbox = false` opts out; a wired-but-unavailable
+  // tool degrades to host (and warns at init). `deps.sandbox` absent ⇒ feature
+  // off ⇒ host with no warning.
+  const resolveSandbox = (
+    cfg: McpServerConfig,
+  ): { profile: McpSandboxProfile; status: McpSandboxStatus } => {
+    if (cfg.sandbox === false) return { profile: 'host', status: 'opt-out' };
+    if (deps.sandbox === undefined || !deps.sandbox.available) {
+      return { profile: 'host', status: 'unavailable' };
+    }
+    if (cfg.network !== undefined) return { profile: 'cwd-rw-net', status: 'sandboxed-net' };
+    return { profile: 'cwd-rw', status: 'sandboxed' };
+  };
+
+  // Build a client for a server, wrapping the spawn in the sandbox when the
+  // resolved profile is non-host.
+  const clientFor = (rt: ServerRuntime): McpClient => {
+    const { profile } = resolveSandbox(rt.config);
+    if (profile === 'host' || deps.sandbox === undefined) {
+      return makeClient(rt.config.transport);
+    }
+    return makeClient(rt.config.transport, { profile, wrap: deps.sandbox.wrap });
+  };
   const now = deps.now ?? (() => Date.now());
   const runtime = new Map<string, ServerRuntime>();
 
@@ -197,7 +230,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
     }
 
     if (!rt.connected) {
-      const client = makeClient(rt.config.transport);
+      const client = clientFor(rt);
       setState(rt, 'handshaking');
       try {
         const sig = handshakeSignal(ctx.signal);
@@ -272,6 +305,11 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
   ): { registered: number; warnings: string[] } => {
     const warnings: string[] = [];
     let registered = 0;
+    // Egress = the server can REACH the network: granted network (`cwd-rw-net`)
+    // OR running unconfined (`host` — opt-out / no sandbox tool, which inherits
+    // the full host network even with no `[network]` grant). Only a sandboxed
+    // no-network server (`cwd-rw`) is non-egress (MCP.md §2.3).
+    const egress = resolveSandbox(rt.config).profile !== 'cwd-rw';
     for (const tool of tools) {
       const wire = dedupeWireName(mcpWireName(rt.config.name, tool.name), (n) => registry.has(n));
       if (registry.has(wire)) {
@@ -287,6 +325,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
             server: rt.config.name,
             tool,
             serverSurface: rt.config.surface,
+            egress,
             call: (args, ctx) => callTool(rt.config.name, tool.name, args, ctx),
           }),
         );
@@ -317,7 +356,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       setState(rt, 'denied');
       return 0;
     }
-    const client = makeClient(rt.config.transport);
+    const client = clientFor(rt);
     setState(rt, 'handshaking');
     try {
       const sig = handshakeSignal();
@@ -409,6 +448,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         // The RAW (unresolved) command — never expose a resolved secret.
         command: rt.config.transport.rawArgv.join(' '),
         mode: forceReprompt || rt.trustedHash !== null ? 'drift' : 'first-visit',
+        sandbox: resolveSandbox(rt.config).status,
         tools: tools.map((t) => ({
           name: t.name,
           description: t.description,
@@ -457,6 +497,16 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
 
       for (const server of config.servers) {
         if (!server.enabled) continue;
+        // Surface every unconfined server: it spawns with full host access +
+        // network (the modal shows it too, but headless / cached-trust paths
+        // never open one). Both opt-out and no-tool land on the host profile.
+        if (deps.sandbox !== undefined && resolveSandbox(server).profile === 'host') {
+          warnings.push(
+            resolveSandbox(server).status === 'opt-out'
+              ? `mcp: server '${server.name}' runs UNSANDBOXED (sandbox=false) — full host access + network`
+              : `mcp: server '${server.name}' will run UNSANDBOXED — no sandbox tool (bwrap/sandbox-exec) available`,
+          );
+        }
         const rt: ServerRuntime = {
           config: server,
           state: 'disconnected',

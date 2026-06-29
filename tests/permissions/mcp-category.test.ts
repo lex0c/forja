@@ -33,4 +33,14 @@ describe('permission engine: mcp category', () => {
   test('mcp is NOT egress — stdio is a local subprocess', () => {
     expect(categoryIsEgress('mcp')).toBe(false);
   });
+
+  test('mcp.egress IS egress — a network-granted server can exfil (MCP.md §2.3)', () => {
+    expect(categoryIsEgress('mcp.egress')).toBe(true);
+  });
+
+  test('an mcp.egress tool defaults to confirm — network egress is never silent', () => {
+    const eng = createPermissionEngine(policy(), { cwd: CWD });
+    const d = eng.check('mcp__proxy__fetch', 'mcp.egress', { url: 'https://x' });
+    expect(d.kind).toBe('confirm');
+  });
 });

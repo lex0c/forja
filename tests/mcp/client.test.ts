@@ -7,10 +7,12 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import {
   buildSpawnEnv,
+  createStdioMcpClient,
   extractMeta,
   flattenContent,
   normalizeInputSchema,
 } from '../../src/mcp/client.ts';
+import type { McpStdioConfig } from '../../src/mcp/types.ts';
 
 describe('buildSpawnEnv — env isolation (no secret / cross-server leak)', () => {
   const saved = { ...process.env };
@@ -104,5 +106,64 @@ describe('flattenContent', () => {
 
   test('a text block whose text is non-string is skipped', () => {
     expect(flattenContent([{ type: 'text', text: 42 }])).toBe('');
+  });
+});
+
+describe('createStdioMcpClient — sandbox wrap in connect()', () => {
+  const cfg = (over: Partial<McpStdioConfig> = {}): McpStdioConfig => ({
+    transport: 'stdio',
+    command: 'bin',
+    args: ['a'],
+    rawArgv: ['bin', 'a'],
+    ...over,
+  });
+
+  test('a fail-closed wrap throw propagates out of connect() BEFORE any spawn', async () => {
+    let wrapCalled = false;
+    const client = createStdioMcpClient(cfg(), {
+      profile: 'cwd-rw',
+      wrap: () => {
+        wrapCalled = true;
+        throw new Error('sandbox: tool unavailable mid-session — refusing to run unsandboxed');
+      },
+    });
+    // The throw fires in the wrap before StdioClientTransport is constructed —
+    // no child is spawned; the manager's connect try maps this to error/disconnected.
+    await expect(client.connect()).rejects.toThrow('refusing to run unsandboxed');
+    expect(wrapCalled).toBe(true);
+  });
+
+  test('connect() threads cwd, inner argv, and the declared env (passthroughEnv) to the wrap', async () => {
+    let capturedCwd: string | undefined;
+    let capturedArgv: readonly string[] | undefined;
+    let capturedPass: Record<string, string> | undefined;
+    const client = createStdioMcpClient(cfg({ cwd: '/srv', env: { PGHOST: 'db.local' } }), {
+      profile: 'cwd-rw',
+      wrap: (a) => {
+        capturedCwd = a.cwd;
+        capturedArgv = a.innerArgv;
+        capturedPass = a.passthroughEnv;
+        throw new Error('stop-before-spawn');
+      },
+    });
+    await expect(client.connect()).rejects.toThrow('stop-before-spawn');
+    expect(capturedCwd).toBe('/srv');
+    expect(capturedArgv).toEqual(['bin', 'a']);
+    expect(capturedPass).toEqual({ PGHOST: 'db.local' });
+  });
+
+  test("profile 'host' is never wrapped (the wrap is not called)", async () => {
+    let wrapCalled = false;
+    const client = createStdioMcpClient(cfg({ command: 'definitely-no-such-bin-xyz', args: [] }), {
+      profile: 'host',
+      wrap: () => {
+        wrapCalled = true;
+        return [];
+      },
+    });
+    // host ⇒ no wrap ⇒ the spawn attempts the (missing) binary and connect rejects
+    // on the spawn, not on the wrap.
+    await expect(client.connect()).rejects.toThrow();
+    expect(wrapCalled).toBe(false);
   });
 });

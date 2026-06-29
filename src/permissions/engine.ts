@@ -1254,7 +1254,7 @@ const policySectionFor = (
   // 'misc' and 'mcp' have no per-tool policy section in v1 — both resolve to
   // an engine-internal default-allow in the dispatch below (operator per-tool
   // MCP rules are a later slice).
-  if (category === 'misc' || category === 'mcp') return undefined;
+  if (category === 'misc' || category === 'mcp' || category === 'mcp.egress') return undefined;
   // A tool may SHARE another's policy section (declared in
   // FS_TOOL_TRAITS). `git` shares `read_file` — an operator who grants
   // file reads thereby governs git's reads with one allow/deny list,
@@ -2500,6 +2500,23 @@ export const createPermissionEngine = (
         decision = {
           kind: 'allow',
           reason: 'mcp category: trusted-manifest tool, default allow',
+          source: { layer: 'default' },
+        };
+        break;
+      case 'mcp.egress':
+        // A sandboxed MCP server GRANTED network (MCP.md §2.3). Its tools cleared
+        // the manifest-trust gate, but network egress is never run silently: like
+        // web.fetch, the default is confirm AND the autonomous posture never
+        // auto-approves it (`categoryIsEgress` blocks the auto-approve above). No
+        // policy section is consulted yet.
+        decision = {
+          kind: 'confirm',
+          prompt: 'Run this network-enabled MCP server tool? It can reach the network (egress).',
+          reason: 'mcp.egress: network-enabled server tool — confirm each call',
+          // 'policy' mirrors web.fetch's routine default-confirm; the
+          // categoryIsEgress check above (not the cause) is what keeps it out of
+          // autonomous auto-approval — egress is never silently run.
+          confirmCause: 'policy',
           source: { layer: 'default' },
         };
         break;

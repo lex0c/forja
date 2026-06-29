@@ -174,7 +174,7 @@ Server crash mid-session: tudo que estava em vôo recebe error; server transita 
 ### 2.1 Stdio
 
 - Spawn: `spawn(command[0], command.slice(1), { env: cleanEnv, cwd, stdio: ["pipe", "pipe", "pipe"] })`
-- Env limpa: apenas `PATH`, `HOME`, `USER`, `MCP_*` vars do user, vars declaradas em `[servers.<name>.env]`
+- Env do child: unsandboxed → apenas `PATH`/`HOME`/`USER` + vars declaradas em `[servers.<name>.env]`; sandboxed → o mesmo allowlist seguro do bash (`SANDBOX_SAFE_ENV_VARS`: + `LANG`/`TERM`/`TZ`/`TMPDIR`/…) + as declaradas. Em ambos, **sem passthrough por prefixo** — um `MCP_*_TOKEN` destinado a um server não vaza para os outros.
 - `setsid` para evitar processo órfão (Linux/macOS)
 - stderr capturado, redirected para `traces/mcp-<name>.log` (rotacionado em 10MB)
 - Detected dead via `kill(pid, 0)` ou `EPIPE` em writes
@@ -189,11 +189,23 @@ Server crash mid-session: tudo que estava em vôo recebe error; server transita 
 
 ### 2.3 Sandbox (stdio)
 
-Mesmo profile que `bash` sandboxing (`SECURITY_GUIDELINE.md §8.1`):
-- Mount: `cwd` declarado read-write; `~/.config/agent` read; `/tmp` read-write isolado; resto read-only
-- Network: per-server allowlist (`[servers.<name>.network.allow_hosts]`); default DENY
-- Ulimits: CPU 30s soft, memory 512MB soft, file size 100MB
-- Linux: `bwrap` opt-in; macOS: `sandbox-exec` opt-in; opt-in via `[servers.<name>.sandbox = true]`
+Server stdio é código local **não-confiável** (§0.1). Mesmo profile que `bash` sandboxing
+(`SECURITY_GUIDELINE.md §8.1`):
+- Mount: `cwd` read-write; `~/.config/agent` read; `/tmp` read-write isolado; resto read-only.
+- Network: **DENY por default**; `[servers.<name>.network.allow_hosts]` concede. **Caveat (§8.1):**
+  bwrap dá rede tudo-ou-nada (`cwd-rw-net` omite `unshare-net`); o allowlist é **advisory** (alimenta
+  confirm/score/auditoria + o modal), **não há filtro por-host no kernel hoje** — filtro real
+  (proxy/nftables) é futuro. A spec não promete confinamento por-host.
+- Egress: server com rede concedida → suas tools contam como **egress** (`categoryIsEgress`), nunca
+  auto-aprovadas sob postura autônoma, mesmo após o trust do manifesto.
+- Ulimits: CPU 30s soft, memory 512MB soft, file size 100MB.
+
+**Default-ON quando há ferramenta** (Linux `bwrap`, macOS `sandbox-exec`); **opt-out** por server via
+`[servers.<name>.sandbox = false]`. Mais agressivo que o sandbox de bash (§9.2, opt-in): o bash é o
+próprio operador, um server MCP é terceiro não-confiável. Sem ferramenta de sandbox → degrada para
+unsandboxed **com warning no boot**; se a ferramenta existia no boot e sumiu, **fail-closed** (recusa
+rodar sem sandbox, não roda silenciosamente exposto). O modal de trust exibe o status efetivo
+(sandboxed / unsandboxed por opt-out / unsandboxed por falta de ferramenta).
 
 Sandbox em SSE/HTTP servers: N/A (server roda fora; agente só faz HTTP). Trust boundary é a rede.
 

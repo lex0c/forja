@@ -27,11 +27,43 @@ export interface McpStdioConfig {
   // secret value, AUDIT §1.5) and used for the command-change trust check +
   // the trust-modal command display. The binary the operator authorizes.
   rawArgv: readonly string[];
-  // Extra env merged onto the minimal spawn env (PATH/HOME/USER/MCP_*).
+  // Extra env merged onto the minimal spawn env (PATH/HOME/USER).
   // Values may be `$VAR` references resolved from the agent session env.
   env?: Readonly<Record<string, string>>;
   // Working directory for the spawned server; defaults to the session cwd.
   cwd?: string;
+}
+
+// The sandbox profiles the MCP layer uses — a SUBSET of the permission engine's
+// SandboxProfile, kept as a local union so this leaf module imports no policy
+// dependency (the values match, so they interop at the bootstrap boundary).
+// 'host' = unsandboxed.
+export type McpSandboxProfile = 'host' | 'cwd-rw' | 'cwd-rw-net';
+
+// The effective sandbox posture of a server, for the trust modal. 'sandboxed' =
+// confined, no network; 'sandboxed-net' = confined + network (advisory
+// allowlist, NOT host-filtered); 'opt-out' = operator set `sandbox = false`;
+// 'unavailable' = sandboxing wired but no tool resolved (runs unconfined).
+export type McpSandboxStatus = 'sandboxed' | 'sandboxed-net' | 'opt-out' | 'unavailable';
+
+// Wraps a server's spawn argv in the sandbox (bwrap / sandbox-exec). Returns the
+// inner argv unchanged for 'host' or when no sandbox tool resolved (degrade);
+// throws when the tool was present at boot but is gone now (fail-closed).
+export type McpSandboxWrap = (args: {
+  profile: McpSandboxProfile;
+  cwd: string;
+  innerArgv: readonly string[];
+  env: NodeJS.ProcessEnv;
+  // Vars that survive the sandbox's `--clearenv` regardless of the allowlist —
+  // the server's declared `[servers.<name>.env]`.
+  passthroughEnv?: Record<string, string>;
+}) => readonly string[];
+
+// Handed to the stdio client when a server is to be sandboxed. Absent ⇒ spawn
+// unconfined (host).
+export interface McpSandboxArg {
+  profile: McpSandboxProfile;
+  wrap: McpSandboxWrap;
 }
 
 export interface McpServerConfig {
@@ -46,6 +78,16 @@ export interface McpServerConfig {
   surface: 'base' | 'deferred';
   transport: McpStdioConfig;
   source: McpServerSource;
+  // Sandbox posture (MCP.md §2.3). `undefined` ⇒ default-on when a sandbox tool
+  // (bwrap / sandbox-exec) is available; `false` ⇒ explicit operator opt-out
+  // (run the server unconfined).
+  sandbox?: boolean;
+  // Operator network allowlist ([servers.<name>.network] allow_hosts). Present
+  // (non-empty) ⇒ the server is granted network. bwrap network is all-or-
+  // nothing, so the host list is ADVISORY (surfaced in the trust modal + audit,
+  // fed to confirm/score), NOT kernel-enforced — per-host filtering is future
+  // (MCP.md §2.3).
+  network?: { allowHosts: readonly string[] };
 }
 
 // The 8-state lifecycle machine (STATE_MACHINE §6.5). The transition
@@ -125,6 +167,9 @@ export interface McpTrustRequest {
   // must show this: trust = "I authorize running this binary."
   command: string;
   mode: McpTrustMode;
+  // The effective sandbox posture (MCP.md §2.3) so the operator sees the
+  // containment they are authorizing (sandboxed / unsandboxed + why).
+  sandbox: McpSandboxStatus;
   // `writes` mirrors the tool's effective checkpoint behavior (`meta.writes ??
   // true`), so the modal can mark side-effecting tools the operator is about to
   // authorize — surfacing a server's self-declared `writes:false`.

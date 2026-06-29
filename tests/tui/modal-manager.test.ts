@@ -1124,6 +1124,7 @@ describe('askMcpTrust (mcp-trust:ask producer, MCP.md §1.5)', () => {
     server: 'postgres',
     command: 'mcp-server-postgres --dsn $X',
     mode: 'first-visit' as const,
+    sandbox: 'sandboxed' as const,
     tools: [{ name: 'query', description: 'run a query', writes: false }],
     manifestHash: 'abc123',
   };

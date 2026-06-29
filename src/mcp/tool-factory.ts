@@ -46,6 +46,9 @@ export interface BuildMcpToolInput {
   // Bound call into the manager for THIS server + tool. Does lazy-connect +
   // state transitions; throws on transport/protocol fault.
   call: (args: unknown, ctx: ToolContext) => Promise<McpCallResult>;
+  // The operator granted this server network (MCP.md §2.3) → its tools take the
+  // egress category (default confirm, never auto-approved under autonomous).
+  egress?: boolean;
 }
 
 const buildMetadata = (input: BuildMcpToolInput): ToolMetadata => {
@@ -54,11 +57,11 @@ const buildMetadata = (input: BuildMcpToolInput): ToolMetadata => {
   // the call unless the server provably declared read-only — MCP.md §3.1.
   const writes = meta.writes ?? true;
   return {
-    category: 'mcp',
+    category: input.egress ? 'mcp.egress' : 'mcp',
     writes,
-    // stdio MCP is a local subprocess, not egress; honor a server hint but
-    // default false (slice 3's remote transport flips the default).
-    network: meta.network ?? false,
+    // A network-granted server's tools ARE egress; a plain stdio server is local
+    // (honor the self-declared hint, default false).
+    network: input.egress === true || (meta.network ?? false),
     // An MCP server can write to its own FS outside the agent worktree, so a
     // write tool's effects are NOT captured by the checkpoint → --undo warns.
     escapesCwd: writes,

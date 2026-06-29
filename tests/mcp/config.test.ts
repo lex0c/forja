@@ -289,3 +289,58 @@ command = ["bin", "--token=\${DATABASE_URL"]
     expect(warnings.some((w) => w.includes('malformed brace reference'))).toBe(true);
   });
 });
+
+describe('loadMcpConfig: sandbox + network (MCP.md §2.3)', () => {
+  test('parses sandbox=false (opt-out) + a network.allow_hosts table', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.db]
+transport = "stdio"
+command = ["bin"]
+sandbox = false
+
+[servers.db.network]
+allow_hosts = ["api.foo.com", "api.bar.com"]
+`,
+    );
+    const { servers, warnings } = load();
+    expect(warnings).toEqual([]);
+    const s = servers[0];
+    if (!s) throw new Error('expected a server');
+    expect(s.sandbox).toBe(false);
+    expect(s.network).toEqual({ allowHosts: ['api.foo.com', 'api.bar.com'] });
+  });
+
+  test('no sandbox/network keys → both undefined (default-on resolved at spawn)', () => {
+    writeFileSync(projectPath, `[servers.db]\ntransport = "stdio"\ncommand = ["bin"]\n`);
+    const { servers } = load();
+    expect(servers[0]?.sandbox).toBeUndefined();
+    expect(servers[0]?.network).toBeUndefined();
+  });
+
+  test('an empty allow_hosts grants no network', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.db]\ntransport = "stdio"\ncommand = ["bin"]\n\n[servers.db.network]\nallow_hosts = []\n`,
+    );
+    expect(load().servers[0]?.network).toBeUndefined();
+  });
+
+  test('a non-boolean sandbox warns', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.db]\ntransport = "stdio"\ncommand = ["bin"]\nsandbox = "yes"\n`,
+    );
+    expect(load().warnings.some((w) => w.includes("'sandbox' must be a boolean"))).toBe(true);
+  });
+
+  test('a non-array allow_hosts warns', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.db]\ntransport = "stdio"\ncommand = ["bin"]\n\n[servers.db.network]\nallow_hosts = "foo.com"\n`,
+    );
+    expect(load().warnings.some((w) => w.includes("'network.allow_hosts' must be an array"))).toBe(
+      true,
+    );
+  });
+});

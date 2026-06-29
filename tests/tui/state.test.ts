@@ -2712,6 +2712,7 @@ describe('mcp-trust:ask reducer', () => {
     mode: 'first-visit' | 'drift';
     server?: string;
     command?: string;
+    sandbox?: 'sandboxed' | 'sandboxed-net' | 'opt-out' | 'unavailable';
     tools?: readonly { name: string; description: string; writes: boolean }[];
     manifestHash?: string;
   }): UIEvent => ({
@@ -2721,6 +2722,7 @@ describe('mcp-trust:ask reducer', () => {
     server: overrides.server ?? 'postgres',
     command: overrides.command ?? 'mcp-server-postgres --dsn $X',
     mode: overrides.mode,
+    sandbox: overrides.sandbox ?? 'sandboxed',
     tools: overrides.tools ?? [{ name: 'query', description: 'run a query', writes: false }],
     manifestHash: overrides.manifestHash ?? 'abc123',
   });
@@ -2821,6 +2823,25 @@ describe('mcp-trust:ask reducer', () => {
     expect(text).toContain('mutate [writes] — changes things');
     expect(text).toContain('peek — reads things'); // no marker for the read-only tool
     expect(text).not.toContain('peek [writes]');
+  });
+
+  test('shows the sandbox posture; both unsandboxed states warn', () => {
+    const cases: Array<['sandboxed' | 'sandboxed-net' | 'opt-out' | 'unavailable', string]> = [
+      ['sandboxed', 'sandbox: ON (cwd-rw, no network)'],
+      ['sandboxed-net', 'sandbox: ON + network'],
+      ['opt-out', '⚠ sandbox: OFF (operator opt-out)'],
+      ['unavailable', '⚠ sandbox: OFF (no sandbox tool available)'],
+    ];
+    for (const [status, expected] of cases) {
+      const r = applyEvent(
+        createInitialState(),
+        mcpTrustEvent({ mode: 'first-visit', sandbox: status }),
+      );
+      const modal = r.state.modal;
+      if (modal === null) throw new Error('expected modal');
+      const text = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+      expect(text).toContain(expected);
+    }
   });
 });
 

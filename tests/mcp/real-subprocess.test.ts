@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import type { LoadedMcpConfig } from '../../src/mcp/config.ts';
 import { createMcpManager } from '../../src/mcp/manager.ts';
 import type { McpServerConfig } from '../../src/mcp/types.ts';
+import { maybeWrapSandboxArgv } from '../../src/permissions/sandbox-runner.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { type ToolRegistry, createToolRegistry } from '../../src/tools/registry.ts';
@@ -99,4 +100,42 @@ describe('mcp real-subprocess integration (SDK stdio + fixture echo server)', ()
     expect(mgr2.state('fixture')).toBe('trusted');
     await mgr2.cleanup();
   });
+});
+
+const bwrapAvailable = process.platform === 'linux' && Bun.which('bwrap') !== null;
+
+describe('mcp real-subprocess + sandbox (bwrap)', () => {
+  // The load-bearing proof that bwrap is transparent to JSON-RPC-over-stdio:
+  // wrap the fixture server in a real cwd-rw sandbox and confirm the echo still
+  // round-trips. Gated on Linux + bwrap (mirrors the bash sandbox tests).
+  test.skipIf(!bwrapAvailable)(
+    'a sandboxed (cwd-rw) server still round-trips a tools/call through bwrap',
+    async () => {
+      const mgr = createMcpManager({
+        db,
+        registry,
+        config: config([serverConfig()]),
+        autoApprove: new Set(['fixture']),
+        sandbox: {
+          available: true,
+          wrap: (a) =>
+            maybeWrapSandboxArgv({
+              profile: a.profile,
+              cwd: a.cwd,
+              innerArgv: a.innerArgv,
+              env: a.env,
+              ...(a.passthroughEnv !== undefined ? { passthroughEnv: a.passthroughEnv } : {}),
+              failClosed: true,
+            }),
+        },
+      });
+      const report = await mgr.init();
+      expect(report.registered).toBe(1);
+
+      const res = await mgr.callTool('fixture', 'echo', { text: 'sandboxed' }, ctx);
+      expect(res.isError).toBe(false);
+      expect(res.content).toBe('echo:sandboxed'); // JSON-RPC survived the bwrap wrap
+      await mgr.cleanup();
+    },
+  );
 });
