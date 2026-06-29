@@ -11,7 +11,8 @@ import {
   createSqliteSink,
   ensureInstallId,
 } from '../../src/permissions/index.ts';
-import { MIGRATIONS, migrate, openDb } from '../../src/storage/index.ts';
+import { MIGRATIONS, closeDb, migrate, openDb } from '../../src/storage/index.ts';
+import { insertServer } from '../../src/storage/repos/mcp-servers.ts';
 
 const captured = () => {
   const lines: string[] = [];
@@ -119,6 +120,38 @@ describe('runDoctor', () => {
     expect(text).toContain('data_dir');
     expect(text).toContain('git');
     expect(text).toContain('summary: all checks passed');
+  });
+
+  test('mcp check warns when a server is stuck in error/degraded state', async () => {
+    const dbPath = join(tmp, 'state.db');
+    const seedDb = openDb(dbPath);
+    migrate(seedDb);
+    insertServer(seedDb, {
+      name: 'db',
+      transport: 'stdio',
+      command: '["x"]',
+      url: null,
+      source: 'project_shared',
+      state: 'error',
+    });
+    closeDb(seedDb);
+    const out = captured();
+    await runDoctor({
+      env,
+      dbPath,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      exists: (p) => p.startsWith('/usr/bin/'),
+      isExecutable: (p) => p.startsWith('/usr/bin/'),
+      readFile: (path) => (path === '/proc/sys/user/max_user_namespaces' ? '15000\n' : null),
+      runCmd: (cmd) =>
+        cmd === 'nft' ? 'nftables v1\n' : cmd === 'getenforce' ? 'Enforcing\n' : null,
+      out: out.write,
+      err: captured().write,
+    });
+    const text = out.lines.join('');
+    expect(text).toContain('status: warn'); // the mcp check (every other probe is ok here)
+    expect(text).toContain('db(error)');
+    expect(text).toContain('reconnect / re-trust');
   });
 
   // Slice 123 (R9 P1): pre-slice `dirWritable` short-circuited on
@@ -353,10 +386,10 @@ describe('runDoctor', () => {
     });
     expect(code).toBe(0);
     const lines = out.lines.join('').trim().split('\n').filter(Boolean);
-    // 12 checks (slice 90 added user_namespaces + net_filtering +
-    // mac_lsm; §13.7 enforcement check brings the total to 12) +
+    // 13 checks (slice 90 added user_namespaces + net_filtering +
+    // mac_lsm; §13.7 enforcement check; + the mcp check) +
     // 1 info (capability ceiling + engine version) + 1 summary.
-    expect(lines.length).toBe(14);
+    expect(lines.length).toBe(15);
     const events = lines.map((l) => JSON.parse(l));
     expect(events[0].kind).toBe('check');
     expect(events[0].name).toBe('platform');
@@ -368,11 +401,12 @@ describe('runDoctor', () => {
     const summary = events[events.length - 1];
     expect(summary.kind).toBe('summary');
     expect(summary.ok).toBe(true);
-    // 12 ok + 0 warn + 0 fail when sandbox binary is present —
+    // 13 ok + 0 warn + 0 fail when sandbox binary is present —
     // sandbox_enforcement resolves to `ok` because the default
-    // broker is now spawn-mode (post-flip). All other probes
+    // broker is now spawn-mode (post-flip), and the mcp check reads
+    // 'no MCP servers' from the fresh fixture DB. All other probes
     // already cleared in this fixture.
-    expect(summary.counts).toEqual({ ok: 12, warn: 0, fail: 0 });
+    expect(summary.counts).toEqual({ ok: 13, warn: 0, fail: 0 });
   });
 
   test('--json: failures bump summary.ok to false + exit 1', async () => {

@@ -736,3 +736,32 @@ describe('McpManager: network server → mcp.egress category (MCP.md §2.3)', ()
     await mgr.cleanup();
   });
 });
+
+describe('McpManager.status()', () => {
+  test('returns live name/state/tool-count for each runtime server', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query'), toolDef('list')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(mgr.status()).toEqual([{ name: 'db', state: 'trusted', tools: 2 }]);
+    await mgr.cleanup();
+  });
+
+  test('a denied (headless fail-closed) server appears with 0 tools', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(mgr.status()).toEqual([{ name: 'db', state: 'denied', tools: 0 }]);
+    await mgr.cleanup();
+  });
+});

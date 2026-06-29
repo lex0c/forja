@@ -100,6 +100,10 @@ export interface McpManager {
     ctx: ToolContext,
   ): Promise<McpCallResult>;
   state(server: string): McpServerState | null;
+  // Live status of every server in the runtime (name, current state, registered
+  // tool count) for /mcp + status views — the McpInitReport snapshot, queryable
+  // after init.
+  status(): McpServerStatus[];
   cleanup(): Promise<void>;
 }
 
@@ -586,6 +590,14 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
 
     state(server) {
       return runtime.get(server)?.state ?? null;
+    },
+
+    status() {
+      return [...runtime.values()].map((rt) => ({
+        name: rt.config.name,
+        state: rt.state,
+        tools: rt.registeredNames.length,
+      }));
     },
 
     async cleanup() {

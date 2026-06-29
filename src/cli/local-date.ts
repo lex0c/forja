@@ -31,3 +31,18 @@ export const localIsoDate = (d: Date = new Date()): string => {
   const day = String(d.getDate()).padStart(2, '0');
   return `${y}-${m}-${day}`;
 };
+
+// Format an epoch-ms timestamp as `YYYY-MM-DD HH:MM` in the operator's LOCAL
+// timezone (same local-getter rationale as localIsoDate above — operator
+// surfaces like /mcp, /memory audit, /sessions all read local, so cross-
+// referencing them doesn't skew by the UTC offset). Returns '—' for a
+// null/non-positive/invalid ms, so a missing or tampered timestamp renders
+// cleanly. Uses the local getters (not toISOString), so an out-of-range ms
+// yields '—' rather than throwing a RangeError.
+export const localTimestamp = (ms: number | null): string => {
+  if (ms === null || ms <= 0) return '—';
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return '—';
+  const pad = (n: number): string => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
