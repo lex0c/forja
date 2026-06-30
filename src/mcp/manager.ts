@@ -1005,8 +1005,17 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         patchServer(db, server, { revoked_at: null });
         return { ok: true, registered, warnings };
       }
-      // Re-denied or failed to connect: the server stays revoked + the result is
-      // NOT ok, so the operator sees the real outcome (not a green "0 tools").
+      // Re-denied or failed to connect: REVOKE durably so the next relaunch's
+      // init() skips the cached forever grant. Without this, a reconnect of a
+      // NEVER-revoked (drifted) server that the operator just declined would leave
+      // the old grant intact — next launch re-registers the stale trusted manifest
+      // and a later call spawns/connects to the very server they declined. Set
+      // revoked_at only when it isn't already set, so an already-revoked server
+      // keeps its original (operator-revoke) timestamp. The result is NOT ok, so
+      // the operator sees the real outcome.
+      if (getServer(db, server)?.revoked_at == null) {
+        patchServer(db, server, { revoked_at: now() });
+      }
       return { ok: false, reason: rt.state, registered, warnings };
     },
 

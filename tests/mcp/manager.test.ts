@@ -1059,6 +1059,47 @@ describe('McpManager: revoke / reconnect (registry hot-swap)', () => {
     await mgr.cleanup();
   });
 
+  test('a DENIED reconnect of a NEVER-revoked (drifted) server revokes it durably', async () => {
+    // A trusted server with a cached "forever" grant, never revoked. The operator
+    // reconnects (e.g. after drift) and DECLINES — the stale grant must not survive
+    // to the next launch, or a later call would spawn/connect to the declined server.
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      confirmTrust: async () => 'no', // decline the re-trust at the identity gate
+      makeClient: fake.makeClient,
+      now: () => 777,
+    });
+    await mgr.init(); // registers from cache (no connect, no prompt)
+    expect(getServer(db, 'db')?.revoked_at).toBeNull(); // never revoked
+
+    const r = await mgr.reconnect('db');
+    expect(r.ok).toBe(false);
+    expect(mgr.state('db')).toBe('denied');
+    expect(getServer(db, 'db')?.revoked_at).toBe(777); // NOW revoked durably
+    expect(fake.stats.made).toBe(0); // declined at the identity gate → never connected
+    await mgr.cleanup();
+
+    // Next launch (fresh manager + registry, same DB): the declined server must
+    // NOT come back from the cached grant.
+    const reg2 = createToolRegistry();
+    const fake2 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m2 = createMcpManager({
+      db,
+      registry: reg2,
+      config: config([serverConfig()]),
+      makeClient: fake2.makeClient,
+    });
+    await m2.init();
+    expect(m2.state('db')).toBe('denied'); // revoked_at → skipped, not re-registered
+    expect(reg2.has('mcp__db__query')).toBe(false);
+    expect(fake2.stats.made).toBe(0);
+    await m2.cleanup();
+  });
+
   test('revoke records revoked_at from the injected clock', async () => {
     const fake = fakeClientFactory({ tools: [toolDef('query')] });
     const mgr = createMcpManager({

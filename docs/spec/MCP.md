@@ -398,7 +398,7 @@ Implementação compartilha pipeline com slash commands canônicos (`AGENTIC_CLI
 
 - `revoke`: `unregister` das tools do registry vivo (o próximo turno cai), `state = denied`, `revoked_at = now()`. O orphan-sweep do `init` **preserva** rows revogadas (sobrevive a um round-trip de config). As subcommands mutantes rodam **entre turnos** (gate `runExclusive`) — mutar o registry no meio de um turno entregaria um tool-set meio-aplicado.
 - `init`: enquanto `revoked_at` está setado, pula o cache e fica `denied` (não re-registra, não re-pergunta headless).
-- `reconnect`: reseta o runtime e força um re-trust (`resolveFreshTrust`); limpa `revoked_at` **somente após sucesso** (state `trusted`). Um reconnect negado/sem-conexão **continua revogado**.
+- `reconnect`: reseta o runtime e força um re-trust (`resolveFreshTrust`); limpa `revoked_at` **somente após sucesso** (state `trusted`). Um reconnect negado/sem-conexão **fica revogado** — seta `revoked_at` mesmo num server **nunca-revogado** (ex.: reconnect pós-drift que o operador recusa), senão o grant cacheado (forever) resurgiria no próximo launch e uma call spawnaria/conectaria no server recusado.
 
 Limitação consciente: como a revogação é estado (não evento), após `revoke→reconnect` bem-sucedido não sobra registro durável de QUE/QUANDO foi revogado. Os valores `'revoked'`/`'superseded'` do enum `decision` ficam **reservados** para uma auditoria-de-revogações futura (exigiria relaxar o `UNIQUE` + lógica de "última decisão"). O grant em si nunca some (forever).
 
