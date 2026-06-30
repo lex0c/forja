@@ -229,8 +229,10 @@ Two tables (migration `081-mcp-servers.ts`, repo `repos/mcp-servers.ts`):
 - **Managing servers in-session:** `/mcp` lists every server with its live state + tool count;
   `/mcp show <server>` adds the command, manifest hash, and trust history; `/mcp revoke <server>`
   denies a server and removes its tools (durable — it stays denied across a relaunch until you
-  reconnect); `/mcp reconnect <server>` clears the revocation and re-trusts + re-registers it (no
-  restart needed); `/mcp logs <server>` tails the server's captured stderr. The mutating commands
+  reconnect); `/mcp reconnect <server>` re-runs the trust handshake — on success it re-registers the
+  tools + clears any revocation (no restart needed), and a **declined or failed** reconnect leaves the
+  server revoked across relaunch (a server you just re-declined never silently returns from its cached
+  grant); `/mcp logs <server>` tails the server's captured stderr. The mutating commands
   run **between turns** (they hot-swap the live tool set).
 - **Server stderr** is captured to `<dataDir>/traces/mcp-<name>.log` (operator-only, lazily created
   on the first byte, rotated at 10 MB with one kept generation). It is *always drained* even when no
