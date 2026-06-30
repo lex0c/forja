@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { createPermissionEngine } from '../../src/permissions/engine.ts';
 import { categoryIsEgress } from '../../src/permissions/types.ts';
-import type { Policy } from '../../src/permissions/types.ts';
+import type { McpPolicy, Policy } from '../../src/permissions/types.ts';
 
 // The 'mcp' category gates tools imported from a trusted MCP server. The
 // per-manifest-hash trust prompt is the heavyweight gate (it approved the
@@ -50,5 +50,63 @@ describe('permission engine: mcp category', () => {
     const eng = createPermissionEngine(policy(), { cwd: CWD, approvalPosture: 'autonomous' });
     const d = eng.check('mcp__proxy__fetch', 'mcp.egress', { url: 'https://x' });
     expect(d.kind).toBe('confirm');
+  });
+});
+
+describe('permission engine: per-tool mcp policy ([tools.mcp])', () => {
+  const withMcp = (mcp: McpPolicy): Policy => policy({ tools: { mcp } });
+
+  test('a deny pattern blocks one tool while siblings keep the category default', () => {
+    const eng = createPermissionEngine(withMcp({ deny: ['mcp__github__delete_*'] }), { cwd: CWD });
+    expect(eng.check('mcp__github__delete_repo', 'mcp', {}).kind).toBe('deny');
+    expect(eng.check('mcp__github__list_repos', 'mcp', {}).kind).toBe('allow');
+  });
+
+  test('deny beats the egress default too', () => {
+    const eng = createPermissionEngine(withMcp({ deny: ['mcp__proxy__*'] }), { cwd: CWD });
+    expect(eng.check('mcp__proxy__fetch', 'mcp.egress', { url: 'https://x' }).kind).toBe('deny');
+  });
+
+  test('a confirm pattern forces a prompt on an otherwise-allowed tool', () => {
+    const eng = createPermissionEngine(withMcp({ confirm: ['mcp__github__*'] }), { cwd: CWD });
+    expect(eng.check('mcp__github__create_issue', 'mcp', {}).kind).toBe('confirm');
+  });
+
+  test('an explicit allow opts an egress tool out of its default confirm', () => {
+    const eng = createPermissionEngine(withMcp({ allow: ['mcp__proxy__fetch'] }), { cwd: CWD });
+    // the operator pre-authorized THIS exact egress tool → allow, not confirm…
+    expect(eng.check('mcp__proxy__fetch', 'mcp.egress', { url: 'https://x' }).kind).toBe('allow');
+    // …a sibling egress tool not listed still confirms (the default holds)
+    expect(eng.check('mcp__proxy__post', 'mcp.egress', { url: 'https://x' }).kind).toBe('confirm');
+  });
+
+  test('an explicit allow on an egress tool holds under autonomous (operator pre-authorized it)', () => {
+    const eng = createPermissionEngine(withMcp({ allow: ['mcp__proxy__fetch'] }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+    });
+    expect(eng.check('mcp__proxy__fetch', 'mcp.egress', { url: 'https://x' }).kind).toBe('allow');
+  });
+
+  test('deny beats allow when a tool matches both', () => {
+    const eng = createPermissionEngine(
+      withMcp({ allow: ['mcp__github__*'], deny: ['mcp__github__delete_*'] }),
+      { cwd: CWD },
+    );
+    expect(eng.check('mcp__github__delete_repo', 'mcp', {}).kind).toBe('deny');
+    expect(eng.check('mcp__github__read', 'mcp', {}).kind).toBe('allow');
+  });
+
+  test('a glob is server- and tool-scoped — no cross-server leak', () => {
+    const eng = createPermissionEngine(withMcp({ deny: ['mcp__github__*'] }), { cwd: CWD });
+    expect(eng.check('mcp__github__x', 'mcp', {}).kind).toBe('deny');
+    expect(eng.check('mcp__gitlab__x', 'mcp', {}).kind).toBe('allow'); // different server
+  });
+
+  test('a session-allow lets a confirmed egress tool through for the rest of the session', () => {
+    const eng = createPermissionEngine(policy(), { cwd: CWD });
+    expect(eng.check('mcp__proxy__fetch', 'mcp.egress', { url: 'https://x' }).kind).toBe('confirm');
+    eng.addSessionAllow('mcp', 'mcp__proxy__fetch');
+    expect(eng.check('mcp__proxy__fetch', 'mcp.egress', { url: 'https://x' }).kind).toBe('allow');
   });
 });

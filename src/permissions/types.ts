@@ -100,6 +100,21 @@ export interface FetchPolicy {
   locked?: boolean;
 }
 
+// Per-tool MCP policy (MCP.md §8). Glob/prefix patterns over the wire name
+// `mcp__<server>__<tool>` (NO regex — same matcher as `bash`). Layered ON TOP of
+// the manifest-trust gate (which already approved the server's whole tool set):
+// an operator `deny` blocks a specific tool, `confirm` forces a prompt, `allow`
+// permits it silently. Precedence deny > allow > confirm; the default (no match)
+// is the CATEGORY default — `mcp` → allow, `mcp.egress` → confirm. An explicit
+// `allow` therefore opts an egress tool out of its default confirm (the operator
+// pre-authorized that exact tool), mirroring `fetch_url`'s allow_hosts.
+export interface McpPolicy {
+  allow?: readonly string[];
+  confirm?: readonly string[];
+  deny?: readonly string[];
+  locked?: boolean;
+}
+
 export interface PolicyToolsSection {
   bash?: BashPolicy;
   read_file?: PathPolicy;
@@ -108,6 +123,9 @@ export interface PolicyToolsSection {
   glob?: PathPolicy;
   grep?: PathPolicy;
   fetch_url?: FetchPolicy;
+  // MCP tools (`mcp__<server>__<tool>`). One section governs every server's
+  // tools; the manifest-trust gate is per-server, this is per-tool-pattern.
+  mcp?: McpPolicy;
   // Future tools fall back to category-level policy until a section exists.
 }
 

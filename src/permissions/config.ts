@@ -231,6 +231,7 @@ const KNOWN_TOOL_KEYS: readonly string[] = [
   'glob',
   'grep',
   'fetch_url',
+  'mcp',
 ];
 
 export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Policy => {
@@ -284,6 +285,11 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
   validatePathPolicy(tools.glob, 'glob', context);
   validatePathPolicy(tools.grep, 'grep', context);
   validateFetchPolicy(tools.fetch_url, 'fetch_url');
+  // MCP policy is the same allow/confirm/deny/locked glob-list shape as bash
+  // (patterns over `mcp__<server>__<tool>` wire names instead of commands), so
+  // it shares bash's validator — the `'mcp'` toolName keeps the error messages
+  // section-correct.
+  validateBashPolicy(tools.mcp, 'mcp');
 
   // Policy-layer sandbox section. Optional; when absent, the
   // bootstrap falls back to hardcoded defaults (`required: false`,

@@ -74,6 +74,7 @@ import type {
   ConfirmCause,
   Decision,
   FetchPolicy,
+  McpPolicy,
   PathPolicy,
   PermissionsView,
   Policy,
@@ -1228,6 +1229,76 @@ const checkFetch = (
   };
 };
 
+// Per-tool MCP gate (`tools.mcp`). The tool already cleared the per-manifest-
+// hash trust prompt + the risk score; this layers the operator's deny/confirm/
+// allow over the wire name `mcp__<server>__<tool>`. Precedence: deny → session-
+// allow → allow → confirm → the category default. The default is NOT mode-
+// dependent (trust already happened): a plain `mcp` tool defaults allow, an
+// `mcp.egress` tool defaults confirm (network egress is never silent; the
+// categoryIsEgress check in check() also keeps it out of autonomous auto-
+// approval). An explicit operator `allow` precedes the egress default, so it
+// opts that tool out of the confirm — the operator pre-authorized it (the same
+// shape as `fetch_url`'s allow_hosts). MCP is not a capability-grant kind
+// (grantRelevantForSection has no 'mcp' branch), so there is no persisted-grant
+// check — only the in-session allowlist.
+const checkMcp = (
+  toolName: string,
+  rules: McpPolicy | undefined,
+  egress: boolean,
+  provenance: SectionProvenance | undefined,
+  sessionAllow: readonly string[] | undefined,
+): Decision => {
+  const layer = sectionLayer(provenance, 'mcp');
+  const denied = firstMatchingCommand(rules?.deny, toolName);
+  if (denied !== null) {
+    return {
+      kind: 'deny',
+      reason: `mcp tool matched deny rule: ${denied}`,
+      source: { layer, rule: denied, section: 'mcp' },
+    };
+  }
+  const sessionMatched = firstMatchingCommand(sessionAllow, toolName);
+  if (sessionMatched !== null) {
+    return {
+      kind: 'allow',
+      reason: `mcp tool matched session-allow rule: ${sessionMatched}`,
+      source: { layer: 'session', rule: sessionMatched, section: 'mcp' },
+    };
+  }
+  const allowed = firstMatchingCommand(rules?.allow, toolName);
+  if (allowed !== null) {
+    return {
+      kind: 'allow',
+      reason: `mcp tool matched allow rule: ${allowed}`,
+      source: { layer, rule: allowed, section: 'mcp' },
+    };
+  }
+  const confirmed = firstMatchingCommand(rules?.confirm, toolName);
+  if (confirmed !== null) {
+    return {
+      kind: 'confirm',
+      confirmCause: 'policy',
+      prompt: `Run MCP tool ${toolName}?`,
+      reason: `mcp tool matched confirm rule: ${confirmed}`,
+      source: { layer, rule: confirmed, section: 'mcp' },
+    };
+  }
+  if (egress) {
+    return {
+      kind: 'confirm',
+      confirmCause: 'policy',
+      prompt: 'Run this network-enabled MCP server tool? It can reach the network (egress).',
+      reason: 'mcp.egress: network-enabled server tool — confirm each call',
+      source: { layer, section: 'mcp' },
+    };
+  }
+  return {
+    kind: 'allow',
+    reason: 'mcp category: trusted-manifest tool, default allow',
+    source: { layer, section: 'mcp' },
+  };
+};
+
 // Resolve the policy section name for a tool. The mapping is mostly
 // identity (`read_file` → `tools.read_file`, `bash` → `tools.bash`),
 // but the bash family — `bash`, `bash_background`, `bash_output`,
@@ -1251,10 +1322,12 @@ const policySectionFor = (
   category: PolicyCategory,
 ): keyof PolicyToolsSection | undefined => {
   if (category === 'bash') return 'bash';
-  // 'misc' and 'mcp' have no per-tool policy section in v1 — both resolve to
-  // an engine-internal default-allow in the dispatch below (operator per-tool
-  // MCP rules are a later slice).
-  if (category === 'misc' || category === 'mcp' || category === 'mcp.egress') return undefined;
+  // `misc` has no per-tool policy section (engine-internal default-allow in the
+  // dispatch). The two MCP categories SHARE one `tools.mcp` section — checkMcp
+  // applies the operator's deny/confirm/allow over the `mcp__<server>__<tool>`
+  // patterns on top of the manifest-trust gate + the category default.
+  if (category === 'misc') return undefined;
+  if (category === 'mcp' || category === 'mcp.egress') return 'mcp';
   // A tool may SHARE another's policy section (declared in
   // FS_TOOL_TRAITS). `git` shares `read_file` — an operator who grants
   // file reads thereby governs git's reads with one allow/deny list,
@@ -2489,36 +2562,21 @@ export const createPermissionEngine = (
         };
         break;
       case 'mcp':
-        // MCP tools clear two gates before reaching here: the per-manifest-
-        // hash trust prompt (the server + its whole tool set was approved)
-        // and the deterministic risk score (the `mcp_tool` feature adds
-        // supply-chain weight, which the approval-gate below can still
-        // upgrade to confirm). So the category-level default is allow;
-        // operator per-tool MCP rules (deny/confirm specific
-        // mcp__<server>__<tool> patterns) are a later slice. No policy
-        // section is consulted (policySectionFor returns undefined for 'mcp').
-        decision = {
-          kind: 'allow',
-          reason: 'mcp category: trusted-manifest tool, default allow',
-          source: { layer: 'default' },
-        };
-        break;
       case 'mcp.egress':
-        // A sandboxed MCP server GRANTED network (MCP.md §2.3). Its tools cleared
-        // the manifest-trust gate, but network egress is never run silently: like
-        // web.fetch, the default is confirm AND the autonomous posture never
-        // auto-approves it (`categoryIsEgress` blocks the auto-approve above). No
-        // policy section is consulted yet.
-        decision = {
-          kind: 'confirm',
-          prompt: 'Run this network-enabled MCP server tool? It can reach the network (egress).',
-          reason: 'mcp.egress: network-enabled server tool — confirm each call',
-          // 'policy' mirrors web.fetch's routine default-confirm; the
-          // categoryIsEgress check above (not the cause) is what keeps it out of
-          // autonomous auto-approval — egress is never silently run.
-          confirmCause: 'policy',
-          source: { layer: 'default' },
-        };
+        // Both MCP categories cleared the per-manifest-hash trust prompt + the
+        // risk score (the `mcp_tool` feature adds supply-chain weight). One
+        // `tools.mcp` section governs both (policySectionFor maps both to 'mcp');
+        // checkMcp layers the operator's deny/confirm/allow over the wire-name
+        // patterns, falling to the category default on no match — `mcp` → allow,
+        // `mcp.egress` → confirm (egress is also kept out of autonomous auto-
+        // approval by the categoryIsEgress check above).
+        decision = checkMcp(
+          toolName,
+          sectionRules as McpPolicy | undefined,
+          category === 'mcp.egress',
+          provenance,
+          sessionAllow.get('mcp'),
+        );
         break;
     }
     // Degraded upgrade applied AFTER the normal pipeline so the

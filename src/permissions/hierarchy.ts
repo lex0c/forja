@@ -96,6 +96,7 @@ export interface SectionProvenance {
   glob?: Layer;
   grep?: Layer;
   fetch_url?: Layer;
+  mcp?: Layer;
   // Policy-layer sandbox section. Per-field writer attribution.
   // Absent when no layer wrote any sandbox field.
   sandbox?: SandboxProvenance;
@@ -140,6 +141,7 @@ const SECTION_KEYS: readonly (keyof PolicyToolsSection)[] = [
   'glob',
   'grep',
   'fetch_url',
+  'mcp',
 ];
 
 // Load each layer if its file exists. enterprisePath=null disables
@@ -429,6 +431,7 @@ const merge = (
     ...(sectionWriter.glob !== undefined ? { glob: sectionWriter.glob } : {}),
     ...(sectionWriter.grep !== undefined ? { grep: sectionWriter.grep } : {}),
     ...(sectionWriter.fetch_url !== undefined ? { fetch_url: sectionWriter.fetch_url } : {}),
+    ...(sectionWriter.mcp !== undefined ? { mcp: sectionWriter.mcp } : {}),
     ...(sandboxProvenance !== undefined ? { sandbox: sandboxProvenance } : {}),
   };
 

@@ -117,6 +117,22 @@ describe('resolvePolicy — locked semantics', () => {
     ]);
   });
 
+  test('enterprise locked tools.mcp prevents project override', () => {
+    const ent = projectFile('ent.yaml');
+    writeFileSync(ent, 'tools:\n  mcp:\n    deny:\n      - "mcp__shell__*"\n    locked: true\n');
+    writeYaml(
+      projectFile('.forja/permissions.yaml'),
+      'tools:\n  mcp:\n    allow:\n      - "mcp__shell__*"\n',
+    );
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: null });
+    // Enterprise wins; the project's allow attempt on the locked section is rejected.
+    expect(result.policy.tools.mcp?.deny).toEqual(['mcp__shell__*']);
+    expect(result.policy.tools.mcp?.allow).toBeUndefined();
+    expect(result.lockConflicts).toEqual([
+      { section: 'tools.mcp', lockedBy: 'enterprise', attemptedBy: 'project' },
+    ]);
+  });
+
   test('user-locked section blocks project but not the locking layer itself', () => {
     const usr = projectFile('usr.yaml');
     writeFileSync(
