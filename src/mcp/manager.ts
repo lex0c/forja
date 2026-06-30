@@ -13,15 +13,18 @@
 //     register on grant, then close (lazy reconnect on first call).
 //
 // callTool() lazy-connects, re-hashes the live manifest, and degrades on
-// drift; a transport fault disconnects + surfaces a tool error. cleanup()
-// closes every live client at teardown.
+// drift; bounds each call at the per-server budget timeout (a timeout keeps the
+// server active + the connection reusable, a transport fault disconnects);
+// enforces the per-session call/token caps (MCP.md §5); and surfaces a tool
+// error. cleanup() closes every live client at teardown.
 //
-// Scoped to slice 1: stdio only; no per-server budget caps; no live
-// re-trust modal (drift → degraded, the call errors until reconfigured);
-// states are set directly here (the pure transition table in state.ts is the
-// documented/tested reference, enforced more strictly in a later slice).
+// Scope notes: stdio only (remote transport is a later slice); a finer
+// soft-warning-before-hard-cap tier + the failure_event audit row + the drift
+// `degraded`→`active` auto-recovery land with the failure_event sink; states are
+// set directly here (the pure transition table in state.ts is the reference).
 
 import { join } from 'node:path';
+import { charsToTokens } from '../providers/tokens.ts';
 import type { DB } from '../storage/db.ts';
 import {
   bumpServerCounters,
@@ -46,6 +49,7 @@ import {
 } from './manifest.ts';
 import { isMcpTerminal, mcpTransition } from './state.ts';
 import { buildMcpTool, mcpWireName } from './tool-factory.ts';
+import { DEFAULT_MCP_BUDGET } from './types.ts';
 import type {
   ConfirmMcpTrust,
   McpCallResult,
@@ -138,6 +142,13 @@ interface ServerRuntime {
   // re-detecting the same drift on every subsequent call.
   drifted: boolean;
   registeredNames: string[];
+  // Per-SESSION budget counters (MCP.md §5). In-memory, so they reset when a new
+  // session rebuilds the manager — unlike the DB's cumulative total_calls /
+  // total_tokens_in (lifetime stats for /mcp show). Drive the configured-cap
+  // disconnect. sessionCalls counts ATTEMPTS (incl. timeouts); sessionTokensIn
+  // accrues only on a successful call's result.
+  sessionCalls: number;
+  sessionTokensIn: number;
 }
 
 const parseCachedManifestTools = (json: string): McpManifestTool[] => {
@@ -182,13 +193,41 @@ const dedupeWireName = (base: string, taken: (name: string) => boolean): string 
 // Bound the handshake (connect + tools/list) so a wedged or hostile server
 // can't hang the agent. This matters most at init(), which is on the bootstrap
 // critical path with no operator to Ctrl-C; it also caps a mid-session
-// lazy-connect. Combined with the session AbortSignal where one exists. The
-// actual tools/call is NOT bounded here (a long tool is legitimate; per-call
-// budget is a later slice).
+// lazy-connect. Combined with the session AbortSignal where one exists.
 const MCP_HANDSHAKE_TIMEOUT_MS = 30_000;
 const handshakeSignal = (sessionSignal?: AbortSignal): AbortSignal => {
   const timeout = AbortSignal.timeout(MCP_HANDSHAKE_TIMEOUT_MS);
   return sessionSignal === undefined ? timeout : AbortSignal.any([sessionSignal, timeout]);
+};
+
+// Bound a single tools/call at the server's budget timeout (MCP.md §5), combined
+// with the session signal. The standalone `timeout` is returned so the caller
+// can tell a TIMEOUT (→ stay active, surface a tool error, §15.3) from a session
+// cancel or a transport fault (→ disconnect).
+const callSignal = (
+  timeoutMs: number,
+  sessionSignal?: AbortSignal,
+): { signal: AbortSignal; timeout: AbortSignal } => {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const signal = sessionSignal === undefined ? timeout : AbortSignal.any([sessionSignal, timeout]);
+  return { signal, timeout };
+};
+
+// Rough token estimate of the result that flows back to the model — feeds the
+// per-server max_tokens_in budget (a soft operational bound, not exact). Uses the
+// shared chars→tokens heuristic. The structured-content stringify is wrapped:
+// it can't throw on a JSON-origin value, but the estimate must NEVER crash the
+// success path of an already-completed call.
+const estimateResultTokens = (res: McpCallResult): number => {
+  let chars = res.content.length;
+  if (res.structured !== undefined) {
+    try {
+      chars += JSON.stringify(res.structured).length;
+    } catch {
+      // Unserializable (shouldn't happen for wire-parsed JSON) → content only.
+    }
+  }
+  return charsToTokens(chars);
 };
 
 export const createMcpManager = (deps: McpManagerDeps): McpManager => {
@@ -268,6 +307,29 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       );
     }
 
+    // Per-session budget (MCP.md §5/§15.6): a runaway server that has burned its
+    // configured call/token cap is disconnected for the rest of the session —
+    // checked BEFORE any (re)connect so a capped server can't even re-spawn. The
+    // cap is the operator's configured value (the loader already clamped it to
+    // the absolute ceiling). A finer soft-warning-then-hard tier + the
+    // failure_event audit row land with the sink in a later slice.
+    const budget = rt.config.budget ?? DEFAULT_MCP_BUDGET;
+    if (
+      rt.sessionCalls >= budget.maxCallsPerSession ||
+      rt.sessionTokensIn >= budget.maxTokensInPerSession
+    ) {
+      if (rt.client !== null) await rt.client.close().catch(() => {});
+      rt.client = null;
+      rt.connected = false;
+      setState(rt, 'disconnected', { last_error: 'mcp.budget.exceeded' });
+      throw new Error(
+        `mcp.budget.exceeded: server '${server}' hit its budget cap ` +
+          `(calls=${rt.sessionCalls}/${budget.maxCallsPerSession}, ` +
+          `tokens_in=${rt.sessionTokensIn}/${budget.maxTokensInPerSession}); ` +
+          `disconnected until the next session`,
+      );
+    }
+
     if (!rt.connected) {
       const client = clientFor(rt);
       setState(rt, 'handshaking');
@@ -324,11 +386,32 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
 
     const client = rt.client;
     if (client === null) throw new Error(`mcp: server '${server}' has no live client`);
+    const { signal, timeout } = callSignal(budget.timeoutMs, ctx.signal);
+    // Charge the ATTEMPT against the in-memory cap BEFORE the call — a server
+    // that times out on every call still has to hit the call cap (a successful
+    // call never reaches the increment otherwise, so a runaway-timeout server
+    // would loop forever uncapped).
+    rt.sessionCalls += 1;
     try {
-      const res = await client.callTool(toolName, args, ctx.signal);
-      bumpServerCounters(db, server, { calls: 1 });
+      const res = await client.callTool(toolName, args, signal);
+      // Successful call: charge tokens to the in-memory budget + the lifetime DB
+      // counters (/mcp show). Lifetime total_calls counts completed calls.
+      const tokensIn = estimateResultTokens(res);
+      bumpServerCounters(db, server, { calls: 1, tokensIn });
+      rt.sessionTokensIn += tokensIn;
       return res;
     } catch (err) {
+      // A per-call TIMEOUT (the budget timeout fired, not a session cancel) is
+      // NOT a transport fault (MCP.md §15.3): stay ACTIVE + keep the connection.
+      // Safe to reuse — the SDK correlates responses to requests by JSON-RPC id,
+      // so the aborted call's late reply is discarded, not mis-read as the next
+      // call's; and a genuinely broken connection self-heals (the next call
+      // faults and disconnects through the branch below).
+      if (timeout.aborted && (ctx.signal === undefined || !ctx.signal.aborted)) {
+        throw new Error(
+          `mcp.timeout: server '${server}' tool '${toolName}' exceeded ${budget.timeoutMs}ms`,
+        );
+      }
       rt.client = null;
       rt.connected = false;
       setState(rt, 'disconnected', {
@@ -544,6 +627,8 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
           connected: false,
           drifted: false,
           registeredNames: [],
+          sessionCalls: 0,
+          sessionTokensIn: 0,
         };
         runtime.set(server.name, rt);
 
@@ -704,6 +789,8 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         connected: false,
         drifted: false,
         registeredNames: [],
+        sessionCalls: 0,
+        sessionTokensIn: 0,
       };
       runtime.set(server, rt);
       const warnings: string[] = [];

@@ -57,6 +57,9 @@ interface FakeSpec {
   callResult?: McpCallResult;
   connectError?: Error;
   listToolsError?: Error;
+  // callTool never resolves on its own — only rejects when the passed signal
+  // aborts (exercises the per-call timeout path).
+  callHangs?: boolean;
 }
 const fakeClientFactory = (spec: FakeSpec) => {
   const stats = {
@@ -87,8 +90,13 @@ const fakeClientFactory = (spec: FakeSpec) => {
         if (spec.listToolsError) throw spec.listToolsError;
         return spec.tools;
       },
-      async callTool() {
+      async callTool(_tool, _args, signal) {
         stats.calls += 1;
+        if (spec.callHangs) {
+          return new Promise<McpCallResult>((_res, rej) => {
+            signal?.addEventListener('abort', () => rej(new Error('aborted')));
+          });
+        }
         return spec.callResult ?? { isError: false, content: 'ok' };
       },
       async close() {
@@ -989,5 +997,121 @@ describe('McpManager: stderr log path (/mcp logs + tee)', () => {
     });
     expect(mgr.logPath('../../etc/passwd')).toBeNull();
     expect(mgr.logPath('a/b')).toBeNull();
+  });
+});
+
+describe('McpManager: per-server budget (MCP.md §5)', () => {
+  test('a per-call timeout surfaces mcp.timeout, stays ACTIVE, and the connection stays reusable', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({ tools: [toolDef('query')], callHangs: true });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          budget: { timeoutMs: 40, maxCallsPerSession: 200, maxTokensInPerSession: 50_000 },
+        }),
+      ]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.timeout/);
+    expect(mgr.state('db')).toBe('active'); // §15.3: a timeout is not a transport fault
+    // The next call REUSES the live connection (a timeout doesn't tear it down);
+    // the SDK discards the aborted call's late reply by request id.
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.timeout/);
+    expect(fake.stats.connects).toBe(1); // one connect, reused across both timeouts
+    await mgr.cleanup();
+  });
+
+  test('the absolute CALL cap disconnects the server for the session', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: 'ok' },
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          budget: { timeoutMs: 30_000, maxCallsPerSession: 2, maxTokensInPerSession: 50_000 },
+        }),
+      ]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx); // 1
+    await mgr.callTool('db', 'query', {}, ctx); // 2 → at the configured cap
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.budget\.exceeded/);
+    expect(mgr.state('db')).toBe('disconnected');
+    // The cap check runs BEFORE reconnect: a capped server must not re-spawn.
+    expect(fake.stats.connects).toBe(1); // only the initial connect, none for the refused call
+    await mgr.cleanup();
+  });
+
+  test('the configured TOKEN cap disconnects the server', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: 'x'.repeat(80) }, // ~20 tokens
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          budget: { timeoutMs: 30_000, maxCallsPerSession: 200, maxTokensInPerSession: 10 },
+        }),
+      ]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx); // ~20 tokens charged > cap 10
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.budget\.exceeded/);
+    expect(mgr.state('db')).toBe('disconnected');
+    await mgr.cleanup();
+  });
+
+  test('a server that TIMES OUT every call still hits the call cap (attempts counted)', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({ tools: [toolDef('query')], callHangs: true });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          budget: { timeoutMs: 30, maxCallsPerSession: 2, maxTokensInPerSession: 50_000 },
+        }),
+      ]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.timeout/); // attempt 1
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.timeout/); // attempt 2
+    // A success would never have incremented past 0 — attempts must count, or a
+    // hanging server loops uncapped forever. The 3rd is refused by the cap.
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.budget\.exceeded/);
+    await mgr.cleanup();
+  });
+
+  test('a successful call charges the lifetime DB counters (calls + estimated tokens)', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: 'rows-and-more-rows' },
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx);
+    const row = getServer(db, 'db');
+    expect(row?.total_calls).toBe(1);
+    expect(row?.total_tokens_in ?? 0).toBeGreaterThan(0); // estimated from the result content
+    await mgr.cleanup();
   });
 });

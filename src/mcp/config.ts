@@ -16,7 +16,14 @@
 
 import { projectAgentPath, userAgentPath } from '../config/agent-paths.ts';
 import { loadTomlSection } from '../config/section.ts';
-import type { McpServerConfig, McpServerSource, McpStdioConfig } from './types.ts';
+import {
+  ABSOLUTE_MCP_BUDGET,
+  DEFAULT_MCP_BUDGET,
+  type McpServerBudget,
+  type McpServerConfig,
+  type McpServerSource,
+  type McpStdioConfig,
+} from './types.ts';
 
 export interface LoadedMcpConfig {
   servers: McpServerConfig[];
@@ -71,6 +78,34 @@ const resolveEnvVars = (
       return resolved;
     },
   );
+};
+
+// A per-server budget field (MCP.md §5): default when absent, warn + default on
+// a non-positive/non-numeric value, clamp down to the absolute cap. Floored to
+// an integer (calls/tokens are counts; ms is whole).
+const parseBudgetField = (
+  raw: unknown,
+  field: string,
+  def: number,
+  cap: number,
+  where: string,
+  warnings: string[],
+): number => {
+  if (raw === undefined) return def;
+  // Reject < 1 (not just <= 0): a fractional like 0.5 would otherwise pass and
+  // then `Math.floor` to 0 — a timeout_ms of 0 fires instantly, a cap of 0 never
+  // lets the server call.
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 1) {
+    warnings.push(`${where}: '${field}' must be a number ≥ 1; using ${def}`);
+    return def;
+  }
+  if (raw > cap) {
+    warnings.push(
+      `${where}: '${field}' (${raw}) exceeds the absolute cap ${cap}; clamped to ${cap}`,
+    );
+    return cap;
+  }
+  return Math.floor(raw);
 };
 
 const asStringArray = (value: unknown): string[] | null => {
@@ -220,12 +255,42 @@ const parseServerEntry = (
     }
   }
 
+  // Per-server budget (MCP.md §5): timeout_ms / max_calls_per_session /
+  // max_tokens_in_per_session, each defaulted + clamped to its absolute cap.
+  const budget: McpServerBudget = {
+    timeoutMs: parseBudgetField(
+      entry.timeout_ms,
+      'timeout_ms',
+      DEFAULT_MCP_BUDGET.timeoutMs,
+      ABSOLUTE_MCP_BUDGET.timeoutMs,
+      where,
+      warnings,
+    ),
+    maxCallsPerSession: parseBudgetField(
+      entry.max_calls_per_session,
+      'max_calls_per_session',
+      DEFAULT_MCP_BUDGET.maxCallsPerSession,
+      ABSOLUTE_MCP_BUDGET.maxCallsPerSession,
+      where,
+      warnings,
+    ),
+    maxTokensInPerSession: parseBudgetField(
+      entry.max_tokens_in_per_session,
+      'max_tokens_in_per_session',
+      DEFAULT_MCP_BUDGET.maxTokensInPerSession,
+      ABSOLUTE_MCP_BUDGET.maxTokensInPerSession,
+      where,
+      warnings,
+    ),
+  };
+
   return {
     name,
     enabled: !disabled,
     surface,
     transport: stdio,
     source,
+    budget,
     ...(sandbox !== undefined ? { sandbox } : {}),
     ...(network !== undefined ? { network } : {}),
   };

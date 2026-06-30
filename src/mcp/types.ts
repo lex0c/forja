@@ -66,6 +66,33 @@ export interface McpSandboxArg {
   wrap: McpSandboxWrap;
 }
 
+// Per-server budget (MCP.md §5). Resolved by the loader: defaults applied, each
+// field clamped to its absolute ceiling. These are the ENFORCED per-session caps
+// — the manager disconnects a server that crosses a count cap and bounds every
+// tools/call at `timeoutMs`. (A finer soft-warning-before-the-hard-cap tier is a
+// later slice; today the configured value IS the hard cap.)
+export interface McpServerBudget {
+  timeoutMs: number;
+  maxCallsPerSession: number;
+  maxTokensInPerSession: number;
+}
+
+// §5 "Default" column — applied when an entry omits a budget field.
+export const DEFAULT_MCP_BUDGET: McpServerBudget = {
+  timeoutMs: 30_000,
+  maxCallsPerSession: 200,
+  maxTokensInPerSession: 50_000,
+};
+
+// §5 "Cap absoluto" column — the ceiling an operator's config can't exceed. The
+// loader clamps each configured value DOWN to these (a `max_calls = 99999`
+// becomes 1000); they are not a separate enforced threshold.
+export const ABSOLUTE_MCP_BUDGET: McpServerBudget = {
+  timeoutMs: 60_000,
+  maxCallsPerSession: 1_000,
+  maxTokensInPerSession: 500_000,
+};
+
 export interface McpServerConfig {
   // [a-z0-9_]; validated by the loader. Becomes the `<server>` half of
   // every `mcp__<server>__<tool>` wire name.
@@ -88,6 +115,10 @@ export interface McpServerConfig {
   // fed to confirm/score), NOT kernel-enforced — per-host filtering is future
   // (MCP.md §2.3).
   network?: { allowHosts: readonly string[] };
+  // Per-server operational budget (MCP.md §5). Populated by the loader with
+  // defaults+clamps; `undefined` only when a McpServerConfig is built directly
+  // (tests) — the manager falls back to DEFAULT_MCP_BUDGET.
+  budget?: McpServerBudget;
 }
 
 // The 8-state lifecycle machine (STATE_MACHINE §6.5). The transition

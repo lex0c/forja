@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { projectAgentPath } from '../../src/config/agent-paths.ts';
 import { loadMcpConfig } from '../../src/mcp/config.ts';
+import { ABSOLUTE_MCP_BUDGET, DEFAULT_MCP_BUDGET } from '../../src/mcp/types.ts';
 
 let workdir: string;
 let projectPath: string;
@@ -51,6 +52,7 @@ cwd = "/work"
     expect(s.transport.args).toEqual(['--dsn', 'postgres://secret@db/app']); // $VAR resolved
     expect(s.transport.env).toEqual({ LOG_LEVEL: 'debug' });
     expect(s.transport.cwd).toBe('/work');
+    expect(s.budget).toEqual(DEFAULT_MCP_BUDGET); // no budget fields → defaults
   });
 
   test('an unset $VAR substitutes empty and warns', () => {
@@ -342,5 +344,74 @@ allow_hosts = ["api.foo.com", "api.bar.com"]
     expect(load().warnings.some((w) => w.includes("'network.allow_hosts' must be an array"))).toBe(
       true,
     );
+  });
+});
+
+describe('loadMcpConfig: per-server budget (§5)', () => {
+  test('custom budget fields are honored', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.x]
+transport = "stdio"
+command = ["bin"]
+timeout_ms = 45000
+max_calls_per_session = 500
+max_tokens_in_per_session = 120000
+`,
+    );
+    const { servers, warnings } = load();
+    expect(warnings).toEqual([]);
+    expect(servers[0]?.budget).toEqual({
+      timeoutMs: 45000,
+      maxCallsPerSession: 500,
+      maxTokensInPerSession: 120000,
+    });
+  });
+
+  test('a value over the absolute cap is clamped + warns', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.x]
+transport = "stdio"
+command = ["bin"]
+max_calls_per_session = 99999
+`,
+    );
+    const { servers, warnings } = load();
+    expect(servers[0]?.budget?.maxCallsPerSession).toBe(ABSOLUTE_MCP_BUDGET.maxCallsPerSession);
+    expect(warnings.some((w) => w.includes('max_calls_per_session') && w.includes('clamped'))).toBe(
+      true,
+    );
+  });
+
+  test('a non-numeric / non-positive budget value warns + uses the default', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.x]
+transport = "stdio"
+command = ["bin"]
+timeout_ms = "soon"
+max_calls_per_session = 0
+`,
+    );
+    const { servers, warnings } = load();
+    expect(servers[0]?.budget?.timeoutMs).toBe(DEFAULT_MCP_BUDGET.timeoutMs);
+    expect(servers[0]?.budget?.maxCallsPerSession).toBe(DEFAULT_MCP_BUDGET.maxCallsPerSession);
+    expect(warnings.some((w) => w.includes('timeout_ms'))).toBe(true);
+    expect(warnings.some((w) => w.includes('max_calls_per_session'))).toBe(true);
+  });
+
+  test('a fractional value < 1 warns + uses the default (would floor to 0)', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.x]
+transport = "stdio"
+command = ["bin"]
+timeout_ms = 0.5
+`,
+    );
+    const { servers, warnings } = load();
+    expect(servers[0]?.budget?.timeoutMs).toBe(DEFAULT_MCP_BUDGET.timeoutMs); // not floored to 0
+    expect(warnings.some((w) => w.includes('timeout_ms'))).toBe(true);
   });
 });

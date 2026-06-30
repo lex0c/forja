@@ -137,6 +137,31 @@ describe('mcp real-subprocess integration (SDK stdio + fixture echo server)', ()
     expect(mgr2.state('fixture')).toBe('trusted');
     await mgr2.cleanup();
   });
+
+  test('enforces the per-server call budget over real pipes (disconnects at the cap)', async () => {
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          budget: { timeoutMs: 30_000, maxCallsPerSession: 2, maxTokensInPerSession: 500_000 },
+        }),
+      ]),
+      autoApprove: new Set(['fixture']),
+    });
+    try {
+      await mgr.init();
+      expect((await mgr.callTool('fixture', 'echo', { text: 'a' }, ctx)).content).toBe('echo:a');
+      expect((await mgr.callTool('fixture', 'echo', { text: 'b' }, ctx)).content).toBe('echo:b');
+      // Third call crosses the cap → disconnected for the session.
+      await expect(mgr.callTool('fixture', 'echo', { text: 'c' }, ctx)).rejects.toThrow(
+        /mcp\.budget\.exceeded/,
+      );
+      expect(mgr.state('fixture')).toBe('disconnected');
+    } finally {
+      await mgr.cleanup();
+    }
+  });
 });
 
 const bwrapAvailable = process.platform === 'linux' && Bun.which('bwrap') !== null;
