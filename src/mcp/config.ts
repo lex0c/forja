@@ -10,19 +10,22 @@
 // Fail-soft like the config.toml loaders: a malformed file / entry emits a
 // warning and is skipped; it never aborts boot.
 //
-// The file's top-level table is `[servers.<name>]`, so we reuse the
-// generic `loadTomlSection(path, 'servers', …)` reader. Slice 1 supports
-// stdio only — sse/http entries are skipped with a warning until slice 2.
+// The file's top-level table is `[servers.<name>]`, so we reuse the generic
+// `loadTomlSection(path, 'servers', …)` reader. `transport` is "stdio" (a
+// spawned subprocess) or "sse"/"http" (a remote endpoint at `url`, with optional
+// env-bearer `auth`); OAuth auth is a later slice.
 
 import { projectAgentPath, userAgentPath } from '../config/agent-paths.ts';
 import { loadTomlSection } from '../config/section.ts';
 import {
   ABSOLUTE_MCP_BUDGET,
   DEFAULT_MCP_BUDGET,
+  type McpRemoteConfig,
   type McpServerBudget,
   type McpServerConfig,
   type McpServerSource,
   type McpStdioConfig,
+  type McpTransportConfig,
 } from './types.ts';
 
 export interface LoadedMcpConfig {
@@ -114,8 +117,88 @@ const asStringArray = (value: unknown): string[] | null => {
   return value as string[];
 };
 
+// Resolve `auth = { kind = "bearer", env = "TOKEN" }` into the Authorization
+// header value. Only env-bearer in this slice (OAuth's authProvider is later).
+// The TOKEN comes from the session env, NEVER from config; an unset var warns +
+// sends no header (the server decides if that's a 401).
+const parseAuthHeader = (
+  raw: unknown,
+  env: NodeJS.ProcessEnv,
+  where: string,
+  warnings: string[],
+): string | undefined => {
+  if (raw === undefined) return undefined;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    warnings.push(`${where}: 'auth' must be a table; ignored`);
+    return undefined;
+  }
+  const auth = raw as Record<string, unknown>;
+  if (auth.kind !== 'bearer') {
+    warnings.push(
+      `${where}: only auth.kind = "bearer" is supported (OAuth is a later slice); ignored`,
+    );
+    return undefined;
+  }
+  if (typeof auth.env !== 'string' || auth.env.length === 0) {
+    warnings.push(`${where}: bearer auth needs 'env' (the env var holding the token); ignored`);
+    return undefined;
+  }
+  const token = env[auth.env];
+  // Reject empty AND whitespace-only tokens — a `Bearer    ` header is just a
+  // silent 401 the operator would have to debug at first call.
+  if (token === undefined || token.trim() === '') {
+    warnings.push(
+      `${where}: bearer token env var $${auth.env} is not set or blank; sending no Authorization header`,
+    );
+    return undefined;
+  }
+  return `Bearer ${token}`;
+};
+
+// Parse an sse/http `[servers.<name>]` entry into a remote transport config.
+// `url` is required + $VAR-resolved + must be http(s). Returns null (skip) on a
+// missing/invalid URL.
+const parseRemoteTransport = (
+  transport: 'sse' | 'http',
+  entry: Record<string, unknown>,
+  env: NodeJS.ProcessEnv,
+  where: string,
+  warnings: string[],
+): McpRemoteConfig | null => {
+  if (typeof entry.url !== 'string' || entry.url.length === 0) {
+    warnings.push(`${where}: a '${transport}' server needs a non-empty 'url' string; skipped`);
+    return null;
+  }
+  const resolvedUrl = resolveEnvVars(entry.url, env, warnings, `${where} url`);
+  let parsed: URL;
+  try {
+    parsed = new URL(resolvedUrl);
+  } catch {
+    warnings.push(`${where}: 'url' is not a valid URL; skipped`);
+    return null;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    warnings.push(`${where}: 'url' must be http(s) (got '${parsed.protocol}'); skipped`);
+    return null;
+  }
+  // Credentials embedded in the URL (`user:pass@host`, incl. a $VAR-resolved
+  // secret) would persist to mcp_servers.url in plaintext. Reject them — the
+  // token belongs in `auth = { kind = "bearer", env = "…" }`, which resolves at
+  // load and never persists.
+  if (parsed.username !== '' || parsed.password !== '') {
+    warnings.push(
+      `${where}: 'url' must not embed credentials (user:pass@) — use auth = { kind = "bearer", env = "…" }; skipped`,
+    );
+    return null;
+  }
+  const remote: McpRemoteConfig = { transport, url: parsed.toString() };
+  const authHeader = parseAuthHeader(entry.auth, env, where, warnings);
+  if (authHeader !== undefined) remote.authHeader = authHeader;
+  return remote;
+};
+
 // Parse one `[servers.<name>]` entry. Returns null (with a warning) when
-// the entry is unusable in this slice; the loader skips it.
+// the entry is unusable; the loader skips it.
 const parseServerEntry = (
   name: string,
   raw: unknown,
@@ -138,74 +221,111 @@ const parseServerEntry = (
   const entry = raw as Record<string, unknown>;
 
   const transport = entry.transport;
-  if (transport !== 'stdio') {
-    if (transport === 'sse' || transport === 'http') {
+  let transportConfig: McpTransportConfig;
+  let sandbox: boolean | undefined;
+  let network: { allowHosts: readonly string[] } | undefined;
+
+  if (transport === 'sse' || transport === 'http') {
+    const remote = parseRemoteTransport(transport, entry, env, where, warnings);
+    if (remote === null) return null;
+    transportConfig = remote;
+    if (entry.sandbox !== undefined || entry.network !== undefined) {
       warnings.push(
-        `${where}: transport '${transport}' is not supported yet (stdio only); skipped`,
+        `${where}: 'sandbox' / 'network' do not apply to a remote server (no subprocess); ignored`,
       );
-    } else {
-      warnings.push(`${where}: missing or invalid transport (expected 'stdio'); skipped`);
     }
-    return null;
-  }
-
-  const command = asStringArray(entry.command);
-  if (command === null || command.length === 0) {
-    warnings.push(`${where}: 'command' must be a non-empty array of strings; skipped`);
-    return null;
-  }
-  const resolvedArgv = command.map((part) => resolveEnvVars(part, env, warnings, where));
-  const head = resolvedArgv[0];
-  if (head === undefined || head === '') {
-    // Empty includes the unset-`$VAR` case (`["$BIN"]` with BIN unset resolves
-    // to `""`) — skip cleanly at load instead of failing later at spawn.
-    warnings.push(`${where}: 'command' resolves to an empty executable; skipped`);
-    return null;
-  }
-
-  const stdio: McpStdioConfig = {
-    transport: 'stdio',
-    command: head,
-    args: resolvedArgv.slice(1),
-    // The unresolved argv, for redacted persistence + command-change trust.
-    rawArgv: command,
-  };
-
-  // Optional env table (string → string), $VAR-resolved.
-  if (entry.env !== undefined) {
-    if (entry.env === null || typeof entry.env !== 'object' || Array.isArray(entry.env)) {
-      warnings.push(`${where}: 'env' must be a table; ignored`);
-    } else {
-      const out: Record<string, string> = {};
-      for (const [k, v] of Object.entries(entry.env as Record<string, unknown>)) {
-        if (typeof v !== 'string') {
-          warnings.push(`${where}: env.${k} must be a string; ignored`);
-          continue;
-        }
-        out[k] = resolveEnvVars(v, env, warnings, `${where} env.${k}`);
-      }
-      stdio.env = out;
+  } else if (transport === 'stdio') {
+    const command = asStringArray(entry.command);
+    if (command === null || command.length === 0) {
+      warnings.push(`${where}: 'command' must be a non-empty array of strings; skipped`);
+      return null;
     }
-  }
-
-  if (entry.cwd !== undefined) {
-    if (typeof entry.cwd !== 'string') {
-      warnings.push(`${where}: 'cwd' must be a string; ignored`);
-    } else {
-      const resolvedCwd = resolveEnvVars(entry.cwd, env, warnings, `${where} cwd`);
-      // An unset `$VAR` resolves to '' — forwarding `cwd: ''` to the spawn is an
-      // invalid working directory (ENOENT); drop it (run in the session cwd).
-      if (resolvedCwd === '') {
-        warnings.push(`${where}: 'cwd' resolves to an empty path; ignored`);
+    const resolvedArgv = command.map((part) => resolveEnvVars(part, env, warnings, where));
+    const head = resolvedArgv[0];
+    if (head === undefined || head === '') {
+      // Empty includes the unset-`$VAR` case (`["$BIN"]` with BIN unset resolves
+      // to `""`) — skip cleanly at load instead of failing later at spawn.
+      warnings.push(`${where}: 'command' resolves to an empty executable; skipped`);
+      return null;
+    }
+    const stdio: McpStdioConfig = {
+      transport: 'stdio',
+      command: head,
+      args: resolvedArgv.slice(1),
+      // The unresolved argv, for redacted persistence + command-change trust.
+      rawArgv: command,
+    };
+    // Optional env table (string → string), $VAR-resolved.
+    if (entry.env !== undefined) {
+      if (entry.env === null || typeof entry.env !== 'object' || Array.isArray(entry.env)) {
+        warnings.push(`${where}: 'env' must be a table; ignored`);
       } else {
-        stdio.cwd = resolvedCwd;
+        const out: Record<string, string> = {};
+        for (const [k, v] of Object.entries(entry.env as Record<string, unknown>)) {
+          if (typeof v !== 'string') {
+            warnings.push(`${where}: env.${k} must be a string; ignored`);
+            continue;
+          }
+          out[k] = resolveEnvVars(v, env, warnings, `${where} env.${k}`);
+        }
+        stdio.env = out;
       }
     }
+    if (entry.cwd !== undefined) {
+      if (typeof entry.cwd !== 'string') {
+        warnings.push(`${where}: 'cwd' must be a string; ignored`);
+      } else {
+        const resolvedCwd = resolveEnvVars(entry.cwd, env, warnings, `${where} cwd`);
+        // An unset `$VAR` resolves to '' — `cwd: ''` is an invalid working dir
+        // (ENOENT); drop it (run in the session cwd).
+        if (resolvedCwd === '') {
+          warnings.push(`${where}: 'cwd' resolves to an empty path; ignored`);
+        } else {
+          stdio.cwd = resolvedCwd;
+        }
+      }
+    }
+    transportConfig = stdio;
+
+    // Sandbox + network apply only to a SPAWNED (stdio) server (MCP.md §2.3):
+    // sandbox = default-on when a tool is available, `false` opts out; a non-
+    // empty network.allow_hosts grants network (advisory — bwrap is all-or-
+    // nothing, not kernel-enforced).
+    if (entry.sandbox !== undefined) {
+      if (typeof entry.sandbox === 'boolean') {
+        sandbox = entry.sandbox;
+      } else {
+        warnings.push(
+          `${where}: 'sandbox' must be a boolean; using the default (on when available)`,
+        );
+      }
+    }
+    if (entry.network !== undefined) {
+      if (
+        entry.network === null ||
+        typeof entry.network !== 'object' ||
+        Array.isArray(entry.network)
+      ) {
+        warnings.push(`${where}: 'network' must be a table; ignored`);
+      } else {
+        const hosts = asStringArray((entry.network as Record<string, unknown>).allow_hosts);
+        if (hosts === null) {
+          warnings.push(`${where}: 'network.allow_hosts' must be an array of strings; ignored`);
+        } else if (hosts.length > 0) {
+          network = { allowHosts: hosts };
+        }
+      }
+    }
+  } else {
+    warnings.push(
+      `${where}: missing or invalid transport (expected 'stdio' / 'sse' / 'http'); skipped`,
+    );
+    return null;
   }
 
   // Forja-native: which model surface the server's tools sit on. Default
-  // 'deferred' (reached via tool_search) so a many-tool server doesn't
-  // bloat the base surface.
+  // 'deferred' (reached via tool_search) so a many-tool server doesn't bloat the
+  // base surface.
   let surface: McpServerConfig['surface'] = 'deferred';
   if (entry.surface !== undefined) {
     if (entry.surface === 'base' || entry.surface === 'deferred') {
@@ -216,44 +336,11 @@ const parseServerEntry = (
   }
 
   if (entry.disabled !== undefined && typeof entry.disabled !== 'boolean') {
-    // A quoted bool (`disabled = "true"`) is a common TOML slip; without this
-    // it would silently stay enabled, dropping the operator's disable intent.
+    // A quoted bool (`disabled = "true"`) is a common TOML slip; without this it
+    // would silently stay enabled, dropping the operator's disable intent.
     warnings.push(`${where}: 'disabled' must be a boolean; treating as not disabled`);
   }
   const disabled = entry.disabled === true;
-
-  // Sandbox posture (MCP.md §2.3): default-on when a sandbox tool is available;
-  // `false` is an explicit opt-out. A non-boolean warns and falls back to the
-  // default.
-  let sandbox: boolean | undefined;
-  if (entry.sandbox !== undefined) {
-    if (typeof entry.sandbox === 'boolean') {
-      sandbox = entry.sandbox;
-    } else {
-      warnings.push(`${where}: 'sandbox' must be a boolean; using the default (on when available)`);
-    }
-  }
-
-  // Network allowlist ([servers.<name>.network] allow_hosts). A non-empty list
-  // grants the server network — bwrap is all-or-nothing, so the hosts are
-  // advisory (surfaced in trust + audit), NOT kernel-enforced (MCP.md §2.3).
-  let network: { allowHosts: readonly string[] } | undefined;
-  if (entry.network !== undefined) {
-    if (
-      entry.network === null ||
-      typeof entry.network !== 'object' ||
-      Array.isArray(entry.network)
-    ) {
-      warnings.push(`${where}: 'network' must be a table; ignored`);
-    } else {
-      const hosts = asStringArray((entry.network as Record<string, unknown>).allow_hosts);
-      if (hosts === null) {
-        warnings.push(`${where}: 'network.allow_hosts' must be an array of strings; ignored`);
-      } else if (hosts.length > 0) {
-        network = { allowHosts: hosts };
-      }
-    }
-  }
 
   // Per-server budget (MCP.md §5): timeout_ms / max_calls_per_session /
   // max_tokens_in_per_session, each defaulted + clamped to its absolute cap.
@@ -288,7 +375,7 @@ const parseServerEntry = (
     name,
     enabled: !disabled,
     surface,
-    transport: stdio,
+    transport: transportConfig,
     source,
     budget,
     ...(sandbox !== undefined ? { sandbox } : {}),

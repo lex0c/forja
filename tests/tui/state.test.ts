@@ -2712,7 +2712,7 @@ describe('mcp-trust:ask reducer', () => {
     mode: 'first-visit' | 'drift';
     server?: string;
     command?: string;
-    sandbox?: 'sandboxed' | 'sandboxed-net' | 'opt-out' | 'unavailable';
+    sandbox?: 'sandboxed' | 'sandboxed-net' | 'opt-out' | 'unavailable' | 'remote';
     tools?: readonly { name: string; description: string; writes: boolean }[];
     manifestHash?: string;
   }): UIEvent => ({
@@ -2826,11 +2826,14 @@ describe('mcp-trust:ask reducer', () => {
   });
 
   test('shows the sandbox posture; both unsandboxed states warn', () => {
-    const cases: Array<['sandboxed' | 'sandboxed-net' | 'opt-out' | 'unavailable', string]> = [
+    const cases: Array<
+      ['sandboxed' | 'sandboxed-net' | 'opt-out' | 'unavailable' | 'remote', string]
+    > = [
       ['sandboxed', 'sandbox: ON (cwd-rw, no network)'],
       ['sandboxed-net', 'sandbox: ON + network'],
       ['opt-out', '⚠ sandbox: OFF (operator opt-out)'],
       ['unavailable', '⚠ sandbox: OFF (no sandbox tool available)'],
+      ['remote', '⚠ remote endpoint — network egress, no sandbox'],
     ];
     for (const [status, expected] of cases) {
       const r = applyEvent(

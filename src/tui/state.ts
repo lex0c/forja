@@ -2177,7 +2177,9 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             ? 'sandbox: ON + network (allowlist advisory — NOT host-filtered)'
             : event.sandbox === 'opt-out'
               ? '⚠ sandbox: OFF (operator opt-out) — full host access'
-              : '⚠ sandbox: OFF (no sandbox tool available) — full host access';
+              : event.sandbox === 'remote'
+                ? '⚠ remote endpoint — network egress, no sandbox (every call is confirmed)'
+                : '⚠ sandbox: OFF (no sandbox tool available) — full host access';
 
       const MAX_LIST = 8;
       const visible = event.tools.slice(0, MAX_LIST);

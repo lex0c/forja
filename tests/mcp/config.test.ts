@@ -4,7 +4,27 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { projectAgentPath } from '../../src/config/agent-paths.ts';
 import { loadMcpConfig } from '../../src/mcp/config.ts';
-import { ABSOLUTE_MCP_BUDGET, DEFAULT_MCP_BUDGET } from '../../src/mcp/types.ts';
+import {
+  ABSOLUTE_MCP_BUDGET,
+  DEFAULT_MCP_BUDGET,
+  type McpRemoteConfig,
+  type McpServerConfig,
+  type McpStdioConfig,
+} from '../../src/mcp/types.ts';
+
+// Narrow the transport union (a wrong-kind parse is a test bug, so throw).
+const stdio = (s: McpServerConfig | undefined): McpStdioConfig => {
+  if (s === undefined || s.transport.transport !== 'stdio') {
+    throw new Error('expected a stdio transport');
+  }
+  return s.transport;
+};
+const remote = (s: McpServerConfig | undefined): McpRemoteConfig => {
+  if (s === undefined || s.transport.transport === 'stdio') {
+    throw new Error('expected a remote transport');
+  }
+  return s.transport;
+};
 
 let workdir: string;
 let projectPath: string;
@@ -48,10 +68,10 @@ cwd = "/work"
     expect(s.enabled).toBe(true);
     expect(s.surface).toBe('deferred'); // default
     expect(s.source).toBe('project_shared');
-    expect(s.transport.command).toBe('mcp-server-postgres');
-    expect(s.transport.args).toEqual(['--dsn', 'postgres://secret@db/app']); // $VAR resolved
-    expect(s.transport.env).toEqual({ LOG_LEVEL: 'debug' });
-    expect(s.transport.cwd).toBe('/work');
+    expect(stdio(s).command).toBe('mcp-server-postgres');
+    expect(stdio(s).args).toEqual(['--dsn', 'postgres://secret@db/app']); // $VAR resolved
+    expect(stdio(s).env).toEqual({ LOG_LEVEL: 'debug' });
+    expect(stdio(s).cwd).toBe('/work');
     expect(s.budget).toEqual(DEFAULT_MCP_BUDGET); // no budget fields → defaults
   });
 
@@ -64,7 +84,7 @@ command = ["bin", "$MISSING_VAR"]
 `,
     );
     const { servers, warnings } = load();
-    expect(servers[0]?.transport.args).toEqual(['']);
+    expect(stdio(servers[0]).args).toEqual(['']);
     expect(warnings.some((w) => w.includes('$MISSING_VAR'))).toBe(true);
   });
 
@@ -102,19 +122,6 @@ surface = "weird"
 });
 
 describe('loadMcpConfig: skip + warn on unusable entries', () => {
-  test('sse/http transport is skipped with a not-supported-yet warning', () => {
-    writeFileSync(
-      projectPath,
-      `[servers.remote]
-transport = "sse"
-url = "https://example.com/mcp"
-`,
-    );
-    const { servers, warnings } = load();
-    expect(servers).toHaveLength(0);
-    expect(warnings.some((w) => w.includes('not supported yet'))).toBe(true);
-  });
-
   test('an invalid server name is skipped', () => {
     writeFileSync(
       projectPath,
@@ -166,8 +173,8 @@ command = ["bin", "--dsn", "\${DATABASE_URL}"]
     );
     const s = load().servers[0];
     if (!s) throw new Error('expected one server');
-    expect(s.transport.rawArgv).toEqual(['bin', '--dsn', '${DATABASE_URL}']); // never the secret
-    expect(s.transport.args).toEqual(['--dsn', 'postgres://secret@db/app']); // resolved for spawn
+    expect(stdio(s).rawArgv).toEqual(['bin', '--dsn', '${DATABASE_URL}']); // never the secret
+    expect(stdio(s).args).toEqual(['--dsn', 'postgres://secret@db/app']); // resolved for spawn
   });
 });
 
@@ -196,7 +203,7 @@ command = ["local-bin"]
     );
     const { servers, warnings } = load({ userPathOverride: userPath });
     expect(servers).toHaveLength(1);
-    expect(servers[0]?.transport.command).toBe('local-bin');
+    expect(stdio(servers[0]).command).toBe('local-bin');
     expect(servers[0]?.source).toBe('project_local');
     expect(warnings.filter((w) => w.includes('redefined')).length).toBe(2);
   });
@@ -260,7 +267,7 @@ cwd = "$WORKDIR"
 `,
     );
     const { servers, warnings } = load();
-    expect(servers[0]?.transport.cwd).toBeUndefined();
+    expect(stdio(servers[0]).cwd).toBeUndefined();
     expect(warnings.some((w) => w.includes("'cwd' resolves to an empty path"))).toBe(true);
   });
 
@@ -274,7 +281,7 @@ cwd = 123
 `,
     );
     const { servers, warnings } = load();
-    expect(servers[0]?.transport.cwd).toBeUndefined();
+    expect(stdio(servers[0]).cwd).toBeUndefined();
     expect(warnings.some((w) => w.includes("'cwd' must be a string"))).toBe(true);
   });
 
@@ -413,5 +420,104 @@ timeout_ms = 0.5
     const { servers, warnings } = load();
     expect(servers[0]?.budget?.timeoutMs).toBe(DEFAULT_MCP_BUDGET.timeoutMs); // not floored to 0
     expect(warnings.some((w) => w.includes('timeout_ms'))).toBe(true);
+  });
+});
+
+describe('loadMcpConfig: remote transport (sse / http)', () => {
+  test('an sse server parses into a remote transport with its URL', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.gh]
+transport = "sse"
+url = "https://mcp.example.com/v1"
+`,
+    );
+    const { servers, warnings } = load();
+    expect(warnings).toEqual([]);
+    expect(servers).toHaveLength(1);
+    const t = remote(servers[0]);
+    expect(t.transport).toBe('sse');
+    expect(t.url).toBe('https://mcp.example.com/v1');
+    expect(t.authHeader).toBeUndefined();
+  });
+
+  test('an http (streamable) server + env-bearer auth resolves the Authorization header', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.gh]
+transport = "http"
+url = "https://mcp.example.com/v1"
+auth = { kind = "bearer", env = "DATABASE_URL" }
+`,
+    );
+    const { servers, warnings } = load(); // env.DATABASE_URL is set in the fixture
+    expect(warnings).toEqual([]);
+    const t = remote(servers[0]);
+    expect(t.transport).toBe('http');
+    expect(t.authHeader).toBe('Bearer postgres://secret@db/app'); // resolved from env, never persisted
+  });
+
+  test('an unset bearer env var warns + sends no header', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.gh]
+transport = "sse"
+url = "https://mcp.example.com/v1"
+auth = { kind = "bearer", env = "NOPE_MISSING" }
+`,
+    );
+    const { servers, warnings } = load();
+    expect(remote(servers[0]).authHeader).toBeUndefined();
+    expect(warnings.some((w) => w.includes('NOPE_MISSING') && w.includes('not set'))).toBe(true);
+  });
+
+  test('a missing or non-http(s) url is skipped', () => {
+    writeFileSync(projectPath, `[servers.a]\ntransport = "sse"\n`); // no url
+    expect(load().servers).toHaveLength(0);
+    writeFileSync(projectPath, `[servers.b]\ntransport = "http"\nurl = "ftp://x/y"\n`);
+    const { servers, warnings } = load();
+    expect(servers).toHaveLength(0);
+    expect(warnings.some((w) => w.includes('http(s)'))).toBe(true);
+  });
+
+  test('a url with embedded credentials (user:pass@) is rejected — keep the token in auth.env', () => {
+    // A literal secret, or a $VAR that resolves to one, must not land in the
+    // persisted url. Both hit the same parsed.username/password gate.
+    writeFileSync(
+      projectPath,
+      `[servers.gh]\ntransport = "http"\nurl = "https://user:s3cret@mcp.example.com/v1"\n`,
+    );
+    const { servers, warnings } = load();
+    expect(servers).toHaveLength(0);
+    expect(warnings.some((w) => w.includes('must not embed credentials'))).toBe(true);
+  });
+
+  test('a blank (whitespace-only) bearer token warns + sends no header', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.gh]\ntransport = "sse"\nurl = "https://mcp.example.com/v1"\nauth = { kind = "bearer", env = "BLANK_TOKEN" }\n`,
+    );
+    const { servers, warnings } = loadMcpConfig({
+      cwd: workdir,
+      env: { ...env, BLANK_TOKEN: '   ' } as NodeJS.ProcessEnv,
+      userPathOverride: null,
+    });
+    expect(remote(servers[0]).authHeader).toBeUndefined();
+    expect(warnings.some((w) => w.includes('BLANK_TOKEN') && w.includes('blank'))).toBe(true);
+  });
+
+  test('sandbox / network on a remote server warn (not applicable, no subprocess)', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.gh]
+transport = "sse"
+url = "https://mcp.example.com/v1"
+sandbox = false
+`,
+    );
+    const { servers, warnings } = load();
+    expect(servers).toHaveLength(1);
+    expect(servers[0]?.sandbox).toBeUndefined();
+    expect(warnings.some((w) => w.includes('do not apply to a remote server'))).toBe(true);
   });
 });

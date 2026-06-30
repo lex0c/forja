@@ -12,16 +12,24 @@ import { chmodSync, createWriteStream, mkdirSync, openSync, renameSync } from 'n
 import { dirname } from 'node:path';
 import type { Readable } from 'node:stream';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { ProviderToolInputSchema } from '../providers/types.ts';
 import type {
   McpCallResult,
   McpClient,
   McpManifestTool,
+  McpRemoteConfig,
   McpSandboxArg,
   McpStdioConfig,
   McpToolMeta,
+  McpTransportConfig,
 } from './types.ts';
+
+// The SDK Transport type, lifted from Client.connect's first parameter so we
+// don't depend on the SDK's internal module path for it.
+type SdkTransport = Parameters<Client['connect']>[0];
 
 // Sent to the server in `initialize`. Cosmetic (the server logs it); not
 // load-bearing.
@@ -230,58 +238,23 @@ export const teeStderr = (stderr: Readable, logPath: string | undefined): Promis
     stderr.on('close', finish);
   });
 
-export const createStdioMcpClient = (
-  cfg: McpStdioConfig,
-  sandbox?: McpSandboxArg,
-  stderrLogPath?: string,
-): McpClient => {
+// Shared adapter over the SDK `Client`. The TRANSPORT is built by `makeTransport`
+// (stdio spawns the child + tees its stderr; remote opens the HTTP/SSE
+// connection); everything below — the handshake wrapper, listTools/callTool with
+// defensive narrowing, close — is identical across transports.
+const sdkClientFrom = (makeTransport: () => SdkTransport): McpClient => {
   let client: Client | null = null;
 
   return {
     async connect(signal) {
-      // When sandboxed (MCP.md §2.3), wrap the server's argv in bwrap /
-      // sandbox-exec. The wrap returns the inner argv unchanged on host /
-      // graceful-degrade and THROWS on fail-closed (tool present at boot, gone
-      // now). Done here, inside connect(), so the throw lands in the manager's
-      // connect try (→ error state / reaped child) rather than crashing boot.
-      const inner = [cfg.command, ...(cfg.args ?? [])];
-      const spawnArgv =
-        sandbox !== undefined && sandbox.profile !== 'host'
-          ? sandbox.wrap({
-              profile: sandbox.profile,
-              cwd: cfg.cwd ?? process.cwd(),
-              innerArgv: inner,
-              env: process.env,
-              // The server's declared env survives the sandbox's --clearenv.
-              ...(cfg.env !== undefined ? { passthroughEnv: { ...cfg.env } } : {}),
-            })
-          : inner;
-      const [spawnCommand = cfg.command, ...spawnArgs] = spawnArgv;
-      const transport = new StdioClientTransport({
-        command: spawnCommand,
-        args: spawnArgs,
-        env: buildSpawnEnv(cfg.env),
-        ...(cfg.cwd !== undefined ? { cwd: cfg.cwd } : {}),
-        // Capture the server's stderr instead of letting it bleed into the
-        // agent's stderr (NDJSON in --json mode); tee'd to mcp-<name>.log below.
-        stderr: 'pipe',
-      });
-      // Drain + tee the child's stderr BEFORE connecting. The SDK exposes its
-      // stderr PassThrough right after construction (the child is spawned inside
-      // c.connect → transport.start), so attaching here — not after the
-      // handshake — (a) captures the stderr of a server that DIES during
-      // `initialize` (the crash reason `/mcp logs` exists to surface), and
-      // (b) keeps the pipe drained through the handshake so a chatty server
-      // can't back up its stderr buffer and deadlock mid-connect.
-      const errStream = (transport as { stderr?: Readable | null }).stderr;
-      if (errStream != null) void teeStderr(errStream, stderrLogPath);
+      const transport = makeTransport();
       const c = new Client(CLIENT_INFO, { capabilities: {} });
       try {
-        // Wire the abort signal so a hung `initialize` (slow / malicious
-        // server) unwinds on user-cancel or a hard budget abort.
+        // Wire the abort signal so a hung `initialize` (slow / malicious server)
+        // unwinds on user-cancel or a hard budget abort.
         await c.connect(transport, signal ? { signal } : undefined);
       } catch (err) {
-        // Close on failure so the spawned child process is reaped when the
+        // Close on failure so a spawned child / open socket is reaped when the
         // handshake throws (timeout / protocol error / abort) — otherwise the
         // adapter's `client` stays null and `close()` would no-op, leaking it.
         await c.close().catch(() => {});
@@ -346,3 +319,78 @@ export const createStdioMcpClient = (
     },
   };
 };
+
+export const createStdioMcpClient = (
+  cfg: McpStdioConfig,
+  sandbox?: McpSandboxArg,
+  stderrLogPath?: string,
+): McpClient =>
+  sdkClientFrom(() => {
+    // When sandboxed (MCP.md §2.3), wrap the server's argv in bwrap /
+    // sandbox-exec. The wrap returns the inner argv unchanged on host /
+    // graceful-degrade and THROWS on fail-closed (tool present at boot, gone
+    // now) — the throw propagates out of connect() to the manager.
+    const inner = [cfg.command, ...(cfg.args ?? [])];
+    const spawnArgv =
+      sandbox !== undefined && sandbox.profile !== 'host'
+        ? sandbox.wrap({
+            profile: sandbox.profile,
+            cwd: cfg.cwd ?? process.cwd(),
+            innerArgv: inner,
+            env: process.env,
+            // The server's declared env survives the sandbox's --clearenv.
+            ...(cfg.env !== undefined ? { passthroughEnv: { ...cfg.env } } : {}),
+          })
+        : inner;
+    const [spawnCommand = cfg.command, ...spawnArgs] = spawnArgv;
+    const transport = new StdioClientTransport({
+      command: spawnCommand,
+      args: spawnArgs,
+      env: buildSpawnEnv(cfg.env),
+      ...(cfg.cwd !== undefined ? { cwd: cfg.cwd } : {}),
+      // Capture the server's stderr instead of letting it bleed into the agent's
+      // stderr (NDJSON in --json mode); tee'd to mcp-<name>.log.
+      stderr: 'pipe',
+    });
+    // Attach the stderr drain BEFORE connecting. The SDK exposes the PassThrough
+    // at construction (the child is spawned inside c.connect → transport.start),
+    // so this (a) captures the stderr of a server that DIES during `initialize`
+    // (the crash reason `/mcp logs` exists to surface), and (b) keeps the pipe
+    // drained through the handshake so a chatty server can't deadlock mid-connect.
+    const errStream = (transport as { stderr?: Readable | null }).stderr;
+    if (errStream != null) void teeStderr(errStream, stderrLogPath);
+    return transport;
+  });
+
+// A REMOTE server (no subprocess, no sandbox, no stderr — MCP.md §2.2). The
+// env-resolved bearer header (if any) rides every request via `requestInit`;
+// OAuth (`authProvider`) is a later slice. 'http' = streamable-HTTP, 'sse' =
+// legacy SSE.
+export const createRemoteMcpClient = (cfg: McpRemoteConfig): McpClient =>
+  sdkClientFrom(() => {
+    const url = new URL(cfg.url);
+    const opts =
+      cfg.authHeader !== undefined
+        ? { requestInit: { headers: { Authorization: cfg.authHeader } } }
+        : undefined;
+    const transport =
+      cfg.transport === 'sse'
+        ? new SSEClientTransport(url, opts)
+        : new StreamableHTTPClientTransport(url, opts);
+    // The SDK's remote transports type `sessionId` as `string | undefined`,
+    // which trips exactOptionalPropertyTypes against the Transport interface's
+    // `sessionId?: string`. They are the SDK's own transports + work with
+    // c.connect at runtime, so the variance is a bundled-types nit.
+    return transport as SdkTransport;
+  });
+
+// Dispatch on the transport kind — the single factory the manager calls. stdio
+// threads the sandbox + stderr-log path; remote ignores them.
+export const createMcpClient = (
+  cfg: McpTransportConfig,
+  sandbox?: McpSandboxArg,
+  stderrLogPath?: string,
+): McpClient =>
+  cfg.transport === 'stdio'
+    ? createStdioMcpClient(cfg, sandbox, stderrLogPath)
+    : createRemoteMcpClient(cfg);

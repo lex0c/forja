@@ -43,4 +43,12 @@ describe('permission engine: mcp category', () => {
     const d = eng.check('mcp__proxy__fetch', 'mcp.egress', { url: 'https://x' });
     expect(d.kind).toBe('confirm');
   });
+
+  test('autonomous does NOT auto-approve an mcp.egress tool — a remote server can exfil', () => {
+    // The autonomous posture flips ordinary policy confirms to allow, but egress
+    // is exempt (categoryIsEgress) — a remote MCP server's every call stays seen.
+    const eng = createPermissionEngine(policy(), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('mcp__proxy__fetch', 'mcp.egress', { url: 'https://x' });
+    expect(d.kind).toBe('confirm');
+  });
 });

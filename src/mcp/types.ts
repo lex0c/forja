@@ -4,8 +4,8 @@
 // factory, manager) without dragging the SDK or a policy dependency in.
 //
 // The single SDK boundary is src/mcp/client.ts, which implements the
-// `McpClient` interface declared here. Per-transport adapters (stdio now;
-// sse/http in slice 2) all satisfy this same interface.
+// `McpClient` interface declared here. Per-transport adapters (stdio + remote
+// sse/http) all satisfy this same interface.
 
 import type { ProviderToolInputSchema } from '../providers/types.ts';
 
@@ -13,9 +13,6 @@ import type { ProviderToolInputSchema } from '../providers/types.ts';
 // project > user) and the audit `source` column. Matches the AUDIT §1.5
 // vocabulary.
 export type McpServerSource = 'user' | 'project_shared' | 'project_local';
-
-// v1 ships stdio only; slice 2 widens this union to 'sse' | 'http'.
-export type McpTransportKind = 'stdio';
 
 export interface McpStdioConfig {
   transport: 'stdio';
@@ -34,6 +31,28 @@ export interface McpStdioConfig {
   cwd?: string;
 }
 
+// A REMOTE MCP server (MCP.md §2.2): no subprocess, no sandbox — the transport
+// is an HTTP connection to `url`, so the tools are inherently EGRESS (the
+// `mcp.egress` permission category). 'http' is streamable-HTTP (the modern
+// transport); 'sse' is the legacy server-sent-events transport. Both go through
+// the same `McpClient` via the SDK.
+export interface McpRemoteConfig {
+  transport: 'sse' | 'http';
+  // The endpoint URL. The trust identity for a remote server (a URL change
+  // forces a re-trust, the way a stdio command change does). Persisted to
+  // mcp_servers.url; shown in the trust modal — it is what the operator
+  // authorizes connecting to.
+  url: string;
+  // Resolved Authorization header value (e.g. `Bearer <token>`) from
+  // `auth = { kind = "bearer", env = "X" }`. Resolved at load from the session
+  // env — the TOKEN never persists (only the env-var NAME is in mcp.toml).
+  // OAuth (`authProvider`) is a separate, later slice.
+  authHeader?: string;
+}
+
+// What the manager spawns/connects. Discriminated by `transport`.
+export type McpTransportConfig = McpStdioConfig | McpRemoteConfig;
+
 // The sandbox profiles the MCP layer uses — a SUBSET of the permission engine's
 // SandboxProfile, kept as a local union so this leaf module imports no policy
 // dependency (the values match, so they interop at the bootstrap boundary).
@@ -43,8 +62,11 @@ export type McpSandboxProfile = 'host' | 'cwd-rw' | 'cwd-rw-net';
 // The effective sandbox posture of a server, for the trust modal. 'sandboxed' =
 // confined, no network; 'sandboxed-net' = confined + network (advisory
 // allowlist, NOT host-filtered); 'opt-out' = operator set `sandbox = false`;
-// 'unavailable' = sandboxing wired but no tool resolved (runs unconfined).
-export type McpSandboxStatus = 'sandboxed' | 'sandboxed-net' | 'opt-out' | 'unavailable';
+// 'unavailable' = sandboxing wired but no tool resolved (runs unconfined);
+// 'remote' = a remote (sse/http) server — no subprocess to sandbox, inherently
+// network egress (gated per-call by mcp.egress, not by a sandbox). The modal
+// must NOT show a remote server as 'sandboxed' — it confines nothing.
+export type McpSandboxStatus = 'sandboxed' | 'sandboxed-net' | 'opt-out' | 'unavailable' | 'remote';
 
 // Wraps a server's spawn argv in the sandbox (bwrap / sandbox-exec). Returns the
 // inner argv unchanged for 'host' or when no sandbox tool resolved (degrade);
@@ -103,7 +125,7 @@ export interface McpServerConfig {
   // Whether the server's tools sit on the base model surface or behind
   // `tool_search` (the Forja-native lazy surface). Default 'deferred'.
   surface: 'base' | 'deferred';
-  transport: McpStdioConfig;
+  transport: McpTransportConfig;
   source: McpServerSource;
   // Sandbox posture (MCP.md §2.3). `undefined` ⇒ default-on when a sandbox tool
   // (bwrap / sandbox-exec) is available; `false` ⇒ explicit operator opt-out

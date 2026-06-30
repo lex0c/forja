@@ -18,7 +18,7 @@ What MCP integration **is**, in this version:
 
 What it **is not** (yet) — see §8:
 
-- Not a remote-transport client (no SSE / streamable-HTTP).
+- Not an OAuth client yet — remote SSE / streamable-HTTP servers work with env-bearer auth; the OAuth flow is a later slice.
 - Not a sandbox (the server process runs with the agent's own privileges in this version).
 - Not exposed to subagents (MCP tools are parent-session-scoped).
 - Not operable mid-session via slash commands (changes mean a config edit + restart).
@@ -56,7 +56,7 @@ Everything lives under `src/mcp/`. The rest of the harness sees MCP tools only a
 ```
 
 - **`config.ts`** loads and merges the `mcp.toml` family into `McpServerConfig[]`.
-- **`client.ts`** is the *only* file that imports `@modelcontextprotocol/sdk`. It wraps the SDK `Client` + `StdioClientTransport` behind the internal `McpClient` interface and defensively parses untrusted server output. A future remote transport adds a sibling factory behind the same interface.
+- **`client.ts`** is the *only* file that imports `@modelcontextprotocol/sdk`. A shared `sdkClientFrom` wraps the SDK `Client` behind the internal `McpClient` interface (defensively parsing untrusted server output); the stdio, SSE, and streamable-HTTP factories differ only in how they build the transport, and `createMcpClient` dispatches on the configured kind.
 - **`manifest.ts`** canonicalizes a `tools/list` response and hashes it — the hash is the trust key.
 - **`tool-factory.ts`** turns a manifest tool into a Forja `Tool`: the wire name, the metadata mapping, and an `execute` that proxies back to the manager.
 - **`manager.ts`** ties it together: built once in `bootstrap` (like the `broker`), it owns each server's connection and state, registers trusted tools at `init()`, lazily connects on the first `callTool()`, and disconnects every child at `cleanup()`.
@@ -81,16 +81,20 @@ Each server is a `[servers.<name>]` table. The **name** must match `^[a-z][a-z0-
 
 | Key | Required | Notes |
 |---|---|---|
-| `transport` | yes | Must be `"stdio"`. `"sse"`/`"http"` are recognized but skipped with a warning (not in this version). |
-| `command` | yes | Non-empty array of strings. `command[0]` is the executable; the rest are argv. |
-| `env` | no | Table of `string → string` added to the child's environment. |
-| `cwd` | no | Working directory for the child process. |
+| `transport` | yes | `"stdio"` (a spawned subprocess), or `"sse"` / `"http"` (a remote endpoint; `"http"` is streamable-HTTP). The keys below are grouped by which transport they apply to. |
+| `command` | stdio | Non-empty array of strings. `command[0]` is the executable; the rest are argv. |
+| `env` | stdio | Table of `string → string` added to the child's environment. |
+| `cwd` | stdio | Working directory for the child process. |
+| `sandbox` | stdio | `false` runs the server **unconfined**. Omit (or `true`) → **sandboxed by default** when a sandbox tool (bwrap / sandbox-exec) is available (§7). |
+| `network` | stdio | A `[servers.<name>.network] allow_hosts = [...]` sub-table grants the server network. The host list is **advisory** (shown in the trust modal + audited), NOT kernel-enforced, and network-granted tools become **egress** (always confirmed, never auto-approved). |
+| `url` | sse/http | The endpoint URL — must be `http(s)`. The trust identity for a remote server (a change re-triggers trust). **No embedded credentials** (`user:pass@…`) — a URL with userinfo is rejected; put the token in `auth`. |
+| `auth` | no (sse/http) | `auth = { kind = "bearer", env = "VAR" }`. The token is read from `$VAR` **at load** and sent as `Authorization: Bearer …`; only the env-var *name* lives in config — the token never persists. An unset/blank `$VAR` warns and sends no header. OAuth is a later slice. |
 | `surface` | no | `"base"` (always on the wire) or `"deferred"` (reached via `tool_search`). **Default `"deferred"`** so a many-tool server doesn't bloat the base surface. |
 | `disabled` | no | `true` to parse-but-skip the server (keeps its trust + state rows). Default enabled. |
-| `sandbox` | no | `false` runs the server **unconfined**. Omit (or `true`) → **sandboxed by default** when a sandbox tool (bwrap / sandbox-exec) is available (§7). |
-| `network` | no | A `[servers.<name>.network] allow_hosts = [...]` sub-table grants the server network. The host list is **advisory** (shown in the trust modal + audited), NOT kernel-enforced, and network-granted tools become **egress** (always confirmed, never auto-approved). |
 
-**`$VAR` / `${VAR}`** in `command`, `env` values, and `cwd` are resolved from the agent session environment. An **unset** variable substitutes an empty string and warns (rather than leaking a literal `$VAR` into the argv). Keep secrets in the environment (and the server entry in the gitignored `mcp.local.toml`) — never inline them.
+A **remote** (sse/http) server has no subprocess, so the stdio-only keys (`command`/`env`/`cwd`/`sandbox`/`network`) don't apply — its tools are inherently **egress** (always confirmed, never auto-approved), and `sandbox`/`network` set on a remote entry warn and are ignored.
+
+**`$VAR` / `${VAR}`** in `command`, `env` values, `cwd`, and `url` are resolved from the agent session environment. An **unset** variable substitutes an empty string and warns (rather than leaking a literal `$VAR`). Keep secrets in the environment (and the server entry in the gitignored `mcp.local.toml`) — never inline them.
 
 ### 2.2 Example
 
@@ -107,13 +111,21 @@ surface   = "base"          # put its tools on the base wire
 env       = { PGCONNECT_TIMEOUT = "5" }
 ```
 
-`$DATABASE_URL` resolves from the environment at load time; the **unresolved** form (`--dsn $DATABASE_URL`) is what gets persisted and shown in the trust modal, so the secret never lands at rest.
+```toml
+# .forja/mcp.local.toml  (gitignored — holds the auth env-var binding)
+[servers.github]
+transport = "http"          # streamable-HTTP; "sse" for the legacy transport
+url       = "https://api.githubcopilot.com/mcp/"
+auth      = { kind = "bearer", env = "GITHUB_MCP_TOKEN" }
+```
+
+`$DATABASE_URL` resolves from the environment at load time; the **unresolved** form (`--dsn $DATABASE_URL`) is what gets persisted and shown in the trust modal, so the secret never lands at rest. For the remote `github` server, the trust identity is its `url` (a change re-prompts), and `$GITHUB_MCP_TOKEN` is read at load and sent as a `Bearer` header — only the variable *name* is in config.
 
 ---
 
 ## 3. Trust
 
-Trusting an MCP server authorizes **two** things: spawning its `command` (arbitrary local code — the real risk) and exposing its declared tools to the model. Trust is keyed on a **manifest hash**.
+Trusting an MCP server authorizes **two** things: reaching it — spawning a stdio server's `command` (arbitrary local code) or connecting to a remote server's `url` (network egress) — and exposing its declared tools to the model. Trust is keyed on a **manifest hash**.
 
 ### 3.1 The manifest hash
 
@@ -213,7 +225,7 @@ Two tables (migration `081-mcp-servers.ts`, repo `repos/mcp-servers.ts`):
 
 ## 7. Operating notes
 
-- **Warnings** from config parsing and trust (`server 'x' redefined…`, `transport 'sse' not supported yet…`, `environment variable $Y is not set…`) surface on the startup banner.
+- **Warnings** from config parsing and trust (`server 'x' redefined…`, `'url' must be http(s)…`, `bearer token env var $Y is not set…`) surface on the startup banner.
 - **Managing servers in-session:** `/mcp` lists every server with its live state + tool count;
   `/mcp show <server>` adds the command, manifest hash, and trust history; `/mcp revoke <server>`
   denies a server and removes its tools (durable — it stays denied across a relaunch until you
@@ -233,10 +245,10 @@ Two tables (migration `081-mcp-servers.ts`, repo `repos/mcp-servers.ts`):
 
 These are specified but intentionally out of the first MCP release; each is its own slice when its ecosystem need is real:
 
-- **Remote transport** — SSE / streamable-HTTP behind the same `McpClient`, plus an egress permission category and bearer/OAuth auth.
+- **Remote OAuth** — the SDK `authProvider` flow (authorize + token refresh) for a remote server. SSE / streamable-HTTP transport + env-bearer auth + the `mcp.egress` gating have shipped; only the interactive OAuth flow remains.
+- **Remote heartbeat health** — proactive staleness detection for a remote (sse/http) connection (`heartbeat_max_age_ms`, spec §2.2/§5). Today a dead idle remote is discovered lazily on the next `tools/call` (which degrades + surfaces the fault), not by a background liveness probe.
 - **Per-host network filtering + ulimits** — the sandbox (§7) confines the filesystem and toggles network on/off, but bwrap network is all-or-nothing: the `allow_hosts` list is advisory, not kernel-enforced (per-host filtering via proxy/nftables is future), and the CPU/memory/file ulimits in the spec are not yet applied. Treat a network-granted server's reach as "the whole network".
 - **Resolved-command change-detection** — hashing the `$VAR`-resolved argv (persisted as a hash, never plaintext) so a re-pointed `$MCP_BIN` re-triggers trust. Today change-detection compares only the unresolved literal (see the §3.3 limitation note).
-- **Per-server budget** — call / token-in / timeout caps and a `degraded`↔`active` auto-recovery loop.
 - **Per-tool MCP policy rules** — an operator policy section that can `confirm`/`deny`/`lock` a specific `mcp__<server>__<tool>` pattern. In this version trust is all-or-nothing at the server level and no `mcp` policy section is consulted.
 - **MCP tools inside subagents** — v1 MCP tools are parent-session-scoped; subagent access goes through the parent↔child IPC seam in a later slice.
 - **Model-in-the-loop eval** — a case where the model itself picks an MCP tool. The real-subprocess integration test is the CI signal in the meantime.

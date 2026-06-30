@@ -20,8 +20,11 @@
 // ones (§15.5); and surfaces a tool error. cleanup() closes every live client
 // at teardown.
 //
-// Scope notes: stdio only (remote transport is a later slice); a finer
-// soft-warning-before-hard-cap budget tier is future; states are set directly
+// Transport-agnostic: stdio (spawned + sandboxed + stderr-tee'd) and remote
+// (sse / streamable-http, inherently egress) both arrive as an `McpClient` via
+// createMcpClient; only the spawn-specific bits (sandbox, stderr, the boot
+// UNSANDBOXED warning) branch on stdio. Scope notes: a finer soft-warning-
+// before-hard-cap budget tier + remote OAuth are future; states are set directly
 // here (the pure transition table in state.ts is the documented reference).
 
 import { join } from 'node:path';
@@ -29,6 +32,7 @@ import type { FailureEventSink } from '../failures/index.ts';
 import { charsToTokens } from '../providers/tokens.ts';
 import type { DB } from '../storage/db.ts';
 import {
+  type McpServerRow,
   bumpServerCounters,
   deleteServer,
   getManifestDecision,
@@ -41,7 +45,7 @@ import {
 } from '../storage/repos/mcp-servers.ts';
 import type { ToolRegistry } from '../tools/registry.ts';
 import type { ToolContext } from '../tools/types.ts';
-import { createStdioMcpClient } from './client.ts';
+import { createMcpClient } from './client.ts';
 import type { LoadedMcpConfig } from './config.ts';
 import {
   canonicalManifestJson,
@@ -63,7 +67,7 @@ import type {
   McpSandboxWrap,
   McpServerConfig,
   McpServerState,
-  McpStdioConfig,
+  McpTransportConfig,
 } from './types.ts';
 
 export interface McpManagerDeps {
@@ -78,7 +82,11 @@ export interface McpManagerDeps {
   // Injectable client factory (tests pass a fake; production uses the SDK
   // stdio adapter). `stderrLogPath` is where the adapter tees the server's
   // stderr (mcp-<name>.log) — undefined ⇒ drain-to-discard.
-  makeClient?: (cfg: McpStdioConfig, sandbox?: McpSandboxArg, stderrLogPath?: string) => McpClient;
+  makeClient?: (
+    cfg: McpTransportConfig,
+    sandbox?: McpSandboxArg,
+    stderrLogPath?: string,
+  ) => McpClient;
   // Directory for per-server stderr logs (`<traceDir>/mcp-<name>.log`, read by
   // `/mcp logs`). Absent ⇒ stderr is drained-to-discard (still prevents the
   // child blocking on a full pipe), no on-disk trail.
@@ -250,9 +258,28 @@ const estimateResultTokens = (res: McpCallResult): number => {
   return charsToTokens(chars);
 };
 
+// The trust IDENTITY of a transport — what persists to mcp_servers and what a
+// change re-triggers trust on. stdio: the RAW (unresolved) argv (never a
+// resolved secret); remote: the URL. `display` is the operator-facing form for
+// the trust modal.
+const transportIdentity = (
+  t: McpTransportConfig,
+): { command: string | null; url: string | null; display: string } =>
+  t.transport === 'stdio'
+    ? { command: JSON.stringify(t.rawArgv), url: null, display: t.rawArgv.join(' ') }
+    : { command: null, url: t.url, display: t.url };
+
+// Did the persisted server's transport identity change vs the configured one (a
+// swapped binary / re-pointed URL / changed transport kind ⇒ force a re-trust)?
+const transportChanged = (existing: McpServerRow, t: McpTransportConfig): boolean =>
+  existing.transport !== t.transport ||
+  (t.transport === 'stdio'
+    ? existing.command !== JSON.stringify(t.rawArgv)
+    : existing.url !== t.url);
+
 export const createMcpManager = (deps: McpManagerDeps): McpManager => {
   const { db, registry, config } = deps;
-  const makeClient = deps.makeClient ?? createStdioMcpClient;
+  const makeClient = deps.makeClient ?? createMcpClient;
 
   // Resolve a server's effective sandbox posture (MCP.md §2.3): default-ON when
   // a tool is available; `sandbox = false` opts out; a wired-but-unavailable
@@ -282,15 +309,20 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
     return join(deps.traceDir, `mcp-${name}.log`);
   };
 
-  // Build a client for a server, wrapping the spawn in the sandbox when the
-  // resolved profile is non-host.
+  // Build a client for a server. A remote server has no subprocess — no sandbox,
+  // no stderr log; the createMcpClient dispatch handles the transport. A stdio
+  // server is wrapped in the sandbox when the resolved profile is non-host.
   const clientFor = (rt: ServerRuntime): McpClient => {
+    const transport = rt.config.transport;
+    if (transport.transport !== 'stdio') {
+      return makeClient(transport, undefined, undefined);
+    }
     const { profile } = resolveSandbox(rt.config);
     const logPath = serverLogPath(rt.config.name);
     if (profile === 'host' || deps.sandbox === undefined) {
-      return makeClient(rt.config.transport, undefined, logPath);
+      return makeClient(transport, undefined, logPath);
     }
-    return makeClient(rt.config.transport, { profile, wrap: deps.sandbox.wrap }, logPath);
+    return makeClient(transport, { profile, wrap: deps.sandbox.wrap }, logPath);
   };
   const now = deps.now ?? (() => Date.now());
   const runtime = new Map<string, ServerRuntime>();
@@ -543,11 +575,13 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
   ): { registered: number; warnings: string[] } => {
     const warnings: string[] = [];
     let registered = 0;
-    // Egress = the server can REACH the network: granted network (`cwd-rw-net`)
-    // OR running unconfined (`host` — opt-out / no sandbox tool, which inherits
-    // the full host network even with no `[network]` grant). Only a sandboxed
-    // no-network server (`cwd-rw`) is non-egress (MCP.md §2.3).
-    const egress = resolveSandbox(rt.config).profile !== 'cwd-rw';
+    // Egress = the server can REACH the network. A REMOTE server is inherently
+    // egress (the transport IS a network connection). A stdio server is egress
+    // when it has granted network (`cwd-rw-net`) OR runs unconfined (`host` —
+    // opt-out / no sandbox tool, which inherits the full host network). Only a
+    // sandboxed no-network stdio server (`cwd-rw`) is non-egress (MCP.md §2.3).
+    const egress =
+      rt.config.transport.transport !== 'stdio' || resolveSandbox(rt.config).profile !== 'cwd-rw';
     for (const tool of tools) {
       const wire = dedupeWireName(mcpWireName(rt.config.name, tool.name), (n) => registry.has(n));
       if (registry.has(wire)) {
@@ -683,10 +717,13 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
     if (deps.confirmTrust !== undefined) {
       const answer = await deps.confirmTrust({
         server: name,
-        // The RAW (unresolved) command — never expose a resolved secret.
-        command: rt.config.transport.rawArgv.join(' '),
+        // The RAW (unresolved) command / the remote URL — never a resolved secret.
+        command: transportIdentity(rt.config.transport).display,
         mode: forceReprompt || rt.trustedHash !== null ? 'drift' : 'first-visit',
-        sandbox: resolveSandbox(rt.config).status,
+        // A remote server has no subprocess — show 'remote' (egress, no sandbox),
+        // never a stdio-oriented 'sandboxed' status that would imply containment.
+        sandbox:
+          rt.config.transport.transport === 'stdio' ? resolveSandbox(rt.config).status : 'remote',
         tools: tools.map((t) => ({
           name: t.name,
           description: t.description,
@@ -713,15 +750,15 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
   // place — AUDIT §1.5) only when a grant re-authorizes a CHANGED command, so a
   // swap stays detectable across sessions until the operator re-approves it.
   const syncTrustedCommand = (rt: ServerRuntime) => {
-    const rawCommandJson = JSON.stringify(rt.config.transport.rawArgv);
+    const id = transportIdentity(rt.config.transport);
     const existing = getServer(db, rt.config.name);
-    if (existing !== null && existing.command === rawCommandJson) return;
+    if (existing !== null && !transportChanged(existing, rt.config.transport)) return;
     if (existing !== null) deleteServer(db, rt.config.name);
     insertServer(db, {
       name: rt.config.name,
       transport: rt.config.transport.transport,
-      command: rawCommandJson,
-      url: null,
+      command: id.command,
+      url: id.url,
       source: rt.config.source,
       state: rt.state,
     });
@@ -751,17 +788,18 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         };
         runtime.set(server.name, rt);
 
-        // Ensure a row exists (command stored RAW/redacted). On an EXISTING
-        // server whose configured command differs from the last-trusted one,
-        // bypass the cache and force a re-trust — the binary was swapped.
-        const rawCommandJson = JSON.stringify(server.transport.rawArgv);
+        // Ensure a row exists (stdio command stored RAW/redacted; remote URL).
+        // On an EXISTING server whose configured transport identity differs from
+        // the last-trusted one, bypass the cache + force a re-trust — the binary
+        // was swapped or the URL re-pointed.
+        const id = transportIdentity(server.transport);
         const existing = getServer(db, server.name);
         if (existing === null) {
           insertServer(db, {
             name: server.name,
             transport: server.transport.transport,
-            command: rawCommandJson,
-            url: null,
+            command: id.command,
+            url: id.url,
             source: server.source,
             state: 'disconnected',
           });
@@ -777,10 +815,16 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
           continue;
         }
 
-        // Surface every unconfined server: it spawns with full host access +
-        // network (the modal shows it too, but headless / cached-trust paths
-        // never open one). Both opt-out and no-tool land on the host profile.
-        if (deps.sandbox !== undefined && resolveSandbox(server).profile === 'host') {
+        // Surface every unconfined STDIO server: it spawns with full host access
+        // + network (the modal shows it too, but headless / cached-trust paths
+        // never open one). Both opt-out and no-tool land on the host profile. A
+        // remote server has no subprocess to sandbox — its egress is gated by the
+        // mcp.egress permission category, not this boot warning.
+        if (
+          server.transport.transport === 'stdio' &&
+          deps.sandbox !== undefined &&
+          resolveSandbox(server).profile === 'host'
+        ) {
           warnings.push(
             resolveSandbox(server).status === 'opt-out'
               ? `mcp: server '${server.name}' runs UNSANDBOXED (sandbox=false) — full host access + network`
@@ -788,7 +832,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
           );
         }
 
-        const commandChanged = existing !== null && existing.command !== rawCommandJson;
+        const commandChanged = existing !== null && transportChanged(existing, server.transport);
 
         const cached = commandChanged ? null : latestTrustedManifest(db, server.name);
         // Defense-in-depth (FAILURE_MODES §14.2): the stored manifest_json is

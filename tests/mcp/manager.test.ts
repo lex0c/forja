@@ -18,7 +18,7 @@ import type {
   McpSandboxArg,
   McpSandboxWrap,
   McpServerConfig,
-  McpStdioConfig,
+  McpTransportConfig,
 } from '../../src/mcp/types.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
@@ -67,6 +67,15 @@ const serverConfig = (over: Partial<McpServerConfig> = {}): McpServerConfig => (
   ...over,
 });
 
+const remoteServerConfig = (over: Partial<McpServerConfig> = {}): McpServerConfig => ({
+  name: 'gh',
+  enabled: true,
+  surface: 'deferred',
+  source: 'project_shared',
+  transport: { transport: 'http', url: 'https://mcp.example.com/v1' },
+  ...over,
+});
+
 const config = (servers: McpServerConfig[]): LoadedMcpConfig => ({
   servers,
   warnings: [],
@@ -97,7 +106,7 @@ const fakeClientFactory = (spec: FakeSpec) => {
     lastLogPath: undefined as string | undefined,
   };
   const makeClient = (
-    _cfg: McpStdioConfig,
+    _cfg: McpTransportConfig,
     sandbox?: McpSandboxArg,
     stderrLogPath?: string,
   ): McpClient => {
@@ -1441,5 +1450,92 @@ describe('McpManager: output-validity recovery (§15.5)', () => {
     }
     expect(mgr.state('db')).toBe('degraded');
     await mgr.cleanup();
+  });
+});
+
+describe('McpManager: remote transport', () => {
+  test('a remote server registers its tools as egress + gets no sandbox / stderr log', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([remoteServerConfig()]),
+      autoApprove: new Set(['gh']),
+      makeClient: fake.makeClient,
+      traceDir: '/data/traces', // present, but a remote server still gets no log
+    });
+    const report = await mgr.init();
+    expect(report.registered).toBe(1);
+    expect(registry.has('mcp__gh__query')).toBe(true);
+    // A remote server reaches the network → its tools are egress (mcp.egress).
+    expect(registry.get('mcp__gh__query')?.metadata.category).toBe('mcp.egress');
+    expect(fake.stats.lastSandbox).toBeUndefined(); // no subprocess → no sandbox wrap
+    expect(fake.stats.lastLogPath).toBeUndefined(); // no subprocess → no stderr log
+    await mgr.cleanup();
+  });
+
+  test("a remote server's trust identity is its URL (a second session reuses the cached grant)", async () => {
+    const f1 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m1 = createMcpManager({
+      db,
+      registry,
+      config: config([remoteServerConfig()]),
+      autoApprove: new Set(['gh']),
+      makeClient: f1.makeClient,
+    });
+    await m1.init();
+    await m1.cleanup();
+
+    // Same URL → cached grant, no fresh connect.
+    const reg2 = createToolRegistry();
+    const f2 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m2 = createMcpManager({
+      db,
+      registry: reg2,
+      config: config([remoteServerConfig()]),
+      makeClient: f2.makeClient,
+    });
+    await m2.init();
+    expect(reg2.has('mcp__gh__query')).toBe(true);
+    expect(f2.stats.made).toBe(0); // URL unchanged → registered from cache, never connected
+    await m2.cleanup();
+  });
+
+  test('a server that switches stdio→remote in config is re-trusted (identity flips command→url)', async () => {
+    // Session 1: trust the server as a stdio subprocess.
+    const f1 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m1 = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ name: 'sw' })]),
+      autoApprove: new Set(['sw']),
+      makeClient: f1.makeClient,
+    });
+    await m1.init();
+    await m1.cleanup();
+    expect(f1.stats.made).toBeGreaterThan(0); // connected to fetch + grant the stdio manifest
+    const row1 = getServer(db, 'sw');
+    expect(row1?.transport).toBe('stdio');
+    expect(row1?.url).toBeNull();
+
+    // Session 2: SAME name, now a remote http endpoint. The transport-kind change
+    // must force a re-handshake — NOT a register from the stale stdio grant.
+    const reg2 = createToolRegistry();
+    const f2 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m2 = createMcpManager({
+      db,
+      registry: reg2,
+      config: config([remoteServerConfig({ name: 'sw' })]),
+      autoApprove: new Set(['sw']),
+      makeClient: f2.makeClient,
+    });
+    await m2.init();
+    expect(f2.stats.made).toBeGreaterThan(0); // re-handshook, not served from the stdio cache
+    expect(reg2.has('mcp__sw__query')).toBe(true);
+    const row2 = getServer(db, 'sw');
+    expect(row2?.transport).toBe('http'); // persisted identity flipped to the remote URL
+    expect(row2?.command).toBeNull();
+    expect(row2?.url).toBe('https://mcp.example.com/v1');
+    await m2.cleanup();
   });
 });

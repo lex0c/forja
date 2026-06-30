@@ -38,7 +38,7 @@ import type {
   McpClient,
   McpSandboxArg,
   McpSandboxWrap,
-  McpStdioConfig,
+  McpTransportConfig,
 } from '../mcp/types.ts';
 import {
   computeSharedFingerprint,
@@ -314,7 +314,7 @@ export interface BootstrapInput {
   // Mirrors the manager's `makeClient` (cfg, sandbox?, stderrLogPath?) so a
   // bootstrap-level fake can observe the sandbox + stderr-log threading.
   mcpMakeClient?: (
-    cfg: McpStdioConfig,
+    cfg: McpTransportConfig,
     sandbox?: McpSandboxArg,
     stderrLogPath?: string,
   ) => McpClient;
