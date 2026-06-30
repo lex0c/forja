@@ -13,15 +13,16 @@
 //     register on grant, then close (lazy reconnect on first call).
 //
 // callTool() lazy-connects, re-hashes the live manifest, and degrades on
-// drift; bounds each call at the per-server budget timeout (a timeout keeps the
-// server active + the connection reusable, a transport fault disconnects);
-// enforces the per-session call/token caps (MCP.md §5); and surfaces a tool
-// error. cleanup() closes every live client at teardown.
+// drift (pinned until re-trust); bounds each call at the per-server budget
+// timeout (a timeout keeps the server active + the connection reusable, a
+// transport fault disconnects); enforces the per-session call/token caps
+// (MCP.md §5); degrades on a malformed result + recovers after 3 well-formed
+// ones (§15.5); and surfaces a tool error. cleanup() closes every live client
+// at teardown.
 //
 // Scope notes: stdio only (remote transport is a later slice); a finer
-// soft-warning-before-hard-cap tier + the failure_event audit row + the drift
-// `degraded`→`active` auto-recovery land with the failure_event sink; states are
-// set directly here (the pure transition table in state.ts is the reference).
+// soft-warning-before-hard-cap budget tier is future; states are set directly
+// here (the pure transition table in state.ts is the documented reference).
 
 import { join } from 'node:path';
 import type { FailureEventSink } from '../failures/index.ts';
@@ -163,6 +164,11 @@ interface ServerRuntime {
   // every refused call (disconnected is not terminal), so gate the audit row.
   // Reset alongside the counters on a session change.
   budgetEmitted: boolean;
+  // Consecutive well-formed outputs since an output.invalid degrade (MCP.md
+  // §15.5). At 3 the server recovers degraded→active. Reset by any invalid
+  // output. Only meaningful while output-degraded (a DRIFT degrade is pinned via
+  // `drifted` and throws before the call, so it never reaches this counter).
+  validStreak: number;
 }
 
 const parseCachedManifestTools = (json: string): McpManifestTool[] => {
@@ -468,6 +474,37 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       const tokensIn = estimateResultTokens(res);
       bumpServerCounters(db, server, { calls: 1, tokensIn });
       rt.sessionTokensIn += tokensIn;
+
+      // Output-validity loop (MCP.md §15.5). A malformed result degrades the
+      // server and returns an ERROR to the model (retry / fall back — not
+      // automatic); a streak of 3 well-formed outputs recovers it to active.
+      // (A DRIFT degrade is pinned via `drifted` and throws before the call, so
+      // it never reaches this recovery path.)
+      if (res.invalid === true) {
+        rt.validStreak = 0;
+        if (rt.state === 'active') setState(rt, 'degraded', { last_error: 'mcp.output.invalid' });
+        const rawTruncated = res.invalidRaw ?? '';
+        emitFailure({
+          code: 'mcp.output.invalid',
+          recovery: 'degraded',
+          userVisible: false,
+          sessionId: ctx.sessionId,
+          payload: { server, tool: toolName, raw_truncated: rawTruncated },
+        });
+        return {
+          isError: true,
+          content:
+            `mcp.output.invalid: server '${server}' tool '${toolName}' returned a malformed result` +
+            `${rawTruncated ? ` (raw: ${rawTruncated})` : ''}; retry or fall back`,
+        };
+      }
+      if (rt.state === 'degraded') {
+        rt.validStreak += 1;
+        if (rt.validStreak >= 3) {
+          rt.validStreak = 0;
+          setState(rt, 'active', { last_error: null }); // mcp.recover_ok
+        }
+      }
       return res;
     } catch (err) {
       // A per-call TIMEOUT (the budget timeout fired, not a session cancel) is
@@ -492,6 +529,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       }
       rt.client = null;
       rt.connected = false;
+      rt.validStreak = 0; // a fresh connection starts a fresh recovery streak
       setState(rt, 'disconnected', {
         last_error: err instanceof Error ? err.message : String(err),
       });
@@ -709,6 +747,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
           sessionCalls: 0,
           sessionTokensIn: 0,
           budgetEmitted: false,
+          validStreak: 0,
         };
         runtime.set(server.name, rt);
 
@@ -873,6 +912,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         sessionCalls: 0,
         sessionTokensIn: 0,
         budgetEmitted: false,
+        validStreak: 0,
       };
       runtime.set(server, rt);
       const warnings: string[] = [];

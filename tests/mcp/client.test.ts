@@ -14,6 +14,7 @@ import {
   createStdioMcpClient,
   extractMeta,
   flattenContent,
+  isInvalidOutput,
   normalizeInputSchema,
   teeStderr,
 } from '../../src/mcp/client.ts';
@@ -111,6 +112,35 @@ describe('flattenContent', () => {
 
   test('a text block whose text is non-string is skipped', () => {
     expect(flattenContent([{ type: 'text', text: 42 }])).toBe('');
+  });
+});
+
+describe('isInvalidOutput — conservative §15.5 detection', () => {
+  test('flags non-array content (the MCP protocol requires an array)', () => {
+    expect(isInvalidOutput('a string', false)).toBe(true);
+    expect(isInvalidOutput(null, false)).toBe(true);
+    expect(isInvalidOutput({ type: 'text' }, false)).toBe(true);
+  });
+
+  test('flags a text block whose text is non-string', () => {
+    expect(isInvalidOutput([{ type: 'text', text: 42 }], false)).toBe(true);
+  });
+
+  test('flags a non-object block (bare null / primitive)', () => {
+    expect(isInvalidOutput([null], false)).toBe(true);
+    expect(isInvalidOutput([42], false)).toBe(true);
+    expect(isInvalidOutput([{ type: 'text', text: 'ok' }, null], false)).toBe(true);
+  });
+
+  test('does NOT flag well-formed, empty, or all-image content (no false positives)', () => {
+    expect(isInvalidOutput([{ type: 'text', text: 'ok' }], false)).toBe(false);
+    expect(isInvalidOutput([], false)).toBe(false); // a legitimate void result
+    expect(isInvalidOutput([{ type: 'image', data: '...' }], false)).toBe(false);
+  });
+
+  test('an explicit isError result is never flagged invalid', () => {
+    expect(isInvalidOutput('garbage', true)).toBe(false);
+    expect(isInvalidOutput([{ type: 'text', text: 42 }], true)).toBe(false);
   });
 });
 

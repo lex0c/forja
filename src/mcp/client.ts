@@ -108,6 +108,25 @@ export const flattenContent = (content: unknown): string => {
   return parts.join('');
 };
 
+// Flag a CLEAR protocol violation in the raw `tools/call` result (MCP.md §15.5),
+// which the manager turns into an `active`→`degraded`→recover loop. Deliberately
+// conservative — a non-array `content` (the MCP spec requires an array), a block
+// that is not an object (a bare `null`/primitive is malformed), or a text block
+// whose `text` is non-string. An empty array or all-image content is NOT flagged:
+// those can be legitimate (a void action, an image-only tool), and degrading a
+// healthy server on a false positive is worse than missing one. An explicit
+// `isError` result is a valid error, not malformed.
+export const isInvalidOutput = (rawContent: unknown, isError: boolean): boolean => {
+  if (isError) return false;
+  if (!Array.isArray(rawContent)) return true;
+  for (const block of rawContent) {
+    const rec = asRecord(block);
+    if (rec === null) return true; // a content block must be an object
+    if (rec.type === 'text' && typeof rec.text !== 'string') return true;
+  }
+  return false;
+};
+
 // MCP.md §2.1: the server's stderr is rotated at 10 MB.
 const STDERR_LOG_CAP_BYTES = 10 * 1024 * 1024;
 
@@ -307,6 +326,16 @@ export const createStdioMcpClient = (
         content: flattenContent(res.content),
       };
       if (res.structuredContent !== undefined) result.structured = res.structuredContent;
+      if (isInvalidOutput(res.content, res.isError === true)) {
+        result.invalid = true;
+        // Preserve the malformed raw (flattenContent above already discarded its
+        // structure) for the §15.5 audit + the model's error.
+        try {
+          result.invalidRaw = JSON.stringify(res.content)?.slice(0, 1024);
+        } catch {
+          result.invalidRaw = String(res.content).slice(0, 1024);
+        }
+      }
       return result;
     },
 

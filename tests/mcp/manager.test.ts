@@ -82,6 +82,9 @@ interface FakeSpec {
   // callTool never resolves on its own — only rejects when the passed signal
   // aborts (exercises the per-call timeout path).
   callHangs?: boolean;
+  // Per-call results in order (falls back to callResult / default when drained).
+  // Lets a test sequence invalid→valid outputs for the §15.5 recovery loop.
+  callResultsQueue?: McpCallResult[];
 }
 const fakeClientFactory = (spec: FakeSpec) => {
   const stats = {
@@ -118,6 +121,9 @@ const fakeClientFactory = (spec: FakeSpec) => {
           return new Promise<McpCallResult>((_res, rej) => {
             signal?.addEventListener('abort', () => rej(new Error('aborted')));
           });
+        }
+        if (spec.callResultsQueue && spec.callResultsQueue.length > 0) {
+          return spec.callResultsQueue.shift() as McpCallResult;
         }
         return spec.callResult ?? { isError: false, content: 'ok' };
       },
@@ -1327,6 +1333,113 @@ describe('McpManager: per-server budget (MCP.md §5)', () => {
     await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.timeout/);
     await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.timeout/);
     expect(audit.emits.filter((e) => e.code === 'mcp.timeout')).toHaveLength(2);
+    await mgr.cleanup();
+  });
+});
+
+describe('McpManager: output-validity recovery (§15.5)', () => {
+  test('a malformed output degrades the server, emits mcp.output.invalid, returns an error to the model', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: '', invalid: true, invalidRaw: '"not an array"' },
+    });
+    const audit = captureSink();
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+      failureSink: audit.sink,
+    });
+    await mgr.init();
+    const r = await mgr.callTool('db', 'query', {}, ctx);
+    expect(r.isError).toBe(true); // returned as an error, not thrown
+    expect(r.content).toContain('mcp.output.invalid');
+    expect(r.content).toContain('not an array'); // the raw, not lost to flattening
+    expect(mgr.state('db')).toBe('degraded'); // active → degraded
+    const row = audit.emits.find((e) => e.code === 'mcp.output.invalid');
+    expect(row).toBeDefined();
+    expect(row?.recovery_action).toBe('degraded');
+    expect((row?.payload as Record<string, unknown> | undefined)?.raw_truncated).toBe(
+      '"not an array"',
+    );
+    await mgr.cleanup();
+  });
+
+  test('3 consecutive well-formed outputs recover a degraded server to active', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResultsQueue: [
+        { isError: false, content: 'bad', invalid: true }, // → degraded
+        { isError: false, content: 'ok' }, // valid 1
+        { isError: false, content: 'ok' }, // valid 2
+        { isError: false, content: 'ok' }, // valid 3 → recover
+      ],
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx); // invalid → degraded
+    expect(mgr.state('db')).toBe('degraded');
+    await mgr.callTool('db', 'query', {}, ctx); // valid 1
+    await mgr.callTool('db', 'query', {}, ctx); // valid 2
+    expect(mgr.state('db')).toBe('degraded'); // streak 2 — not yet
+    await mgr.callTool('db', 'query', {}, ctx); // valid 3 → recover
+    expect(mgr.state('db')).toBe('active');
+    await mgr.cleanup();
+  });
+
+  test('an invalid output resets the recovery streak (no premature recover)', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResultsQueue: [
+        { isError: false, content: 'bad', invalid: true }, // → degraded
+        { isError: false, content: 'ok' }, // valid 1
+        { isError: false, content: 'ok' }, // valid 2
+        { isError: false, content: 'bad', invalid: true }, // resets streak
+        { isError: false, content: 'ok' }, // valid 1 again
+        { isError: false, content: 'ok' }, // valid 2
+      ],
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    for (let i = 0; i < 6; i++) await mgr.callTool('db', 'query', {}, ctx);
+    expect(mgr.state('db')).toBe('degraded'); // only 2 valid since the reset → still degraded
+    await mgr.cleanup();
+  });
+
+  test('a DRIFT-degraded server does NOT auto-recover via the output-validity path', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]); // trusted = [query]
+    // The live manifest has an extra tool → the hash drifts on the first connect.
+    const fake = fakeClientFactory({ tools: [toolDef('query'), toolDef('extra')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    // First call connects, detects drift → degraded + pinned.
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/manifest_drift/);
+    expect(mgr.state('db')).toBe('degraded');
+    // Further calls throw drift BEFORE the call — they never reach the valid-output
+    // recovery counter, so the drift never auto-recovers (only /mcp reconnect does).
+    for (let i = 0; i < 4; i++) {
+      await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/manifest_drift/);
+    }
+    expect(mgr.state('db')).toBe('degraded');
     await mgr.cleanup();
   });
 });

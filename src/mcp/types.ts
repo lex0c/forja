@@ -174,6 +174,16 @@ export interface McpCallResult {
   isError: boolean;
   content: string;
   structured?: unknown;
+  // The adapter flagged the raw result as malformed (MCP.md §15.5: a clear
+  // protocol violation — `content` not an array, a non-object block, or a text
+  // block with non-string `text`). Drives the `active`→`degraded`→recover loop.
+  // Absent ⇒ well-formed.
+  invalid?: boolean;
+  // The serialized raw `content` (truncated), captured ONLY when `invalid` — the
+  // flattened `content` above loses the malformed structure (a non-array raw
+  // flattens to ''), so this preserves what actually came over the wire for the
+  // §15.5 audit row + the model's error.
+  invalidRaw?: string;
 }
 
 // The thin SDK abstraction. src/mcp/client.ts is the ONLY implementer;

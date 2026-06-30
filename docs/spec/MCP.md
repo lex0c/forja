@@ -351,9 +351,11 @@ não-numérico → warning + default.
   da sessão, mas a violação aconteceu uma vez), checado **antes de qualquer reconexão** pra um server
   capado não re-spawnar. Bloqueio até a próxima sessão (§15.6) — ou um `/mcp reconnect` do operador.
 
-Um tier mais fino de **soft-warning antes do hard cap** + a auto-recuperação `degraded`→`active` de
-drift/output-inválido (§15.5) são slices futuros. Budget herda de step parent em `orchestrated`
-profile (cascading via `ORCHESTRATION.md §11`).
+Um tier mais fino de **soft-warning antes do hard cap** é slice futuro. A auto-recuperação
+`degraded`→`active` por **output inválido** (§15.5) está implementada (3 outputs bem-formados
+consecutivos → `active`); um degrade por **drift** de manifesto fica pinado até um `/mcp reconnect`
+(re-trust), não auto-recupera. Budget herda de step parent em `orchestrated` profile (cascading via
+`ORCHESTRATION.md §11`).
 
 ---
 

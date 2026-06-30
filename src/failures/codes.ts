@@ -128,6 +128,12 @@ export const CODE_VOCABULARY: ReadonlyMap<string, FailureClass> = new Map<string
   // to the model as a tool error. recovery_action = 'ignored' (handed to the
   // model to decide), not user_visible (per-call, the audit row is for forensics).
   ['mcp.timeout', 'mcp'],
+  // mcp.output.invalid: a tools/call result was malformed — a clear protocol
+  // violation (§15.5). The server transitions active→degraded and the model gets
+  // an error result to retry/fall back on; 3 consecutive valid outputs recover it
+  // to active. recovery_action = 'degraded', not user_visible (the §15.5 banner
+  // only fires if it persists > 5 min, which is a later concern).
+  ['mcp.output.invalid', 'mcp'],
 ]);
 
 export const isFailureCode = (code: string): boolean => CODE_VOCABULARY.has(code);
