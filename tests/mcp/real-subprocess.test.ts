@@ -7,6 +7,8 @@
 // runs from the repo (where the SDK resolves) and needs `bun` on PATH.
 
 import { beforeEach, describe, expect, test } from 'bun:test';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { LoadedMcpConfig } from '../../src/mcp/config.ts';
 import { createMcpManager } from '../../src/mcp/manager.ts';
@@ -34,6 +36,19 @@ const config = (servers: McpServerConfig[]): LoadedMcpConfig => ({
   warnings: [],
   paths: { user: null, project: '/p/mcp.toml', local: '/p/mcp.local.toml' },
 });
+
+// Poll for the tee'd file to contain `needle` — the stderr drain flushes
+// asynchronously after the child's stream closes.
+const waitForLog = async (path: string, needle: string, tries = 100): Promise<string> => {
+  for (let i = 0; i < tries; i++) {
+    if (existsSync(path)) {
+      const text = readFileSync(path, 'utf8');
+      if (text.includes(needle)) return text;
+    }
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  return existsSync(path) ? readFileSync(path, 'utf8') : '';
+};
 
 let db: DB;
 let registry: ToolRegistry;
@@ -68,6 +83,28 @@ describe('mcp real-subprocess integration (SDK stdio + fixture echo server)', ()
     expect(out).toEqual({ content: 'echo:via-tool' });
 
     await mgr.cleanup();
+  });
+
+  test('tees the real child stderr to <traceDir>/mcp-<name>.log (drain over real pipes)', async () => {
+    const traceDir = mkdtempSync(join(tmpdir(), 'mcp-trace-'));
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['fixture']),
+      traceDir, // the production wiring that real-subprocess otherwise never exercises
+    });
+    try {
+      await mgr.init();
+      await mgr.callTool('fixture', 'echo', { text: 'x' }, ctx); // force a real spawn
+      await mgr.cleanup(); // close → child stderr ends → tee flushes
+      // Proves the cast `(transport as {...}).stderr` actually resolves to the
+      // SDK's PassThrough and the pre-connect attach captures the startup banner.
+      const text = await waitForLog(join(traceDir, 'mcp-fixture.log'), 'echo-server: ready');
+      expect(text).toContain('echo-server: ready');
+    } finally {
+      rmSync(traceDir, { recursive: true, force: true });
+    }
   });
 
   test('headless fail-closed (no auto-approve): denies WITHOUT spawning', async () => {

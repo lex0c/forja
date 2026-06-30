@@ -2,13 +2,30 @@
 // server with its live state + tool count; `/mcp show <server>` adds the spawned
 // command, manifest hash, source layer, last error, and the trust-decision
 // history; `/mcp revoke <server>` denies + unregisters a server (durable across
-// relaunch); `/mcp reconnect <server>` re-trusts + re-registers it. The mutating
-// subcommands run BETWEEN turns (they hot-swap the live tool registry). `/mcp
-// logs` lands in a later slice.
+// relaunch); `/mcp reconnect <server>` re-trusts + re-registers it; `/mcp logs
+// <server>` tails the server's captured stderr. The mutating subcommands run
+// BETWEEN turns (they hot-swap the live tool registry).
 
+import { existsSync } from 'node:fs';
 import { getServer, listManifestHistory, listServers } from '../../../storage/repos/mcp-servers.ts';
 import { localTimestamp } from '../../local-date.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
+
+// Read the last `maxLines` non-empty lines of a (possibly large, ≤10 MB after
+// rotation) log file, scanning only the trailing `maxBytes` so `/mcp logs`
+// never slurps the whole file. A mid-file slice drops its partial first line —
+// UNLESS the whole window is one line (a >maxBytes record with no newline),
+// where dropping it would falsely report the log as empty; keep that (truncated)
+// tail instead.
+const tailLines = async (path: string, maxLines: number, maxBytes = 65536): Promise<string[]> => {
+  const file = Bun.file(path);
+  const size = file.size;
+  const sliced = size > maxBytes;
+  const text = await (sliced ? file.slice(size - maxBytes) : file).text();
+  const lines = text.split('\n');
+  const dropPartial = sliced && lines.length > 1;
+  return (dropPartial ? lines.slice(1) : lines).filter((l) => l.length > 0).slice(-maxLines);
+};
 
 const handleShow = (ctx: SlashContext, name: string): SlashResult => {
   const row = getServer(ctx.db, name);
@@ -136,25 +153,72 @@ const handleReconnect = async (ctx: SlashContext, name: string): Promise<SlashRe
   };
 };
 
+const handleLogs = async (ctx: SlashContext, name: string): Promise<SlashResult> => {
+  const mgr = ctx.baseConfig.mcpManager;
+  if (mgr === undefined) {
+    return { kind: 'error', message: '/mcp logs: MCP is not active in this session' };
+  }
+  if (getServer(ctx.db, name) === null) {
+    return { kind: 'error', message: `/mcp: no server '${name}' (try /mcp to list)` };
+  }
+  const path = mgr.logPath(name);
+  if (path === null) {
+    return { kind: 'ok', notes: [`No stderr log is configured for '${name}' (headless session).`] };
+  }
+  if (!existsSync(path)) {
+    return {
+      kind: 'ok',
+      notes: [
+        `No stderr captured for '${name}' yet — the server hasn't written to stderr or hasn't been spawned.`,
+        `(log: ${path})`,
+      ],
+    };
+  }
+  let tail: string[];
+  try {
+    tail = await tailLines(path, 40);
+  } catch {
+    // The file existed at the existsSync check but the read failed — most likely
+    // a 10 MB rotation renamed it in between. A retry will land on the fresh log.
+    return {
+      kind: 'ok',
+      notes: [
+        `Could not read '${name}' stderr just now (it may have just rotated) — try again. (${path})`,
+      ],
+    };
+  }
+  if (tail.length === 0) {
+    return { kind: 'ok', notes: [`'${name}' stderr log is empty (${path}).`] };
+  }
+  return {
+    kind: 'ok',
+    notes: [
+      `mcp '${name}' stderr — last ${tail.length} line${tail.length === 1 ? '' : 's'} (${path}):`,
+      ...tail,
+    ],
+  };
+};
+
 export const mcpCommand: SlashCommand = {
   name: 'mcp',
-  description: 'Inspect + control MCP servers (show / revoke / reconnect)',
-  argHint: '[show|revoke|reconnect <server>]',
+  description: 'Inspect + control MCP servers (show / revoke / reconnect / logs)',
+  argHint: '[show|revoke|reconnect|logs <server>]',
   exec: async (args, ctx): Promise<SlashResult> => {
     const sub = args[0];
     if (sub === undefined || sub === 'list') return handleList(ctx);
-    if (sub === 'show' || sub === 'revoke' || sub === 'reconnect') {
+    if (sub === 'show' || sub === 'revoke' || sub === 'reconnect' || sub === 'logs') {
       const name = args[1];
       if (name === undefined) {
         return { kind: 'error', message: `/mcp ${sub} <server>: name required` };
       }
       if (sub === 'show') return handleShow(ctx, name);
       if (sub === 'revoke') return handleRevoke(ctx, name);
-      return handleReconnect(ctx, name);
+      if (sub === 'reconnect') return handleReconnect(ctx, name);
+      return handleLogs(ctx, name);
     }
     return {
       kind: 'error',
-      message: `/mcp: unknown subcommand '${sub}' (try: /mcp list, /mcp show|revoke|reconnect <server>)`,
+      message: `/mcp: unknown subcommand '${sub}' (try: /mcp list, /mcp show|revoke|reconnect|logs <server>)`,
     };
   },
 };

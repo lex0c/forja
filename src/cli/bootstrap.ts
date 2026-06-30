@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { loadRetentionConfig } from '../audit/config-loader.ts';
 import {
   type Broker,
@@ -33,7 +33,13 @@ import {
 } from '../hooks/index.ts';
 import { loadMcpConfig } from '../mcp/config.ts';
 import { type McpInitReport, type McpManager, createMcpManager } from '../mcp/manager.ts';
-import type { ConfirmMcpTrust, McpClient, McpSandboxWrap, McpStdioConfig } from '../mcp/types.ts';
+import type {
+  ConfirmMcpTrust,
+  McpClient,
+  McpSandboxArg,
+  McpSandboxWrap,
+  McpStdioConfig,
+} from '../mcp/types.ts';
 import {
   computeSharedFingerprint,
   createMemoryRegistry,
@@ -305,7 +311,13 @@ export interface BootstrapInput {
   // Test seam: inject a fake MCP client factory so a test can exercise the
   // bootstrap → manager → registration path without spawning a real stdio
   // subprocess. Production leaves it absent (the SDK stdio adapter is used).
-  mcpMakeClient?: (cfg: McpStdioConfig) => McpClient;
+  // Mirrors the manager's `makeClient` (cfg, sandbox?, stderrLogPath?) so a
+  // bootstrap-level fake can observe the sandbox + stderr-log threading.
+  mcpMakeClient?: (
+    cfg: McpStdioConfig,
+    sandbox?: McpSandboxArg,
+    stderrLogPath?: string,
+  ) => McpClient;
 }
 
 // §13.7 sandbox-enforcement snapshot — captured at bootstrap time so
@@ -1627,6 +1639,10 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       registry: toolRegistry,
       config: mcpConfig,
       sandbox: mcpSandbox,
+      // Per-server stderr logs land in a `traces/` dir beside the DB — under
+      // the default absolute dbPath that is `<dataDir>/traces/`, and a test's
+      // dbPath override isolates them along with the DB.
+      traceDir: join(dirname(dbPath), 'traces'),
       ...(input.confirmMcpTrust !== undefined ? { confirmTrust: input.confirmMcpTrust } : {}),
       ...(input.autoApproveMcp !== undefined ? { autoApprove: input.autoApproveMcp } : {}),
       ...(input.mcpMakeClient !== undefined ? { makeClient: input.mcpMakeClient } : {}),

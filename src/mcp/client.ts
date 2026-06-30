@@ -8,6 +8,9 @@
 // narrowed, missing/ill-typed fields degrade to safe defaults rather than
 // throwing or trusting the declared TS type.
 
+import { chmodSync, createWriteStream, mkdirSync, openSync, renameSync } from 'node:fs';
+import { dirname } from 'node:path';
+import type { Readable } from 'node:stream';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { ProviderToolInputSchema } from '../providers/types.ts';
@@ -105,7 +108,114 @@ export const flattenContent = (content: unknown): string => {
   return parts.join('');
 };
 
-export const createStdioMcpClient = (cfg: McpStdioConfig, sandbox?: McpSandboxArg): McpClient => {
+// MCP.md §2.1: the server's stderr is rotated at 10 MB.
+const STDERR_LOG_CAP_BYTES = 10 * 1024 * 1024;
+
+// Drain the server's piped stderr and tee it to `logPath`. Draining is
+// MANDATORY even without a path: an unread `stderr: 'pipe'` fills (OS pipe +
+// the SDK's in-memory PassThrough) and the child then BLOCKS on its next stderr
+// write — the `data` listener is what keeps it moving. The file is opened
+// lazily on the first byte (a silent server leaves no empty artifact), in
+// APPEND mode (a reconnect must NOT truncate the prior session's crash output)
+// with mode 0600 set AT CREATE — stderr can carry secret-shaped payloads
+// (panics dumping env, a tool echoing a Bearer token), and creating 0600
+// avoids the world-readable window a chmod-after-lazy-create would leave.
+// Best-effort throughout: a mkdir/open/write failure drops the sink but keeps
+// draining so the child never blocks. Keeps one rotation generation (`<log>.1`)
+// at 10 MB. Parallels `subagents/spawn-factory.ts#drainStderrToLogFile`, but
+// that consumes a Web ReadableStream (Bun.spawn); the SDK transport hands us a
+// Node `Readable` (node:child_process), a different stream surface.
+//
+// Returns a promise that resolves once the stream ends and the final flush
+// completes — `connect()` fire-and-forgets it; tests await it. Exported for
+// direct testing without a real subprocess (push bytes into a Node Readable,
+// end it, await, assert the file).
+export const teeStderr = (stderr: Readable, logPath: string | undefined): Promise<void> =>
+  new Promise<void>((resolve) => {
+    let sink: { write: (c: Uint8Array) => void; end: () => Promise<void> } | undefined;
+    let opened = false;
+    let bytes = 0;
+    let done = false;
+    const open = (): void => {
+      if (logPath === undefined) return;
+      try {
+        mkdirSync(dirname(logPath), { recursive: true });
+        try {
+          chmodSync(dirname(logPath), 0o700);
+        } catch {
+          // Best-effort dir lockdown (the load-bearing barrier).
+        }
+        // openSync (NOT createWriteStream's async open) so the file exists
+        // SYNCHRONOUSLY — the rotation's renameSync below needs it present, and
+        // 'a'+0o600 gives append (no truncate on reconnect) + operator-only-at-
+        // create (no world-readable chmod race) in one syscall. The stream wraps
+        // that fd for non-blocking, fd-prompt writes (so `/mcp logs` on a live
+        // server sees the latest lines) and closes it on end.
+        const fd = openSync(logPath, 'a', 0o600);
+        const stream = createWriteStream(logPath, { fd, autoClose: true });
+        stream.on('error', () => {
+          sink = undefined; // EACCES / disk full → drain-to-discard from here.
+        });
+        sink = {
+          write: (c) => {
+            stream.write(c);
+          },
+          end: () => new Promise<void>((res) => stream.end(res)),
+        };
+      } catch {
+        sink = undefined; // synchronous open failure — drain-to-discard.
+      }
+    };
+    stderr.on('data', (chunk: Buffer) => {
+      if (!opened) {
+        opened = true;
+        open();
+      }
+      if (sink === undefined || logPath === undefined) return;
+      if (bytes + chunk.length > STDERR_LOG_CAP_BYTES) {
+        // Rotate: close, keep one generation, reopen fresh. The old stream's fd
+        // keeps writing into the renamed `.1` inode (Unix), so in-flight bytes
+        // aren't lost; the reopen appends to a fresh `<log>`.
+        try {
+          void sink.end();
+          renameSync(logPath, `${logPath}.1`);
+        } catch {
+          // Best-effort rotation.
+        }
+        bytes = 0;
+        open();
+        if (sink === undefined) return;
+      }
+      try {
+        sink.write(chunk);
+        bytes += chunk.length;
+      } catch {
+        sink = undefined; // mid-run write failure — keep draining to discard.
+      }
+    });
+    // end/error/close can all fire; flush + resolve exactly once.
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      void (async () => {
+        try {
+          await sink?.end();
+        } catch {
+          // Best-effort flush.
+        }
+        resolve();
+      })();
+    };
+    stderr.on('end', finish);
+    stderr.on('error', finish);
+    stderr.on('close', finish);
+  });
+
+export const createStdioMcpClient = (
+  cfg: McpStdioConfig,
+  sandbox?: McpSandboxArg,
+  stderrLogPath?: string,
+): McpClient => {
   let client: Client | null = null;
 
   return {
@@ -134,10 +244,18 @@ export const createStdioMcpClient = (cfg: McpStdioConfig, sandbox?: McpSandboxAr
         env: buildSpawnEnv(cfg.env),
         ...(cfg.cwd !== undefined ? { cwd: cfg.cwd } : {}),
         // Capture the server's stderr instead of letting it bleed into the
-        // agent's stderr (which is NDJSON in --json mode). The manager can
-        // later tee it to traces/mcp-<name>.log.
+        // agent's stderr (NDJSON in --json mode); tee'd to mcp-<name>.log below.
         stderr: 'pipe',
       });
+      // Drain + tee the child's stderr BEFORE connecting. The SDK exposes its
+      // stderr PassThrough right after construction (the child is spawned inside
+      // c.connect → transport.start), so attaching here — not after the
+      // handshake — (a) captures the stderr of a server that DIES during
+      // `initialize` (the crash reason `/mcp logs` exists to surface), and
+      // (b) keeps the pipe drained through the handshake so a chatty server
+      // can't back up its stderr buffer and deadlock mid-connect.
+      const errStream = (transport as { stderr?: Readable | null }).stderr;
+      if (errStream != null) void teeStderr(errStream, stderrLogPath);
       const c = new Client(CLIENT_INFO, { capabilities: {} });
       try {
         // Wire the abort signal so a hung `initialize` (slow / malicious

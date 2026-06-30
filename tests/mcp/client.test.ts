@@ -4,13 +4,18 @@
 // tests/mcp/real-subprocess.test.ts; here we pin the degradation + env-
 // isolation properties directly.
 
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import {
   buildSpawnEnv,
   createStdioMcpClient,
   extractMeta,
   flattenContent,
   normalizeInputSchema,
+  teeStderr,
 } from '../../src/mcp/client.ts';
 import type { McpStdioConfig } from '../../src/mcp/types.ts';
 
@@ -165,5 +170,74 @@ describe('createStdioMcpClient — sandbox wrap in connect()', () => {
     // on the spawn, not on the wrap.
     await expect(client.connect()).rejects.toThrow();
     expect(wrapCalled).toBe(false);
+  });
+});
+
+describe('teeStderr — drain + tee the server stderr', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'mcp-tee-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('tees the stream to the log file (mkdir -p of the trace dir)', async () => {
+    const path = join(dir, 'traces', 'mcp-db.log'); // dir does not exist yet
+    await teeStderr(Readable.from([Buffer.from('boot\n'), Buffer.from('listening\n')]), path);
+    expect(readFileSync(path, 'utf8')).toBe('boot\nlistening\n');
+  });
+
+  test('lazy: a silent stream creates no on-disk artifact', async () => {
+    const path = join(dir, 'traces', 'mcp-quiet.log');
+    await teeStderr(Readable.from([]), path);
+    expect(existsSync(path)).toBe(false);
+  });
+
+  test('drain-to-discard: an undefined path still consumes the stream (no child block)', async () => {
+    // The whole point of draining even without a sink: an unread pipe blocks the
+    // child. With no path we must still read every chunk to EOF.
+    let ended = false;
+    const src = Readable.from([Buffer.from('x'), Buffer.from('y')]);
+    src.on('end', () => {
+      ended = true;
+    });
+    await teeStderr(src, undefined);
+    expect(ended).toBe(true);
+  });
+
+  test('resolves on a stream error without throwing', async () => {
+    const path = join(dir, 'mcp-err.log');
+    const src = new Readable({
+      read() {
+        this.destroy(new Error('pipe broke'));
+      },
+    });
+    await teeStderr(src, path); // must resolve, not reject
+    expect(true).toBe(true);
+  });
+
+  test('APPENDS across reconnects — a second tee does not truncate the first', async () => {
+    const path = join(dir, 'mcp-db.log');
+    await teeStderr(Readable.from([Buffer.from('session-one crash\n')]), path);
+    // A lazy reconnect reopens the SAME path; the prior session's stderr (the
+    // crash reason) must survive, not be wiped by an offset-0 truncate.
+    await teeStderr(Readable.from([Buffer.from('session-two\n')]), path);
+    expect(readFileSync(path, 'utf8')).toBe('session-one crash\nsession-two\n');
+  });
+
+  test('creates the log operator-only (0600), not at the default umask', async () => {
+    const path = join(dir, 'traces', 'mcp-db.log');
+    await teeStderr(Readable.from([Buffer.from('secret-shaped: Bearer xyz\n')]), path);
+    expect(statSync(path).mode & 0o777).toBe(0o600); // no world/group read
+  });
+
+  test('rotates at 10 MB, keeping one .1 generation + a fresh active log', async () => {
+    const path = join(dir, 'mcp-db.log');
+    const a = Buffer.alloc(6 * 1024 * 1024, 0x61); // 6 MB
+    const b = Buffer.alloc(5 * 1024 * 1024, 0x62); // 5 MB → 11 MB total crosses the cap
+    await teeStderr(Readable.from([a, b]), path);
+    expect(existsSync(`${path}.1`)).toBe(true); // the first 6 MB rotated out
+    expect(statSync(path).size).toBeLessThan(6 * 1024 * 1024); // active log holds only the post-rotation tail
   });
 });

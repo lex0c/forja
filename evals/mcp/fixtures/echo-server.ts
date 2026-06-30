@@ -35,4 +35,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   return { content: [{ type: 'text', text: `echo:${text}` }] };
 });
 
+// A startup line on stderr — exercises the client's stderr drain/tee
+// (`/mcp logs`) end-to-end against a real child's stderr pipe.
+process.stderr.write('echo-server: ready\n');
+
 await server.connect(new StdioServerTransport());

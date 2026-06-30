@@ -1,6 +1,9 @@
-// /mcp slash command (read-only: list + show). MCP.md §7.
+// /mcp slash command (list / show / revoke / reconnect / logs). MCP.md §7.
 
 import { beforeEach, describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { mcpCommand } from '../../../src/cli/slash/commands/mcp.ts';
 import type { SlashContext } from '../../../src/cli/slash/types.ts';
 import type { HarnessConfig } from '../../../src/harness/index.ts';
@@ -20,6 +23,7 @@ interface FakeHooks {
   reconnect?: (
     name: string,
   ) => Promise<{ ok: boolean; reason?: string; registered: number; warnings: string[] }>;
+  logPath?: (name: string) => string | null;
 }
 const fakeManager = (status: McpServerStatus[], hooks: FakeHooks = {}): McpManager =>
   ({
@@ -27,6 +31,7 @@ const fakeManager = (status: McpServerStatus[], hooks: FakeHooks = {}): McpManag
     callTool: async () => ({ isError: false, content: '' }),
     state: (n: string) => status.find((s) => s.name === n)?.state ?? null,
     status: () => status,
+    logPath: hooks.logPath ?? (() => null),
     revoke: hooks.revoke ?? (async () => ({ ok: true, tools: 0 })),
     reconnect: hooks.reconnect ?? (async () => ({ ok: true, registered: 0, warnings: [] })),
     cleanup: async () => {},
@@ -69,7 +74,7 @@ beforeEach(() => {
   migrate(db);
 });
 
-describe('/mcp slash command (read-only)', () => {
+describe('/mcp slash command', () => {
   test('no servers + no manager → friendly empty note', async () => {
     const r = await mcpCommand.exec([], buildCtx());
     expect(r.kind).toBe('ok');
@@ -293,5 +298,81 @@ describe('/mcp slash command (read-only)', () => {
   test('reconnect without a manager (headless) errors', async () => {
     const r = await mcpCommand.exec(['reconnect', 'db'], buildCtx());
     expect(r.kind).toBe('error');
+  });
+
+  test('logs without a manager errors', async () => {
+    seed('db', 'trusted');
+    const r = await mcpCommand.exec(['logs', 'db'], buildCtx());
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message).toContain('not active');
+  });
+
+  test('logs of an unknown server errors', async () => {
+    const r = await mcpCommand.exec(['logs', 'nope'], buildCtx(fakeManager([])));
+    expect(r.kind).toBe('error');
+  });
+
+  test('logs with no configured log path → friendly note (headless trace dir absent)', async () => {
+    seed('db', 'trusted');
+    const r = await mcpCommand.exec(
+      ['logs', 'db'],
+      buildCtx(fakeManager([], { logPath: () => null })),
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    expect(r.notes?.join('\n')).toContain('No stderr log');
+  });
+
+  test('logs of a server that has not written stderr yet → "no stderr captured"', async () => {
+    seed('db', 'trusted');
+    const r = await mcpCommand.exec(
+      ['logs', 'db'],
+      buildCtx(fakeManager([], { logPath: () => '/no/such/dir/mcp-db.log' })),
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    expect(r.notes?.join('\n')).toContain('No stderr captured');
+  });
+
+  test('logs tails the captured stderr file (last N lines)', async () => {
+    seed('db', 'trusted');
+    const dir = mkdtempSync(join(tmpdir(), 'mcp-logs-'));
+    const path = join(dir, 'mcp-db.log');
+    writeFileSync(path, 'line one\nline two\nline three\n');
+    try {
+      const r = await mcpCommand.exec(
+        ['logs', 'db'],
+        buildCtx(fakeManager([], { logPath: () => path })),
+      );
+      expect(r.kind).toBe('ok');
+      if (r.kind !== 'ok') return;
+      const text = r.notes?.join('\n') ?? '';
+      expect(text).toContain('last 3 lines');
+      expect(text).toContain('line one');
+      expect(text).toContain('line three');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('logs of a server whose last record exceeds 64 KiB shows the truncated tail, not "empty"', async () => {
+    seed('db', 'trusted');
+    const dir = mkdtempSync(join(tmpdir(), 'mcp-logs-'));
+    const path = join(dir, 'mcp-db.log');
+    writeFileSync(path, 'x'.repeat(70 * 1024)); // one 70 KiB line, no newline
+    try {
+      const r = await mcpCommand.exec(
+        ['logs', 'db'],
+        buildCtx(fakeManager([], { logPath: () => path })),
+      );
+      expect(r.kind).toBe('ok');
+      if (r.kind !== 'ok') return;
+      const text = r.notes?.join('\n') ?? '';
+      expect(text).not.toContain('is empty'); // the >64 KiB single-line fix
+      expect(text).toContain('xxx'); // shows the (truncated) trailing content
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

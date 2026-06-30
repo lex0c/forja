@@ -21,6 +21,7 @@
 // states are set directly here (the pure transition table in state.ts is the
 // documented/tested reference, enforced more strictly in a later slice).
 
+import { join } from 'node:path';
 import type { DB } from '../storage/db.ts';
 import {
   bumpServerCounters,
@@ -69,8 +70,13 @@ export interface McpManagerDeps {
   // --auto-approve-mcp <list>: servers granted without a prompt in headless.
   autoApprove?: ReadonlySet<string>;
   // Injectable client factory (tests pass a fake; production uses the SDK
-  // stdio adapter).
-  makeClient?: (cfg: McpStdioConfig, sandbox?: McpSandboxArg) => McpClient;
+  // stdio adapter). `stderrLogPath` is where the adapter tees the server's
+  // stderr (mcp-<name>.log) — undefined ⇒ drain-to-discard.
+  makeClient?: (cfg: McpStdioConfig, sandbox?: McpSandboxArg, stderrLogPath?: string) => McpClient;
+  // Directory for per-server stderr logs (`<traceDir>/mcp-<name>.log`, read by
+  // `/mcp logs`). Absent ⇒ stderr is drained-to-discard (still prevents the
+  // child blocking on a full pipe), no on-disk trail.
+  traceDir?: string;
   // Sandbox wrap for spawned servers (MCP.md §2.3). `available` is the boot-time
   // tool detection (drives default-on + the modal status); `wrap` produces the
   // bwrap/sandbox-exec argv. Absent ⇒ no sandboxing (every server runs host).
@@ -104,6 +110,11 @@ export interface McpManager {
   // tool count) for /mcp + status views — the McpInitReport snapshot, queryable
   // after init.
   status(): McpServerStatus[];
+  // Absolute path to a server's stderr log (`<traceDir>/mcp-<name>.log`) for
+  // `/mcp logs`, or null when no traceDir is configured (headless/test). The
+  // file is created lazily on the server's first stderr byte, so the path may
+  // not exist yet — the caller checks.
+  logPath(name: string): string | null;
   // Operator revocation (`/mcp revoke`): deny the server, unregister its tools
   // (the next turn's tool list drops them), and persist the revocation so a
   // relaunch keeps it denied. Between-turns only.
@@ -199,14 +210,28 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
     return { profile: 'cwd-rw', status: 'sandboxed' };
   };
 
+  // Per-server stderr log path (`<traceDir>/mcp-<name>.log`). Every name that
+  // reaches here is config-validated to `^[a-z][a-z0-9_]*$` (clientFor uses
+  // `rt.config.name`; `/mcp logs` gates on `getServer`), but `logPath` is public
+  // on the interface — co-locate a defensive traversal guard so a future un-
+  // gated caller can't escape `traceDir`. undefined ⇒ drain-to-discard.
+  const serverLogPath = (name: string): string | undefined => {
+    if (deps.traceDir === undefined) return undefined;
+    if (name.length === 0 || name.includes('/') || name.includes('\\') || name.includes('..')) {
+      return undefined;
+    }
+    return join(deps.traceDir, `mcp-${name}.log`);
+  };
+
   // Build a client for a server, wrapping the spawn in the sandbox when the
   // resolved profile is non-host.
   const clientFor = (rt: ServerRuntime): McpClient => {
     const { profile } = resolveSandbox(rt.config);
+    const logPath = serverLogPath(rt.config.name);
     if (profile === 'host' || deps.sandbox === undefined) {
-      return makeClient(rt.config.transport);
+      return makeClient(rt.config.transport, undefined, logPath);
     }
-    return makeClient(rt.config.transport, { profile, wrap: deps.sandbox.wrap });
+    return makeClient(rt.config.transport, { profile, wrap: deps.sandbox.wrap }, logPath);
   };
   const now = deps.now ?? (() => Date.now());
   const runtime = new Map<string, ServerRuntime>();
@@ -623,6 +648,10 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         state: rt.state,
         tools: rt.registeredNames.length,
       }));
+    },
+
+    logPath(name) {
+      return serverLogPath(name) ?? null;
     },
 
     async revoke(server) {

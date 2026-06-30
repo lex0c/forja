@@ -66,10 +66,16 @@ const fakeClientFactory = (spec: FakeSpec) => {
     calls: 0,
     lastConnectSignal: undefined as AbortSignal | undefined,
     lastSandbox: undefined as McpSandboxArg | undefined,
+    lastLogPath: undefined as string | undefined,
   };
-  const makeClient = (_cfg: McpStdioConfig, sandbox?: McpSandboxArg): McpClient => {
+  const makeClient = (
+    _cfg: McpStdioConfig,
+    sandbox?: McpSandboxArg,
+    stderrLogPath?: string,
+  ): McpClient => {
     stats.made += 1;
     stats.lastSandbox = sandbox;
+    stats.lastLogPath = stderrLogPath;
     return {
       async connect(signal) {
         stats.connects += 1;
@@ -926,5 +932,62 @@ describe('McpManager: revoke / reconnect (registry hot-swap)', () => {
     const r = await mgr.reconnect('db');
     expect(r.ok).toBe(false);
     await mgr.cleanup();
+  });
+});
+
+describe('McpManager: stderr log path (/mcp logs + tee)', () => {
+  test('logPath returns <traceDir>/mcp-<name>.log when a traceDir is set', () => {
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      traceDir: '/data/traces',
+    });
+    expect(mgr.logPath('db')).toBe('/data/traces/mcp-db.log');
+  });
+
+  test('logPath is null without a traceDir (headless/test)', () => {
+    const mgr = createMcpManager({ db, registry, config: config([serverConfig()]) });
+    expect(mgr.logPath('db')).toBeNull();
+  });
+
+  test('the manager threads the per-server log path to the client factory', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+      traceDir: '/data/traces',
+    });
+    await mgr.init(); // fresh-trust path connects → clientFor → makeClient(cfg, _, logPath)
+    expect(fake.stats.lastLogPath).toBe('/data/traces/mcp-db.log');
+    await mgr.cleanup();
+  });
+
+  test('without a traceDir the factory gets an undefined log path (drain-to-discard)', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(fake.stats.lastLogPath).toBeUndefined();
+    await mgr.cleanup();
+  });
+
+  test('logPath defends against a traversal name even with a traceDir', () => {
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([]),
+      traceDir: '/data/traces',
+    });
+    expect(mgr.logPath('../../etc/passwd')).toBeNull();
+    expect(mgr.logPath('a/b')).toBeNull();
   });
 });
