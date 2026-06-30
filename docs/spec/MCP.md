@@ -331,9 +331,29 @@ Limites operacionais (`PERFORMANCE.md §8`):
 | `timeout_ms` | 30000 | 60000 | per-call |
 | `heartbeat_max_age_ms` | 60000 | 300000 | SSE/HTTP only |
 
-Excedeu cap absoluto → server transita para `disconnected` com `failure_event` `mcp.budget.exceeded`. Soft cap → warning em audit, sem ação.
+**Modelo de enforcement (implementado).** O valor **configurado** por server (`[servers.<name>]
+timeout_ms` / `max_calls_per_session` / `max_tokens_in_per_session`) é o **cap enforçado**; a coluna
+"Cap absoluto" é o **teto** ao qual o loader faz clamp do valor configurado (um `max_calls = 99999`
+vira 1000), não um segundo limiar. Defaults aplicados quando o campo é omitido; valor `< 1` ou
+não-numérico → warning + default.
 
-Budget herda de step parent em `orchestrated` profile (cascading via `ORCHESTRATION.md §11`).
+- **`timeout_ms`** limita uma única `tools/call`. Estouro → `failure_event` `mcp.timeout` (classe
+  `mcp`, recovery `ignored`); o server **fica `active`** e a conexão reusável (§15.3) — não é fault de
+  transporte —, e o timeout volta ao modelo como tool error pra ele decidir.
+- **`max_calls_per_session` / `max_tokens_in_per_session`** são contados **per-sessão** (in-memory;
+  distintos dos contadores cumulativos `total_*` do DB que alimentam `/mcp show`). Como o manager é
+  broker-style (uma instância pro processo inteiro, e cada prompt do REPL é uma sessão nova, §1.1), os
+  contadores **resetam quando uma nova sessão chama o server** — é isso que torna o cap per-sessão e
+  **levanta o bloqueio** da sessão anterior. As chamadas contam **tentativas** (incluindo timeouts,
+  senão um server que trava em toda chamada loopa sem nunca bater o cap); tokens-in só acumulam em
+  chamada bem-sucedida. Cruzar o cap → `disconnected` + `failure_event` `mcp.budget.exceeded` (recovery
+  `pending_repair`, user-visible, **uma vez por trip** — o cap-check re-dispara em toda chamada recusada
+  da sessão, mas a violação aconteceu uma vez), checado **antes de qualquer reconexão** pra um server
+  capado não re-spawnar. Bloqueio até a próxima sessão (§15.6) — ou um `/mcp reconnect` do operador.
+
+Um tier mais fino de **soft-warning antes do hard cap** + a auto-recuperação `degraded`→`active` de
+drift/output-inválido (§15.5) são slices futuros. Budget herda de step parent em `orchestrated`
+profile (cascading via `ORCHESTRATION.md §11`).
 
 ---
 

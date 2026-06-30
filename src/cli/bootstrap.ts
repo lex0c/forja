@@ -1643,6 +1643,9 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       // the default absolute dbPath that is `<dataDir>/traces/`, and a test's
       // dbPath override isolates them along with the DB.
       traceDir: join(dirname(dbPath), 'traces'),
+      // Budget/timeout failure_events ride the same audit chain as the rest of
+      // the session (mcp.budget.exceeded / mcp.timeout, MCP.md §5/§15).
+      failureSink,
       ...(input.confirmMcpTrust !== undefined ? { confirmTrust: input.confirmMcpTrust } : {}),
       ...(input.autoApproveMcp !== undefined ? { autoApprove: input.autoApproveMcp } : {}),
       ...(input.mcpMakeClient !== undefined ? { makeClient: input.mcpMakeClient } : {}),

@@ -24,6 +24,7 @@
 // set directly here (the pure transition table in state.ts is the reference).
 
 import { join } from 'node:path';
+import type { FailureEventSink } from '../failures/index.ts';
 import { charsToTokens } from '../providers/tokens.ts';
 import type { DB } from '../storage/db.ts';
 import {
@@ -87,6 +88,10 @@ export interface McpManagerDeps {
   sandbox?: { available: boolean; wrap: McpSandboxWrap };
   // Injectable clock for decided_at / last_connected_at.
   now?: () => number;
+  // Audit sink for per-server budget/timeout failure_events (MCP.md §5/§15).
+  // Absent ⇒ no audit rows (headless/test). Emits are best-effort — an audit
+  // failure never breaks a tool call.
+  failureSink?: FailureEventSink;
 }
 
 export interface McpServerStatus {
@@ -142,13 +147,22 @@ interface ServerRuntime {
   // re-detecting the same drift on every subsequent call.
   drifted: boolean;
   registeredNames: string[];
-  // Per-SESSION budget counters (MCP.md §5). In-memory, so they reset when a new
-  // session rebuilds the manager — unlike the DB's cumulative total_calls /
-  // total_tokens_in (lifetime stats for /mcp show). Drive the configured-cap
-  // disconnect. sessionCalls counts ATTEMPTS (incl. timeouts); sessionTokensIn
-  // accrues only on a successful call's result.
+  // Per-SESSION budget counters (MCP.md §5), distinct from the DB's cumulative
+  // total_calls / total_tokens_in (lifetime stats for /mcp show). Drive the
+  // configured-cap disconnect. sessionCalls counts ATTEMPTS (incl. timeouts);
+  // sessionTokensIn accrues only on a successful call's result. The manager is
+  // broker-style — ONE instance across the process's many sessions (each REPL
+  // prompt is a fresh session, MCP.md §1.1) — so callTool resets these when
+  // `budgetSession` no longer matches the calling session, or they'd accumulate
+  // process-wide instead of per-session (and the §15.6 "blocked until the next
+  // session" never lifts).
+  budgetSession: string | null;
   sessionCalls: number;
   sessionTokensIn: number;
+  // mcp.budget.exceeded is emitted once per trip — the cap check re-fires on
+  // every refused call (disconnected is not terminal), so gate the audit row.
+  // Reset alongside the counters on a session change.
+  budgetEmitted: boolean;
 }
 
 const parseCachedManifestTools = (json: string): McpManifestTool[] => {
@@ -275,6 +289,33 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
   const now = deps.now ?? (() => Date.now());
   const runtime = new Map<string, ServerRuntime>();
 
+  // Best-effort budget/timeout audit row (MCP.md §5/§15). Session-scoped, so it
+  // takes the call's ctx.sessionId; an emit failure must never break the call.
+  const emitFailure = (event: {
+    code: string;
+    recovery: string;
+    userVisible: boolean;
+    sessionId: string;
+    payload: Record<string, unknown>;
+  }): void => {
+    // No sink, or no real session to key the chain to — a malformed ctx would
+    // otherwise default to BOOTSTRAP_SESSION_ID and pollute the bootstrap chain
+    // with per-session events.
+    if (deps.failureSink === undefined || !event.sessionId) return;
+    try {
+      deps.failureSink.emit({
+        code: event.code,
+        classe: 'mcp',
+        recovery_action: event.recovery,
+        user_visible: event.userVisible,
+        session_id: event.sessionId,
+        payload: event.payload,
+      });
+    } catch {
+      // Audit is best-effort; the tool call proceeds regardless.
+    }
+  };
+
   const setState = (
     rt: ServerRuntime,
     state: McpServerState,
@@ -307,12 +348,22 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       );
     }
 
+    // Reset the per-session counters when a new session calls this server (the
+    // broker-style manager outlives any one session). This is what makes the cap
+    // per-SESSION and lifts the §15.6 "blocked until the next session" disconnect
+    // — a server budget-disconnected last session gets a fresh budget now.
+    if (rt.budgetSession !== ctx.sessionId) {
+      rt.budgetSession = ctx.sessionId;
+      rt.sessionCalls = 0;
+      rt.sessionTokensIn = 0;
+      rt.budgetEmitted = false;
+    }
+
     // Per-session budget (MCP.md §5/§15.6): a runaway server that has burned its
     // configured call/token cap is disconnected for the rest of the session —
     // checked BEFORE any (re)connect so a capped server can't even re-spawn. The
     // cap is the operator's configured value (the loader already clamped it to
-    // the absolute ceiling). A finer soft-warning-then-hard tier + the
-    // failure_event audit row land with the sink in a later slice.
+    // the absolute ceiling). A finer soft-warning-then-hard tier lands later.
     const budget = rt.config.budget ?? DEFAULT_MCP_BUDGET;
     if (
       rt.sessionCalls >= budget.maxCallsPerSession ||
@@ -322,6 +373,24 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       rt.client = null;
       rt.connected = false;
       setState(rt, 'disconnected', { last_error: 'mcp.budget.exceeded' });
+      // Once per trip — the cap check re-fires on every refused call this session
+      // (disconnected is not terminal), but the breach happened once.
+      if (!rt.budgetEmitted) {
+        rt.budgetEmitted = true;
+        emitFailure({
+          code: 'mcp.budget.exceeded',
+          recovery: 'pending_repair', // disconnected, awaiting next session / reconnect
+          userVisible: true,
+          sessionId: ctx.sessionId,
+          payload: {
+            server,
+            calls: rt.sessionCalls,
+            tokens_in: rt.sessionTokensIn,
+            max_calls: budget.maxCallsPerSession,
+            max_tokens_in: budget.maxTokensInPerSession,
+          },
+        });
+      }
       throw new Error(
         `mcp.budget.exceeded: server '${server}' hit its budget cap ` +
           `(calls=${rt.sessionCalls}/${budget.maxCallsPerSession}, ` +
@@ -408,6 +477,15 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       // call's; and a genuinely broken connection self-heals (the next call
       // faults and disconnects through the branch below).
       if (timeout.aborted && (ctx.signal === undefined || !ctx.signal.aborted)) {
+        // Per-call event — each timeout is a distinct call failure, so (unlike
+        // the once-per-trip budget row) this fires per timed-out call.
+        emitFailure({
+          code: 'mcp.timeout',
+          recovery: 'ignored',
+          userVisible: false,
+          sessionId: ctx.sessionId,
+          payload: { server, tool: toolName, timeout_ms: budget.timeoutMs },
+        });
         throw new Error(
           `mcp.timeout: server '${server}' tool '${toolName}' exceeded ${budget.timeoutMs}ms`,
         );
@@ -627,8 +705,10 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
           connected: false,
           drifted: false,
           registeredNames: [],
+          budgetSession: null,
           sessionCalls: 0,
           sessionTokensIn: 0,
+          budgetEmitted: false,
         };
         runtime.set(server.name, rt);
 
@@ -789,8 +869,10 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         connected: false,
         drifted: false,
         registeredNames: [],
+        budgetSession: null,
         sessionCalls: 0,
         sessionTokensIn: 0,
+        budgetEmitted: false,
       };
       runtime.set(server, rt);
       const warnings: string[] = [];

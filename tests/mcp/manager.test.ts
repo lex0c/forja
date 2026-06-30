@@ -1,4 +1,9 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
+import {
+  type EmitFailureEventInput,
+  type FailureEventSink,
+  createSqliteFailureSink,
+} from '../../src/failures/index.ts';
 import type { LoadedMcpConfig } from '../../src/mcp/config.ts';
 import { createMcpManager } from '../../src/mcp/manager.ts';
 import {
@@ -17,6 +22,7 @@ import type {
 } from '../../src/mcp/types.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
+import { listFailureEventsBySession } from '../../src/storage/repos/failure-events.ts';
 import {
   getServer,
   insertServer,
@@ -27,7 +33,23 @@ import {
 import { type ToolRegistry, createToolRegistry } from '../../src/tools/registry.ts';
 import type { ToolContext } from '../../src/tools/types.ts';
 
-const ctx = { signal: new AbortController().signal } as unknown as ToolContext;
+const ctx = {
+  signal: new AbortController().signal,
+  sessionId: 'sess-1',
+} as unknown as ToolContext;
+
+// Capturing failure_event sink — records every emit for assertion.
+const captureSink = (): { sink: FailureEventSink; emits: EmitFailureEventInput[] } => {
+  const emits: EmitFailureEventInput[] = [];
+  const sink: FailureEventSink = {
+    emit: (i) => {
+      emits.push(i);
+      return { id: 'fake', this_chain_hash: 'fake' };
+    },
+    verifyChain: () => ({ ok: true, rows: 0 }),
+  };
+  return { sink, emits };
+};
 
 const toolDef = (name: string): McpManifestTool => ({
   name,
@@ -1112,6 +1134,199 @@ describe('McpManager: per-server budget (MCP.md §5)', () => {
     const row = getServer(db, 'db');
     expect(row?.total_calls).toBe(1);
     expect(row?.total_tokens_in ?? 0).toBeGreaterThan(0); // estimated from the result content
+    await mgr.cleanup();
+  });
+
+  test('the budget-cap disconnect emits an mcp.budget.exceeded audit row', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: 'ok' },
+    });
+    const audit = captureSink();
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          budget: { timeoutMs: 30_000, maxCallsPerSession: 1, maxTokensInPerSession: 50_000 },
+        }),
+      ]),
+      makeClient: fake.makeClient,
+      failureSink: audit.sink,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx); // 1 → at the cap
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.budget\.exceeded/);
+    const row = audit.emits.find((e) => e.code === 'mcp.budget.exceeded');
+    expect(row).toBeDefined();
+    expect(row?.classe).toBe('mcp');
+    expect(row?.recovery_action).toBe('pending_repair');
+    expect(row?.session_id).toBe('sess-1');
+    expect(row?.user_visible).toBe(true);
+    const payload = row?.payload as Record<string, unknown> | undefined;
+    expect(payload?.server).toBe('db');
+    expect(payload?.calls).toBe(1);
+    expect(payload?.max_calls).toBe(1);
+    expect(payload).toHaveProperty('tokens_in');
+    expect(payload).toHaveProperty('max_tokens_in');
+    await mgr.cleanup();
+  });
+
+  test('a per-call timeout emits an mcp.timeout audit row (not user-visible)', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({ tools: [toolDef('query')], callHangs: true });
+    const audit = captureSink();
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          budget: { timeoutMs: 40, maxCallsPerSession: 200, maxTokensInPerSession: 50_000 },
+        }),
+      ]),
+      makeClient: fake.makeClient,
+      failureSink: audit.sink,
+    });
+    await mgr.init();
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.timeout/);
+    const row = audit.emits.find((e) => e.code === 'mcp.timeout');
+    expect(row).toBeDefined();
+    expect(row?.recovery_action).toBe('ignored');
+    expect(row?.user_visible).toBe(false);
+    const payload = row?.payload as Record<string, unknown> | undefined;
+    expect(payload?.tool).toBe('query');
+    expect(payload?.timeout_ms).toBe(40);
+    await mgr.cleanup();
+  });
+
+  test('the audit row persists through the REAL sqlite sink with an intact chain', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: 'ok' },
+    });
+    const sink = createSqliteFailureSink({ db });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          budget: { timeoutMs: 30_000, maxCallsPerSession: 1, maxTokensInPerSession: 50_000 },
+        }),
+      ]),
+      makeClient: fake.makeClient,
+      failureSink: sink,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx);
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.budget\.exceeded/);
+    const rows = listFailureEventsBySession(db, 'sess-1');
+    expect(rows.some((r) => r.code === 'mcp.budget.exceeded' && r.classe === 'mcp')).toBe(true);
+    expect(sink.verifyChain('sess-1').ok).toBe(true); // the registered code + chain hold end-to-end
+    await mgr.cleanup();
+  });
+
+  const capOneConfig = () =>
+    config([
+      serverConfig({
+        budget: { timeoutMs: 30_000, maxCallsPerSession: 1, maxTokensInPerSession: 50_000 },
+      }),
+    ]);
+
+  test('the per-session budget RESETS when a new session calls the server (§15.6 block lifts)', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: 'ok' },
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: capOneConfig(),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx); // sess-1: at the cap
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.budget\.exceeded/);
+    // A NEW session resets the broker-shared counters — the disconnect lifts and
+    // the server reconnects with a fresh budget.
+    const ctx2 = {
+      signal: new AbortController().signal,
+      sessionId: 'sess-2',
+    } as unknown as ToolContext;
+    expect((await mgr.callTool('db', 'query', {}, ctx2)).content).toBe('ok');
+    await mgr.cleanup();
+  });
+
+  test('mcp.budget.exceeded emits ONCE per trip, not per refused call', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: 'ok' },
+    });
+    const audit = captureSink();
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: capOneConfig(),
+      makeClient: fake.makeClient,
+      failureSink: audit.sink,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx); // at the cap
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/budget/); // refused (emit)
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/budget/); // refused again
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/budget/); // and again
+    expect(audit.emits.filter((e) => e.code === 'mcp.budget.exceeded')).toHaveLength(1);
+    await mgr.cleanup();
+  });
+
+  test('an emit that THROWS never breaks the tool call (best-effort audit)', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: 'ok' },
+    });
+    const throwingSink: FailureEventSink = {
+      emit: () => {
+        throw new Error('sink down');
+      },
+      verifyChain: () => ({ ok: true, rows: 0 }),
+    };
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: capOneConfig(),
+      makeClient: fake.makeClient,
+      failureSink: throwingSink,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx); // at the cap
+    // The call surfaces ITS OWN budget error, not the sink's 'sink down'.
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.budget\.exceeded/);
+    await mgr.cleanup();
+  });
+
+  test('mcp.timeout emits per timed-out call (each is a distinct failure)', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({ tools: [toolDef('query')], callHangs: true });
+    const audit = captureSink();
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          budget: { timeoutMs: 30, maxCallsPerSession: 200, maxTokensInPerSession: 50_000 },
+        }),
+      ]),
+      makeClient: fake.makeClient,
+      failureSink: audit.sink,
+    });
+    await mgr.init();
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.timeout/);
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.timeout/);
+    expect(audit.emits.filter((e) => e.code === 'mcp.timeout')).toHaveLength(2);
     await mgr.cleanup();
   });
 });
