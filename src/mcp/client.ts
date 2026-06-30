@@ -8,7 +8,7 @@
 // narrowed, missing/ill-typed fields degrade to safe defaults rather than
 // throwing or trusting the declared TS type.
 
-import { chmodSync, createWriteStream, mkdirSync, openSync, renameSync } from 'node:fs';
+import { chmodSync, createWriteStream, fstatSync, mkdirSync, openSync, renameSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { Readable } from 'node:stream';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -179,6 +179,17 @@ export const teeStderr = (stderr: Readable, logPath: string | undefined): Promis
         // that fd for non-blocking, fd-prompt writes (so `/mcp logs` on a live
         // server sees the latest lines) and closes it on end.
         const fd = openSync(logPath, 'a', 0o600);
+        // 'a' (append) keeps a prior session's bytes, so SEED the rotation counter
+        // from the file's current size — via the fd (no TOCTOU vs the open) — so
+        // the cap counts the WHOLE file, not just this drain. Otherwise an existing
+        // mcp-<name>.log + repeated reconnects each append ~another cap and the file
+        // grows well past STDERR_LOG_CAP_BYTES. (If a prior rotation's rename failed
+        // the file is still full, so this seeds near the cap and re-rotates.)
+        try {
+          bytes = fstatSync(fd).size;
+        } catch {
+          bytes = 0;
+        }
         const stream = createWriteStream(logPath, { fd, autoClose: true });
         stream.on('error', () => {
           sink = undefined; // EACCES / disk full → drain-to-discard from here.
@@ -209,7 +220,8 @@ export const teeStderr = (stderr: Readable, logPath: string | undefined): Promis
         } catch {
           // Best-effort rotation.
         }
-        bytes = 0;
+        // open() reseeds `bytes` from the reopened file (0 after a clean rename;
+        // the still-full size if the rename failed → it re-rotates next chunk).
         open();
         if (sink === undefined) return;
       }

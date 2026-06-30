@@ -270,4 +270,17 @@ describe('teeStderr — drain + tee the server stderr', () => {
     expect(existsSync(`${path}.1`)).toBe(true); // the first 6 MB rotated out
     expect(statSync(path).size).toBeLessThan(6 * 1024 * 1024); // active log holds only the post-rotation tail
   });
+
+  test('seeds the rotation counter from an existing log so a reconnect honors the cap', async () => {
+    const path = join(dir, 'mcp-db.log');
+    // A prior session already left the log near the cap.
+    await teeStderr(Readable.from([Buffer.alloc(9 * 1024 * 1024, 0x61)]), path); // 9 MB
+    expect(existsSync(`${path}.1`)).toBe(false); // still under the cap → no rotation yet
+    // A reconnect appends 2 MB → 11 MB total crosses the cap, so it MUST rotate.
+    // The counter is seeded from the existing 9 MB (via fstat), not restarted at 0
+    // — otherwise the file would grow to 11 MB, well past the advertised 10 MB cap.
+    await teeStderr(Readable.from([Buffer.alloc(2 * 1024 * 1024, 0x62)]), path); // 2 MB
+    expect(existsSync(`${path}.1`)).toBe(true); // rotated, not grown past the cap
+    expect(statSync(path).size).toBeLessThan(10 * 1024 * 1024); // active log under the cap
+  });
 });
