@@ -2715,6 +2715,7 @@ describe('mcp-trust:ask reducer', () => {
     sandbox?: 'sandboxed' | 'sandboxed-net' | 'opt-out' | 'unavailable' | 'remote';
     tools?: readonly { name: string; description: string; writes: boolean }[];
     manifestHash?: string;
+    preConnect?: boolean;
   }): UIEvent => ({
     type: 'mcp-trust:ask',
     ts: 1,
@@ -2725,6 +2726,26 @@ describe('mcp-trust:ask reducer', () => {
     sandbox: overrides.sandbox ?? 'sandboxed',
     tools: overrides.tools ?? [{ name: 'query', description: 'run a query', writes: false }],
     manifestHash: overrides.manifestHash ?? 'abc123',
+    preConnect: overrides.preConnect ?? false,
+  });
+
+  test('pre-connect identity gate shows the identity only — no tools, no manifest hash', () => {
+    const r = applyEvent(
+      createInitialState(),
+      mcpTrustEvent({
+        mode: 'first-visit',
+        preConnect: true,
+        tools: [{ name: 'query', description: 'run a query', writes: true }],
+      }),
+    );
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    const text = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+    expect(text).toContain('mcp-server-postgres'); // the identity (command) IS shown
+    expect(text).toContain('REVIEW before they become callable'); // identity-gate prose
+    expect(text).not.toContain('run a query'); // the tool entry (description) is NOT shown pre-connect
+    expect(text).not.toContain('manifest hash'); // nor the hash (not fetched yet)
+    expect(text).not.toContain('[writes]');
   });
 
   test('first-visit shows the spawn-this-binary prose, the command, and the tools', () => {

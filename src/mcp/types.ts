@@ -235,9 +235,16 @@ export interface McpTrustRequest {
   sandbox: McpSandboxStatus;
   // `writes` mirrors the tool's effective checkpoint behavior (`meta.writes ??
   // true`), so the modal can mark side-effecting tools the operator is about to
-  // authorize — surfacing a server's self-declared `writes:false`.
+  // authorize — surfacing a server's self-declared `writes:false`. EMPTY on a
+  // pre-connect identity gate (the tools aren't fetched yet — that's the point).
   tools: ReadonlyArray<{ name: string; description: string; writes: boolean }>;
   manifestHash: string;
+  // The PRE-CONNECT identity gate (MCP.md §1.5): authorize reaching the server
+  // (running the command / opening the URL with auth) BEFORE the handshake, so a
+  // hostile config never spawns code or leaks a bearer token just to fetch the
+  // manifest. When true the modal shows only the identity (no tools/hash — not
+  // fetched); the manifest-trust prompt with the tool list follows post-connect.
+  preConnect?: boolean;
 }
 
 export type McpTrustAnswer = 'yes' | 'no' | 'cancel';

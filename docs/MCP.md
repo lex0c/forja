@@ -138,12 +138,10 @@ Trusting an MCP server authorizes **two** things: reaching it — spawning a std
 
 ### 3.3 Interactive: the trust modal
 
-When a TTY operator is present, an unknown/changed manifest raises the `askMcpTrust` modal. It is a **trust-gate** modal (the same warn-toned "stop and read" family as cwd-trust and shared-memory trust). It shows:
+When a TTY operator is present, trusting an unknown/changed server is a **two-step** gate (the same warn-toned "stop and read" family as cwd-trust and shared-memory trust) — so nothing runs or connects before you approve:
 
-- the **server name**,
-- the **command** being authorized (the headline — this is the binary you are about to run, shown from the unresolved argv so no secret leaks),
-- the **tool inventory** (name + description, capped at 8 with an overflow line),
-- the **manifest hash**.
+1. **Identity gate (before connecting).** Forja shows the **server name**, the **command / URL** being authorized (the headline — the binary it is about to run, shown from the unresolved argv so no secret leaks, or the endpoint it is about to reach with any configured auth), and the **sandbox posture**. The tool inventory is *not* shown — the tools aren't fetched yet, and fetching them is the very spawn/connection this gate authorizes. Decline and **nothing is run and no token is sent**.
+2. **Manifest review (after connecting).** Once the identity is authorized, Forja connects, fetches the manifest, and raises the manifest-trust modal: the **tool inventory** (name + description + `[writes]` markers, capped at 8 with an overflow line) and the **manifest hash** — where you review what the server exposes. A `--auto-approve-mcp` server clears both steps without a prompt; headless without it is fail-closed.
 
 Every string in the modal is sanitized at the render boundary (a hostile manifest can't repaint the terminal). The **conservative default is "No, do not run it"** — hitting Enter without reading declines. Esc / timeout / cancel all resolve to deny. Tools the server declares as writing are marked `[writes]` in the inventory so the operator can see which ones carry side effects.
 

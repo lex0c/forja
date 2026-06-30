@@ -2181,52 +2181,73 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
                 ? '⚠ remote endpoint — network egress, no sandbox (every call is confirmed)'
                 : '⚠ sandbox: OFF (no sandbox tool available) — full host access';
 
-      const MAX_LIST = 8;
-      const visible = event.tools.slice(0, MAX_LIST);
-      const overflow = event.tools.length - visible.length;
-
       const previewLines: PreviewLine[] = [
         `server:  ${safeServer}`,
         `command: ${safeCommand}`,
         sandboxLine,
         '',
       ];
-      if (event.mode === 'first-visit') {
+      if (event.preConnect) {
+        // PRE-CONNECT identity gate (MCP.md §1.5): the tools aren't fetched yet —
+        // fetching them IS the spawn/connect we're gating, so a hostile config
+        // can't run code or leak a bearer token before this approval. Authorize
+        // the IDENTITY (command/URL) here; the tool list is reviewed in the
+        // manifest-trust prompt that follows the (now-authorized) connect.
         previewLines.push(
-          'An MCP server wants to run the command above and expose these tools',
-          'to the model. Trusting it AUTHORIZES RUNNING THAT BINARY. Review the',
-          'tools it declares before confirming:',
+          event.mode === 'first-visit'
+            ? 'A configured MCP server has NOT been reached yet. Authorizing lets'
+            : 'A configured MCP server changed. Re-authorizing lets',
+          'Forja RUN this command / connect to this URL (with any configured auth)',
+          'and load its tools — which you then REVIEW before they become callable.',
+        );
+        previewLines.push('');
+        previewLines.push(
+          'If you authorize: Forja connects; the tool list is shown for review next.',
+        );
+        previewLines.push(
+          'If you decline: the server is never run or connected (nothing is sent).',
         );
       } else {
-        previewLines.push(
-          'A previously-trusted MCP server changed (its command or tool set).',
-          'Trusting again RE-AUTHORIZES running the command above. Review the',
-          'current tools before confirming:',
-        );
-      }
-      previewLines.push('');
-
-      if (visible.length === 0) {
-        previewLines.push('(the server declares no tools)');
-      } else {
-        for (const t of visible) {
-          // Mark side-effecting tools so the operator sees which ones write —
-          // and, by omission, which the server claims are read-only (the
-          // `writes:false` it is asking them to trust).
-          const marker = t.writes ? ' [writes]' : '';
+        const MAX_LIST = 8;
+        const visible = event.tools.slice(0, MAX_LIST);
+        const overflow = event.tools.length - visible.length;
+        if (event.mode === 'first-visit') {
           previewLines.push(
-            `  ${sanitizeOneLineForDisplay(t.name)}${marker} — ${sanitizeOneLineForDisplay(t.description)}`,
+            'An MCP server wants to run the command above and expose these tools',
+            'to the model. Trusting it AUTHORIZES RUNNING THAT BINARY. Review the',
+            'tools it declares before confirming:',
+          );
+        } else {
+          previewLines.push(
+            'A previously-trusted MCP server changed (its command or tool set).',
+            'Trusting again RE-AUTHORIZES running the command above. Review the',
+            'current tools before confirming:',
           );
         }
-        if (overflow > 0) {
-          previewLines.push(`  …and ${overflow} more tool${overflow === 1 ? '' : 's'} not shown`);
+        previewLines.push('');
+
+        if (visible.length === 0) {
+          previewLines.push('(the server declares no tools)');
+        } else {
+          for (const t of visible) {
+            // Mark side-effecting tools so the operator sees which ones write —
+            // and, by omission, which the server claims are read-only (the
+            // `writes:false` it is asking them to trust).
+            const marker = t.writes ? ' [writes]' : '';
+            previewLines.push(
+              `  ${sanitizeOneLineForDisplay(t.name)}${marker} — ${sanitizeOneLineForDisplay(t.description)}`,
+            );
+          }
+          if (overflow > 0) {
+            previewLines.push(`  …and ${overflow} more tool${overflow === 1 ? '' : 's'} not shown`);
+          }
         }
+        previewLines.push('');
+        previewLines.push(`manifest hash: ${sanitizeOneLineForDisplay(event.manifestHash)}`);
+        previewLines.push('');
+        previewLines.push('If you trust: the server runs on next use; its tools become callable.');
+        previewLines.push('If you decline: the server is not run and its tools stay hidden.');
       }
-      previewLines.push('');
-      previewLines.push(`manifest hash: ${sanitizeOneLineForDisplay(event.manifestHash)}`);
-      previewLines.push('');
-      previewLines.push('If you trust: the server runs on next use; its tools become callable.');
-      previewLines.push('If you decline: the server is not run and its tools stay hidden.');
 
       return {
         state: {

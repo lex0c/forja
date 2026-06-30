@@ -465,6 +465,9 @@ export type McpTrustAskEvent = BaseEvent & {
   sandbox: import('../mcp/types.ts').McpSandboxStatus;
   tools: readonly { name: string; description: string; writes: boolean }[];
   manifestHash: string;
+  // Pre-connect identity gate (MCP.md §1.5): authorize reaching the server before
+  // the handshake. When true the modal shows only the identity (no tools/hash).
+  preConnect?: boolean;
 };
 
 // `scope` mirrors `MemoryScope` from `src/memory/types.ts`. We re-declare

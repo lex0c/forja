@@ -88,6 +88,9 @@ interface FakeSpec {
   callResult?: McpCallResult;
   connectError?: Error;
   listToolsError?: Error;
+  // callTool rejects immediately with this (a non-timeout transport fault), to
+  // exercise the disconnect-and-reap branch.
+  callError?: Error;
   // callTool never resolves on its own — only rejects when the passed signal
   // aborts (exercises the per-call timeout path).
   callHangs?: boolean;
@@ -126,6 +129,7 @@ const fakeClientFactory = (spec: FakeSpec) => {
       },
       async callTool(_tool, _args, signal) {
         stats.calls += 1;
+        if (spec.callError) throw spec.callError;
         if (spec.callHangs) {
           return new Promise<McpCallResult>((_res, rej) => {
             signal?.addEventListener('abort', () => rej(new Error('aborted')));
@@ -239,6 +243,113 @@ describe('McpManager.init: fresh trust', () => {
   });
 });
 
+describe('McpManager.init: pre-connect identity gate (MCP.md §1.5)', () => {
+  test('declining the identity gate denies WITHOUT connecting (no spawn, no token sent)', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const preConnectFlags: boolean[] = [];
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      confirmTrust: async (req) => {
+        preConnectFlags.push(req.preConnect === true);
+        return 'no'; // decline at the identity gate
+      },
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(mgr.state('db')).toBe('denied');
+    expect(fake.stats.made).toBe(0); // never built a client → never spawned / connected
+    expect(preConnectFlags).toEqual([true]); // only the pre-connect identity prompt fired
+  });
+
+  test('the identity gate precedes the manifest prompt; approving both connects + registers', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const preConnectFlags: boolean[] = [];
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      confirmTrust: async (req) => {
+        preConnectFlags.push(req.preConnect === true);
+        return 'yes';
+      },
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(mgr.state('db')).toBe('trusted');
+    expect(registry.has('mcp__db__query')).toBe(true);
+    expect(preConnectFlags).toEqual([true, false]); // identity gate FIRST, then the manifest review
+    expect(fake.stats.connects).toBe(1); // connected only AFTER the identity was authorized
+  });
+
+  test('a remote server: the bearer URL is not opened until the identity is authorized', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([remoteServerConfig()]),
+      confirmTrust: async () => 'no',
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(mgr.state('gh')).toBe('denied');
+    expect(fake.stats.made).toBe(0); // no connect → the Authorization: Bearer header is never sent
+  });
+
+  test('approving the identity then declining the manifest review denies (after connecting)', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    let call = 0;
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      // 'yes' to the identity gate, 'no' to the manifest review that follows.
+      confirmTrust: async () => (call++ === 0 ? 'yes' : 'no'),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(mgr.state('db')).toBe('denied');
+    expect(registry.has('mcp__db__query')).toBe(false);
+    expect(fake.stats.connects).toBe(1); // identity approved → connected, THEN the tools declined
+    expect(call).toBe(2); // both prompts fired
+  });
+
+  test('headless auto-approve connects + trusts with NO identity prompt', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      // No confirmTrust (headless) + auto-approved → neither the identity gate nor
+      // the manifest prompt can fire; the server still connects + trusts.
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(mgr.state('db')).toBe('trusted');
+    expect(registry.has('mcp__db__query')).toBe(true);
+    expect(fake.stats.connects).toBe(1);
+  });
+
+  test('a modal fault during the identity gate fails closed (denied, not uncaught)', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      confirmTrust: async () => {
+        throw new Error('modal crashed');
+      },
+      makeClient: fake.makeClient,
+    });
+    // init must not reject — the per-server fault is contained + fails closed.
+    await mgr.init();
+    expect(mgr.state('db')).toBe('denied');
+    expect(fake.stats.made).toBe(0); // faulted at the gate → never connected
+  });
+});
+
 describe('McpManager.init: cached-trusted is lazy (no connect)', () => {
   test('registers from cache without ever constructing a client', async () => {
     seedTrusted(db, 'db', [toolDef('query')]);
@@ -296,6 +407,31 @@ describe('McpManager.callTool', () => {
 
     await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/manifest_drift/);
     expect(mgr.state('db')).toBe('degraded');
+  });
+
+  test('a non-timeout call fault reaps the failed client (no leak across retries)', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callError: new Error('transport fault'),
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow('transport fault');
+    expect(mgr.state('db')).toBe('disconnected');
+    expect(fake.stats.closes).toBe(1); // the failed client was closed, not orphaned
+
+    // The model retries: a fresh client is built (the old one was reaped) and the
+    // next fault reaps it too — closes track made, so children don't accumulate.
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow('transport fault');
+    expect(fake.stats.made).toBe(2); // one client per attempt
+    expect(fake.stats.closes).toBe(2); // each attempt reaps its own — no leak
   });
 
   test('a denied server is not callable', async () => {

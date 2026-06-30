@@ -837,6 +837,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           sandbox: req.sandbox,
           tools: req.tools,
           manifestHash: req.manifestHash,
+          preConnect: req.preConnect === true,
         }),
         MCP_TRUST_OPTIONS,
         opts?.timeoutMs,

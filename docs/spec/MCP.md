@@ -26,11 +26,13 @@ Sem este doc, MCP fica como folclore espalhado por 7 docs — cada implementador
 ### 1.1 Visão geral
 
 ```
-discover → handshake → trust_prompt → register → activate → call → degrade? → disconnect
-   │           │             │            │          │        │        │           │
-config     initialize    user input  tools/list  first    tools/  schema     transport
-file       /protocol     + hash      registered  use      call     err        broken
+discover → identity_gate → handshake → manifest_prompt → register → activate → call → degrade? → disconnect
+   │            │              │              │              │           │        │        │           │
+config      autoriza       initialize     tools/list +   tools       first    tools/  schema    transport
+arquivo     comando/URL    /protocolo     hash + review  registradas uso      call     err       quebrado
 ```
+
+O `identity_gate` (§1.5) é **pré-connect**: o operador autoriza ALCANÇAR o server — rodar o comando / abrir a URL com auth — ANTES do handshake. Um `mcp.toml` hostil não pode spawnar código nem vazar um bearer token só pra buscar o manifesto, mesmo que o operador recuse depois.
 
 Estados formais em `STATE_MACHINE.md §6.5`. Esta seção é narrativa.
 
@@ -119,7 +121,11 @@ Mismatch em `protocolVersion` exato → `mcp.initialize_protocol_mismatch` → `
 
 ### 1.5 Trust prompt
 
-Após `initialize`, harness chama `tools/list`, computa hash, e compara com `mcp_manifest_history`.
+Trust é em **dois passos**, pra nunca rodar/conectar antes da aprovação:
+
+**Passo 1 — identity gate (pré-connect).** Pra um server não-cacheado (novo, comando/URL mudou, ou `/mcp reconnect`), ANTES do handshake o operador autoriza a IDENTIDADE: o modal mostra só `<name>` + o comando RAW / a URL + a postura de sandbox (sem tools — ainda não buscadas, e buscá-las É o spawn/connect que estamos gateando). Recusa → `denied`, sem spawn e **sem token enviado**. Aprova → segue pro handshake. Headless: skip se `--auto-approve-mcp` (o fail-closed abaixo já negou o caso sem-grant).
+
+**Passo 2 — manifest prompt (pós-connect).** Após `initialize`, harness chama `tools/list`, computa hash, e compara com `mcp_manifest_history` (é aqui que o operador revê a lista de tools + os marcadores `[writes]`):
 
 | Caso | Comportamento |
 |---|---|

@@ -68,6 +68,7 @@ import type {
   McpServerConfig,
   McpServerState,
   McpTransportConfig,
+  McpTrustAnswer,
 } from './types.ts';
 
 export interface McpManagerDeps {
@@ -430,10 +431,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         });
       }
       throw new Error(
-        `mcp.budget.exceeded: server '${server}' hit its budget cap ` +
-          `(calls=${rt.sessionCalls}/${budget.maxCallsPerSession}, ` +
-          `tokens_in=${rt.sessionTokensIn}/${budget.maxTokensInPerSession}); ` +
-          `disconnected until the next session`,
+        `mcp.budget.exceeded: server '${server}' hit its budget cap (calls=${rt.sessionCalls}/${budget.maxCallsPerSession}, tokens_in=${rt.sessionTokensIn}/${budget.maxTokensInPerSession}); disconnected until the next session`,
       );
     }
 
@@ -559,6 +557,11 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
           `mcp.timeout: server '${server}' tool '${toolName}' exceeded ${budget.timeoutMs}ms`,
         );
       }
+      // Reap the failed client BEFORE dropping the reference. A transport fault
+      // or session abort leaves the stdio child + pipe alive otherwise (the SDK
+      // won't reap it), and the model's retry spins up a fresh client each time —
+      // one leaked child per retry. Mirror the handshake-failure path above.
+      await client.close().catch(() => {});
       rt.client = null;
       rt.connected = false;
       rt.validStreak = 0; // a fresh connection starts a fresh recovery streak
@@ -627,6 +630,43 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
     if (deps.confirmTrust === undefined && deps.autoApprove?.has(name) !== true) {
       setState(rt, 'denied');
       return 0;
+    }
+    // PRE-CONNECT IDENTITY GATE (MCP.md §1.5): authorize REACHING this server —
+    // running the command / opening the URL with any configured auth — BEFORE the
+    // handshake. A hostile `mcp.toml` must not spawn code or leak a bearer token
+    // just to fetch the manifest, even if the operator then declines. Headless +
+    // auto-approved skips it (the fail-closed above already denied the headless
+    // no-grant case); the post-connect manifest-trust prompt (with the tool list
+    // to review) still follows once the identity is authorized.
+    if (deps.confirmTrust !== undefined) {
+      let answer: McpTrustAnswer;
+      try {
+        answer = await deps.confirmTrust({
+          server: name,
+          command: transportIdentity(rt.config.transport).display,
+          mode: forceReprompt ? 'drift' : 'first-visit',
+          sandbox:
+            rt.config.transport.transport === 'stdio' ? resolveSandbox(rt.config).status : 'remote',
+          tools: [],
+          manifestHash: '',
+          preConnect: true,
+        });
+      } catch (err) {
+        // A modal fault/abort during the identity gate must NOT escape init()
+        // uncaught. Fail closed: `denied` (the server never reached `handshaking`,
+        // so `error` would be an illegal transition from `disconnected`; `denied`
+        // is the legal pre-handshake terminal, and a server we couldn't get
+        // approval for must not run). The warning carries the real cause.
+        setState(rt, 'denied', { last_error: err instanceof Error ? err.message : String(err) });
+        warnings.push(
+          `mcp: server '${name}' identity prompt failed: ${err instanceof Error ? err.message : err}`,
+        );
+        return 0;
+      }
+      if (answer !== 'yes') {
+        setState(rt, 'denied');
+        return 0;
+      }
     }
     const client = clientFor(rt);
     setState(rt, 'handshaking');
