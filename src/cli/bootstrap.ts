@@ -1599,7 +1599,10 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   let mcpInit: McpInitReport;
   try {
     const mcpConfig = loadMcpConfig({
-      cwd,
+      // Repo-root cwd (like every other project-scoped loader above), so running
+      // forja from a subdirectory still finds <repo>/.forja/mcp.toml + mcp.local.toml
+      // — NOT the raw invocation cwd, which would silently drop project MCP servers.
+      cwd: projectConfigCwd,
       ...(input.userMcpPath !== undefined ? { userPathOverride: input.userMcpPath } : {}),
     });
     // Sandbox wrap for spawned stdio servers (MCP.md §2.3). Reuses the bash

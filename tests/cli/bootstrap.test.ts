@@ -205,6 +205,48 @@ surface = "base"
     db.close();
   });
 
+  test('finds the repo-root .forja/mcp.toml when launched from a subdirectory', async () => {
+    // Regression: MCP project config must resolve from the REPO ROOT (like every
+    // other project-scoped loader), not the raw invocation cwd — otherwise a
+    // repo-root mcp.toml is silently dropped when forja runs from a subdir.
+    Bun.spawnSync({ cmd: ['git', 'init', workdir] }); // resolveRepoRoot maps subdir → root
+    const mcpTomlPath = join(workdir, '.forja', 'mcp.toml');
+    mkdirSync(dirname(mcpTomlPath), { recursive: true });
+    writeFileSync(
+      mcpTomlPath,
+      `[servers.fixture]\ntransport = "stdio"\ncommand = ["fake-bin"]\nsurface = "base"\n`,
+    );
+    const subdir = join(workdir, 'pkg', 'nested');
+    mkdirSync(subdir, { recursive: true });
+    const makeFakeClient = (): import('../../src/mcp/types.ts').McpClient => ({
+      connect: async () => ({ protocolVersion: '2024-11-05', serverVersion: '1.0.0' }),
+      listTools: async () => [
+        {
+          name: 'echo',
+          description: 'echo back text',
+          inputSchema: { type: 'object', properties: { text: { type: 'string' } } },
+          meta: { writes: false },
+        },
+      ],
+      callTool: async () => ({ isError: false, content: 'ok' }),
+      close: async () => {},
+    });
+    const { config, db } = await bootstrap({
+      prompt: 'hi',
+      cwd: subdir, // launched from a nested subdirectory
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      userMcpPath: null,
+      autoApproveMcp: new Set(['fixture']),
+      mcpMakeClient: makeFakeClient,
+    });
+    const names = config.toolRegistry.list().map((t) => t.name);
+    expect(names).toContain('mcp__fixture__echo'); // repo-root mcp.toml found from the subdir
+    db.close();
+  });
+
   test('grants read_file + grep on the fetch_url spill dir (read elided pages)', async () => {
     // fetch_url spills oversized pages to `<cache>/fetch/<hash>.md`; without
     // this grant the scaffolded `./**`-only read policy would deny the
