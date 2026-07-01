@@ -277,7 +277,13 @@ const sdkClientFrom = (makeTransport: () => SdkTransport): McpClient => {
       const protocolVersion =
         asString((transport as { protocolVersion?: unknown }).protocolVersion) ??
         FALLBACK_PROTOCOL_VERSION;
-      return { protocolVersion, serverVersion: asString(info?.version) ?? null };
+      return {
+        protocolVersion,
+        // The server's self-reported identity from `initialize.serverInfo` — both
+        // feed the manifest hash (spec §3.2), so a re-branded server re-trusts.
+        serverName: asString(info?.name) ?? null,
+        serverVersion: asString(info?.version) ?? null,
+      };
     },
 
     async listTools(signal) {

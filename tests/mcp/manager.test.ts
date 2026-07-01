@@ -93,6 +93,9 @@ interface FakeSpec {
   callResult?: McpCallResult;
   connectError?: Error;
   listToolsError?: Error;
+  // The server's self-reported `initialize.serverInfo.name` — feeds the manifest
+  // hash (spec §3.2). Defaults to null (reports no name), matching recordGrantOnly.
+  serverName?: string | null;
   // callTool rejects immediately with this (a non-timeout transport fault), to
   // exercise the disconnect-and-reap branch.
   callError?: Error;
@@ -126,7 +129,11 @@ const fakeClientFactory = (spec: FakeSpec) => {
         stats.connects += 1;
         stats.lastConnectSignal = signal;
         if (spec.connectError) throw spec.connectError;
-        return { protocolVersion: '2024-11-05', serverVersion: '1.0.0' };
+        return {
+          protocolVersion: '2024-11-05',
+          serverName: spec.serverName ?? null,
+          serverVersion: '1.0.0',
+        };
       },
       async listTools() {
         if (spec.listToolsError) throw spec.listToolsError;
@@ -157,9 +164,17 @@ const fakeClientFactory = (spec: FakeSpec) => {
 // Record a GRANTED manifest in the append-only history WITHOUT an mcp_servers
 // row — i.e. the "swept" state a removed server leaves behind (the row is gone,
 // the forever grant survives). The manager must NOT reuse such a grant by name.
-const recordGrantOnly = (db: DB, server: string, tools: McpManifestTool[]): string => {
+// `serverName` is the server's self-reported name folded into the hash (spec
+// §3.2); defaults to null (matching the fake client), so a caller seeding a grant
+// that must survive a live handshake leaves it null unless testing name drift.
+const recordGrantOnly = (
+  db: DB,
+  server: string,
+  tools: McpManifestTool[],
+  serverName: string | null = null,
+): string => {
   const canonical = canonicalizeManifest({
-    server,
+    serverName,
     protocolVersion: '2024-11-05',
     serverVersion: '1.0.0',
     tools,
@@ -798,6 +813,35 @@ describe('McpManager.callTool', () => {
     expect(mgr.state('db')).toBe('degraded');
   });
 
+  test('a changed serverInfo.name (same tools + version) drifts on first call', async () => {
+    // The finding: a replaced server at the same command that keeps its tool
+    // schemas + version but re-brands its reported serverInfo.name must
+    // re-trigger trust rather than ride the cached grant.
+    recordGrantOnly(db, 'db', [toolDef('query')], 'server-old'); // granted at name 'server-old'
+    insertServer(db, {
+      name: 'db',
+      transport: 'stdio',
+      command: JSON.stringify(['fake-bin']),
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    // Live server reports a DIFFERENT name, identical tools + version.
+    const fake = fakeClientFactory({ tools: [toolDef('query')], serverName: 'server-new' });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init(); // cached (no connect) → trusted at the old hash
+    expect(mgr.state('db')).toBe('trusted');
+    expect(fake.stats.made).toBe(0);
+
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/manifest_drift/);
+    expect(mgr.state('db')).toBe('degraded');
+  });
+
   test('a non-timeout call fault reaps the failed client (no leak across retries)', async () => {
     seedTrusted(db, 'db', [toolDef('query')]);
     const fake = fakeClientFactory({
@@ -1097,7 +1141,7 @@ describe('McpManager: review hardening', () => {
     // leaving the hash). The cached path must reject it, not register from it.
     const goodTools = [toolDef('query')];
     const canonical = canonicalizeManifest({
-      server: 'db',
+      serverName: null,
       protocolVersion: '2024-11-05',
       serverVersion: '1.0.0',
       tools: goodTools,

@@ -177,7 +177,11 @@ surface = "base"
     // Fake MCP client — exercises the bootstrap → manager → registration path
     // without spawning a real stdio subprocess.
     const makeFakeClient = (): import('../../src/mcp/types.ts').McpClient => ({
-      connect: async () => ({ protocolVersion: '2024-11-05', serverVersion: '1.0.0' }),
+      connect: async () => ({
+        protocolVersion: '2024-11-05',
+        serverName: null,
+        serverVersion: '1.0.0',
+      }),
       listTools: async () => [
         {
           name: 'echo',
@@ -250,7 +254,7 @@ surface = "base"
     const makeFakeClient = (): import('../../src/mcp/types.ts').McpClient => ({
       connect: async () => {
         connected = true;
-        return { protocolVersion: '2024-11-05', serverVersion: '1.0.0' };
+        return { protocolVersion: '2024-11-05', serverName: null, serverVersion: '1.0.0' };
       },
       listTools: async () => [
         {
@@ -297,7 +301,11 @@ surface = "base"
     const subdir = join(workdir, 'pkg', 'nested');
     mkdirSync(subdir, { recursive: true });
     const makeFakeClient = (): import('../../src/mcp/types.ts').McpClient => ({
-      connect: async () => ({ protocolVersion: '2024-11-05', serverVersion: '1.0.0' }),
+      connect: async () => ({
+        protocolVersion: '2024-11-05',
+        serverName: null,
+        serverVersion: '1.0.0',
+      }),
       listTools: async () => [
         {
           name: 'echo',

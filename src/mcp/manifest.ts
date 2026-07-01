@@ -29,12 +29,12 @@ const byName = (a: McpManifestTool, b: McpManifestTool): number =>
 // the stored JSON are order-independent (a server reordering its
 // `tools/list` output must not invalidate trust).
 export const canonicalizeManifest = (input: {
-  server: string;
+  serverName: string | null;
   protocolVersion: string;
   serverVersion: string | null;
   tools: readonly McpManifestTool[];
 }): CanonicalManifest => ({
-  server: input.server,
+  serverName: input.serverName,
   protocolVersion: input.protocolVersion,
   serverVersion: input.serverVersion,
   tools: [...input.tools].sort(byName),
@@ -44,7 +44,7 @@ export const canonicalizeManifest = (input: {
 // `canonicalManifestJson` and `hashManifest` so the persisted
 // `manifest_json` is byte-identical to what was hashed (auditable).
 const hashPayload = (m: CanonicalManifest) => ({
-  serverInfo: { name: m.server, version: m.serverVersion },
+  serverInfo: { name: m.serverName, version: m.serverVersion },
   tools: [...m.tools].sort(byName).map((t) => ({
     name: t.name,
     description: t.description,

@@ -129,7 +129,7 @@ Trusting an MCP server authorizes **two** things: reaching it — spawning a std
 
 ### 3.1 The manifest hash
 
-`manifest_hash = sha256(canonical_json(...))` over each tool's `name`, `description`, `inputSchema`, **and** `meta` (the `_meta.agentic_cli` hints). Covering `meta` is the core integrity property: a trusted server cannot silently downgrade a tool's declared `category` or flip `writes` after the fact — any such change re-hashes and re-prompts. The MCP `protocolVersion` is deliberately **not** hashed (it's transport noise, not capability).
+`manifest_hash = sha256(canonical_json(...))` over the server's reported `serverInfo` (`{ name, version }`) **and** each tool's `name`, `description`, `inputSchema`, `meta` (the `_meta.agentic_cli` hints). Covering `meta` is the core integrity property: a trusted server cannot silently downgrade a tool's declared `category` or flip `writes` after the fact — any such change re-hashes and re-prompts. The `serverInfo.name` is the server's **own** reported name (from `initialize`), not your config alias — so a replaced server at the same command/URL that re-brands itself, even while keeping identical tools + version, re-triggers trust. The MCP `protocolVersion` is deliberately **not** hashed (it's transport noise, not capability).
 
 ### 3.2 First-visit vs drift
 

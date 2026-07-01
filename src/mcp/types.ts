@@ -199,7 +199,12 @@ export interface McpManifestTool {
 // A normalized manifest ready to hash / persist. Tools are sorted by name
 // (see src/mcp/manifest.ts).
 export interface CanonicalManifest {
-  server: string;
+  // The server's SELF-REPORTED `initialize.serverInfo.name` (null when it
+  // reports none) — NOT the operator's config alias. Part of the hash (spec
+  // §3.2 `serverInfo: { name, version }`), so a server that swaps its reported
+  // identity while keeping the same tools re-triggers trust. The config alias is
+  // the mcp_servers row key, kept separate.
+  serverName: string | null;
   protocolVersion: string;
   serverVersion: string | null;
   tools: readonly McpManifestTool[];
@@ -227,9 +232,13 @@ export interface McpCallResult {
 // everything else depends on this interface. All methods accept an
 // AbortSignal so a session cancel / hard budget aborts an in-flight call.
 export interface McpClient {
-  // Spawn + `initialize` handshake. Returns the negotiated protocol +
-  // declared server version.
-  connect(signal?: AbortSignal): Promise<{ protocolVersion: string; serverVersion: string | null }>;
+  // Spawn + `initialize` handshake. Returns the negotiated protocol + the
+  // server's self-reported name + version (both null when unreported). The name
+  // feeds the manifest hash (spec §3.2), so a replaced server that re-brands
+  // itself re-triggers trust.
+  connect(
+    signal?: AbortSignal,
+  ): Promise<{ protocolVersion: string; serverName: string | null; serverVersion: string | null }>;
   listTools(signal?: AbortSignal): Promise<McpManifestTool[]>;
   callTool(tool: string, args: unknown, signal?: AbortSignal): Promise<McpCallResult>;
   close(): Promise<void>;

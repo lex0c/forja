@@ -509,7 +509,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         const liveTools = await client.listTools(sig);
         const liveHash = hashManifest(
           canonicalizeManifest({
-            server,
+            serverName: info.serverName,
             protocolVersion: info.protocolVersion,
             serverVersion: info.serverVersion,
             tools: liveTools,
@@ -741,7 +741,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       const info = await client.connect(sig);
       const tools = await client.listTools(sig);
       const canonical = canonicalizeManifest({
-        server: name,
+        serverName: info.serverName,
         protocolVersion: info.protocolVersion,
         serverVersion: info.serverVersion,
         tools,

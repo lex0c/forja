@@ -18,7 +18,7 @@ const manifest = (
   tools: McpManifestTool[],
   over: Partial<CanonicalManifest> = {},
 ): CanonicalManifest => ({
-  server: 'postgres',
+  serverName: 'postgres',
   protocolVersion: '2024-11-05',
   serverVersion: '1.0.0',
   tools,
@@ -72,6 +72,12 @@ describe('hashManifest: coverage (any tool field change re-prompts)', () => {
     expect(hashManifest(manifest([tool('q')], { serverVersion: '2.0.0' }))).not.toBe(base);
   });
 
+  test('serverName change → different hash (replaced-server guard)', () => {
+    // A server that keeps its version + tool schemas but re-brands its reported
+    // serverInfo.name must re-trigger trust (spec §3.2 hashes serverInfo.name).
+    expect(hashManifest(manifest([tool('q')], { serverName: 'impostor' }))).not.toBe(base);
+  });
+
   test('adding a tool → different hash', () => {
     expect(hashManifest(manifest([tool('q'), tool('r')]))).not.toBe(base);
   });
@@ -88,7 +94,7 @@ describe('hashManifest: protocolVersion is NOT hashed', () => {
 describe('canonicalizeManifest', () => {
   test('sorts tools by name', () => {
     const c = canonicalizeManifest({
-      server: 's',
+      serverName: 's',
       protocolVersion: 'p',
       serverVersion: null,
       tools: [tool('zulu'), tool('alpha'), tool('mike')],
