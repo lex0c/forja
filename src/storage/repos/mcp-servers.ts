@@ -1,27 +1,34 @@
-// mcp_servers + mcp_manifest_history repo. Schema in migration
-// 081-mcp-servers.ts; spec AUDIT.md §1.5.
+// mcp_servers + mcp_manifest_history repo. Schema in migrations
+// 081-mcp-servers.ts / 083-mcp-servers-scoped.ts; spec AUDIT.md §1.5.
 //
-// `mcp_servers` is MUTABLE state (one row per configured server). The
-// immutable columns (name/transport/command/url/source) are set once by
-// `insertServer`; a transport/command change is remove + insert
-// (`deleteServer` then `insertServer`), never an in-place rewrite — per
-// AUDIT §1.5. The mutable columns are patched by `patchServer` (state,
-// manifest hash, protocol/server version, last_connected_at, last_error)
-// and the counters by `bumpServerCounters`.
+// Both tables are keyed by `(scope, name)` / `(scope, server_name)`, NOT by name
+// alone: `sessions.db` is user-global but project MCP config is per-repo, so the
+// same `<name>` (`db`, `postgres`) in different repos must be distinct rows.
+// `scope` = the project root for project servers, `''` (global) for `user`
+// servers. Every read/write takes the scope so one repo can't clobber another's
+// identity or cached trust.
 //
-// `mcp_manifest_history` is APPEND-ONLY, FOREVER retention (no prune
-// primitive — the gc sweep must skip it). One row per trust decision;
-// (server_name, hash) is UNIQUE so a re-decision on the same hash is a
-// caller-side concern (the manager looks up `getManifestDecision` before
-// inserting). Enum columns (state/transport/decision) are typed `string`
-// here — same convention as failure_events.classe: the DB CHECK + the
-// src/mcp domain unions are the vocabulary authority, the row shape stays
-// decoupled from the higher layer.
+// `mcp_servers` is MUTABLE state (one row per configured `(scope, name)`). The
+// immutable columns (scope/name/transport/command/url/source) are set once by
+// `insertServer`; a transport/command change is remove + insert (`deleteServer`
+// then `insertServer`), never an in-place rewrite — per AUDIT §1.5. The mutable
+// columns are patched by `patchServer` and the counters by `bumpServerCounters`.
+//
+// `mcp_manifest_history` is APPEND-ONLY, FOREVER retention (no prune primitive —
+// the gc sweep must skip it). One row per trust decision; (scope, server_name,
+// hash) is UNIQUE so a re-decision on the same hash is a caller-side concern (the
+// manager looks up `getManifestDecision` before inserting). Enum columns
+// (state/transport/decision) are typed `string` here — same convention as
+// failure_events.classe: the DB CHECK + the src/mcp domain unions are the
+// vocabulary authority, the row shape stays decoupled from the higher layer.
 
 import type { SQLQueryBindings } from 'bun:sqlite';
 import type { DB } from '../db.ts';
 
 export interface McpServerRow {
+  // Project isolation key: the repo root for project servers, '' for user
+  // (global). Part of the primary key alongside `name`.
+  scope: string;
   name: string;
   transport: string; // 'stdio' | 'sse' | 'http' (CHECK)
   command: string | null; // JSON array string (stdio); env values redacted
@@ -45,6 +52,7 @@ export interface McpServerRow {
 // Immutable-at-insert columns plus the initial state. Counters default
 // to 0 and audit_schema_version to 1 at the DB layer.
 export interface InsertServerInput {
+  scope: string;
   name: string;
   transport: string;
   command: string | null;
@@ -68,6 +76,7 @@ export interface McpServerPatch {
 }
 
 const SERVER_COLUMNS = [
+  'scope',
   'name',
   'transport',
   'command',
@@ -101,39 +110,76 @@ const PATCHABLE_COLUMNS = [
   'revoked_at',
 ] as const;
 
-export const getServer = (db: DB, name: string): McpServerRow | null => {
-  return (db.query(`${SERVER_SELECT} WHERE name = ?`).get(name) as McpServerRow | null) ?? null;
+export const getServer = (db: DB, scope: string, name: string): McpServerRow | null => {
+  return (
+    (db
+      .query(`${SERVER_SELECT} WHERE scope = ? AND name = ?`)
+      .get(scope, name) as McpServerRow | null) ?? null
+  );
 };
 
-export const listServers = (db: DB): McpServerRow[] => {
-  return db.query(`${SERVER_SELECT} ORDER BY name ASC`).all() as McpServerRow[];
+// First row matching a name across ANY scope, for the degraded path where the
+// caller can't determine the scope (no live manager, or a server not in the
+// current config). Prefer the scoped `getServer` when the scope is known. The row
+// carries its own `scope`, so a follow-up scoped read (e.g. history) is exact.
+export const getServerAnyScope = (db: DB, name: string): McpServerRow | null => {
+  return (
+    (db.query(`${SERVER_SELECT} WHERE name = ? LIMIT 1`).get(name) as McpServerRow | null) ?? null
+  );
+};
+
+// List persisted rows. With `scopes` given, restricts to those scopes (the
+// current invocation's — the repo scope + the global ''); without it, returns
+// every row (audit / diagnostics that span projects).
+export const listServers = (db: DB, scopes?: readonly string[]): McpServerRow[] => {
+  if (scopes === undefined) {
+    return db.query(`${SERVER_SELECT} ORDER BY name ASC`).all() as McpServerRow[];
+  }
+  if (scopes.length === 0) return [];
+  const placeholders = scopes.map(() => '?').join(', ');
+  return db
+    .query(`${SERVER_SELECT} WHERE scope IN (${placeholders}) ORDER BY name ASC`)
+    .all(...scopes) as McpServerRow[];
 };
 
 export const insertServer = (db: DB, input: InsertServerInput): void => {
   db.query(
-    `INSERT INTO mcp_servers (name, transport, command, url, source, state)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(input.name, input.transport, input.command, input.url, input.source, input.state);
+    `INSERT INTO mcp_servers (scope, name, transport, command, url, source, state)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    input.scope,
+    input.name,
+    input.transport,
+    input.command,
+    input.url,
+    input.source,
+    input.state,
+  );
 };
 
-export const deleteServer = (db: DB, name: string): void => {
-  db.query('DELETE FROM mcp_servers WHERE name = ?').run(name);
+export const deleteServer = (db: DB, scope: string, name: string): void => {
+  db.query('DELETE FROM mcp_servers WHERE scope = ? AND name = ?').run(scope, name);
 };
 
 // Patch the mutable columns. No-op when the patch carries none of them.
-export const patchServer = (db: DB, name: string, patch: McpServerPatch): void => {
+export const patchServer = (db: DB, scope: string, name: string, patch: McpServerPatch): void => {
   const cols = PATCHABLE_COLUMNS.filter((c) => c in patch);
   if (cols.length === 0) return;
   const setClause = cols.map((c) => `${c} = ?`).join(', ');
   const values = cols.map(
     (c) => ((patch as Record<string, unknown>)[c] ?? null) as SQLQueryBindings,
   );
-  db.query(`UPDATE mcp_servers SET ${setClause} WHERE name = ?`).run(...values, name);
+  db.query(`UPDATE mcp_servers SET ${setClause} WHERE scope = ? AND name = ?`).run(
+    ...values,
+    scope,
+    name,
+  );
 };
 
 // Atomic per-server counter increment (MCP.md §5 budget accounting).
 export const bumpServerCounters = (
   db: DB,
+  scope: string,
   name: string,
   delta: { calls?: number; tokensIn?: number },
 ): void => {
@@ -141,14 +187,15 @@ export const bumpServerCounters = (
     `UPDATE mcp_servers
         SET total_calls = total_calls + ?,
             total_tokens_in = total_tokens_in + ?
-      WHERE name = ?`,
-  ).run(delta.calls ?? 0, delta.tokensIn ?? 0, name);
+      WHERE scope = ? AND name = ?`,
+  ).run(delta.calls ?? 0, delta.tokensIn ?? 0, scope, name);
 };
 
 // ─── mcp_manifest_history (append-only, forever) ───────────────────────
 
 export interface McpManifestHistoryRow {
   id: number;
+  scope: string;
   server_name: string;
   hash: string;
   previous_hash: string | null;
@@ -163,6 +210,7 @@ export interface McpManifestHistoryRow {
 }
 
 export interface RecordManifestDecisionInput {
+  scope: string;
   server_name: string;
   hash: string;
   previous_hash: string | null;
@@ -177,6 +225,7 @@ export interface RecordManifestDecisionInput {
 
 const MANIFEST_COLUMNS = [
   'id',
+  'scope',
   'server_name',
   'hash',
   'previous_hash',
@@ -194,17 +243,18 @@ const MANIFEST_SELECT = `SELECT ${MANIFEST_COLUMNS.join(', ')} FROM mcp_manifest
 
 // Append a trust decision. Returns the assigned row id (INTEGER PK
 // autoincrements). The caller is responsible for not re-recording an
-// identical (server_name, hash) — that pair is UNIQUE, so a duplicate
+// identical (scope, server_name, hash) — that triple is UNIQUE, so a duplicate
 // throws; consult `getManifestDecision` first.
 export const recordManifestDecision = (db: DB, input: RecordManifestDecisionInput): number => {
   const result = db
     .query(
       `INSERT INTO mcp_manifest_history
-         (server_name, hash, previous_hash, manifest_json, protocol_version,
+         (scope, server_name, hash, previous_hash, manifest_json, protocol_version,
           server_version, decision, decided_by, decided_at, approval_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
+      input.scope,
       input.server_name,
       input.hash,
       input.previous_hash,
@@ -219,15 +269,15 @@ export const recordManifestDecision = (db: DB, input: RecordManifestDecisionInpu
   return Number(result.lastInsertRowid);
 };
 
-// Re-decide an existing (server, hash) manifest row in place. The
-// (server_name, hash) pair is UNIQUE, so a decision that CHANGES after a prior
-// one — e.g. a manifest the operator DECLINED and later approves via `/mcp
-// reconnect` or `--auto-approve-mcp` — cannot be appended as a second row; the
-// caller updates the existing row so `latestTrustedManifest` sees the new grant
-// on the next boot instead of the approval being silently lost. Returns true
-// when a row matched. (Same-hash re-decision only; a new hash still appends.)
+// Re-decide an existing (scope, server, hash) manifest row in place. The triple
+// is UNIQUE, so a decision that CHANGES after a prior one — e.g. a manifest the
+// operator DECLINED and later approves via `/mcp reconnect` or
+// `--auto-approve-mcp` — cannot be appended as a second row; the caller updates
+// the existing row so `latestTrustedManifest` sees the new grant on the next boot
+// instead of the approval being silently lost. Returns true when a row matched.
 export const updateManifestDecision = (
   db: DB,
+  scope: string,
   serverName: string,
   hash: string,
   update: { decision: string; decided_by: string; decided_at: number },
@@ -236,46 +286,57 @@ export const updateManifestDecision = (
     .query(
       `UPDATE mcp_manifest_history
           SET decision = ?, decided_by = ?, decided_at = ?
-        WHERE server_name = ? AND hash = ?`,
+        WHERE scope = ? AND server_name = ? AND hash = ?`,
     )
-    .run(update.decision, update.decided_by, update.decided_at, serverName, hash);
+    .run(update.decision, update.decided_by, update.decided_at, scope, serverName, hash);
   return result.changes > 0;
 };
 
-// The decision recorded for an exact (server, hash) pair, if any. Drives
+// The decision recorded for an exact (scope, server, hash) triple, if any. Drives
 // the "trusted-cached → skip prompt" path: a `granted` row here means the
-// operator already approved this exact manifest.
+// operator already approved this exact manifest in this scope.
 export const getManifestDecision = (
   db: DB,
+  scope: string,
   serverName: string,
   hash: string,
 ): McpManifestHistoryRow | null => {
   return (
     (db
-      .query(`${MANIFEST_SELECT} WHERE server_name = ? AND hash = ?`)
-      .get(serverName, hash) as McpManifestHistoryRow | null) ?? null
+      .query(`${MANIFEST_SELECT} WHERE scope = ? AND server_name = ? AND hash = ?`)
+      .get(scope, serverName, hash) as McpManifestHistoryRow | null) ?? null
   );
 };
 
-// Most recent `granted` manifest for a server (newest decided_at). Used
+// Most recent `granted` manifest for a (scope, server) (newest decided_at). Used
 // to recognise the steady-state trusted hash across sessions.
-export const latestTrustedManifest = (db: DB, serverName: string): McpManifestHistoryRow | null => {
+export const latestTrustedManifest = (
+  db: DB,
+  scope: string,
+  serverName: string,
+): McpManifestHistoryRow | null => {
   return (
     (db
       .query(
         `${MANIFEST_SELECT}
-          WHERE server_name = ? AND decision = 'granted'
+          WHERE scope = ? AND server_name = ? AND decision = 'granted'
           ORDER BY decided_at DESC, id DESC
           LIMIT 1`,
       )
-      .get(serverName) as McpManifestHistoryRow | null) ?? null
+      .get(scope, serverName) as McpManifestHistoryRow | null) ?? null
   );
 };
 
-// Full decision history for a server, newest first. Powers `/mcp show`
-// and the doctor MCP section (later slices).
-export const listManifestHistory = (db: DB, serverName: string): McpManifestHistoryRow[] => {
+// Full decision history for a (scope, server), newest first. Powers `/mcp show`
+// and the doctor MCP section.
+export const listManifestHistory = (
+  db: DB,
+  scope: string,
+  serverName: string,
+): McpManifestHistoryRow[] => {
   return db
-    .query(`${MANIFEST_SELECT} WHERE server_name = ? ORDER BY decided_at DESC, id DESC`)
-    .all(serverName) as McpManifestHistoryRow[];
+    .query(
+      `${MANIFEST_SELECT} WHERE scope = ? AND server_name = ? ORDER BY decided_at DESC, id DESC`,
+    )
+    .all(scope, serverName) as McpManifestHistoryRow[];
 };

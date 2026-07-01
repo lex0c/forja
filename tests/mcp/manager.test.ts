@@ -38,6 +38,13 @@ const ctx = {
   sessionId: 'sess-1',
 } as unknown as ToolContext;
 
+// The storage scope a project server resolves to when the manager gets no
+// `projectRoot` dep: projectRoot ?? sessionCwd ?? process.cwd(). Every seed below
+// uses it so the rows match what the manager looks up. (Tests that pass an
+// explicit `cwd` also pass `projectRoot: SCOPE` to keep the scope constant while
+// only the command identity varies.)
+const SCOPE = process.cwd();
+
 // Capturing failure_event sink — records every emit for assertion.
 const captureSink = (): { sink: FailureEventSink; emits: EmitFailureEventInput[] } => {
   const emits: EmitFailureEventInput[] = [];
@@ -180,6 +187,7 @@ const recordGrantOnly = (
   });
   const hash = hashManifest(canonical);
   recordManifestDecision(db, {
+    scope: SCOPE,
     server_name: server,
     hash,
     previous_hash: null,
@@ -222,8 +230,9 @@ const stdioIdentity = (
 // own row first (the orphan-sweep test) isn't double-inserted.
 const seedTrusted = (db: DB, server: string, tools: McpManifestTool[]): string => {
   const hash = recordGrantOnly(db, server, tools);
-  if (getServer(db, server) === null) {
+  if (getServer(db, SCOPE, server) === null) {
     insertServer(db, {
+      scope: SCOPE,
       name: server,
       transport: 'stdio',
       command: stdioIdentity(['fake-bin']),
@@ -261,8 +270,8 @@ describe('McpManager.init: fresh trust', () => {
     expect(registry.has('mcp__db__query')).toBe(true);
     expect(registry.has('mcp__db__list')).toBe(true);
     expect(mgr.state('db')).toBe('trusted');
-    expect(getServer(db, 'db')?.state).toBe('trusted');
-    expect(latestTrustedManifest(db, 'db')?.decided_by).toBe('auto_approve');
+    expect(getServer(db, SCOPE, 'db')?.state).toBe('trusted');
+    expect(latestTrustedManifest(db, SCOPE, 'db')?.decided_by).toBe('auto_approve');
   });
 
   test('headless without auto-approve fails closed (denied, no tools)', async () => {
@@ -273,7 +282,7 @@ describe('McpManager.init: fresh trust', () => {
     expect(report.registered).toBe(0);
     expect(registry.has('mcp__db__query')).toBe(false);
     expect(mgr.state('db')).toBe('denied');
-    expect(latestTrustedManifest(db, 'db')).toBeNull();
+    expect(latestTrustedManifest(db, SCOPE, 'db')).toBeNull();
   });
 
   test('confirmTrust "yes" grants, "no" denies', async () => {
@@ -438,7 +447,7 @@ describe('McpManager.init: auto-approve wins over the interactive prompt', () =>
     expect(mgr.state('db')).toBe('trusted');
     expect(registry.has('mcp__db__query')).toBe(true);
     expect(fake.stats.connects).toBe(1); // still connected + registered
-    expect(latestTrustedManifest(db, 'db')?.decided_by).toBe('auto_approve');
+    expect(latestTrustedManifest(db, SCOPE, 'db')?.decided_by).toBe('auto_approve');
   });
 
   test('a NON-auto-approved server in the same run still prompts', async () => {
@@ -461,7 +470,7 @@ describe('McpManager.init: auto-approve wins over the interactive prompt', () =>
 
     expect(prompts).toBeGreaterThan(0); // identity gate (+ manifest) still fired
     expect(mgr.state('other')).toBe('trusted');
-    expect(latestTrustedManifest(db, 'other')?.decided_by).toBe('user');
+    expect(latestTrustedManifest(db, SCOPE, 'other')?.decided_by).toBe('user');
   });
 });
 
@@ -474,6 +483,7 @@ describe('McpManager.init: stdio trust identity includes the effective cwd', () 
   const seedRow = (command: string) => {
     recordGrantOnly(db, 'db', [toolDef('query')]);
     insertServer(db, {
+      scope: SCOPE,
       name: 'db',
       transport: 'stdio',
       command,
@@ -491,6 +501,7 @@ describe('McpManager.init: stdio trust identity includes the effective cwd', () 
       registry,
       config: config([relativeConfig()]),
       cwd: '/dir-a', // same directory the grant was authorized in
+      projectRoot: SCOPE,
       makeClient: fake.makeClient,
     });
     const report = await mgr.init();
@@ -508,6 +519,7 @@ describe('McpManager.init: stdio trust identity includes the effective cwd', () 
       registry,
       config: config([relativeConfig()]),
       cwd: '/dir-b', // launched elsewhere → ./server resolves to a DIFFERENT binary
+      projectRoot: SCOPE,
       // Headless + not auto-approved → the required re-trust fails closed BEFORE spawning.
       makeClient: fake.makeClient,
     });
@@ -535,6 +547,7 @@ describe('McpManager.init: stdio trust identity includes the effective cwd', () 
       registry,
       config: config([serverConfig({ transport: nodeScript })]),
       cwd: '/proj-b', // ./server.js now resolves to a different file
+      projectRoot: SCOPE,
       makeClient: fake.makeClient,
     });
     const report = await mgr.init();
@@ -562,6 +575,7 @@ describe('McpManager.init: stdio trust identity includes the effective cwd', () 
         }),
       ]),
       cwd: '/authorized', // session cwd unchanged, but cfg.cwd moved
+      projectRoot: SCOPE,
       makeClient: fake.makeClient,
     });
     const report = await mgr.init();
@@ -591,6 +605,7 @@ describe('McpManager.init: stdio trust identity includes the effective cwd', () 
       registry,
       config: config([absConfig()]),
       cwd: '/dir-a',
+      projectRoot: SCOPE,
       makeClient: same.makeClient,
     });
     expect((await mgrSame.init()).registered).toBe(1);
@@ -601,6 +616,7 @@ describe('McpManager.init: stdio trust identity includes the effective cwd', () 
     migrate(db2);
     recordGrantOnly(db2, 'db', [toolDef('query')]);
     insertServer(db2, {
+      scope: SCOPE,
       name: 'db',
       transport: 'stdio',
       command: stdioIdentity(['/opt/mcp/server'], { cwd: '/dir-a' }),
@@ -614,6 +630,7 @@ describe('McpManager.init: stdio trust identity includes the effective cwd', () 
       registry: createToolRegistry(),
       config: config([absConfig()]),
       cwd: '/dir-b', // writable root moves to /dir-b
+      projectRoot: SCOPE,
       makeClient: moved.makeClient,
     });
     const report = await mgrMoved.init();
@@ -677,7 +694,7 @@ describe('McpManager.init: credential bindings in the trust identity', () => {
     });
     await mgr.init();
 
-    const command = getServer(db, 'db')?.command ?? '';
+    const command = getServer(db, SCOPE, 'db')?.command ?? '';
     expect(command).toContain('$SECRET'); // the binding is recorded
     expect(command).not.toContain('super-secret-value'); // the resolved secret is NOT
   });
@@ -694,6 +711,7 @@ describe('McpManager.init: credential bindings in the trust identity', () => {
     // Seed the row with the env-inclusive identity a prior grant would have written.
     recordGrantOnly(db, 'db', [toolDef('query')]);
     insertServer(db, {
+      scope: SCOPE,
       name: 'db',
       transport: 'stdio',
       command: stdioIdentity(['fake-bin'], { env: { SECRET: '$SECRET' } }),
@@ -719,6 +737,7 @@ describe('McpManager.init: credential bindings in the trust identity', () => {
     // TOKEN_B. The URL is unchanged, but the new credential binding must re-trust.
     recordGrantOnly(db, 'gh', [toolDef('query')]);
     insertServer(db, {
+      scope: SCOPE,
       name: 'gh',
       transport: 'http',
       command: null,
@@ -760,6 +779,7 @@ describe('McpManager.init: credential bindings in the trust identity', () => {
     // sent to a new endpoint — the resolved-origin fold must force a re-trust.
     recordGrantOnly(db, 'gh', [toolDef('query')]);
     insertServer(db, {
+      scope: SCOPE,
       name: 'gh',
       transport: 'http',
       command: null,
@@ -796,6 +816,7 @@ describe('McpManager.init: credential bindings in the trust identity', () => {
     // and the resolved token never entered the identity to begin with).
     recordGrantOnly(db, 'gh', [toolDef('query')]);
     insertServer(db, {
+      scope: SCOPE,
       name: 'gh',
       transport: 'http',
       command: null,
@@ -843,7 +864,7 @@ describe('McpManager.init: a re-approved manifest persists durably', () => {
     });
     await mgr1.init();
     expect(mgr1.state('db')).toBe('denied');
-    expect(latestTrustedManifest(db, 'db')).toBeNull(); // only a denied row so far
+    expect(latestTrustedManifest(db, SCOPE, 'db')).toBeNull(); // only a denied row so far
 
     // Boot 2 (same db): the operator auto-approves the SAME manifest. The prior
     // denied row can't be re-inserted (UNIQUE) — it must be UPDATED to granted so
@@ -860,7 +881,7 @@ describe('McpManager.init: a re-approved manifest persists durably', () => {
     await mgr2.init();
     expect(mgr2.state('db')).toBe('trusted');
     expect(reg2.has('mcp__db__query')).toBe(true);
-    const grant = latestTrustedManifest(db, 'db');
+    const grant = latestTrustedManifest(db, SCOPE, 'db');
     expect(grant?.decision).toBe('granted');
     expect(grant?.decided_by).toBe('auto_approve');
 
@@ -943,7 +964,7 @@ describe('McpManager.callTool', () => {
 
     await mgr.callTool('db', 'query', { sql: 'y' }, ctx);
     expect(fake.stats.connects).toBe(1); // reused
-    expect(getServer(db, 'db')?.total_calls).toBe(2);
+    expect(getServer(db, SCOPE, 'db')?.total_calls).toBe(2);
   });
 
   test('manifest drift on first call → degraded + throws', async () => {
@@ -967,6 +988,7 @@ describe('McpManager.callTool', () => {
     // re-trigger trust rather than ride the cached grant.
     recordGrantOnly(db, 'db', [toolDef('query')], 'server-old'); // granted at name 'server-old'
     insertServer(db, {
+      scope: SCOPE,
       name: 'db',
       transport: 'stdio',
       command: stdioIdentity(['fake-bin']),
@@ -1065,6 +1087,7 @@ describe('McpManager: code-review hardening', () => {
   // A prior session's mcp_servers row pinning the last-trusted command identity.
   const priorRow = (command: string[]) =>
     insertServer(db, {
+      scope: SCOPE,
       name: 'db',
       transport: 'stdio',
       command: stdioIdentity(command),
@@ -1169,6 +1192,7 @@ describe('McpManager: stale-row sweep (AUDIT §1.5)', () => {
     // A user-scoped row + granted manifest from a prior session for a server now
     // GONE from the (global) user config → swept.
     insertServer(db, {
+      scope: SCOPE,
       name: 'gone',
       transport: 'stdio',
       command: '["x"]',
@@ -1186,25 +1210,27 @@ describe('McpManager: stale-row sweep (AUDIT §1.5)', () => {
       makeClient: fake.makeClient,
     });
     await mgr.init();
-    expect(getServer(db, 'gone')).toBeNull(); // orphan STATE row swept
-    expect(latestTrustedManifest(db, 'gone')).not.toBeNull(); // history is forever
-    expect(getServer(db, 'db')).not.toBeNull(); // configured server kept
+    expect(getServer(db, SCOPE, 'gone')).toBeNull(); // orphan STATE row swept
+    expect(latestTrustedManifest(db, SCOPE, 'gone')).not.toBeNull(); // history is forever
+    expect(getServer(db, SCOPE, 'db')).not.toBeNull(); // configured server kept
   });
 
-  test('init PRESERVES a project-scoped row absent from this repo (user-global db)', async () => {
-    // sessions.db is user-global; a project_shared/project_local row not in THIS
-    // repo's config may belong to ANOTHER repo. Sweeping it would delete that
-    // project's cached trust, so it must survive.
+  test('init PRESERVES rows in ANOTHER project scope (user-global db)', async () => {
+    // sessions.db is user-global; a project row in a DIFFERENT scope (another
+    // repo) must never be swept by THIS repo's init — even a same-name collision.
+    const OTHER = '/another/repo';
     insertServer(db, {
-      name: 'other-repo-server',
+      scope: OTHER,
+      name: 'db', // same name as this repo's server — must NOT collide
       transport: 'stdio',
-      command: '["x"]',
+      command: '["other-bin"]',
       url: null,
       source: 'project_shared',
       state: 'trusted',
     });
     insertServer(db, {
-      name: 'other-repo-local',
+      scope: OTHER,
+      name: 'other-only',
       transport: 'stdio',
       command: '["y"]',
       url: null,
@@ -1215,13 +1241,43 @@ describe('McpManager: stale-row sweep (AUDIT §1.5)', () => {
     const mgr = createMcpManager({
       db,
       registry,
-      config: config([serverConfig()]), // only 'db' is configured in this repo
+      config: config([serverConfig()]), // only 'db' is configured in THIS repo (scope SCOPE)
       autoApprove: new Set(['db']),
       makeClient: fake.makeClient,
     });
     await mgr.init();
-    expect(getServer(db, 'other-repo-server')).not.toBeNull(); // NOT swept
-    expect(getServer(db, 'other-repo-local')).not.toBeNull(); // NOT swept
+    // The other scope's rows survive; the same-named 'db' there is a distinct row.
+    expect(getServer(db, OTHER, 'db')?.command).toBe('["other-bin"]'); // NOT overwritten
+    expect(getServer(db, OTHER, 'other-only')).not.toBeNull(); // NOT swept
+  });
+
+  test('a user server SHADOWED by a same-named project server keeps its cached trust', async () => {
+    // sessions.db is user-global. A user 'db' (scope '') was trusted before; now
+    // THIS repo defines a PROJECT 'db' (which wins the config merge, so the user
+    // entry is invisible in config.servers). The user row must NOT be swept — a '')
+    // row is orphaned only when the NAME is absent from config entirely, not when
+    // merely shadowed — or opening a repo that reuses the name would lose the user
+    // server's trust.
+    insertServer(db, {
+      scope: '', // the user-global row
+      name: 'db',
+      transport: 'stdio',
+      command: '["user-bin"]',
+      url: null,
+      source: 'user',
+      state: 'trusted',
+    });
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]), // a PROJECT 'db' (source project_shared → scope SCOPE)
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(getServer(db, '', 'db')?.command).toBe('["user-bin"]'); // user row PRESERVED (shadowed)
+    expect(getServer(db, SCOPE, 'db')).not.toBeNull(); // the project 'db' is its own row
   });
 
   test('a granted manifest whose server row was swept is re-trusted, not reused by name', async () => {
@@ -1297,6 +1353,7 @@ describe('McpManager: stale-row sweep (AUDIT §1.5)', () => {
 
   test('a disabled server keeps its row (still in config, just off)', async () => {
     insertServer(db, {
+      scope: SCOPE,
       name: 'db',
       transport: 'stdio',
       command: '["fake-bin"]',
@@ -1312,7 +1369,7 @@ describe('McpManager: stale-row sweep (AUDIT §1.5)', () => {
       makeClient: fake.makeClient,
     });
     await mgr.init();
-    expect(getServer(db, 'db')).not.toBeNull(); // disabled ≠ removed from config
+    expect(getServer(db, SCOPE, 'db')).not.toBeNull(); // disabled ≠ removed from config
   });
 });
 
@@ -1329,6 +1386,7 @@ describe('McpManager: review hardening', () => {
       tools: goodTools,
     });
     recordManifestDecision(db, {
+      scope: SCOPE,
       server_name: 'db',
       hash: hashManifest(canonical),
       previous_hash: null,
@@ -1343,6 +1401,7 @@ describe('McpManager: review hardening', () => {
     // The identity-bearing row must be present for the cached grant to be taken at
     // all (a swept row → re-trust, not the hash-check path this test exercises).
     insertServer(db, {
+      scope: SCOPE,
       name: 'db',
       transport: 'stdio',
       command: stdioIdentity(['fake-bin']),
@@ -1376,7 +1435,7 @@ describe('McpManager: review hardening', () => {
       makeClient: fake1.makeClient,
     });
     await mgr1.init();
-    const hashA = latestTrustedManifest(db, 'db')?.hash;
+    const hashA = latestTrustedManifest(db, SCOPE, 'db')?.hash;
     await mgr1.cleanup();
 
     // Session 2: the command AND the tool set changed → manifest B, force-
@@ -1401,9 +1460,9 @@ describe('McpManager: review hardening', () => {
     await mgr2.init();
     await mgr2.cleanup();
 
-    const history = listManifestHistory(db, 'db');
+    const history = listManifestHistory(db, SCOPE, 'db');
     expect(history.length).toBe(2);
-    const hashB = latestTrustedManifest(db, 'db')?.hash;
+    const hashB = latestTrustedManifest(db, SCOPE, 'db')?.hash;
     expect(hashB).not.toBe(hashA);
     const rowB = history.find((h) => h.hash === hashB);
     expect(rowB?.previous_hash).toBe(hashA ?? null); // the chain forms (was always null before)
@@ -1667,7 +1726,7 @@ describe('McpManager: revoke / reconnect (registry hot-swap)', () => {
     expect(registry.has('mcp__db__query')).toBe(false); // unregistered (next turn drops them)
     expect(registry.has('mcp__db__list')).toBe(false);
     expect(mgr.state('db')).toBe('denied');
-    expect(getServer(db, 'db')?.revoked_at).not.toBeNull(); // durable
+    expect(getServer(db, SCOPE, 'db')?.revoked_at).not.toBeNull(); // durable
     await mgr.cleanup();
   });
 
@@ -1699,7 +1758,7 @@ describe('McpManager: revoke / reconnect (registry hot-swap)', () => {
     expect(report.registered).toBe(0);
     expect(reg2.has('mcp__db__query')).toBe(false);
     expect(m2.state('db')).toBe('denied');
-    expect(latestTrustedManifest(db, 'db')).not.toBeNull(); // the grant survives forever (durability builds on it)
+    expect(latestTrustedManifest(db, SCOPE, 'db')).not.toBeNull(); // the grant survives forever (durability builds on it)
     expect(f2.stats.made).toBe(0); // never even spawned
     await m2.cleanup();
   });
@@ -1722,7 +1781,7 @@ describe('McpManager: revoke / reconnect (registry hot-swap)', () => {
     expect(r.registered).toBe(1);
     expect(registry.has('mcp__db__query')).toBe(true); // re-registered
     expect(mgr.state('db')).toBe('trusted');
-    expect(getServer(db, 'db')?.revoked_at).toBeNull(); // revocation cleared
+    expect(getServer(db, SCOPE, 'db')?.revoked_at).toBeNull(); // revocation cleared
     await mgr.cleanup();
   });
 
@@ -1744,14 +1803,14 @@ describe('McpManager: revoke / reconnect (registry hot-swap)', () => {
     });
     await mgr.init();
     await mgr.revoke('db');
-    expect(getServer(db, 'db')?.revoked_at).toBe(999);
+    expect(getServer(db, SCOPE, 'db')?.revoked_at).toBe(999);
 
     // reconnect hits the connect error → error state. The revocation must NOT be
     // cleared, or the next relaunch silently re-registers from the cached grant.
     const r = await mgr.reconnect('db');
     expect(r.ok).toBe(false);
     expect(mgr.state('db')).toBe('error');
-    expect(getServer(db, 'db')?.revoked_at).toBe(999); // still revoked
+    expect(getServer(db, SCOPE, 'db')?.revoked_at).toBe(999); // still revoked
     await mgr.cleanup();
   });
 
@@ -1770,12 +1829,12 @@ describe('McpManager: revoke / reconnect (registry hot-swap)', () => {
       now: () => 777,
     });
     await mgr.init(); // registers from cache (no connect, no prompt)
-    expect(getServer(db, 'db')?.revoked_at).toBeNull(); // never revoked
+    expect(getServer(db, SCOPE, 'db')?.revoked_at).toBeNull(); // never revoked
 
     const r = await mgr.reconnect('db');
     expect(r.ok).toBe(false);
     expect(mgr.state('db')).toBe('denied');
-    expect(getServer(db, 'db')?.revoked_at).toBe(777); // NOW revoked durably
+    expect(getServer(db, SCOPE, 'db')?.revoked_at).toBe(777); // NOW revoked durably
     expect(fake.stats.made).toBe(0); // declined at the identity gate → never connected
     await mgr.cleanup();
 
@@ -1808,7 +1867,7 @@ describe('McpManager: revoke / reconnect (registry hot-swap)', () => {
     });
     await mgr.init();
     await mgr.revoke('db');
-    expect(getServer(db, 'db')?.revoked_at).toBe(12345);
+    expect(getServer(db, SCOPE, 'db')?.revoked_at).toBe(12345);
     await mgr.cleanup();
   });
 
@@ -1830,7 +1889,7 @@ describe('McpManager: revoke / reconnect (registry hot-swap)', () => {
     // revoked row (else a re-add would re-register from the cached grant).
     const m2 = createMcpManager({ db, registry: createToolRegistry(), config: config([]) });
     await m2.init();
-    expect(getServer(db, 'db')?.revoked_at).not.toBeNull(); // spared by the sweep
+    expect(getServer(db, SCOPE, 'db')?.revoked_at).not.toBeNull(); // spared by the sweep
     await m2.cleanup();
   });
 
@@ -2047,7 +2106,7 @@ describe('McpManager: per-server budget (MCP.md §5)', () => {
     });
     await mgr.init();
     await mgr.callTool('db', 'query', {}, ctx);
-    const row = getServer(db, 'db');
+    const row = getServer(db, SCOPE, 'db');
     expect(row?.total_calls).toBe(1);
     expect(row?.total_tokens_in ?? 0).toBeGreaterThan(0); // estimated from the result content
     await mgr.cleanup();
@@ -2397,7 +2456,7 @@ describe('McpManager: remote transport', () => {
     });
     await mgr.init();
     expect(modalCommand).toBe('https://mcp.example.com/v1?token=$TOKEN'); // modal shows the RAW url
-    const persisted = getServer(db, 'gh')?.url ?? '';
+    const persisted = getServer(db, SCOPE, 'gh')?.url ?? '';
     expect(persisted).toContain('token=$TOKEN'); // identity keeps the RAW (unexpanded) url
     expect(persisted).toContain('"origin":"https://mcp.example.com"'); // + the resolved origin (non-secret)
     expect(persisted).not.toContain('RESOLVED-SECRET'); // the secret never lands at rest
@@ -2444,7 +2503,7 @@ describe('McpManager: remote transport', () => {
     await m1.init();
     await m1.cleanup();
     expect(f1.stats.made).toBeGreaterThan(0); // connected to fetch + grant the stdio manifest
-    const row1 = getServer(db, 'sw');
+    const row1 = getServer(db, SCOPE, 'sw');
     expect(row1?.transport).toBe('stdio');
     expect(row1?.url).toBeNull();
 
@@ -2462,7 +2521,7 @@ describe('McpManager: remote transport', () => {
     await m2.init();
     expect(f2.stats.made).toBeGreaterThan(0); // re-handshook, not served from the stdio cache
     expect(reg2.has('mcp__sw__query')).toBe(true);
-    const row2 = getServer(db, 'sw');
+    const row2 = getServer(db, SCOPE, 'sw');
     expect(row2?.transport).toBe('http'); // persisted identity flipped to the remote URL
     expect(row2?.command).toBeNull();
     expect(row2?.url).toContain('https://mcp.example.com/v1'); // identity blob carries the remote URL

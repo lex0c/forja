@@ -51,7 +51,7 @@ Everything lives under `src/mcp/`. The rest of the harness sees MCP tools only a
         └──────────────────┘ └────────────────┘ └──────────────────┘
 
    storage:  migrations/081-mcp-servers.ts + repos/mcp-servers.ts
-             mcp_servers          = per-server STATE (user-scoped rows swept when they leave config)
+             mcp_servers          = per-server STATE, keyed (scope, name) — scoped per project
              mcp_manifest_history = trust decisions, APPEND-ONLY FOREVER
 ```
 
@@ -171,7 +171,7 @@ A **refusing** permission boot (a broken audit chain without `--accept-broken-ch
 
 Every decision (`granted` / `denied` / `revoked` / `superseded`) appends to `mcp_manifest_history`, which is **append-only and never pruned**. A re-**seen** server whose identity row is still present (a restart, a `disabled` toggle) with a matching command + hash re-uses its cached grant with no fresh prompt. A server **removed from config and re-added** — its identity row swept — re-trusts through the pre-connect identity gate: the grant is not inherited by name, so a re-added entry pointing at a different command/URL can't ride the old trust.
 
-The `(server, hash)` pair holds **one** decision row (it is unique). If you **decline** a manifest and later approve the *same* manifest (via `/mcp reconnect` or `--auto-approve-mcp`), that row flips `denied → granted` in place, so the approval is durable across the next boot rather than being re-prompted every time.
+The `(scope, server, hash)` triple holds **one** decision row (it is unique). If you **decline** a manifest and later approve the *same* manifest (via `/mcp reconnect` or `--auto-approve-mcp`), that row flips `denied → granted` in place, so the approval is durable across the next boot rather than being re-prompted every time.
 
 ---
 
@@ -228,9 +228,10 @@ A server moves through eight states (`STATE_MACHINE §6.5`); the current value i
 
 ## 6. Storage + audit
 
-Two tables (migration `081-mcp-servers.ts`, repo `repos/mcp-servers.ts`):
+Two tables (migrations `081-mcp-servers.ts` / `083-mcp-servers-scoped.ts`, repo `repos/mcp-servers.ts`):
 
-- **`mcp_servers`** — per-server STATE: transport, the redacted command, source layer, current state + manifest hash, counters. This is mutable state, so a **`user`-scoped** row is **swept when the server leaves config**: `manager.init()` deletes any `user`-source row whose name is in neither the enabled nor disabled config set (toggling `disabled` keeps the row). A **project-scoped** row (`project_shared` / `project_local`) is **never** swept this way, because `sessions.db` is user-global while the config is only the current repo's — a project row absent here may belong to another repo, and sweeping it would delete that project's cached trust. A genuinely-removed project server just leaves a harmless stale row; a re-add with a changed command/URL still re-trusts via the identity comparison. Revoked rows always survive (the revocation must outlast a config round-trip).
+- **Rows are keyed by `(scope, name)`, not by name alone.** `sessions.db` is user-global but project MCP config is per-repo, so the same `<name>` (`db`, `postgres`) in different repos would otherwise collide on one row — approving one repo's server would overwrite the other's identity + cached trust, and the other would re-prompt / fail closed on its next run despite a prior approval. `scope` = the **project root** for `project_shared` / `project_local` servers, `''` (global) for `user` servers (shared across repos on purpose).
+- **`mcp_servers`** — per-server STATE: transport, the redacted command, source layer, current state + manifest hash, counters. Mutable state, so a row is **swept when its `(scope, name)` leaves config**: `manager.init()` deletes any row — within THIS invocation's scopes (the current repo + the global `''`) — whose name is in neither the enabled nor disabled config set (toggling `disabled` keeps the row). Rows in **another repo's scope** are never even looked at, so their cached trust is untouched. Revoked rows always survive (the revocation must outlast a config round-trip).
 - **`mcp_manifest_history`** — every trust decision, **append-only forever**. It is deliberately absent from `GC_TABLES`, so `forja gc` never prunes it; the forever-retention holds by construction. The server's history survives even after its `mcp_servers` row is swept — but the manager will **not** reuse a grant by name once the identity row is gone: the row is what records the command/URL a grant authorized, so a re-added server re-trusts through the identity gate rather than silently inheriting the grant.
 
 ---

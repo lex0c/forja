@@ -8,7 +8,12 @@
 
 import { existsSync } from 'node:fs';
 import { sanitizeOneLineForDisplay, stripControlKeepLines } from '../../../sanitize/ansi.ts';
-import { getServer, listManifestHistory, listServers } from '../../../storage/repos/mcp-servers.ts';
+import {
+  getServer,
+  getServerAnyScope,
+  listManifestHistory,
+  listServers,
+} from '../../../storage/repos/mcp-servers.ts';
 import { localTimestamp } from '../../local-date.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
@@ -49,13 +54,18 @@ const renderEndpoint = (raw: string): string => {
 };
 
 const handleShow = (ctx: SlashContext, name: string): SlashResult => {
-  const row = getServer(ctx.db, name);
+  // Read the right `(scope, name)` row: the manager knows this server's scope
+  // (from its config source); without a manager (or a server not in config) fall
+  // back to the first row matching the name across scopes.
+  const mgr = ctx.baseConfig.mcpManager;
+  const scope = mgr?.scopeFor(name) ?? null;
+  const row = scope !== null ? getServer(ctx.db, scope, name) : getServerAnyScope(ctx.db, name);
   if (row === null) {
     return { kind: 'error', message: `/mcp: no server '${name}' (try /mcp to list)` };
   }
   // Prefer the manager's LIVE state over the persisted row; the row is the
   // last-written value and may lag a mid-session transition.
-  const live = ctx.baseConfig.mcpManager?.state(name);
+  const live = mgr?.state(name);
   // Sanitize every field that originates OUTSIDE the harness before it lands in a
   // note the info renderer prints verbatim: the persisted identity (command / URL)
   // comes from a repo's mcp.toml, and protocol/server version + last_error come
@@ -81,7 +91,7 @@ const handleShow = (ctx: SlashContext, name: string): SlashResult => {
     `  last connected: ${localTimestamp(row.last_connected_at)}`,
     `  last error:     ${row.last_error !== null ? s(row.last_error) : 'none'}`,
   ];
-  const history = listManifestHistory(ctx.db, name);
+  const history = listManifestHistory(ctx.db, row.scope, name);
   if (history.length > 0) {
     lines.push('  trust history (newest first):');
     for (const h of history.slice(0, 10)) {
@@ -98,7 +108,9 @@ const handleList = (ctx: SlashContext): SlashResult => {
   // Live status (state + tool count) from the manager when present; fall back to
   // the persisted rows (headless / no manager) so `/mcp` still works.
   const mgr = ctx.baseConfig.mcpManager;
-  const rows = listServers(ctx.db);
+  // With a manager, restrict to THIS session's scopes (the repo + the global user
+  // scope) so another repo's rows don't leak into the list; without one, show all.
+  const rows = mgr !== undefined ? listServers(ctx.db, mgr.scopes()) : listServers(ctx.db);
   const live = mgr?.status() ?? [];
   const liveByName = new Map(live.map((s) => [s.name, s]));
   const rowByName = new Map(rows.map((r) => [r.name, r]));
@@ -193,7 +205,8 @@ const handleLogs = async (ctx: SlashContext, name: string): Promise<SlashResult>
   if (mgr === undefined) {
     return { kind: 'error', message: '/mcp logs: MCP is not active in this session' };
   }
-  if (getServer(ctx.db, name) === null) {
+  const scope = mgr.scopeFor(name);
+  if (scope === null || getServer(ctx.db, scope, name) === null) {
     return { kind: 'error', message: `/mcp: no server '${name}' (try /mcp to list)` };
   }
   const path = mgr.logPath(name);

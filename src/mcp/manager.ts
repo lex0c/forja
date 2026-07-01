@@ -68,6 +68,7 @@ import type {
   McpSandboxStatus,
   McpSandboxWrap,
   McpServerConfig,
+  McpServerSource,
   McpServerState,
   McpStdioConfig,
   McpTransportConfig,
@@ -89,6 +90,12 @@ export interface McpManagerDeps {
   // into the stdio trust identity so a relative executable launched from a
   // different directory re-triggers trust. Defaults to `process.cwd()`.
   cwd?: string;
+  // Repo root of the current project, used as the STORAGE scope for project
+  // servers (AUDIT §1.5): `sessions.db` is user-global but project config is
+  // per-repo, so a project server's rows key on `(projectRoot, name)` to isolate
+  // the same `<name>` across repos. `user` servers key on '' (global). Defaults
+  // to the session cwd.
+  projectRoot?: string;
   // Injectable client factory (tests pass a fake; production uses the SDK
   // stdio adapter). `stderrLogPath` is where the adapter tees the server's
   // stderr (mcp-<name>.log) — undefined ⇒ drain-to-discard.
@@ -134,6 +141,13 @@ export interface McpManager {
     ctx: ToolContext,
   ): Promise<McpCallResult>;
   state(server: string): McpServerState | null;
+  // The storage scopes this session owns (the current repo root + the global user
+  // scope ''), for scoping `/mcp list` reads to the session's servers.
+  scopes(): string[];
+  // The storage scope of a configured server by name (from its source), or null
+  // when the server isn't in this session's config — lets `/mcp show` read the
+  // right `(scope, name)` row instead of guessing.
+  scopeFor(server: string): string | null;
   // Live status of every server in the runtime (name, current state, registered
   // tool count) for /mcp + status views — the McpInitReport snapshot, queryable
   // after init.
@@ -363,6 +377,12 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
   // stdioCommandIdentity). Matches the client's `process.cwd()` spawn fallback so
   // the identity tracks the directory a relative executable actually resolves in.
   const sessionCwd = deps.cwd ?? process.cwd();
+  // Storage scope (AUDIT §1.5): project servers key their rows on the repo root,
+  // `user` servers on '' (global, shared across repos). Isolates the same `<name>`
+  // in different repos so approving one repo's server can't clobber another's.
+  const projectRoot = deps.projectRoot ?? sessionCwd;
+  const scopeOf = (cfg: { source: McpServerSource }): string =>
+    cfg.source === 'user' ? '' : projectRoot;
 
   // Resolve a server's effective sandbox posture (MCP.md §2.3): default-ON when
   // a tool is available; `sandbox = false` opts out; a wired-but-unavailable
@@ -446,7 +466,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
     // transition is a manager bug; throw rather than corrupt persisted state.
     mcpTransition(rt.state, state);
     rt.state = state;
-    patchServer(db, rt.config.name, { state, ...patch });
+    patchServer(db, scopeOf(rt.config), rt.config.name, { state, ...patch });
   };
 
   // Forward declaration: the tool `call` closure captures this; it is always
@@ -587,7 +607,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       // Successful call: charge tokens to the in-memory budget + the lifetime DB
       // counters (/mcp show). Lifetime total_calls counts completed calls.
       const tokensIn = estimateResultTokens(res);
-      bumpServerCounters(db, server, { calls: 1, tokensIn });
+      bumpServerCounters(db, scopeOf(rt.config), server, { calls: 1, tokensIn });
       rt.sessionTokensIn += tokensIn;
 
       // Output-validity loop (MCP.md §15.5). A malformed result degrades the
@@ -817,20 +837,21 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
     forceReprompt: boolean,
   ): Promise<boolean> => {
     const name = rt.config.name;
-    const prior = getManifestDecision(db, name, hash);
+    const scope = scopeOf(rt.config);
+    const prior = getManifestDecision(db, scope, name, hash);
     // Honor a prior same-hash decision UNLESS the command changed: a swapped
     // binary advertising the identical tool list must not inherit the grant.
     if (prior !== null && !forceReprompt) return prior.decision === 'granted';
 
     const record = (decision: 'granted' | 'denied', decidedBy: string) => {
       if (prior !== null) {
-        // (server, hash) already recorded — the UNIQUE index forbids a second
-        // row. When the operator RE-decides the same manifest (a forced reprompt
-        // reached here), flip the existing row so a decline→approve (or the
-        // reverse) is durable across the next boot rather than silently lost.
+        // (scope, server, hash) already recorded — the UNIQUE index forbids a
+        // second row. When the operator RE-decides the same manifest (a forced
+        // reprompt reached here), flip the existing row so a decline→approve (or
+        // the reverse) is durable across the next boot rather than silently lost.
         // Same decision ⇒ nothing to write.
         if (prior.decision !== decision) {
-          updateManifestDecision(db, name, hash, {
+          updateManifestDecision(db, scope, name, hash, {
             decision,
             decided_by: decidedBy,
             decided_at: now(),
@@ -839,12 +860,13 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         return;
       }
       recordManifestDecision(db, {
+        scope,
         server_name: name,
         hash,
         // The hash this decision supersedes: the latest already-granted
         // manifest for this server (null on first trust). `rt.trustedHash` is
         // still null here (set only after the grant), so query the store.
-        previous_hash: latestTrustedManifest(db, name)?.hash ?? null,
+        previous_hash: latestTrustedManifest(db, scope, name)?.hash ?? null,
         manifest_json: manifestJson,
         protocol_version: info.protocolVersion,
         server_version: info.serverVersion,
@@ -896,11 +918,13 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
   // place — AUDIT §1.5) only when a grant re-authorizes a CHANGED command, so a
   // swap stays detectable across sessions until the operator re-approves it.
   const syncTrustedCommand = (rt: ServerRuntime) => {
+    const scope = scopeOf(rt.config);
     const id = transportIdentity(rt.config.transport, sessionCwd);
-    const existing = getServer(db, rt.config.name);
+    const existing = getServer(db, scope, rt.config.name);
     if (existing !== null && !transportChanged(existing, rt.config.transport, sessionCwd)) return;
-    if (existing !== null) deleteServer(db, rt.config.name);
+    if (existing !== null) deleteServer(db, scope, rt.config.name);
     insertServer(db, {
+      scope,
       name: rt.config.name,
       transport: rt.config.transport.transport,
       command: id.command,
@@ -943,9 +967,11 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         // grant by name, running the very command the operator just declined. With a
         // null identity, `transportChanged` reports a mismatch until a grant lands, so
         // a never-granted (or declined) server always re-trusts through the gate.
-        const existing = getServer(db, server.name);
+        const scope = scopeOf(server);
+        const existing = getServer(db, scope, server.name);
         if (existing === null) {
           insertServer(db, {
+            scope,
             name: server.name,
             transport: server.transport.transport,
             command: null,
@@ -995,7 +1021,9 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         // manifest still honors the prior hash-decision, so only the IDENTITY is
         // re-prompted, not the tool set).
         const cached =
-          commandChanged || existing === null ? null : latestTrustedManifest(db, server.name);
+          commandChanged || existing === null
+            ? null
+            : latestTrustedManifest(db, scope, server.name);
         // Defense-in-depth (FAILURE_MODES §14.2): the stored manifest_json is
         // the exact string that was hashed, so a granted row must re-hash to
         // its own `hash`. A mismatch means the row was tampered (DB write)
@@ -1033,24 +1061,29 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       }
 
       // AUDIT §1.5: an mcp_servers row is STATE — removed once the server leaves
-      // config. But `sessions.db` is USER-GLOBAL while `config.servers` is only
-      // THIS repo's merged config, so a PROJECT-scoped row absent here may simply
-      // belong to ANOTHER repo. Sweeping it would delete that project's cached
-      // trust (its headless runs would then fail-closed, and its interactive runs
-      // would have to re-authorize on the next boot). So only sweep `user`-source
-      // orphans — a user-scoped row absent from the (global) user config really
-      // was removed. A project-scoped orphan is left in place: a genuinely-removed
-      // project server just leaves a harmless stale row, and a re-add pointing at a
-      // CHANGED command/URL still re-trusts via the identity comparison
-      // (`commandChanged`, above) rather than inheriting the grant. Revoked rows
-      // always survive (the revocation must outlast a config round-trip).
-      // Compared against ALL configured names (incl. disabled), so toggling
-      // `disabled` keeps the row.
-      const configNames = new Set(config.servers.map((s) => s.name));
-      for (const row of listServers(db)) {
-        if (!configNames.has(row.name) && row.revoked_at == null && row.source === 'user') {
-          deleteServer(db, row.name);
-        }
+      // config. Scope-aware: rows are keyed by `(scope, name)`, so this sweep only
+      // considers THIS invocation's scopes — the current repo root + the global
+      // user scope `''` — and deletes a `(scope, name)` no longer in config. Rows
+      // of ANOTHER repo (a different scope) aren't even listed, so their cached
+      // trust is never touched. Compared against ALL configured servers (incl.
+      // disabled), so toggling `disabled` keeps the row. A revoked row always
+      // survives (the revocation must outlast a config round-trip).
+      // The '' (user) scope is GLOBAL, and a merged config can SHADOW a user
+      // server with a same-named PROJECT server (project layer wins), hiding the
+      // user entry from config.servers. So a '' row is orphaned only when its NAME
+      // is absent from config entirely (not when merely shadowed), or a user
+      // server this repo shadows would lose its cached trust. A project-scoped row
+      // uses the exact (scope, name). Keys join on a space (names are
+      // ^[a-z][a-z0-9_]*$, no spaces, so `<scope> <name>` can't alias).
+      const configuredKeys = new Set(config.servers.map((s) => `${scopeOf(s)} ${s.name}`));
+      const configuredNames = new Set(config.servers.map((s) => s.name));
+      for (const row of listServers(db, [projectRoot, ''])) {
+        if (row.revoked_at != null) continue;
+        const orphan =
+          row.scope === ''
+            ? !configuredNames.has(row.name)
+            : !configuredKeys.has(`${row.scope} ${row.name}`);
+        if (orphan) deleteServer(db, row.scope, row.name);
       }
 
       return { registered, servers, warnings };
@@ -1060,6 +1093,15 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
 
     state(server) {
       return runtime.get(server)?.state ?? null;
+    },
+
+    scopes() {
+      return [projectRoot, ''];
+    },
+
+    scopeFor(server) {
+      const cfg = config.servers.find((s) => s.name === server);
+      return cfg !== undefined ? scopeOf(cfg) : null;
     },
 
     status() {
@@ -1075,7 +1117,11 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
     },
 
     async revoke(server) {
-      if (getServer(db, server) === null) {
+      // Resolve the scope from the configured server (incl. disabled); a server
+      // not in config can't be scoped and is treated as unknown.
+      const cfg = config.servers.find((s) => s.name === server);
+      const scope = cfg !== undefined ? scopeOf(cfg) : null;
+      if (scope === null || getServer(db, scope, server) === null) {
         return { ok: false, reason: 'unknown server', tools: 0 };
       }
       const rt = runtime.get(server);
@@ -1096,7 +1142,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       }
       // Durable across relaunch (init skips the cached grant while revoked_at is
       // set); also covers a configured-but-not-in-runtime (disabled) server.
-      patchServer(db, server, { state: 'denied', revoked_at: now() });
+      patchServer(db, scope, server, { state: 'denied', revoked_at: now() });
       return { ok: true, tools };
     },
 
@@ -1105,6 +1151,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       if (cfg === undefined) {
         return { ok: false, reason: 'unknown or disabled server', registered: 0, warnings: [] };
       }
+      const scope = scopeOf(cfg);
       const old = runtime.get(server);
       if (old !== undefined) {
         for (const wire of old.registeredNames) registry.unregister(wire);
@@ -1134,7 +1181,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       const warnings: string[] = [];
       const registered = await resolveFreshTrust(rt, warnings, true);
       if (rt.state === 'trusted') {
-        patchServer(db, server, { revoked_at: null });
+        patchServer(db, scope, server, { revoked_at: null });
         return { ok: true, registered, warnings };
       }
       // Re-denied or failed to connect: REVOKE durably so the next relaunch's
@@ -1145,8 +1192,8 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       // revoked_at only when it isn't already set, so an already-revoked server
       // keeps its original (operator-revoke) timestamp. The result is NOT ok, so
       // the operator sees the real outcome.
-      if (getServer(db, server)?.revoked_at == null) {
-        patchServer(db, server, { revoked_at: now() });
+      if (getServer(db, scope, server)?.revoked_at == null) {
+        patchServer(db, scope, server, { revoked_at: now() });
       }
       return { ok: false, reason: rt.state, registered, warnings };
     },

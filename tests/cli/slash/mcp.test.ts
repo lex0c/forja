@@ -22,6 +22,10 @@ import { createModalManager } from '../../../src/tui/modal-manager.ts';
 
 let db: DB;
 
+// No real manager computes a scope in these tests (a bare `buildCtx()` uses the
+// any-scope reads; the mock reports scope ''), so a fixed '' matches every seed.
+const SCOPE = '';
+
 interface FakeHooks {
   revoke?: (name: string) => Promise<{ ok: boolean; reason?: string; tools: number }>;
   reconnect?: (
@@ -34,6 +38,10 @@ const fakeManager = (status: McpServerStatus[], hooks: FakeHooks = {}): McpManag
     init: async () => ({ registered: 0, servers: [], warnings: [] }),
     callTool: async () => ({ isError: false, content: '' }),
     state: (n: string) => status.find((s) => s.name === n)?.state ?? null,
+    scopes: () => [SCOPE],
+    // All seeded rows use scope '' here; the caller's getServer null-check handles
+    // an unknown server, so return the scope unconditionally.
+    scopeFor: () => SCOPE,
     status: () => status,
     logPath: hooks.logPath ?? (() => null),
     revoke: hooks.revoke ?? (async () => ({ ok: true, tools: 0 })),
@@ -65,6 +73,7 @@ const buildCtx = (mgr?: McpManager, isRunning = false): SlashContext => {
 
 const seed = (name: string, state: string, source = 'project_shared'): void =>
   insertServer(db, {
+    scope: SCOPE,
     name,
     transport: 'stdio',
     command: JSON.stringify([`${name}-bin`]),
@@ -102,6 +111,7 @@ describe('/mcp slash command', () => {
   test('show <server> renders details + trust history', async () => {
     seed('db', 'trusted');
     recordManifestDecision(db, {
+      scope: SCOPE,
       server_name: 'db',
       hash: 'abc123def456789',
       previous_hash: null,
@@ -125,6 +135,7 @@ describe('/mcp slash command', () => {
 
   test('show <remote> renders the trusted URL (not command: —)', async () => {
     insertServer(db, {
+      scope: SCOPE,
       name: 'gh',
       transport: 'http',
       command: null, // remote servers carry no command
@@ -143,6 +154,7 @@ describe('/mcp slash command', () => {
 
   test('show <remote> unwraps the {url, auth} identity blob', async () => {
     insertServer(db, {
+      scope: SCOPE,
       name: 'gh',
       transport: 'sse',
       command: null,
@@ -164,6 +176,7 @@ describe('/mcp slash command', () => {
     // a hostile server reports control bytes in its version + last error. /mcp show
     // must strip them — the info renderer prints these notes verbatim.
     insertServer(db, {
+      scope: SCOPE,
       name: 'evil',
       transport: 'stdio',
       command: '["\x1b[2J\x1b[Hevil-bin","real\rFORGED"]',
@@ -171,7 +184,10 @@ describe('/mcp slash command', () => {
       source: 'project_shared',
       state: 'trusted',
     });
-    patchServer(db, 'evil', { server_version: '9\x1b[31m9', last_error: 'boom\x07\x08fail' });
+    patchServer(db, SCOPE, 'evil', {
+      server_version: '9\x1b[31m9',
+      last_error: 'boom\x07\x08fail',
+    });
     const r = await mcpCommand.exec(['show', 'evil'], buildCtx());
     expect(r.kind).toBe('ok');
     if (r.kind !== 'ok') return;
@@ -187,6 +203,7 @@ describe('/mcp slash command', () => {
 
   test('show strips control bytes from a hostile remote URL', async () => {
     insertServer(db, {
+      scope: SCOPE,
       name: 'evilremote',
       transport: 'http',
       command: null,
@@ -267,6 +284,7 @@ describe('/mcp slash command', () => {
   test('a zero / unknown trust timestamp renders as "—", not a false 1970 date', async () => {
     seed('db', 'trusted');
     recordManifestDecision(db, {
+      scope: SCOPE,
       server_name: 'db',
       hash: 'h0',
       previous_hash: null,

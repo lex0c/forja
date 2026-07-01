@@ -14,6 +14,9 @@ import {
 import { MIGRATIONS, closeDb, migrate, openDb } from '../../src/storage/index.ts';
 import { insertServer } from '../../src/storage/repos/mcp-servers.ts';
 
+// doctor reads mcp_servers unscoped (all rows), so any scope matches the seed.
+const SCOPE = '';
+
 const captured = () => {
   const lines: string[] = [];
   return { write: (s: string) => lines.push(s), lines };
@@ -127,6 +130,7 @@ describe('runDoctor', () => {
     const seedDb = openDb(dbPath);
     migrate(seedDb);
     insertServer(seedDb, {
+      scope: SCOPE,
       name: 'db',
       transport: 'stdio',
       command: '["x"]',

@@ -1645,6 +1645,10 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       // executable launched from a different directory re-triggers trust. Matches
       // the client's `process.cwd()` spawn fallback (run.ts passes the same).
       cwd,
+      // Repo root — the STORAGE scope for project servers (AUDIT §1.5), so the
+      // user-global sessions.db isolates the same server name across repos. Same
+      // repo-root resolution every other project-scoped loader uses.
+      projectRoot: projectConfigCwd,
       sandbox: mcpSandbox,
       // Per-server stderr logs land in a `traces/` dir beside the DB — under
       // the default absolute dbPath that is `<dataDir>/traces/`, and a test's

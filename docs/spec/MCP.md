@@ -394,7 +394,7 @@ Anti-pattern: server que muda manifest a cada minuto (ex: server "dynamic" que a
 
 Implementação compartilha pipeline com slash commands canônicos (`AGENTIC_CLI.md §2.5`). Output JSON via `--json` flag.
 
-**Modelo de revoke/reconnect (durabilidade + auditoria).** `revoke` é **durável**: precisa sobreviver a um relaunch, senão o `init` re-registra do grant cacheado (que vive no `mcp_manifest_history` append-only para sempre). A revogação é gravada como **estado** — uma coluna `revoked_at` (epoch-ms) na row mutável `mcp_servers`, NÃO uma decisão de manifesto — porque o `UNIQUE(server_name, hash)` do history proíbe uma 2ª decision row para o hash já concedido. Semântica:
+**Modelo de revoke/reconnect (durabilidade + auditoria).** `revoke` é **durável**: precisa sobreviver a um relaunch, senão o `init` re-registra do grant cacheado (que vive no `mcp_manifest_history` append-only para sempre). A revogação é gravada como **estado** — uma coluna `revoked_at` (epoch-ms) na row mutável `mcp_servers`, NÃO uma decisão de manifesto — porque o `UNIQUE(scope, server_name, hash)` do history proíbe uma 2ª decision row para o hash já concedido. Semântica:
 
 - `revoke`: `unregister` das tools do registry vivo (o próximo turno cai), `state = denied`, `revoked_at = now()`. O orphan-sweep do `init` **preserva** rows revogadas (sobrevive a um round-trip de config). As subcommands mutantes rodam **entre turnos** (gate `runExclusive`) — mutar o registry no meio de um turno entregaria um tool-set meio-aplicado.
 - `init`: enquanto `revoked_at` está setado, pula o cache e fica `denied` (não re-registra, não re-pergunta headless).
@@ -426,7 +426,7 @@ Limitação consciente: como a revogação é estado (não evento), após `revok
 
 ### 9.1 Tabelas (ver `AUDIT.md §1.5`)
 
-- `mcp_servers` — config + estado atual (1 row per server name)
+- `mcp_servers` — config + estado atual (1 row per `(scope, name)`; `scope` = project root pra servers de projeto, `''` global pra `user` — isola o mesmo `<name>` entre repos num `sessions.db` user-global)
 - `mcp_manifest_history` — versions de manifest (append-only, forever retention)
 - `tool_calls` ganha coluna `mcp_server` para distinguir canônico vs MCP
 
