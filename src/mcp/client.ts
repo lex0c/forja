@@ -250,6 +250,53 @@ export const teeStderr = (stderr: Readable, logPath: string | undefined): Promis
     stderr.on('close', finish);
   });
 
+// The error to surface when the handshake signal fires — a timeout signal from
+// `AbortSignal.timeout` carries a `TimeoutError` reason (a readable "operation
+// timed out"); a user/budget abort may carry none.
+const connectAbortError = (signal: AbortSignal): Error => {
+  const reason = (signal as AbortSignal & { reason?: unknown }).reason;
+  return reason instanceof Error ? reason : new Error('mcp connect aborted');
+};
+
+// Enforce the handshake signal around the WHOLE connect, not just `initialize`.
+// `Client.connect` awaits `transport.start()` (for SSE: the stream open, which
+// blocks until the server sends its `endpoint` event and can hang forever if it
+// never does) BEFORE it applies `RequestOptions.signal` to the initialize
+// request — so the signal passed to `connect` alone does NOT bound `start()`.
+// Race the connect against the signal so the advertised timeout + user abort
+// actually fire; the caller closes the client on throw, which tears down the
+// transport (aborting a hung SSE stream). The signal is still passed through so
+// the SDK also aborts the initialize request itself once start() has resolved.
+export const abortableConnect = async (
+  c: Client,
+  transport: SdkTransport,
+  signal?: AbortSignal,
+): Promise<void> => {
+  const connecting = c.connect(transport, signal ? { signal } : undefined);
+  if (signal === undefined) {
+    await connecting;
+    return;
+  }
+  // A late settle (after we've already lost the race to the abort) must not
+  // surface as an unhandled rejection.
+  connecting.catch(() => {});
+  if (signal.aborted) throw connectAbortError(signal);
+  await new Promise<void>((resolve, reject) => {
+    const onAbort = () => reject(connectAbortError(signal));
+    signal.addEventListener('abort', onAbort, { once: true });
+    connecting.then(
+      () => {
+        signal.removeEventListener('abort', onAbort);
+        resolve();
+      },
+      (err: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      },
+    );
+  });
+};
+
 // Shared adapter over the SDK `Client`. The TRANSPORT is built by `makeTransport`
 // (stdio spawns the child + tees its stderr; remote opens the HTTP/SSE
 // connection); everything below — the handshake wrapper, listTools/callTool with
@@ -262,9 +309,9 @@ const sdkClientFrom = (makeTransport: () => SdkTransport): McpClient => {
       const transport = makeTransport();
       const c = new Client(CLIENT_INFO, { capabilities: {} });
       try {
-        // Wire the abort signal so a hung `initialize` (slow / malicious server)
-        // unwinds on user-cancel or a hard budget abort.
-        await c.connect(transport, signal ? { signal } : undefined);
+        // Bound the ENTIRE handshake (transport start + initialize) by the signal
+        // — a hung SSE stream open would otherwise slip past the timeout/abort.
+        await abortableConnect(c, transport, signal);
       } catch (err) {
         // Close on failure so a spawned child / open socket is reaped when the
         // handshake throws (timeout / protocol error / abort) — otherwise the

@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import {
+  abortableConnect,
   buildSpawnEnv,
   createStdioMcpClient,
   extractMeta,
@@ -282,5 +283,68 @@ describe('teeStderr — drain + tee the server stderr', () => {
     await teeStderr(Readable.from([Buffer.alloc(2 * 1024 * 1024, 0x62)]), path); // 2 MB
     expect(existsSync(`${path}.1`)).toBe(true); // rotated, not grown past the cap
     expect(statSync(path).size).toBeLessThan(10 * 1024 * 1024); // active log under the cap
+  });
+});
+
+describe('abortableConnect — the handshake signal bounds transport start too', () => {
+  type Args = Parameters<typeof abortableConnect>;
+  const dummyTransport = {} as unknown as Args[1];
+  // A Client whose connect() NEVER resolves — models an SSE transport.start()
+  // that hangs waiting for an `endpoint` event the server never sends.
+  const hangingClient = {
+    connect: () => new Promise<void>(() => {}),
+  } as unknown as Args[0];
+
+  test('a hung connect rejects when the signal fires (does not wait for start)', async () => {
+    const started = Date.now();
+    await expect(
+      abortableConnect(hangingClient, dummyTransport, AbortSignal.timeout(20)),
+    ).rejects.toThrow(); // the timeout reason surfaces instead of hanging forever
+    expect(Date.now() - started).toBeLessThan(2000); // bounded, not indefinite
+  });
+
+  test('an already-aborted signal rejects immediately', async () => {
+    await expect(
+      abortableConnect(hangingClient, dummyTransport, AbortSignal.abort()),
+    ).rejects.toThrow();
+  });
+
+  test('resolves when connect completes before any abort', async () => {
+    const okClient = { connect: async () => {} } as unknown as Args[0];
+    await abortableConnect(okClient, dummyTransport, new AbortController().signal);
+  });
+
+  test('passes the signal through to the SDK connect (initialize stays abortable)', async () => {
+    let receivedOpts: unknown;
+    const spyClient = {
+      connect: async (_t: unknown, opts: unknown) => {
+        receivedOpts = opts;
+      },
+    } as unknown as Args[0];
+    const ctrl = new AbortController();
+    await abortableConnect(spyClient, dummyTransport, ctrl.signal);
+    expect(receivedOpts).toEqual({ signal: ctrl.signal });
+  });
+
+  test('with no signal → a plain connect (no race)', async () => {
+    let called = false;
+    const okClient = {
+      connect: async () => {
+        called = true;
+      },
+    } as unknown as Args[0];
+    await abortableConnect(okClient, dummyTransport, undefined);
+    expect(called).toBe(true);
+  });
+
+  test('a connect rejection surfaces (not swallowed by the race)', async () => {
+    const failClient = {
+      connect: async () => {
+        throw new Error('handshake boom');
+      },
+    } as unknown as Args[0];
+    await expect(
+      abortableConnect(failClient, dummyTransport, new AbortController().signal),
+    ).rejects.toThrow('handshake boom');
   });
 });

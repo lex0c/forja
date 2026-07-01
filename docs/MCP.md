@@ -218,7 +218,7 @@ A server moves through eight states (`STATE_MACHINE §6.5`); the current value i
 | `denied` | trust declined (or headless fail-closed) — no tools |
 | `error` | connect/handshake failure |
 
-**Connections are lazy.** `init()` performs the handshake needed to obtain + hash the manifest and resolve trust, then registers the tools and drops the connection. The server is re-spawned on the **first `tools/call`**, and the handshake at both points is **timeout-bounded** so a wedged server can't hang startup. `cleanup()` (run at every teardown site — REPL shutdown, one-shot `run`, and per-eval-case) disconnects every child.
+**Connections are lazy.** `init()` performs the handshake needed to obtain + hash the manifest and resolve trust, then registers the tools and drops the connection. The server is re-spawned on the **first `tools/call`**, and the handshake at both points is **timeout-bounded (30s) around the *entire* connect** — transport start included, not just the `initialize` request — so a remote server that opens the stream but never completes the handshake (an SSE server that withholds its `endpoint` event) can't hang startup or the first tool call. `cleanup()` (run at every teardown site — REPL shutdown, one-shot `run`, and per-eval-case) disconnects every child.
 
 ---
 
