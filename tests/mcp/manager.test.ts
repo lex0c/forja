@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
+import { resolve } from 'node:path';
 import {
   type EmitFailureEventInput,
   type FailureEventSink,
@@ -373,6 +374,166 @@ describe('McpManager.init: pre-connect identity gate (MCP.md §1.5)', () => {
     await mgr.init();
     expect(mgr.state('db')).toBe('denied');
     expect(fake.stats.made).toBe(0); // faulted at the gate → never connected
+  });
+});
+
+describe('McpManager.init: auto-approve wins over the interactive prompt', () => {
+  test('an auto-approved server grants without any confirmTrust prompt, even interactively', async () => {
+    // Regression: --auto-approve-mcp <name> must skip BOTH the identity gate and
+    // the manifest prompt in an INTERACTIVE run (confirmTrust present), not only
+    // headless — otherwise the flag never works with a TTY and still blocks boot
+    // on the two modals.
+    let prompts = 0;
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      confirmTrust: async () => {
+        prompts += 1;
+        return 'yes';
+      },
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+
+    expect(prompts).toBe(0); // neither the identity gate nor the manifest prompt fired
+    expect(mgr.state('db')).toBe('trusted');
+    expect(registry.has('mcp__db__query')).toBe(true);
+    expect(fake.stats.connects).toBe(1); // still connected + registered
+    expect(latestTrustedManifest(db, 'db')?.decided_by).toBe('auto_approve');
+  });
+
+  test('a NON-auto-approved server in the same run still prompts', async () => {
+    // The short-circuit is scoped to listed servers only — an unlisted server
+    // must still go through the trust modals.
+    let prompts = 0;
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ name: 'other' })]),
+      confirmTrust: async () => {
+        prompts += 1;
+        return 'yes';
+      },
+      autoApprove: new Set(['db']), // 'other' is NOT listed
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+
+    expect(prompts).toBeGreaterThan(0); // identity gate (+ manifest) still fired
+    expect(mgr.state('other')).toBe('trusted');
+    expect(latestTrustedManifest(db, 'other')?.decided_by).toBe('user');
+  });
+});
+
+describe('McpManager.init: stdio trust identity includes cwd (relative executable)', () => {
+  const relativeConfig = (over: Partial<McpServerConfig> = {}): McpServerConfig =>
+    serverConfig({
+      transport: { transport: 'stdio', command: './server', args: [], rawArgv: ['./server'] },
+      ...over,
+    });
+  // The persisted identity for `./server` resolved against a given directory.
+  const relIdentity = (cwd: string): string => JSON.stringify([resolve(cwd, './server')]);
+  const seedRow = (command: string) => {
+    recordGrantOnly(db, 'db', [toolDef('query')]);
+    insertServer(db, {
+      name: 'db',
+      transport: 'stdio',
+      command,
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
+    });
+  };
+
+  test('reuses cached trust when launched from the SAME cwd', async () => {
+    seedRow(relIdentity('/dir-a'));
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([relativeConfig()]),
+      cwd: '/dir-a', // same directory the grant was authorized in
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(1);
+    expect(mgr.state('db')).toBe('trusted');
+    expect(fake.stats.made).toBe(0); // cached → no connect
+  });
+
+  test('does NOT reuse cached trust from a DIFFERENT cwd (relative binary would differ)', async () => {
+    seedRow(relIdentity('/dir-a')); // grant authorized in /dir-a
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([relativeConfig()]),
+      cwd: '/dir-b', // launched elsewhere → ./server resolves to a DIFFERENT binary
+      // Headless + not auto-approved → the required re-trust fails closed BEFORE spawning.
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(0); // the old manifest is NOT registered
+    expect(registry.has('mcp__db__query')).toBe(false);
+    expect(mgr.state('db')).toBe('denied'); // re-trust required, none available
+    expect(fake.stats.connects).toBe(0); // never spawned the relocated binary
+  });
+
+  test('an explicit cfg.cwd change re-triggers trust for a relative executable', async () => {
+    seedRow(relIdentity('/authorized'));
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        relativeConfig({
+          transport: {
+            transport: 'stdio',
+            command: './server',
+            args: [],
+            rawArgv: ['./server'],
+            cwd: '/moved', // cfg.cwd overrides the session cwd
+          },
+        }),
+      ]),
+      cwd: '/authorized', // session cwd unchanged, but cfg.cwd moved
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(0);
+    expect(mgr.state('db')).toBe('denied');
+  });
+
+  test('an ABSOLUTE executable is cwd-independent (no spurious re-trust)', async () => {
+    seedRow(JSON.stringify(['/opt/mcp/server']));
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          transport: {
+            transport: 'stdio',
+            command: '/opt/mcp/server',
+            args: [],
+            rawArgv: ['/opt/mcp/server'],
+          },
+        }),
+      ]),
+      cwd: '/somewhere-new', // different cwd, but an absolute path doesn't move
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(1); // cached trust honored despite the cwd change
+    expect(fake.stats.made).toBe(0);
   });
 });
 

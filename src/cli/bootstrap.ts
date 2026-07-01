@@ -1641,6 +1641,10 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       db,
       registry: toolRegistry,
       config: mcpConfig,
+      // Session cwd — folds into a stdio server's trust identity so a relative
+      // executable launched from a different directory re-triggers trust. Matches
+      // the client's `process.cwd()` spawn fallback (run.ts passes the same).
+      cwd,
       sandbox: mcpSandbox,
       // Per-server stderr logs land in a `traces/` dir beside the DB — under
       // the default absolute dbPath that is `<dataDir>/traces/`, and a test's

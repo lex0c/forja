@@ -27,7 +27,7 @@
 // before-hard-cap budget tier + remote OAuth are future; states are set directly
 // here (the pure transition table in state.ts is the documented reference).
 
-import { join } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import type { FailureEventSink } from '../failures/index.ts';
 import { charsToTokens } from '../providers/tokens.ts';
 import type { DB } from '../storage/db.ts';
@@ -67,6 +67,7 @@ import type {
   McpSandboxWrap,
   McpServerConfig,
   McpServerState,
+  McpStdioConfig,
   McpTransportConfig,
   McpTrustAnswer,
 } from './types.ts';
@@ -78,8 +79,14 @@ export interface McpManagerDeps {
   // Operator confirmation surface. Absent ⇒ headless ⇒ fail-closed unless the
   // server is in `autoApprove`.
   confirmTrust?: ConfirmMcpTrust;
-  // --auto-approve-mcp <list>: servers granted without a prompt in headless.
+  // --auto-approve-mcp <list>: servers granted without a prompt (headless AND
+  // interactive — an operator who listed a server opted out of both its prompts).
   autoApprove?: ReadonlySet<string>;
+  // Session working directory — the fallback cwd a stdio server spawns in when it
+  // declares no `cwd` (matches the client's `process.cwd()` spawn fallback). Folds
+  // into the stdio trust identity so a relative executable launched from a
+  // different directory re-triggers trust. Defaults to `process.cwd()`.
+  cwd?: string;
   // Injectable client factory (tests pass a fake; production uses the SDK
   // stdio adapter). `stderrLogPath` is where the adapter tees the server's
   // stderr (mcp-<name>.log) — undefined ⇒ drain-to-discard.
@@ -259,30 +266,59 @@ const estimateResultTokens = (res: McpCallResult): number => {
   return charsToTokens(chars);
 };
 
+// The persisted stdio command identity: the raw argv, but with a RELATIVE
+// executable resolved to its absolute path against the effective working
+// directory (`cfg.cwd`, else the session cwd — the same fallback the client
+// spawns with). A relative `argv[0]` (`./server`, `bin/mcp`) names a DIFFERENT
+// binary when the same config is launched from another directory, so folding the
+// resolved path into the identity re-triggers trust on a cwd change (the
+// pre-connect gate + manifest prompt run again) instead of silently spawning
+// whatever now sits at that relative path. An absolute path or a bare PATH name
+// (`node`, `npx`, or a `$VAR`) is cwd-independent — kept raw, so no spurious
+// re-trust and a `$VAR` never resolves at rest.
+const stdioCommandIdentity = (t: McpStdioConfig, sessionCwd: string): string => {
+  const [exe, ...rest] = t.rawArgv;
+  const relative = exe !== undefined && !isAbsolute(exe) && /[/\\]/.test(exe);
+  return JSON.stringify(
+    exe === undefined
+      ? [...t.rawArgv]
+      : [relative ? resolve(t.cwd ?? sessionCwd, exe) : exe, ...rest],
+  );
+};
+
 // The trust IDENTITY of a transport — what persists to mcp_servers and what a
-// change re-triggers trust on. Always the RAW (unresolved) form so a resolved
-// secret never lands at rest — stdio: the raw argv; remote: the raw (unexpanded)
-// URL (`?token=$TOKEN`, not the expanded value). `display` is the operator-facing
-// form for the trust modal.
+// change re-triggers trust on. Secrets never land at rest — stdio: the raw argv
+// (with only a relative executable resolved, see stdioCommandIdentity); remote:
+// the raw (unexpanded) URL (`?token=$TOKEN`, not the expanded value). `display`
+// is the operator-facing form for the trust modal (always the RAW argv/URL).
 const transportIdentity = (
   t: McpTransportConfig,
+  sessionCwd: string,
 ): { command: string | null; url: string | null; display: string } =>
   t.transport === 'stdio'
-    ? { command: JSON.stringify(t.rawArgv), url: null, display: t.rawArgv.join(' ') }
+    ? { command: stdioCommandIdentity(t, sessionCwd), url: null, display: t.rawArgv.join(' ') }
     : { command: null, url: t.rawUrl, display: t.rawUrl };
 
 // Did the persisted server's transport identity change vs the configured one (a
-// swapped binary / re-pointed URL / changed transport kind ⇒ force a re-trust)?
-// Compares the RAW forms (the persisted identity is the unresolved argv / URL).
-const transportChanged = (existing: McpServerRow, t: McpTransportConfig): boolean =>
+// swapped binary / re-pointed URL / changed transport kind / moved cwd for a
+// relative executable ⇒ force a re-trust)? Compares the persisted identity forms.
+const transportChanged = (
+  existing: McpServerRow,
+  t: McpTransportConfig,
+  sessionCwd: string,
+): boolean =>
   existing.transport !== t.transport ||
   (t.transport === 'stdio'
-    ? existing.command !== JSON.stringify(t.rawArgv)
+    ? existing.command !== stdioCommandIdentity(t, sessionCwd)
     : existing.url !== t.rawUrl);
 
 export const createMcpManager = (deps: McpManagerDeps): McpManager => {
   const { db, registry, config } = deps;
   const makeClient = deps.makeClient ?? createMcpClient;
+  // The cwd that folds into a stdio server's trust identity (see
+  // stdioCommandIdentity). Matches the client's `process.cwd()` spawn fallback so
+  // the identity tracks the directory a relative executable actually resolves in.
+  const sessionCwd = deps.cwd ?? process.cwd();
 
   // Resolve a server's effective sandbox posture (MCP.md §2.3): default-ON when
   // a tool is available; `sandbox = false` opts out; a wired-but-unavailable
@@ -636,16 +672,17 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
     // PRE-CONNECT IDENTITY GATE (MCP.md §1.5): authorize REACHING this server —
     // running the command / opening the URL with any configured auth — BEFORE the
     // handshake. A hostile `mcp.toml` must not spawn code or leak a bearer token
-    // just to fetch the manifest, even if the operator then declines. Headless +
-    // auto-approved skips it (the fail-closed above already denied the headless
-    // no-grant case); the post-connect manifest-trust prompt (with the tool list
-    // to review) still follows once the identity is authorized.
-    if (deps.confirmTrust !== undefined) {
+    // just to fetch the manifest, even if the operator then declines. An
+    // auto-approved server (`--auto-approve-mcp`) skips it in EITHER mode — the
+    // operator who listed the server opted out of its prompts, so an interactive
+    // run must honor that too rather than still blocking startup on the modal; the
+    // manifest decision below applies the same precedence.
+    if (deps.autoApprove?.has(name) !== true && deps.confirmTrust !== undefined) {
       let answer: McpTrustAnswer;
       try {
         answer = await deps.confirmTrust({
           server: name,
-          command: transportIdentity(rt.config.transport).display,
+          command: transportIdentity(rt.config.transport, sessionCwd).display,
           mode: forceReprompt ? 'drift' : 'first-visit',
           sandbox:
             rt.config.transport.transport === 'stdio' ? resolveSandbox(rt.config).status : 'remote',
@@ -756,11 +793,20 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       });
     };
 
+    // Auto-approve wins over the prompt: an operator who listed this server in
+    // `--auto-approve-mcp` opted out of its trust prompts, so grant without
+    // prompting in EITHER mode (checked BEFORE confirmTrust so an interactive run
+    // honors the flag instead of still opening the modal).
+    if (deps.autoApprove?.has(name) === true) {
+      record('granted', 'auto_approve');
+      return true;
+    }
+
     if (deps.confirmTrust !== undefined) {
       const answer = await deps.confirmTrust({
         server: name,
         // The RAW (unresolved) command / the remote URL — never a resolved secret.
-        command: transportIdentity(rt.config.transport).display,
+        command: transportIdentity(rt.config.transport, sessionCwd).display,
         mode: forceReprompt || rt.trustedHash !== null ? 'drift' : 'first-visit',
         // A remote server has no subprocess — show 'remote' (egress, no sandbox),
         // never a stdio-oriented 'sandboxed' status that would imply containment.
@@ -778,11 +824,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       return granted;
     }
 
-    // Headless: fail-closed unless explicitly auto-approved.
-    if (deps.autoApprove?.has(name) === true) {
-      record('granted', 'auto_approve');
-      return true;
-    }
+    // Headless with no auto-approve: fail-closed.
     record('denied', 'ci');
     return false;
   };
@@ -792,9 +834,9 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
   // place — AUDIT §1.5) only when a grant re-authorizes a CHANGED command, so a
   // swap stays detectable across sessions until the operator re-approves it.
   const syncTrustedCommand = (rt: ServerRuntime) => {
-    const id = transportIdentity(rt.config.transport);
+    const id = transportIdentity(rt.config.transport, sessionCwd);
     const existing = getServer(db, rt.config.name);
-    if (existing !== null && !transportChanged(existing, rt.config.transport)) return;
+    if (existing !== null && !transportChanged(existing, rt.config.transport, sessionCwd)) return;
     if (existing !== null) deleteServer(db, rt.config.name);
     insertServer(db, {
       name: rt.config.name,
@@ -878,7 +920,8 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
           );
         }
 
-        const commandChanged = existing !== null && transportChanged(existing, server.transport);
+        const commandChanged =
+          existing !== null && transportChanged(existing, server.transport, sessionCwd);
 
         // Reuse the cached grant ONLY when the identity-bearing row is present: the
         // row holds the command/URL that `commandChanged` verifies. If the row was

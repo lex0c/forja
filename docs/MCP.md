@@ -147,6 +147,8 @@ Every string in the modal is sanitized at the render boundary (a hostile manifes
 
 > **Limitation — `$VAR` in a command is trust over the *literal*.** Both the modal and the command-change re-trust use the **unresolved** argv. If a command contains a variable (e.g. `command = ["$MCP_BIN"]`), re-pointing that variable in the environment swaps the real binary **without** re-triggering trust, and the modal only ever shows the literal `$MCP_BIN`. Trusting such a server means trusting whatever the operator's environment resolves it to. Hashing the *resolved* command for change-detection is a deferred follow-up (§8); until then, prefer a literal executable for servers you don't fully control and keep `$VAR` for arguments/secrets, not the binary itself.
 
+> **Relative executables are trust *per directory*.** A relative `argv[0]` (`./server`, `bin/mcp`) resolves against the server's working directory (`cwd`, else the session directory), so the same config launched from a different directory can run a different binary. To close that gap, a relative executable's **resolved absolute path** is folded into the persisted trust identity — moving the server's directory (a changed `cwd`, or launching forja from elsewhere) re-triggers the trust prompt rather than silently spawning the relocated binary. Absolute paths and bare PATH names (`node`, `npx`, a `$VAR`) are directory-independent and don't re-prompt on a move. A *relative script argument* to a bare interpreter (`command = ["node", "./script.js"]` with no `cwd`) is not covered by this — pin it with an explicit `cwd` or an absolute path.
+
 ### 3.4 Headless: fail-closed
 
 With no interactive confirmer (one-shot `run`, evals, CI), a server is **denied unless explicitly allowed** via:
