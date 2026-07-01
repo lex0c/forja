@@ -874,7 +874,17 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
 
         const commandChanged = existing !== null && transportChanged(existing, server.transport);
 
-        const cached = commandChanged ? null : latestTrustedManifest(db, server.name);
+        // Reuse the cached grant ONLY when the identity-bearing row is present: the
+        // row holds the command/URL that `commandChanged` verifies. If the row was
+        // swept (server removed from mcp.toml, then re-added) the grant survives by
+        // NAME in the append-only history, but its identity is gone — reusing it
+        // would let a re-added server pointing at a DIFFERENT command/URL inherit
+        // the old trust without the pre-connect identity gate. So `existing === null`
+        // forces re-trust: the identity gate re-confirms the command/URL (a matching
+        // manifest still honors the prior hash-decision, so only the IDENTITY is
+        // re-prompted, not the tool set).
+        const cached =
+          commandChanged || existing === null ? null : latestTrustedManifest(db, server.name);
         // Defense-in-depth (FAILURE_MODES §14.2): the stored manifest_json is
         // the exact string that was hashed, so a granted row must re-hash to
         // its own `hash`. A mismatch means the row was tampered (DB write)
@@ -909,10 +919,12 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       }
 
       // AUDIT §1.5: an mcp_servers row is STATE — removed once the server leaves
-      // config. Sweep orphans here (the append-only-forever manifest history
-      // stays, so a re-added server re-uses its cached grant). Compared against
-      // ALL configured names (incl. disabled), so toggling `disabled` keeps the
-      // row.
+      // config. Sweep orphans here. The append-only-forever manifest history
+      // stays, but the row (which holds the command/URL) goes — so a re-added
+      // server re-trusts through the identity gate rather than silently inheriting
+      // the grant by name (a swapped command/URL must be re-confirmed; see the
+      // `existing === null` cache guard above). Compared against ALL configured
+      // names (incl. disabled), so toggling `disabled` keeps the row.
       const configNames = new Set(config.servers.map((s) => s.name));
       for (const row of listServers(db)) {
         // Keep a REVOKED row even when its server leaves config: the revocation

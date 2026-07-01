@@ -159,7 +159,7 @@ The flag lists servers by name; it rejects an empty list and rejects `*` (no bla
 
 ### 3.5 History
 
-Every decision (`granted` / `denied` / `revoked` / `superseded`) appends to `mcp_manifest_history`, which is **append-only and never pruned**. A re-added or re-seen server with a matching command + hash re-uses its cached grant with no fresh prompt.
+Every decision (`granted` / `denied` / `revoked` / `superseded`) appends to `mcp_manifest_history`, which is **append-only and never pruned**. A re-**seen** server whose identity row is still present (a restart, a `disabled` toggle) with a matching command + hash re-uses its cached grant with no fresh prompt. A server **removed from config and re-added** — its identity row swept — re-trusts through the pre-connect identity gate: the grant is not inherited by name, so a re-added entry pointing at a different command/URL can't ride the old trust.
 
 ---
 
@@ -219,7 +219,7 @@ A server moves through eight states (`STATE_MACHINE §6.5`); the current value i
 Two tables (migration `081-mcp-servers.ts`, repo `repos/mcp-servers.ts`):
 
 - **`mcp_servers`** — per-server STATE: transport, the redacted command, source layer, current state + manifest hash, counters. This is mutable state, so it is **swept when the server leaves config**: `manager.init()` deletes any `mcp_servers` row whose name is in neither the enabled nor disabled config set (toggling `disabled` keeps the row).
-- **`mcp_manifest_history`** — every trust decision, **append-only forever**. It is deliberately absent from `GC_TABLES`, so `forja gc` never prunes it; the forever-retention holds by construction. The server's history survives even after its `mcp_servers` row is swept, so a re-added server re-uses its cached grant.
+- **`mcp_manifest_history`** — every trust decision, **append-only forever**. It is deliberately absent from `GC_TABLES`, so `forja gc` never prunes it; the forever-retention holds by construction. The server's history survives even after its `mcp_servers` row is swept — but the manager will **not** reuse a grant by name once the identity row is gone: the row is what records the command/URL a grant authorized, so a re-added server re-trusts through the identity gate rather than silently inheriting the grant.
 
 ---
 

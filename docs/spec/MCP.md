@@ -123,7 +123,7 @@ Mismatch em `protocolVersion` exato → `mcp.initialize_protocol_mismatch` → `
 
 Trust é em **dois passos**, pra nunca rodar/conectar antes da aprovação:
 
-**Passo 1 — identity gate (pré-connect).** Pra um server não-cacheado (novo, comando/URL mudou, ou `/mcp reconnect`), ANTES do handshake o operador autoriza a IDENTIDADE: o modal mostra só `<name>` + o comando RAW / a URL + a postura de sandbox (sem tools — ainda não buscadas, e buscá-las É o spawn/connect que estamos gateando). Recusa → `denied`, sem spawn e **sem token enviado**. Aprova → segue pro handshake. Headless: skip se `--auto-approve-mcp` (o fail-closed abaixo já negou o caso sem-grant).
+**Passo 1 — identity gate (pré-connect).** Pra um server não-cacheado (novo, comando/URL mudou, `/mcp reconnect`, ou **re-adicionado após remoção do config** — o orphan-sweep varreu a row identitária, então o grant forever não é reusado por nome), ANTES do handshake o operador autoriza a IDENTIDADE: o modal mostra só `<name>` + o comando RAW / a URL + a postura de sandbox (sem tools — ainda não buscadas, e buscá-las É o spawn/connect que estamos gateando). Recusa → `denied`, sem spawn e **sem token enviado**. Aprova → segue pro handshake. Headless: skip se `--auto-approve-mcp` (o fail-closed abaixo já negou o caso sem-grant).
 
 **Passo 2 — manifest prompt (pós-connect).** Após `initialize`, harness chama `tools/list`, computa hash, e compara com `mcp_manifest_history` (é aqui que o operador revê a lista de tools + os marcadores `[writes]`):
 

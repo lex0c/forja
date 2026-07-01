@@ -149,7 +149,10 @@ const fakeClientFactory = (spec: FakeSpec) => {
 };
 
 // Seed a granted manifest so init() takes the cached (no-connect) path.
-const seedTrusted = (db: DB, server: string, tools: McpManifestTool[]): string => {
+// Record a GRANTED manifest in the append-only history WITHOUT an mcp_servers
+// row — i.e. the "swept" state a removed server leaves behind (the row is gone,
+// the forever grant survives). The manager must NOT reuse such a grant by name.
+const recordGrantOnly = (db: DB, server: string, tools: McpManifestTool[]): string => {
   const canonical = canonicalizeManifest({
     server,
     protocolVersion: '2024-11-05',
@@ -169,6 +172,25 @@ const seedTrusted = (db: DB, server: string, tools: McpManifestTool[]): string =
     decided_at: 1,
     approval_id: null,
   });
+  return hash;
+};
+
+// A REAL granted server: the forever grant PLUS its identity-bearing mcp_servers
+// row (the manager reuses a cached grant only when the row is present). The row
+// matches serverConfig (stdio fake-bin); idempotent so a caller that inserts its
+// own row first (the orphan-sweep test) isn't double-inserted.
+const seedTrusted = (db: DB, server: string, tools: McpManifestTool[]): string => {
+  const hash = recordGrantOnly(db, server, tools);
+  if (getServer(db, server) === null) {
+    insertServer(db, {
+      name: server,
+      transport: 'stdio',
+      command: JSON.stringify(['fake-bin']),
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
+    });
+  }
   return hash;
 };
 
@@ -609,6 +631,35 @@ describe('McpManager: stale-row sweep (AUDIT §1.5)', () => {
     expect(getServer(db, 'db')).not.toBeNull(); // configured server kept
   });
 
+  test('a granted manifest whose server row was swept is re-trusted, not reused by name', async () => {
+    // The swept state: the forever grant survives in history, but the identity-
+    // bearing mcp_servers row is gone (the server left config). Re-adding the name
+    // with a DIFFERENT command must go through the pre-connect identity gate — it
+    // must NOT silently inherit the old grant by name.
+    recordGrantOnly(db, 'db', [toolDef('query')]); // grant, NO row
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    let gateCommand: string | undefined;
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          transport: { transport: 'stdio', command: 'evil-bin', args: [], rawArgv: ['evil-bin'] },
+        }),
+      ]),
+      confirmTrust: async (req) => {
+        if (req.preConnect) gateCommand = req.command;
+        return 'no'; // the operator sees the swapped command and declines
+      },
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(gateCommand).toBe('evil-bin'); // the identity gate re-confirmed the NEW command
+    expect(registry.has('mcp__db__query')).toBe(false); // NOT registered from the stale grant
+    expect(mgr.state('db')).toBe('denied');
+    expect(fake.stats.made).toBe(0); // declined at the gate → never connected
+  });
+
   test('a disabled server keeps its row (still in config, just off)', async () => {
     insertServer(db, {
       name: 'db',
@@ -653,6 +704,16 @@ describe('McpManager: review hardening', () => {
       decided_by: 'user',
       decided_at: 1,
       approval_id: null,
+    });
+    // The identity-bearing row must be present for the cached grant to be taken at
+    // all (a swept row → re-trust, not the hash-check path this test exercises).
+    insertServer(db, {
+      name: 'db',
+      transport: 'stdio',
+      command: JSON.stringify(['fake-bin']),
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
     });
     const fake = fakeClientFactory({ tools: goodTools });
     const mgr = createMcpManager({
