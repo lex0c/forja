@@ -381,9 +381,15 @@ export const createStdioMcpClient = (
   });
 
 // A REMOTE server (no subprocess, no sandbox, no stderr — MCP.md §2.2). The
-// env-resolved bearer header (if any) rides every request via `requestInit`;
-// OAuth (`authProvider`) is a later slice. 'http' = streamable-HTTP, 'sse' =
-// legacy SSE.
+// env-resolved bearer header (if any) rides EVERY request via `requestInit`,
+// including the initial SSE stream open: in @modelcontextprotocol/sdk 1.29.0 the
+// SSE transport's `_commonHeaders()` merges `requestInit.headers` and applies
+// them to both the stream-opening request (via the EventSource `fetch` wrapper in
+// `_startOrAuth`) AND the recurring POSTs — so a separate `eventSourceInit.fetch`
+// would be redundant here. (Re-verify this if the SDK is upgraded: older SSE
+// transports only honored `eventSourceInit` for the stream, which would drop the
+// header from connect().) OAuth (`authProvider`) is a later slice. 'http' =
+// streamable-HTTP, 'sse' = legacy SSE.
 export const createRemoteMcpClient = (cfg: McpRemoteConfig): McpClient =>
   sdkClientFrom(() => {
     const url = new URL(cfg.url);
