@@ -27,6 +27,11 @@ export interface McpStdioConfig {
   // Extra env merged onto the minimal spawn env (PATH/HOME/USER).
   // Values may be `$VAR` references resolved from the agent session env.
   env?: Readonly<Record<string, string>>;
+  // The ORIGINAL, $VAR-UNRESOLVED env table as written in mcp.toml (e.g.
+  // `{ SECRET: "$SECRET" }`). Folded into the trust identity so adding or
+  // changing a credential binding re-triggers trust, WITHOUT persisting the
+  // resolved secret (mirrors rawArgv / rawUrl). Absent when no `env` is declared.
+  rawEnv?: Readonly<Record<string, string>>;
   // Working directory for the spawned server; defaults to the session cwd.
   cwd?: string;
 }
@@ -53,6 +58,11 @@ export interface McpRemoteConfig {
   // env — the TOKEN never persists (only the env-var NAME is in mcp.toml).
   // OAuth (`authProvider`) is a separate, later slice.
   authHeader?: string;
+  // The bearer auth env-var NAME (`X` from `auth = { env = "X" }`) — NOT the
+  // token. Folded into the trust identity so re-pointing the auth binding
+  // re-triggers trust; safe to persist (a name, never a secret). Absent when the
+  // server declares no `auth`.
+  authEnv?: string;
 }
 
 // What the manager spawns/connects. Discriminated by `transport`.

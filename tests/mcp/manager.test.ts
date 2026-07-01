@@ -537,6 +537,208 @@ describe('McpManager.init: stdio trust identity includes cwd (relative executabl
   });
 });
 
+describe('McpManager.init: credential bindings in the trust identity', () => {
+  test('adding a stdio env binding forces re-trust (no silent cached grant)', async () => {
+    // Previously trusted with no env; the operator adds `SECRET = "$SECRET"`.
+    // The raw argv is unchanged, but the new binding must re-trigger trust before
+    // the next spawn passes the resolved secret to the approved command.
+    seedTrusted(db, 'db', [toolDef('query')]); // row identity = ["fake-bin"], no env
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          transport: {
+            transport: 'stdio',
+            command: 'fake-bin',
+            args: [],
+            rawArgv: ['fake-bin'],
+            env: { SECRET: 'super-secret-value' },
+            rawEnv: { SECRET: '$SECRET' },
+          },
+        }),
+      ]),
+      // Headless + not auto-approved → the required re-trust fails closed.
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(0);
+    expect(mgr.state('db')).toBe('denied');
+    expect(fake.stats.connects).toBe(0); // never spawned with the new secret
+  });
+
+  test('the persisted env identity holds the $VAR literal, never the resolved secret', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          transport: {
+            transport: 'stdio',
+            command: 'fake-bin',
+            args: [],
+            rawArgv: ['fake-bin'],
+            env: { SECRET: 'super-secret-value' },
+            rawEnv: { SECRET: '$SECRET' },
+          },
+        }),
+      ]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+
+    const command = getServer(db, 'db')?.command ?? '';
+    expect(command).toContain('$SECRET'); // the binding is recorded
+    expect(command).not.toContain('super-secret-value'); // the resolved secret is NOT
+  });
+
+  test('an unchanged env binding reuses the cached grant (no re-trust)', async () => {
+    const envTransport = {
+      transport: 'stdio' as const,
+      command: 'fake-bin',
+      args: [] as string[],
+      rawArgv: ['fake-bin'],
+      env: { SECRET: 'super-secret-value' },
+      rawEnv: { SECRET: '$SECRET' },
+    };
+    // Seed the row with the env-inclusive identity a prior grant would have written.
+    recordGrantOnly(db, 'db', [toolDef('query')]);
+    insertServer(db, {
+      name: 'db',
+      transport: 'stdio',
+      command: JSON.stringify({ argv: ['fake-bin'], env: { SECRET: '$SECRET' } }),
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ transport: envTransport })]),
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(1);
+    expect(fake.stats.made).toBe(0); // identity matched → cached, no connect
+  });
+
+  test('changing a remote auth env binding forces re-trust', async () => {
+    // Trusted at rawUrl with auth env TOKEN_A; the operator re-points auth to
+    // TOKEN_B. The URL is unchanged, but the new credential binding must re-trust.
+    recordGrantOnly(db, 'gh', [toolDef('query')]);
+    insertServer(db, {
+      name: 'gh',
+      transport: 'http',
+      command: null,
+      url: JSON.stringify({ url: 'https://mcp.example.com/v1', auth: 'TOKEN_A' }),
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        remoteServerConfig({
+          transport: {
+            transport: 'http',
+            url: 'https://mcp.example.com/v1',
+            rawUrl: 'https://mcp.example.com/v1',
+            authEnv: 'TOKEN_B', // re-pointed
+          },
+        }),
+      ]),
+      // Headless + not auto-approved → the required re-trust fails closed.
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(0);
+    expect(mgr.state('gh')).toBe('denied');
+    expect(fake.stats.connects).toBe(0); // never connected with the new token
+  });
+});
+
+describe('McpManager.init: a re-approved manifest persists durably', () => {
+  test('a decline then --auto-approve grant is not lost on the next boot', async () => {
+    // Boot 1: pass the identity gate, decline the manifest → a `denied` history
+    // row for (db, hash). (yes → gate, no → manifest.)
+    let call = 0;
+    const decline = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr1 = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      confirmTrust: async () => (call++ === 0 ? 'yes' : 'no'),
+      makeClient: decline.makeClient,
+    });
+    await mgr1.init();
+    expect(mgr1.state('db')).toBe('denied');
+    expect(latestTrustedManifest(db, 'db')).toBeNull(); // only a denied row so far
+
+    // Boot 2 (same db): the operator auto-approves the SAME manifest. The prior
+    // denied row can't be re-inserted (UNIQUE) — it must be UPDATED to granted so
+    // the approval is durable.
+    const reg2 = createToolRegistry();
+    const approve = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr2 = createMcpManager({
+      db,
+      registry: reg2,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: approve.makeClient,
+    });
+    await mgr2.init();
+    expect(mgr2.state('db')).toBe('trusted');
+    expect(reg2.has('mcp__db__query')).toBe(true);
+    const grant = latestTrustedManifest(db, 'db');
+    expect(grant?.decision).toBe('granted');
+    expect(grant?.decided_by).toBe('auto_approve');
+
+    // Boot 3 (same db): headless, NO auto-approve — the durable grant is honored
+    // from cache without a prompt or a connection.
+    const reg3 = createToolRegistry();
+    const boot3 = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr3 = createMcpManager({
+      db,
+      registry: reg3,
+      config: config([serverConfig()]),
+      makeClient: boot3.makeClient,
+    });
+    await mgr3.init();
+    expect(mgr3.state('db')).toBe('trusted');
+    expect(reg3.has('mcp__db__query')).toBe(true);
+    expect(boot3.stats.made).toBe(0); // cached grant → no connect
+  });
+});
+
+describe('McpManager.init: a trusted zero-tool manifest is a valid cache', () => {
+  test('registers nothing but stays trusted without re-handshaking', async () => {
+    // A server that legitimately exposes NO tools: the cached manifest is valid
+    // (hash verifies) and empty — it must not be treated as unreadable and
+    // re-handshaked (which would re-spawn the server) on every boot.
+    seedTrusted(db, 'db', []); // granted, zero-tool manifest + its row
+    const fake = fakeClientFactory({ tools: [] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(0); // nothing to register
+    expect(mgr.state('db')).toBe('trusted'); // but still trusted
+    expect(fake.stats.made).toBe(0); // and NOT re-handshaked
+  });
+});
+
 describe('McpManager.init: cached-trusted is lazy (no connect)', () => {
   test('registers from cache without ever constructing a client', async () => {
     seedTrusted(db, 'db', [toolDef('query')]);

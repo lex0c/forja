@@ -149,6 +149,8 @@ Every string in the modal is sanitized at the render boundary (a hostile manifes
 
 > **Relative executables are trust *per directory*.** A relative `argv[0]` (`./server`, `bin/mcp`) resolves against the server's working directory (`cwd`, else the session directory), so the same config launched from a different directory can run a different binary. To close that gap, a relative executable's **resolved absolute path** is folded into the persisted trust identity — moving the server's directory (a changed `cwd`, or launching forja from elsewhere) re-triggers the trust prompt rather than silently spawning the relocated binary. Absolute paths and bare PATH names (`node`, `npx`, a `$VAR`) are directory-independent and don't re-prompt on a move. A *relative script argument* to a bare interpreter (`command = ["node", "./script.js"]` with no `cwd`) is not covered by this — pin it with an explicit `cwd` or an absolute path.
 
+> **Credential bindings are part of the identity.** The trust identity also folds in a server's **unresolved** credential bindings — a stdio `env` table (e.g. `SECRET = "$SECRET"`) and a remote `auth`'s env-var **name**. Adding or re-pointing a binding re-triggers trust before the next spawn/connection hands the newly-resolved secret to a previously-approved command or endpoint. Only the `$VAR` literal / the env-var name enters the identity — never the resolved token. (As with `$VAR` in a command, changing what the *same* `$SECRET` resolves to in your environment is trust over the literal binding and does not re-prompt.)
+
 ### 3.4 Headless: fail-closed
 
 With no interactive confirmer (one-shot `run`, evals, CI), a server is **denied unless explicitly allowed** via:
@@ -164,6 +166,8 @@ A **refusing** permission boot (a broken audit chain without `--accept-broken-ch
 ### 3.5 History
 
 Every decision (`granted` / `denied` / `revoked` / `superseded`) appends to `mcp_manifest_history`, which is **append-only and never pruned**. A re-**seen** server whose identity row is still present (a restart, a `disabled` toggle) with a matching command + hash re-uses its cached grant with no fresh prompt. A server **removed from config and re-added** — its identity row swept — re-trusts through the pre-connect identity gate: the grant is not inherited by name, so a re-added entry pointing at a different command/URL can't ride the old trust.
+
+The `(server, hash)` pair holds **one** decision row (it is unique). If you **decline** a manifest and later approve the *same* manifest (via `/mcp reconnect` or `--auto-approve-mcp`), that row flips `denied → granted` in place, so the approval is durable across the next boot rather than being re-prompted every time.
 
 ---
 

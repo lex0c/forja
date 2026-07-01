@@ -155,6 +155,20 @@ const parseAuthHeader = (
   return `Bearer ${token}`;
 };
 
+// The bearer auth env-var NAME from `auth = { kind = "bearer", env = "X" }`,
+// for the trust identity (folded in so re-pointing the binding re-triggers
+// trust). Just the NAME — never the token. No warnings here; parseAuthHeader
+// owns validation. Returns the name even when the token is currently unset — the
+// binding is what the operator authorized, independent of the runtime value.
+const bearerEnvName = (raw: unknown): string | undefined => {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const auth = raw as Record<string, unknown>;
+  if (auth.kind !== 'bearer' || typeof auth.env !== 'string' || auth.env.length === 0) {
+    return undefined;
+  }
+  return auth.env;
+};
+
 // Parse an sse/http `[servers.<name>]` entry into a remote transport config.
 // `url` is required + $VAR-resolved + must be http(s). Returns null (skip) on a
 // missing/invalid URL.
@@ -196,6 +210,8 @@ const parseRemoteTransport = (
   const remote: McpRemoteConfig = { transport, url: parsed.toString(), rawUrl: entry.url };
   const authHeader = parseAuthHeader(entry.auth, env, where, warnings);
   if (authHeader !== undefined) remote.authHeader = authHeader;
+  const authEnv = bearerEnvName(entry.auth);
+  if (authEnv !== undefined) remote.authEnv = authEnv;
   return remote;
 };
 
@@ -263,14 +279,19 @@ const parseServerEntry = (
         warnings.push(`${where}: 'env' must be a table; ignored`);
       } else {
         const out: Record<string, string> = {};
+        const rawOut: Record<string, string> = {};
         for (const [k, v] of Object.entries(entry.env as Record<string, unknown>)) {
           if (typeof v !== 'string') {
             warnings.push(`${where}: env.${k} must be a string; ignored`);
             continue;
           }
           out[k] = resolveEnvVars(v, env, warnings, `${where} env.${k}`);
+          // Keep the UNRESOLVED binding for the trust identity — never the
+          // resolved secret (mirrors rawArgv).
+          rawOut[k] = v;
         }
         stdio.env = out;
+        stdio.rawEnv = rawOut;
       }
     }
     if (entry.cwd !== undefined) {

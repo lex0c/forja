@@ -42,6 +42,7 @@ import {
   listServers,
   patchServer,
   recordManifestDecision,
+  updateManifestDecision,
 } from '../storage/repos/mcp-servers.ts';
 import type { ToolRegistry } from '../tools/registry.ts';
 import type { ToolContext } from '../tools/types.ts';
@@ -61,6 +62,7 @@ import type {
   McpCallResult,
   McpClient,
   McpManifestTool,
+  McpRemoteConfig,
   McpSandboxArg,
   McpSandboxProfile,
   McpSandboxStatus,
@@ -187,10 +189,15 @@ interface ServerRuntime {
   validStreak: number;
 }
 
-const parseCachedManifestTools = (json: string): McpManifestTool[] => {
+// Returns null when the cached JSON is structurally UNUSABLE (a parse error, or
+// `tools` missing / not an array) — distinct from a valid manifest that simply
+// declares ZERO tools (returns []). The caller relies on that distinction: a
+// hash-verified empty manifest is a legitimate cached grant to register (nothing
+// to add, but still trusted + no re-handshake), whereas null means re-handshake.
+const parseCachedManifestTools = (json: string): McpManifestTool[] | null => {
   try {
     const parsed = JSON.parse(json) as { tools?: unknown };
-    if (!Array.isArray(parsed.tools)) return [];
+    if (!Array.isArray(parsed.tools)) return null;
     return parsed.tools.filter((t): t is McpManifestTool => {
       const r = t as Record<string, unknown> | null;
       return (
@@ -211,7 +218,7 @@ const parseCachedManifestTools = (json: string): McpManifestTool[] => {
       );
     });
   } catch {
-    return [];
+    return null;
   }
 };
 
@@ -279,29 +286,49 @@ const estimateResultTokens = (res: McpCallResult): number => {
 const stdioCommandIdentity = (t: McpStdioConfig, sessionCwd: string): string => {
   const [exe, ...rest] = t.rawArgv;
   const relative = exe !== undefined && !isAbsolute(exe) && /[/\\]/.test(exe);
-  return JSON.stringify(
+  const argv =
     exe === undefined
       ? [...t.rawArgv]
-      : [relative ? resolve(t.cwd ?? sessionCwd, exe) : exe, ...rest],
+      : [relative ? resolve(t.cwd ?? sessionCwd, exe) : exe, ...rest];
+  // Fold the UNRESOLVED env bindings in when present, so adding/changing a
+  // credential entry (`SECRET = "$SECRET"`) re-triggers trust before the next
+  // spawn passes the newly-resolved secret to a previously-approved command —
+  // WITHOUT persisting the resolved value (only the `$VAR` literal). Sorted for a
+  // determinism-stable identity. The no-env case stays a bare argv array so
+  // existing identities don't churn.
+  const rawEnv = t.rawEnv;
+  if (rawEnv === undefined || Object.keys(rawEnv).length === 0) return JSON.stringify(argv);
+  const env = Object.fromEntries(
+    Object.entries(rawEnv).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
   );
+  return JSON.stringify({ argv, env });
 };
+
+// The persisted remote URL identity: the raw (unexpanded) URL, plus the bearer
+// auth env-var NAME when the server binds one — so re-pointing or adding an
+// `auth = { env = "X" }` re-triggers trust before the next connection sends a
+// newly-resolved token to a previously-approved endpoint. Only the NAME (never
+// the token) enters the identity; the no-auth case stays the bare rawUrl string.
+const remoteUrlIdentity = (t: McpRemoteConfig): string =>
+  t.authEnv === undefined ? t.rawUrl : JSON.stringify({ url: t.rawUrl, auth: t.authEnv });
 
 // The trust IDENTITY of a transport — what persists to mcp_servers and what a
 // change re-triggers trust on. Secrets never land at rest — stdio: the raw argv
-// (with only a relative executable resolved, see stdioCommandIdentity); remote:
-// the raw (unexpanded) URL (`?token=$TOKEN`, not the expanded value). `display`
-// is the operator-facing form for the trust modal (always the RAW argv/URL).
+// (relative executable resolved) + the UNRESOLVED env bindings; remote: the raw
+// (unexpanded) URL + the auth env-var NAME. `display` is the operator-facing form
+// for the trust modal (always the RAW argv / URL, no folded metadata).
 const transportIdentity = (
   t: McpTransportConfig,
   sessionCwd: string,
 ): { command: string | null; url: string | null; display: string } =>
   t.transport === 'stdio'
     ? { command: stdioCommandIdentity(t, sessionCwd), url: null, display: t.rawArgv.join(' ') }
-    : { command: null, url: t.rawUrl, display: t.rawUrl };
+    : { command: null, url: remoteUrlIdentity(t), display: t.rawUrl };
 
 // Did the persisted server's transport identity change vs the configured one (a
 // swapped binary / re-pointed URL / changed transport kind / moved cwd for a
-// relative executable ⇒ force a re-trust)? Compares the persisted identity forms.
+// relative executable / changed credential binding ⇒ force a re-trust)? Compares
+// the persisted identity forms.
 const transportChanged = (
   existing: McpServerRow,
   t: McpTransportConfig,
@@ -310,7 +337,7 @@ const transportChanged = (
   existing.transport !== t.transport ||
   (t.transport === 'stdio'
     ? existing.command !== stdioCommandIdentity(t, sessionCwd)
-    : existing.url !== t.rawUrl);
+    : existing.url !== remoteUrlIdentity(t));
 
 export const createMcpManager = (deps: McpManagerDeps): McpManager => {
   const { db, registry, config } = deps;
@@ -757,9 +784,10 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
   };
 
   // Returns true (granted) / false (denied), recording the decision in
-  // mcp_manifest_history only when it's the FIRST for this (server, hash) — the
-  // UNIQUE index forbids a second row, so a forced re-decision on an
-  // already-recorded hash changes only this session's outcome.
+  // mcp_manifest_history. The (server, hash) pair is UNIQUE, so a forced
+  // re-decision on an already-recorded hash UPDATES that row in place (a decline
+  // the operator later approves — via `/mcp reconnect` or `--auto-approve-mcp` —
+  // must persist the grant, not be dropped and re-prompted on the next boot).
   const resolveTrustDecision = async (
     rt: ServerRuntime,
     hash: string,
@@ -775,7 +803,21 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
     if (prior !== null && !forceReprompt) return prior.decision === 'granted';
 
     const record = (decision: 'granted' | 'denied', decidedBy: string) => {
-      if (prior !== null) return; // (server, hash) already recorded — UNIQUE
+      if (prior !== null) {
+        // (server, hash) already recorded — the UNIQUE index forbids a second
+        // row. When the operator RE-decides the same manifest (a forced reprompt
+        // reached here), flip the existing row so a decline→approve (or the
+        // reverse) is durable across the next boot rather than silently lost.
+        // Same decision ⇒ nothing to write.
+        if (prior.decision !== decision) {
+          updateManifestDecision(db, name, hash, {
+            decision,
+            decided_by: decidedBy,
+            decided_at: now(),
+          });
+        }
+        return;
+      }
       recordManifestDecision(db, {
         server_name: name,
         hash,
@@ -939,29 +981,32 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         // its own `hash`. A mismatch means the row was tampered (DB write)
         // without updating the hash — reject the cache and re-handshake rather
         // than register from downgraded tool metadata.
-        let cachedTools: McpManifestTool[] = [];
+        let cachedTools: McpManifestTool[] | null = null;
         if (cached !== null) {
           if (hashManifestJson(cached.manifest_json) === cached.hash) {
             cachedTools = parseCachedManifestTools(cached.manifest_json);
+            if (cachedTools === null) {
+              warnings.push(
+                `mcp: cached manifest for '${server.name}' is unreadable; re-handshaking`,
+              );
+            }
           } else {
             warnings.push(
               `mcp: cached manifest for '${server.name}' failed its hash check; re-handshaking`,
             );
           }
         }
-        if (cached !== null && cachedTools.length > 0) {
-          // Steady state: register from cache, no connect (lazy).
+        if (cached !== null && cachedTools !== null) {
+          // Steady state: register from cache, no connect (lazy). A hash-verified
+          // manifest with ZERO tools is a legitimate grant — register nothing but
+          // stay trusted and still skip the handshake (don't re-spawn / re-auth a
+          // server just because it exposes no tools).
           const { registered: n, warnings: w } = registerServerTools(rt, cachedTools);
           warnings.push(...w);
           rt.trustedHash = cached.hash;
           setState(rt, 'trusted', { current_manifest_hash: cached.hash });
           registered += n;
         } else {
-          if (cached !== null) {
-            warnings.push(
-              `mcp: cached manifest for '${server.name}' is unreadable; re-handshaking`,
-            );
-          }
           registered += await resolveFreshTrust(rt, warnings, commandChanged);
         }
         servers.push({ name: server.name, state: rt.state, tools: rt.registeredNames.length });

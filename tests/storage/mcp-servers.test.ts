@@ -14,6 +14,7 @@ import {
   listServers,
   patchServer,
   recordManifestDecision,
+  updateManifestDecision,
 } from '../../src/storage/repos/mcp-servers.ts';
 
 let db: DB;
@@ -181,6 +182,36 @@ describe('mcp_manifest_history repo: record + lookup', () => {
     recordManifestDecision(db, manifestInput({ hash: 'h1', decided_at: 1000 }));
     recordManifestDecision(db, manifestInput({ hash: 'h2', decided_at: 2000 }));
     expect(listManifestHistory(db, 'postgres').map((r) => r.hash)).toEqual(['h2', 'h1']);
+  });
+
+  test('updateManifestDecision flips an existing (server, hash) decision in place', () => {
+    // The (server, hash) pair is UNIQUE, so a decline the operator later approves
+    // can't be appended — it must update the existing row so latestTrustedManifest
+    // sees the grant on the next boot.
+    recordManifestDecision(db, manifestInput({ hash: 'h1', decision: 'denied', decided_at: 1000 }));
+    expect(latestTrustedManifest(db, 'postgres')).toBeNull();
+
+    const changed = updateManifestDecision(db, 'postgres', 'h1', {
+      decision: 'granted',
+      decided_by: 'auto_approve',
+      decided_at: 2000,
+    });
+    expect(changed).toBe(true);
+    const row = getManifestDecision(db, 'postgres', 'h1');
+    expect(row?.decision).toBe('granted');
+    expect(row?.decided_by).toBe('auto_approve');
+    expect(row?.decided_at).toBe(2000);
+    expect(latestTrustedManifest(db, 'postgres')?.hash).toBe('h1'); // now durable
+  });
+
+  test('updateManifestDecision returns false when no row matches', () => {
+    expect(
+      updateManifestDecision(db, 'postgres', 'missing', {
+        decision: 'granted',
+        decided_by: 'user',
+        decided_at: 1,
+      }),
+    ).toBe(false);
   });
 });
 

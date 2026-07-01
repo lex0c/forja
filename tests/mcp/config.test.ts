@@ -71,6 +71,8 @@ cwd = "/work"
     expect(stdio(s).command).toBe('mcp-server-postgres');
     expect(stdio(s).args).toEqual(['--dsn', 'postgres://secret@db/app']); // $VAR resolved
     expect(stdio(s).env).toEqual({ LOG_LEVEL: 'debug' });
+    // The UNRESOLVED binding is kept for the trust identity — never the secret.
+    expect(stdio(s).rawEnv).toEqual({ LOG_LEVEL: '$LOG' });
     expect(stdio(s).cwd).toBe('/work');
     expect(s.budget).toEqual(DEFAULT_MCP_BUDGET); // no budget fields → defaults
   });
@@ -455,6 +457,7 @@ auth = { kind = "bearer", env = "DATABASE_URL" }
     const t = remote(servers[0]);
     expect(t.transport).toBe('http');
     expect(t.authHeader).toBe('Bearer postgres://secret@db/app'); // resolved from env, never persisted
+    expect(t.authEnv).toBe('DATABASE_URL'); // the binding NAME (not the token) enters the trust identity
   });
 
   test('an unset bearer env var warns + sends no header', () => {
@@ -468,6 +471,9 @@ auth = { kind = "bearer", env = "NOPE_MISSING" }
     );
     const { servers, warnings } = load();
     expect(remote(servers[0]).authHeader).toBeUndefined();
+    // The binding NAME still enters the identity — the operator authorized this
+    // env var; re-pointing it re-trusts even though the token is currently unset.
+    expect(remote(servers[0]).authEnv).toBe('NOPE_MISSING');
     expect(warnings.some((w) => w.includes('NOPE_MISSING') && w.includes('not set'))).toBe(true);
   });
 

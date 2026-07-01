@@ -219,6 +219,29 @@ export const recordManifestDecision = (db: DB, input: RecordManifestDecisionInpu
   return Number(result.lastInsertRowid);
 };
 
+// Re-decide an existing (server, hash) manifest row in place. The
+// (server_name, hash) pair is UNIQUE, so a decision that CHANGES after a prior
+// one — e.g. a manifest the operator DECLINED and later approves via `/mcp
+// reconnect` or `--auto-approve-mcp` — cannot be appended as a second row; the
+// caller updates the existing row so `latestTrustedManifest` sees the new grant
+// on the next boot instead of the approval being silently lost. Returns true
+// when a row matched. (Same-hash re-decision only; a new hash still appends.)
+export const updateManifestDecision = (
+  db: DB,
+  serverName: string,
+  hash: string,
+  update: { decision: string; decided_by: string; decided_at: number },
+): boolean => {
+  const result = db
+    .query(
+      `UPDATE mcp_manifest_history
+          SET decision = ?, decided_by = ?, decided_at = ?
+        WHERE server_name = ? AND hash = ?`,
+    )
+    .run(update.decision, update.decided_by, update.decided_at, serverName, hash);
+  return result.changes > 0;
+};
+
 // The decision recorded for an exact (server, hash) pair, if any. Drives
 // the "trusted-cached → skip prompt" path: a `granted` row here means the
 // operator already approved this exact manifest.
