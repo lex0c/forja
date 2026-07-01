@@ -854,6 +854,127 @@ describe('McpManager.init: credential bindings in the trust identity', () => {
   });
 });
 
+describe('McpManager.init: containment posture is part of the trust identity', () => {
+  test('flipping sandbox=false → default re-triggers trust (containment downgrade)', async () => {
+    // Boot 1: trusted WITH sandbox=false (opt-out) — the identity row folds it.
+    const f1 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m1 = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ sandbox: false })]),
+      autoApprove: new Set(['db']),
+      makeClient: f1.makeClient,
+    });
+    await m1.init();
+    expect(m1.state('db')).toBe('trusted');
+    await m1.cleanup();
+
+    // Boot 2 (same db): the SAME command but now sandboxed (opt-out removed) →
+    // the identity differs, so the cached grant must NOT be reused; headless
+    // re-trust fails closed instead of silently downgrading containment.
+    const reg2 = createToolRegistry();
+    const f2 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m2 = createMcpManager({
+      db,
+      registry: reg2,
+      config: config([serverConfig()]), // sandbox default (on when available)
+      makeClient: f2.makeClient,
+    });
+    await m2.init();
+    expect(m2.state('db')).toBe('denied'); // re-trust required, none available
+    expect(f2.stats.made).toBe(0); // not reused from cache
+  });
+
+  test('adding network.allow_hosts re-triggers trust (egress grant)', async () => {
+    const f1 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m1 = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]), // no network
+      autoApprove: new Set(['db']),
+      makeClient: f1.makeClient,
+    });
+    await m1.init();
+    await m1.cleanup();
+
+    const reg2 = createToolRegistry();
+    const f2 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m2 = createMcpManager({
+      db,
+      registry: reg2,
+      config: config([serverConfig({ network: { allowHosts: ['api.example.com'] } })]),
+      makeClient: f2.makeClient,
+    });
+    await m2.init();
+    expect(m2.state('db')).toBe('denied'); // egress posture changed → re-trust
+    expect(f2.stats.made).toBe(0);
+  });
+
+  test('an UNCHANGED sandbox=false posture reuses the cached grant (no spurious re-trust)', async () => {
+    const f1 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m1 = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ sandbox: false })]),
+      autoApprove: new Set(['db']),
+      makeClient: f1.makeClient,
+    });
+    await m1.init();
+    await m1.cleanup();
+
+    const reg2 = createToolRegistry();
+    const f2 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m2 = createMcpManager({
+      db,
+      registry: reg2,
+      config: config([serverConfig({ sandbox: false })]), // identical posture
+      makeClient: f2.makeClient,
+    });
+    await m2.init();
+    expect(m2.state('db')).toBe('trusted');
+    expect(f2.stats.made).toBe(0); // identity matched → cached, no re-connect
+  });
+});
+
+describe('McpManager.init: the trust modal discloses env + cwd (not just argv)', () => {
+  test('the identity-gate command shows env bindings + cwd, never the resolved secret', async () => {
+    // The stdio env (LD_PRELOAD / NODE_OPTIONS) is a code-execution surface that
+    // survives even the sandbox --clearenv, yet argv alone hides it. The modal
+    // `command` must disclose the bindings + an explicit cwd so the operator sees
+    // what they authorize — showing the UNRESOLVED $VAR, never the resolved secret.
+    let gateCommand: string | undefined;
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          transport: {
+            transport: 'stdio',
+            command: 'node',
+            args: ['./s.js'],
+            rawArgv: ['node', './s.js'],
+            env: { LD_PRELOAD: '/evil.so', SECRET: 'super-secret-value' },
+            rawEnv: { LD_PRELOAD: '/evil.so', SECRET: '$SECRET' },
+            cwd: '/work',
+          },
+        }),
+      ]),
+      confirmTrust: async (req) => {
+        if (req.preConnect) gateCommand = req.command;
+        return 'no';
+      },
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(gateCommand).toContain('node ./s.js');
+    expect(gateCommand).toContain('LD_PRELOAD=/evil.so'); // the injected-code surface is visible
+    expect(gateCommand).toContain('SECRET=$SECRET'); // the binding, not the resolved token
+    expect(gateCommand).not.toContain('super-secret-value'); // resolved secret never shown
+    expect(gateCommand).toContain('cwd: /work');
+  });
+});
+
 describe('McpManager.init: a re-approved manifest persists durably', () => {
   test('a decline then --auto-approve grant is not lost on the next boot', async () => {
     // Boot 1: pass the identity gate, decline the manifest → a `denied` history

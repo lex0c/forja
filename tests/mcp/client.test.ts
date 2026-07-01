@@ -10,12 +10,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import {
+  MAX_MCP_TOOLS,
+  MAX_TOOL_RESULT_CHARS,
   abortableConnect,
   buildSpawnEnv,
   createStdioMcpClient,
   extractMeta,
   flattenContent,
   isInvalidOutput,
+  narrowManifestTools,
   normalizeInputSchema,
   teeStderr,
 } from '../../src/mcp/client.ts';
@@ -113,6 +116,81 @@ describe('flattenContent', () => {
 
   test('a text block whose text is non-string is skipped', () => {
     expect(flattenContent([{ type: 'text', text: 42 }])).toBe('');
+  });
+
+  test('bounds a single oversized result at MAX_TOOL_RESULT_CHARS + a marker', () => {
+    const huge = 'a'.repeat(MAX_TOOL_RESULT_CHARS + 5000); // one pathological block
+    const out = flattenContent([{ type: 'text', text: huge }]);
+    expect(out.startsWith('a'.repeat(1000))).toBe(true);
+    expect(out).toContain('truncated'); // marker appended
+    expect(out.length).toBeLessThan(MAX_TOOL_RESULT_CHARS + 100); // capped, not the full 1 MiB+5k
+  });
+
+  test('truncates ACROSS blocks once the running total crosses the cap', () => {
+    const near = 'a'.repeat(MAX_TOOL_RESULT_CHARS - 10);
+    const out = flattenContent([
+      { type: 'text', text: near },
+      { type: 'text', text: 'bbbbbbbbbbbbbbbbbbbb' }, // 20 chars, only ~10 fit
+    ]);
+    expect(out).toContain('truncated');
+    expect(out.length).toBeLessThan(MAX_TOOL_RESULT_CHARS + 100);
+  });
+
+  test('a result exactly at the cap is NOT marked truncated', () => {
+    const exact = 'a'.repeat(MAX_TOOL_RESULT_CHARS);
+    const out = flattenContent([{ type: 'text', text: exact }]);
+    expect(out).toBe(exact); // no marker
+  });
+});
+
+describe('narrowManifestTools — bounds an untrusted tools/list', () => {
+  test('narrows well-formed tools (name/description/inputSchema/meta)', () => {
+    const tools = narrowManifestTools([
+      {
+        name: 'query',
+        description: 'run a query',
+        inputSchema: { type: 'object', properties: { sql: { type: 'string' } } },
+        _meta: { agentic_cli: { writes: false } },
+      },
+    ]);
+    expect(tools).toHaveLength(1);
+    expect(tools[0]?.name).toBe('query');
+    expect(tools[0]?.description).toBe('run a query');
+    expect(tools[0]?.meta).toEqual({ writes: false });
+  });
+
+  test('a non-array → [] and non-object / nameless entries are skipped', () => {
+    expect(narrowManifestTools('nope')).toEqual([]);
+    expect(narrowManifestTools(undefined)).toEqual([]);
+    const tools = narrowManifestTools([null, 42, { description: 'no name' }, { name: 'ok' }]);
+    expect(tools.map((t) => t.name)).toEqual(['ok']);
+  });
+
+  test('caps the tool COUNT at MAX_MCP_TOOLS', () => {
+    const many = Array.from({ length: MAX_MCP_TOOLS + 50 }, (_, i) => ({ name: `t${i}` }));
+    expect(narrowManifestTools(many)).toHaveLength(MAX_MCP_TOOLS);
+  });
+
+  test('truncates an over-long name and description', () => {
+    const tools = narrowManifestTools([{ name: 'n'.repeat(500), description: 'd'.repeat(9000) }]);
+    expect(tools[0]?.name.length).toBe(128);
+    expect(tools[0]?.description.length).toBe(4096);
+  });
+
+  test('degrades an oversized inputSchema to the empty object schema', () => {
+    const bloated = { type: 'object', properties: { x: { description: 'a'.repeat(70000) } } };
+    const tools = narrowManifestTools([{ name: 'x', inputSchema: bloated }]);
+    expect(tools[0]?.inputSchema).toEqual({ type: 'object' }); // schema over 64 KiB dropped
+  });
+
+  test('a well-formed (in-bounds) inputSchema passes through', () => {
+    const schema = {
+      type: 'object' as const,
+      properties: { a: { type: 'number' } },
+      required: ['a'],
+    };
+    const tools = narrowManifestTools([{ name: 'x', inputSchema: schema }]);
+    expect(tools[0]?.inputSchema).toEqual(schema);
   });
 });
 

@@ -304,17 +304,58 @@ const estimateResultTokens = (res: McpCallResult): number => {
 // changing a credential re-trusts before the next spawn passes the newly-resolved
 // secret to an approved command — without persisting the resolved value. Sorted
 // for a determinism-stable identity; omitted entirely when there is no env.
-const stdioCommandIdentity = (t: McpStdioConfig, sessionCwd: string): string => {
+//
+// The CONTAINMENT posture is folded too — `sandbox: false` (opt-out) and a
+// `network` grant both change what an approved server can reach (host FS / the
+// network) yet touch neither argv, cwd, nor env. Without them in the identity a
+// gitignored `.forja/mcp.local.toml` could flip `sandbox = false` (or add
+// `network.allow_hosts`) on an already-trusted server and the cached grant would
+// silently reuse — spawning it UNSANDBOXED with no re-prompt. The DECLARED intent
+// is folded (config-derived, machine-independent), NOT the resolved profile
+// (which depends on bwrap availability, so it must not perturb the identity across
+// machines). Both are OMITTED at their default (sandboxed, no network) so a plain
+// server's identity stays byte-identical to before this fold.
+const stdioCommandIdentity = (
+  t: McpStdioConfig,
+  posture: Pick<McpServerConfig, 'sandbox' | 'network'>,
+  sessionCwd: string,
+): string => {
   const rawEnv = t.rawEnv;
   const env =
     rawEnv !== undefined && Object.keys(rawEnv).length > 0
       ? Object.fromEntries(Object.entries(rawEnv).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
       : undefined;
+  const net =
+    posture.network !== undefined
+      ? [...posture.network.allowHosts].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+      : undefined;
   return JSON.stringify({
     argv: t.rawArgv,
     cwd: t.cwd ?? sessionCwd,
     ...(env !== undefined ? { env } : {}),
+    ...(posture.sandbox === false ? { sandbox: false } : {}),
+    ...(net !== undefined ? { net } : {}),
   });
+};
+
+// The operator-facing form for the trust modal: the RAW argv, PLUS the env
+// bindings and an explicit cwd when present. The env is load-bearing risk surface
+// (`LD_PRELOAD` / `NODE_OPTIONS` inject code into the spawned process, surviving
+// even the sandbox `--clearenv`), and a relocated cwd moves the writable root / a
+// relative binary — yet neither shows in `argv` alone. Shows the UNRESOLVED
+// bindings (`SECRET=$SECRET`), so no resolved secret leaks into the prompt.
+const stdioDisplay = (t: McpStdioConfig): string => {
+  const parts = [t.rawArgv.join(' ')];
+  if (t.cwd !== undefined) parts.push(`[cwd: ${t.cwd}]`);
+  const rawEnv = t.rawEnv;
+  if (rawEnv !== undefined && Object.keys(rawEnv).length > 0) {
+    const bindings = Object.entries(rawEnv)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([k, v]) => `${k}=${v}`)
+      .join(', ');
+    parts.push(`[env: ${bindings}]`);
+  }
+  return parts.join('  ');
 };
 
 // The persisted remote URL identity: the raw (unexpanded) URL + the RESOLVED
@@ -365,26 +406,32 @@ const remoteDisplay = (t: McpRemoteConfig): string => {
 // trust modal — the RAW argv (stdio) / the RAW URL + the resolved origin when the
 // raw form hides it (remote); no folded metadata otherwise.
 const transportIdentity = (
-  t: McpTransportConfig,
+  cfg: McpServerConfig,
   sessionCwd: string,
-): { command: string | null; url: string | null; display: string } =>
-  t.transport === 'stdio'
-    ? { command: stdioCommandIdentity(t, sessionCwd), url: null, display: t.rawArgv.join(' ') }
+): { command: string | null; url: string | null; display: string } => {
+  const t = cfg.transport;
+  return t.transport === 'stdio'
+    ? { command: stdioCommandIdentity(t, cfg, sessionCwd), url: null, display: stdioDisplay(t) }
     : { command: null, url: remoteUrlIdentity(t), display: remoteDisplay(t) };
+};
 
 // Did the persisted server's transport identity change vs the configured one (a
 // swapped binary / re-pointed URL / changed transport kind / moved cwd for a
-// relative executable / changed credential binding ⇒ force a re-trust)? Compares
-// the persisted identity forms.
+// relative executable / changed credential binding / changed containment posture
+// ⇒ force a re-trust)? Compares the persisted identity forms.
 const transportChanged = (
   existing: McpServerRow,
-  t: McpTransportConfig,
+  cfg: McpServerConfig,
   sessionCwd: string,
-): boolean =>
-  existing.transport !== t.transport ||
-  (t.transport === 'stdio'
-    ? existing.command !== stdioCommandIdentity(t, sessionCwd)
-    : existing.url !== remoteUrlIdentity(t));
+): boolean => {
+  const t = cfg.transport;
+  return (
+    existing.transport !== t.transport ||
+    (t.transport === 'stdio'
+      ? existing.command !== stdioCommandIdentity(t, cfg, sessionCwd)
+      : existing.url !== remoteUrlIdentity(t))
+  );
+};
 
 export const createMcpManager = (deps: McpManagerDeps): McpManager => {
   const { db, registry, config } = deps;
@@ -765,7 +812,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       try {
         answer = await deps.confirmTrust({
           server: name,
-          command: transportIdentity(rt.config.transport, sessionCwd).display,
+          command: transportIdentity(rt.config, sessionCwd).display,
           mode: forceReprompt ? 'drift' : 'first-visit',
           sandbox:
             rt.config.transport.transport === 'stdio' ? resolveSandbox(rt.config).status : 'remote',
@@ -910,7 +957,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       const answer = await deps.confirmTrust({
         server: name,
         // The RAW (unresolved) command / the remote URL — never a resolved secret.
-        command: transportIdentity(rt.config.transport, sessionCwd).display,
+        command: transportIdentity(rt.config, sessionCwd).display,
         mode: forceReprompt || rt.trustedHash !== null ? 'drift' : 'first-visit',
         // A remote server has no subprocess — show 'remote' (egress, no sandbox),
         // never a stdio-oriented 'sandboxed' status that would imply containment.
@@ -939,9 +986,9 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
   // swap stays detectable across sessions until the operator re-approves it.
   const syncTrustedCommand = (rt: ServerRuntime) => {
     const scope = scopeOf(rt.config);
-    const id = transportIdentity(rt.config.transport, sessionCwd);
+    const id = transportIdentity(rt.config, sessionCwd);
     const existing = getServer(db, scope, rt.config.name);
-    if (existing !== null && !transportChanged(existing, rt.config.transport, sessionCwd)) return;
+    if (existing !== null && !transportChanged(existing, rt.config, sessionCwd)) return;
     if (existing !== null) deleteServer(db, scope, rt.config.name);
     insertServer(db, {
       scope,
@@ -1028,8 +1075,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
           );
         }
 
-        const commandChanged =
-          existing !== null && transportChanged(existing, server.transport, sessionCwd);
+        const commandChanged = existing !== null && transportChanged(existing, server, sessionCwd);
 
         // Reuse the cached grant ONLY when the identity-bearing row is present: the
         // row holds the command/URL that `commandChanged` verifies. If the row was

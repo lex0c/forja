@@ -45,6 +45,21 @@ const asRecord = (v: unknown): Record<string, unknown> | null =>
 const asString = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
 const asBool = (v: unknown): boolean | undefined => (typeof v === 'boolean' ? v : undefined);
 
+// Defensive bounds on UNTRUSTED server output (a hostile/wedged server must not
+// be able to OOM the process, flood the tool registry, or blow the model context
+// / cost). These cap what we FORWARD, HASH, PERSIST and REGISTER — the transient
+// SDK-side parse of the raw JSON-RPC frame is the SDK's own concern.
+//   • A single tools/call text result (flattenContent) — 1 MiB. A legitimate
+//     large result (a file dump) fits; a 500 MB payload is truncated with a marker.
+export const MAX_TOOL_RESULT_CHARS = 1_048_576;
+//   • One manifest's tool COUNT + per-field sizes (narrowManifestTools). A server
+//     advertising 10^6 tools, or multi-MB descriptions/schemas, is bounded before
+//     the manager hashes + writes manifest_json + floods the registry.
+export const MAX_MCP_TOOLS = 256;
+const MAX_TOOL_NAME_CHARS = 128;
+const MAX_TOOL_DESCRIPTION_CHARS = 4096;
+const MAX_INPUT_SCHEMA_CHARS = 65_536;
+
 // Minimal spawn env (MCP.md §2.1): PATH/HOME/USER plus the server's own
 // declared `env` (from its mcp.toml entry, $VAR-resolved). The server does NOT
 // inherit the agent's environment — no API keys / session secrets leak in.
@@ -102,18 +117,70 @@ export const extractMeta = (rawMeta: unknown): McpToolMeta => {
 };
 
 // Flatten the content block array to text (slice 1 is text-only; image /
-// embedded-resource blocks are dropped with the text preserved).
+// embedded-resource blocks are dropped with the text preserved). Bounded at
+// MAX_TOOL_RESULT_CHARS: a hostile/wedged server returning one enormous result
+// would otherwise be forwarded verbatim into the model context (and retained in
+// history) — blowing memory / context / cost before the per-session token cap can
+// trip on the NEXT call. Stop joining once the cap is reached and append a marker.
 export const flattenContent = (content: unknown): string => {
   if (!Array.isArray(content)) return '';
   const parts: string[] = [];
+  let total = 0;
+  let truncated = false;
   for (const block of content) {
     const rec = asRecord(block);
-    if (rec !== null && rec.type === 'text') {
-      const text = asString(rec.text);
-      if (text !== undefined) parts.push(text);
+    if (rec === null || rec.type !== 'text') continue;
+    const text = asString(rec.text);
+    if (text === undefined) continue;
+    if (total + text.length > MAX_TOOL_RESULT_CHARS) {
+      parts.push(text.slice(0, MAX_TOOL_RESULT_CHARS - total));
+      truncated = true;
+      break;
     }
+    parts.push(text);
+    total += text.length;
   }
-  return parts.join('');
+  const out = parts.join('');
+  return truncated
+    ? `${out}\n…[truncated: MCP result exceeded ${MAX_TOOL_RESULT_CHARS} chars]`
+    : out;
+};
+
+// Narrow + BOUND an untrusted `tools/list` payload into McpManifestTool[]. Caps
+// the tool count and each field (name / description / inputSchema) so a
+// pathological manifest can't OOM the hash/register step or bloat manifest_json.
+// Skips a non-object entry or a nameless tool (unusable); an over-long name or
+// description is truncated; an oversized inputSchema degrades to `{type:'object'}`.
+export const narrowManifestTools = (rawTools: unknown): McpManifestTool[] => {
+  const list = Array.isArray(rawTools) ? rawTools : [];
+  const tools: McpManifestTool[] = [];
+  for (const raw of list) {
+    if (tools.length >= MAX_MCP_TOOLS) break; // bound a pathological tool count
+    const rec = asRecord(raw);
+    if (rec === null) continue;
+    const name = asString(rec.name);
+    if (name === undefined) continue; // a nameless tool is unusable
+    tools.push({
+      name: name.slice(0, MAX_TOOL_NAME_CHARS),
+      description: (asString(rec.description) ?? '').slice(0, MAX_TOOL_DESCRIPTION_CHARS),
+      inputSchema: boundInputSchema(rec.inputSchema),
+      meta: extractMeta(rec._meta),
+    });
+  }
+  return tools;
+};
+
+// normalizeInputSchema, then reject an oversized schema (a multi-MB blob a server
+// could use to bloat the manifest hash + persisted manifest_json) by degrading to
+// the empty object schema.
+const boundInputSchema = (raw: unknown): ProviderToolInputSchema => {
+  const schema = normalizeInputSchema(raw);
+  try {
+    if (JSON.stringify(schema).length > MAX_INPUT_SCHEMA_CHARS) return { type: 'object' };
+  } catch {
+    return { type: 'object' };
+  }
+  return schema;
 };
 
 // Flag a CLEAR protocol violation in the raw `tools/call` result (MCP.md §15.5),
@@ -336,19 +403,7 @@ const sdkClientFrom = (makeTransport: () => SdkTransport): McpClient => {
     async listTools(signal) {
       if (client === null) throw new Error('mcp client: listTools called before connect');
       const res = await client.listTools(undefined, signal ? { signal } : undefined);
-      const tools: McpManifestTool[] = [];
-      for (const raw of res.tools ?? []) {
-        const rec = raw as unknown as Record<string, unknown>;
-        const name = asString(rec.name);
-        if (name === undefined) continue; // a nameless tool is unusable
-        tools.push({
-          name,
-          description: asString(rec.description) ?? '',
-          inputSchema: normalizeInputSchema(rec.inputSchema),
-          meta: extractMeta(rec._meta),
-        });
-      }
-      return tools;
+      return narrowManifestTools(res.tools);
     },
 
     async callTool(tool, args, signal) {
