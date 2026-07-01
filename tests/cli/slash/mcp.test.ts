@@ -11,7 +11,11 @@ import type { McpManager, McpServerStatus } from '../../../src/mcp/manager.ts';
 import { createRegistry as createModelRegistry } from '../../../src/providers/registry.ts';
 import { type DB, openMemoryDb } from '../../../src/storage/db.ts';
 import { migrate } from '../../../src/storage/migrate.ts';
-import { insertServer, recordManifestDecision } from '../../../src/storage/repos/mcp-servers.ts';
+import {
+  insertServer,
+  patchServer,
+  recordManifestDecision,
+} from '../../../src/storage/repos/mcp-servers.ts';
 import { createBus } from '../../../src/tui/bus.ts';
 import { createFocusStack } from '../../../src/tui/focus-stack.ts';
 import { createModalManager } from '../../../src/tui/modal-manager.ts';
@@ -153,6 +157,50 @@ describe('/mcp slash command', () => {
     expect(text).toContain('https://mcp.example.com/v1');
     expect(text).toContain('auth env: $GH_TOKEN'); // the bound env var name, not the token
     expect(text).not.toContain('{'); // the raw JSON blob is not shown
+  });
+
+  test('show strips ANSI + control bytes from the persisted identity + server fields', async () => {
+    // A hostile repo plants ANSI + a CR overwrite in the persisted stdio command;
+    // a hostile server reports control bytes in its version + last error. /mcp show
+    // must strip them — the info renderer prints these notes verbatim.
+    insertServer(db, {
+      name: 'evil',
+      transport: 'stdio',
+      command: '["\x1b[2J\x1b[Hevil-bin","real\rFORGED"]',
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    patchServer(db, 'evil', { server_version: '9\x1b[31m9', last_error: 'boom\x07\x08fail' });
+    const r = await mcpCommand.exec(['show', 'evil'], buildCtx());
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = r.notes?.join('\n') ?? '';
+    expect(text.includes('\x1b')).toBe(false);
+    expect(text.includes('\r')).toBe(false);
+    expect(text.includes('\x07')).toBe(false);
+    expect(text.includes('\x08')).toBe(false);
+    // Printable content survives (stripped, not dropped wholesale).
+    expect(text).toContain('evil-bin');
+    expect(text).toContain('FORGED');
+  });
+
+  test('show strips control bytes from a hostile remote URL', async () => {
+    insertServer(db, {
+      name: 'evilremote',
+      transport: 'http',
+      command: null,
+      url: 'https://x/\x1b[2J\x1b[Hmcp\rFORGED',
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    const r = await mcpCommand.exec(['show', 'evilremote'], buildCtx());
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = r.notes?.join('\n') ?? '';
+    expect(text.includes('\x1b')).toBe(false);
+    expect(text.includes('\r')).toBe(false);
+    expect(text).toContain('https://x/'); // the printable endpoint survives
   });
 
   test('show <unknown> errors', async () => {

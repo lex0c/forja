@@ -7,7 +7,7 @@
 // BETWEEN turns (they hot-swap the live tool registry).
 
 import { existsSync } from 'node:fs';
-import { stripControlKeepLines } from '../../../sanitize/ansi.ts';
+import { sanitizeOneLineForDisplay, stripControlKeepLines } from '../../../sanitize/ansi.ts';
 import { getServer, listManifestHistory, listServers } from '../../../storage/repos/mcp-servers.ts';
 import { localTimestamp } from '../../local-date.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
@@ -56,6 +56,15 @@ const handleShow = (ctx: SlashContext, name: string): SlashResult => {
   // Prefer the manager's LIVE state over the persisted row; the row is the
   // last-written value and may lag a mid-session transition.
   const live = ctx.baseConfig.mcpManager?.state(name);
+  // Sanitize every field that originates OUTSIDE the harness before it lands in a
+  // note the info renderer prints verbatim: the persisted identity (command / URL)
+  // comes from a repo's mcp.toml, and protocol/server version + last_error come
+  // from the server's own initialize/handshake — a hostile repo or server could
+  // otherwise embed ANSI/control bytes to repaint or forge the operator's terminal
+  // when they inspect it (same anti-spoof the trust modal + /mcp logs already do).
+  // The remaining fields are harness-controlled (validated name, state/source/
+  // decision enums, hex hash, numbers, formatted timestamps) — left as-is.
+  const s = sanitizeOneLineForDisplay;
   const lines: string[] = [
     `mcp server '${name}':`,
     `  state:    ${live ?? row.state}`,
@@ -64,13 +73,13 @@ const handleShow = (ctx: SlashContext, name: string): SlashResult => {
     // `url` (command null). Show whichever this transport uses so a remote
     // server's approved endpoint is visible instead of `command: —`.
     row.transport === 'stdio'
-      ? `  command:  ${row.command ?? '—'}`
-      : `  url:      ${row.url !== null ? renderEndpoint(row.url) : '—'}`,
+      ? `  command:  ${row.command !== null ? s(row.command) : '—'}`
+      : `  url:      ${row.url !== null ? s(renderEndpoint(row.url)) : '—'}`,
     `  manifest: ${row.current_manifest_hash ?? '—'}`,
-    `  protocol: ${row.protocol_version ?? '—'}${row.server_version !== null ? ` (server ${row.server_version})` : ''}`,
+    `  protocol: ${row.protocol_version !== null ? s(row.protocol_version) : '—'}${row.server_version !== null ? ` (server ${s(row.server_version)})` : ''}`,
     `  calls:    ${row.total_calls}`,
     `  last connected: ${localTimestamp(row.last_connected_at)}`,
-    `  last error:     ${row.last_error ?? 'none'}`,
+    `  last error:     ${row.last_error !== null ? s(row.last_error) : 'none'}`,
   ];
   const history = listManifestHistory(ctx.db, name);
   if (history.length > 0) {
