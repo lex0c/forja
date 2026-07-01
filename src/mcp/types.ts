@@ -38,11 +38,16 @@ export interface McpStdioConfig {
 // the same `McpClient` via the SDK.
 export interface McpRemoteConfig {
   transport: 'sse' | 'http';
-  // The endpoint URL. The trust identity for a remote server (a URL change
-  // forces a re-trust, the way a stdio command change does). Persisted to
-  // mcp_servers.url; shown in the trust modal — it is what the operator
-  // authorizes connecting to.
+  // The $VAR-RESOLVED endpoint the transport actually connects to. May carry a
+  // secret a `$VAR` expanded into (e.g. `?token=<resolved>`), so it is NEVER
+  // persisted or shown — only used for the live connection.
   url: string;
+  // The ORIGINAL, $VAR-UNRESOLVED url as written in mcp.toml. The trust IDENTITY:
+  // persisted to mcp_servers.url + shown in the trust modal (a change re-trusts,
+  // the way a stdio `rawArgv` change does). Because it is unresolved, a
+  // `url = "https://h/mcp?token=$TOKEN"` never lands at rest as the token value —
+  // it stays `…?token=$TOKEN` (mirrors `McpStdioConfig.rawArgv`).
+  rawUrl: string;
   // Resolved Authorization header value (e.g. `Bearer <token>`) from
   // `auth = { kind = "bearer", env = "X" }`. Resolved at load from the session
   // env — the TOKEN never persists (only the env-var NAME is in mcp.toml).

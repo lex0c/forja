@@ -492,6 +492,23 @@ auth = { kind = "bearer", env = "NOPE_MISSING" }
     expect(warnings.some((w) => w.includes('must not embed credentials'))).toBe(true);
   });
 
+  test('a $VAR-expanded secret in the url query stays out of the persisted/displayed identity', () => {
+    // rawUrl (the trust identity — persisted + shown) keeps the UNEXPANDED form, so
+    // a query/path token never lands at rest as its resolved value; only the live
+    // `url` (used for the connection) carries it. Covers the query/path case the
+    // userinfo (user:pass@) check above misses.
+    writeFileSync(
+      projectPath,
+      `[servers.gh]\ntransport = "http"\nurl = "https://mcp.example.com/mcp?token=$LOG"\n`,
+    );
+    const { servers, warnings } = load(); // env.LOG = 'debug'
+    expect(warnings).toEqual([]);
+    const t = remote(servers[0]);
+    expect(t.rawUrl).toBe('https://mcp.example.com/mcp?token=$LOG'); // identity: unexpanded
+    expect(t.rawUrl).not.toContain('debug'); // the resolved value never enters the identity
+    expect(t.url).toContain('token=debug'); // the live connection url DOES carry it
+  });
+
   test('a blank (whitespace-only) bearer token warns + sends no header', () => {
     writeFileSync(
       projectPath,

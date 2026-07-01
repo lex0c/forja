@@ -72,7 +72,11 @@ const remoteServerConfig = (over: Partial<McpServerConfig> = {}): McpServerConfi
   enabled: true,
   surface: 'deferred',
   source: 'project_shared',
-  transport: { transport: 'http', url: 'https://mcp.example.com/v1' },
+  transport: {
+    transport: 'http',
+    url: 'https://mcp.example.com/v1',
+    rawUrl: 'https://mcp.example.com/v1',
+  },
   ...over,
 });
 
@@ -1709,6 +1713,33 @@ describe('McpManager: remote transport', () => {
     expect(registry.get('mcp__gh__query')?.metadata.category).toBe('mcp.egress');
     expect(fake.stats.lastSandbox).toBeUndefined(); // no subprocess → no sandbox wrap
     expect(fake.stats.lastLogPath).toBeUndefined(); // no subprocess → no stderr log
+    await mgr.cleanup();
+  });
+
+  test('the trust modal + persisted identity use the RAW url, not the resolved secret', async () => {
+    const cfg = remoteServerConfig({
+      transport: {
+        transport: 'http',
+        url: 'https://mcp.example.com/v1?token=RESOLVED-SECRET', // the live connection target
+        rawUrl: 'https://mcp.example.com/v1?token=$TOKEN', // the identity (unexpanded)
+      },
+    });
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    let modalCommand: string | undefined;
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([cfg]),
+      confirmTrust: async (req) => {
+        modalCommand = req.command; // identity gate + manifest both show transportIdentity.display
+        return 'yes';
+      },
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(modalCommand).toBe('https://mcp.example.com/v1?token=$TOKEN'); // modal shows the RAW url
+    expect(getServer(db, 'gh')?.url).toBe('https://mcp.example.com/v1?token=$TOKEN'); // persisted = RAW
+    expect(getServer(db, 'gh')?.url).not.toContain('RESOLVED-SECRET'); // the secret never lands at rest
     await mgr.cleanup();
   });
 

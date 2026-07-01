@@ -181,17 +181,19 @@ const parseRemoteTransport = (
     warnings.push(`${where}: 'url' must be http(s) (got '${parsed.protocol}'); skipped`);
     return null;
   }
-  // Credentials embedded in the URL (`user:pass@host`, incl. a $VAR-resolved
-  // secret) would persist to mcp_servers.url in plaintext. Reject them — the
-  // token belongs in `auth = { kind = "bearer", env = "…" }`, which resolves at
-  // load and never persists.
+  // Credentials in the URL userinfo (`user:pass@host`). Reject them: a LITERAL
+  // one would persist via `rawUrl`, and a $VAR-resolved one belongs in
+  // `auth = { kind = "bearer", env = "…" }` (Bearer, never at rest) rather than
+  // Basic auth in the URL. The persisted identity is `rawUrl` (the UNRESOLVED
+  // form), so a `?token=$TOKEN` in the query/path never lands at rest as the
+  // token value — only the live `url` below carries the resolved secret.
   if (parsed.username !== '' || parsed.password !== '') {
     warnings.push(
       `${where}: 'url' must not embed credentials (user:pass@) — use auth = { kind = "bearer", env = "…" }; skipped`,
     );
     return null;
   }
-  const remote: McpRemoteConfig = { transport, url: parsed.toString() };
+  const remote: McpRemoteConfig = { transport, url: parsed.toString(), rawUrl: entry.url };
   const authHeader = parseAuthHeader(entry.auth, env, where, warnings);
   if (authHeader !== undefined) remote.authHeader = authHeader;
   return remote;

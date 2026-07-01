@@ -87,7 +87,7 @@ Each server is a `[servers.<name>]` table. The **name** must match `^[a-z][a-z0-
 | `cwd` | stdio | Working directory for the child process. |
 | `sandbox` | stdio | `false` runs the server **unconfined**. Omit (or `true`) → **sandboxed by default** when a sandbox tool (bwrap / sandbox-exec) is available (§7). |
 | `network` | stdio | A `[servers.<name>.network] allow_hosts = [...]` sub-table grants the server network. The host list is **advisory** (shown in the trust modal + audited), NOT kernel-enforced, and network-granted tools become **egress** (always confirmed, never auto-approved). |
-| `url` | sse/http | The endpoint URL — must be `http(s)`. The trust identity for a remote server (a change re-triggers trust). **No embedded credentials** (`user:pass@…`) — a URL with userinfo is rejected; put the token in `auth`. |
+| `url` | sse/http | The endpoint URL — must be `http(s)`. Its **unresolved** form (any `$VAR` left as-is) is the trust identity: persisted + shown in the modal (a change re-triggers trust), so a `?token=$VAR` never lands at rest as the resolved value — only the live connection uses the resolved URL. **No embedded credentials** (`user:pass@…`) — a URL with userinfo is rejected; put a bearer token in `auth`. |
 | `auth` | no (sse/http) | `auth = { kind = "bearer", env = "VAR" }`. The token is read from `$VAR` **at load** and sent as `Authorization: Bearer …`; only the env-var *name* lives in config — the token never persists. An unset/blank `$VAR` warns and sends no header. OAuth is a later slice. |
 | `surface` | no | `"base"` (always on the wire) or `"deferred"` (reached via `tool_search`). **Default `"deferred"`** so a many-tool server doesn't bloat the base surface. |
 | `disabled` | no | `true` to parse-but-skip the server (keeps its trust + state rows). Default enabled. |
@@ -119,7 +119,7 @@ url       = "https://api.githubcopilot.com/mcp/"
 auth      = { kind = "bearer", env = "GITHUB_MCP_TOKEN" }
 ```
 
-`$DATABASE_URL` resolves from the environment at load time; the **unresolved** form (`--dsn $DATABASE_URL`) is what gets persisted and shown in the trust modal, so the secret never lands at rest. For the remote `github` server, the trust identity is its `url` (a change re-prompts), and `$GITHUB_MCP_TOKEN` is read at load and sent as a `Bearer` header — only the variable *name* is in config.
+`$DATABASE_URL` resolves from the environment at load time; the **unresolved** form (`--dsn $DATABASE_URL`) is what gets persisted and shown in the trust modal, so the secret never lands at rest. For the remote `github` server, the trust identity is its **unresolved** `url` (a `$VAR` stays unexpanded at rest — like the stdio unresolved argv — so a query/path token never persists), and `$GITHUB_MCP_TOKEN` is read at load and sent as a `Bearer` header — only the variable *name* is in config.
 
 ---
 

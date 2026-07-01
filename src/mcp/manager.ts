@@ -260,23 +260,25 @@ const estimateResultTokens = (res: McpCallResult): number => {
 };
 
 // The trust IDENTITY of a transport — what persists to mcp_servers and what a
-// change re-triggers trust on. stdio: the RAW (unresolved) argv (never a
-// resolved secret); remote: the URL. `display` is the operator-facing form for
-// the trust modal.
+// change re-triggers trust on. Always the RAW (unresolved) form so a resolved
+// secret never lands at rest — stdio: the raw argv; remote: the raw (unexpanded)
+// URL (`?token=$TOKEN`, not the expanded value). `display` is the operator-facing
+// form for the trust modal.
 const transportIdentity = (
   t: McpTransportConfig,
 ): { command: string | null; url: string | null; display: string } =>
   t.transport === 'stdio'
     ? { command: JSON.stringify(t.rawArgv), url: null, display: t.rawArgv.join(' ') }
-    : { command: null, url: t.url, display: t.url };
+    : { command: null, url: t.rawUrl, display: t.rawUrl };
 
 // Did the persisted server's transport identity change vs the configured one (a
 // swapped binary / re-pointed URL / changed transport kind ⇒ force a re-trust)?
+// Compares the RAW forms (the persisted identity is the unresolved argv / URL).
 const transportChanged = (existing: McpServerRow, t: McpTransportConfig): boolean =>
   existing.transport !== t.transport ||
   (t.transport === 'stdio'
     ? existing.command !== JSON.stringify(t.rawArgv)
-    : existing.url !== t.url);
+    : existing.url !== t.rawUrl);
 
 export const createMcpManager = (deps: McpManagerDeps): McpManager => {
   const { db, registry, config } = deps;
