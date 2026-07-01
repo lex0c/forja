@@ -841,9 +841,11 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
 
   // Returns true (granted) / false (denied), recording the decision in
   // mcp_manifest_history. The (server, hash) pair is UNIQUE, so a forced
-  // re-decision on an already-recorded hash UPDATES that row in place (a decline
-  // the operator later approves — via `/mcp reconnect` or `--auto-approve-mcp` —
-  // must persist the grant, not be dropped and re-prompted on the next boot).
+  // re-decision on an already-recorded hash UPDATES that row in place — a decline
+  // the operator later approves (via `/mcp reconnect` or `--auto-approve-mcp`)
+  // must persist the grant, not be dropped and re-prompted on the next boot; and
+  // an identity change that re-hashes to the SAME manifest refreshes the row's
+  // decided_at/decided_by so the audit trail shows who approved the new identity.
   const resolveTrustDecision = async (
     rt: ServerRuntime,
     hash: string,
@@ -861,18 +863,20 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
 
     const record = (decision: 'granted' | 'denied', decidedBy: string) => {
       if (prior !== null) {
-        // (scope, server, hash) already recorded — the UNIQUE index forbids a
-        // second row. When the operator RE-decides the same manifest (a forced
-        // reprompt reached here), flip the existing row so a decline→approve (or
-        // the reverse) is durable across the next boot rather than silently lost.
-        // Same decision ⇒ nothing to write.
-        if (prior.decision !== decision) {
-          updateManifestDecision(db, scope, name, hash, {
-            decision,
-            decided_by: decidedBy,
-            decided_at: now(),
-          });
-        }
+        // Reaching here with a prior row means a FORCED re-decision — the early
+        // return above already honored any non-forced same-hash decision, so this
+        // path is only a changed identity (a swapped command/URL) or an explicit
+        // `/mcp reconnect` re-prompting the operator. The (scope, server, hash)
+        // triple is UNIQUE, so update the row in place to stamp THIS decision's
+        // decided_at/decided_by — even when the decision VALUE is unchanged. A
+        // swapped binary that re-hashes identically is still a fresh
+        // authorization; `/mcp show` + the forever history must record WHO
+        // approved the new identity and WHEN, not keep the stale original grant.
+        updateManifestDecision(db, scope, name, hash, {
+          decision,
+          decided_by: decidedBy,
+          decided_at: now(),
+        });
         return;
       }
       recordManifestDecision(db, {
@@ -1091,10 +1095,23 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       // server this repo shadows would lose its cached trust. A project-scoped row
       // uses the exact (scope, name). Keys join on a space (names are
       // ^[a-z][a-z0-9_]*$, no spaces, so `<scope> <name>` can't alias).
+      // A layer that fail-softed (invalid TOML, or a skipped `[servers.<name>]`
+      // entry) drops its servers from config.servers even though the operator
+      // never removed them. Sweeping that layer's storage scope would then delete
+      // the persisted state + trust identity + cumulative counters of a still-
+      // configured server — a temporary typo silently erasing cached trust. So
+      // skip the sweep for any scope fed by an incompletely-loaded layer (measure
+      // twice, cut once); its orphans linger harmlessly until the config parses
+      // cleanly. The '' scope is fed by the user layer; projectRoot by project +
+      // local (either incomplete taints the whole scope).
+      const dirtyScopes = new Set<string>();
+      for (const src of config.incompleteSources) dirtyScopes.add(scopeOf({ source: src }));
+
       const configuredKeys = new Set(config.servers.map((s) => `${scopeOf(s)} ${s.name}`));
       const configuredNames = new Set(config.servers.map((s) => s.name));
       for (const row of listServers(db, [projectRoot, ''])) {
         if (row.revoked_at != null) continue;
+        if (dirtyScopes.has(row.scope)) continue;
         const orphan =
           row.scope === ''
             ? !configuredNames.has(row.name)

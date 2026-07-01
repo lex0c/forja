@@ -243,6 +243,52 @@ describe('loadMcpConfig: fail-soft + empty', () => {
   });
 });
 
+describe('loadMcpConfig: incompleteSources (partial-load guard)', () => {
+  test('a clean load reports no incomplete sources', () => {
+    writeFileSync(projectPath, `[servers.db]\ntransport="stdio"\ncommand=["bin"]\n`);
+    expect([...load().incompleteSources]).toEqual([]);
+  });
+
+  test('no files anywhere → no incomplete sources (an absent layer is complete)', () => {
+    // An absent file is an intentional "no servers", not a partial load — the
+    // manager must still be free to sweep that scope.
+    expect([...load().incompleteSources]).toEqual([]);
+  });
+
+  test('a malformed project TOML marks the project source incomplete', () => {
+    writeFileSync(projectPath, 'not = = valid [[[');
+    expect(load().incompleteSources.has('project_shared')).toBe(true);
+  });
+
+  test('a malformed LOCAL TOML marks project_local incomplete; a clean project stays out', () => {
+    writeFileSync(projectPath, `[servers.db]\ntransport="stdio"\ncommand=["bin"]\n`);
+    writeFileSync(localPath, 'garbage = = [[[');
+    const { incompleteSources } = load();
+    expect(incompleteSources.has('project_local')).toBe(true);
+    expect(incompleteSources.has('project_shared')).toBe(false);
+  });
+
+  test('a SKIPPED entry (invalid name) also marks the layer incomplete', () => {
+    // A partial parse — one good server survives, one is dropped — still taints the
+    // layer: the surviving-only server list can no longer be trusted as complete.
+    writeFileSync(
+      projectPath,
+      `[servers.good]\ntransport="stdio"\ncommand=["bin"]\n\n[servers.Bad-Name]\ntransport="stdio"\ncommand=["bin"]\n`,
+    );
+    const { servers, incompleteSources } = load();
+    expect(servers.map((s) => s.name)).toEqual(['good']); // the good one still loads
+    expect(incompleteSources.has('project_shared')).toBe(true); // but the layer is flagged
+  });
+
+  test('the user layer is flagged independently of the project layer', () => {
+    writeFileSync(userPath, 'broken = = [[[');
+    writeFileSync(projectPath, `[servers.db]\ntransport="stdio"\ncommand=["bin"]\n`);
+    const { incompleteSources } = load({ userPathOverride: userPath });
+    expect(incompleteSources.has('user')).toBe(true);
+    expect(incompleteSources.has('project_shared')).toBe(false);
+  });
+});
+
 describe('loadMcpConfig: bad-type diagnostics (review hardening)', () => {
   test('a non-boolean disabled warns and stays enabled (intent not silently dropped)', () => {
     writeFileSync(

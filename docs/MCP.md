@@ -171,7 +171,9 @@ A **refusing** permission boot (a broken audit chain without `--accept-broken-ch
 
 Every decision (`granted` / `denied` / `revoked` / `superseded`) appends to `mcp_manifest_history`, which is **append-only and never pruned**. A re-**seen** server whose identity row is still present (a restart, a `disabled` toggle) with a matching command + hash re-uses its cached grant with no fresh prompt. A server **removed from config and re-added** — its identity row swept — re-trusts through the pre-connect identity gate: the grant is not inherited by name, so a re-added entry pointing at a different command/URL can't ride the old trust.
 
-The `(scope, server, hash)` triple holds **one** decision row (it is unique). If you **decline** a manifest and later approve the *same* manifest (via `/mcp reconnect` or `--auto-approve-mcp`), that row flips `denied → granted` in place, so the approval is durable across the next boot rather than being re-prompted every time.
+The `(scope, server, hash)` triple holds **one** decision row (it is unique). If you **decline** a manifest and later approve the *same* manifest (via `/mcp reconnect` or `--auto-approve-mcp`), that row flips `denied → granted` in place, so the approval is durable across the next boot rather than being re-prompted every time. When a **changed identity** (a swapped command or re-pointed URL) re-prompts but the server still reports the *same* manifest hash, the row's `decided_at` / `decided_by` are refreshed on re-approval even though the decision value is unchanged — so `/mcp show` and the history record who approved the **new** identity, not the stale original grant.
+
+The orphan sweep that removes an `mcp_servers` row when its server leaves config is **skipped for any scope whose config layer failed to load** (a malformed `mcp.toml` / `mcp.local.toml` / user file, or a skipped entry). A temporary typo therefore never erases a still-configured server's cached trust + counters: the row lingers until the config parses cleanly again.
 
 ---
 

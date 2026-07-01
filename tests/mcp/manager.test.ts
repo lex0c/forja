@@ -18,6 +18,7 @@ import type {
   McpSandboxArg,
   McpSandboxWrap,
   McpServerConfig,
+  McpServerSource,
   McpTransportConfig,
 } from '../../src/mcp/types.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
@@ -87,10 +88,14 @@ const remoteServerConfig = (over: Partial<McpServerConfig> = {}): McpServerConfi
   ...over,
 });
 
-const config = (servers: McpServerConfig[]): LoadedMcpConfig => ({
+const config = (
+  servers: McpServerConfig[],
+  incompleteSources: ReadonlySet<McpServerSource> = new Set(),
+): LoadedMcpConfig => ({
   servers,
   warnings: [],
   paths: { user: null, project: '/p/mcp.toml', local: '/p/mcp.local.toml' },
+  incompleteSources,
 });
 
 // A fake McpClient + a spy on the makeClient factory.
@@ -1371,6 +1376,57 @@ describe('McpManager: stale-row sweep (AUDIT §1.5)', () => {
     await mgr.init();
     expect(getServer(db, SCOPE, 'db')).not.toBeNull(); // disabled ≠ removed from config
   });
+
+  test('a parse-failed layer is NOT swept — a still-configured server keeps its row', async () => {
+    // A temporary typo makes loadMcpConfig fail-soft that layer: the server drops
+    // out of config.servers even though the operator never removed it. The sweep
+    // must skip the project scope (incompleteSources flags project_shared), so the
+    // trusted row + counters survive until the config parses cleanly again.
+    seedTrusted(db, 'db', [toolDef('query')]); // trusted project row at SCOPE
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      // config.servers is empty (the layer failed to parse) but its source is flagged.
+      config: config([], new Set(['project_shared'])),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(getServer(db, SCOPE, 'db')).not.toBeNull(); // NOT swept — the layer was incomplete
+    expect(latestTrustedManifest(db, SCOPE, 'db')).not.toBeNull();
+  });
+
+  test('a CLEANLY-loaded empty layer still sweeps a genuinely removed server', async () => {
+    // Contrast: config.servers is empty AND the load was clean (an intentional
+    // removal, no incomplete source) → the orphan STATE row is swept as before.
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([]), // clean load, server genuinely gone
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(getServer(db, SCOPE, 'db')).toBeNull(); // swept
+    expect(latestTrustedManifest(db, SCOPE, 'db')).not.toBeNull(); // history is forever
+  });
+
+  test('a failed OTHER layer does not block sweeping a cleanly-loaded scope', async () => {
+    // The user layer failed to parse (flags '') but the project layer loaded
+    // cleanly. A removed PROJECT server is still swept — only the '' scope is
+    // spared. Proves the guard is per-scope, not global.
+    seedTrusted(db, 'db', [toolDef('query')]); // project row at SCOPE, now unconfigured
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([], new Set(['user'])), // only the user layer is incomplete
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(getServer(db, SCOPE, 'db')).toBeNull(); // project scope was clean → swept
+  });
 });
 
 describe('McpManager: review hardening', () => {
@@ -1466,6 +1522,59 @@ describe('McpManager: review hardening', () => {
     expect(hashB).not.toBe(hashA);
     const rowB = history.find((h) => h.hash === hashB);
     expect(rowB?.previous_hash).toBe(hashA ?? null); // the chain forms (was always null before)
+  });
+
+  test('an identity change with an UNCHANGED manifest refreshes the trust decision', async () => {
+    // Session 1: grant manifest A at command fake-bin (decided_by user, at t=1000).
+    const fake1 = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr1 = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      confirmTrust: async () => 'yes',
+      now: () => 1000,
+      makeClient: fake1.makeClient,
+    });
+    await mgr1.init();
+    const before = latestTrustedManifest(db, SCOPE, 'db');
+    expect(before?.decided_by).toBe('user');
+    expect(before?.decided_at).toBe(1000);
+    await mgr1.cleanup();
+
+    // Session 2: the command changed (fake-bin → fake-bin-v2) but the tool set is
+    // IDENTICAL → the SAME manifest hash, force-reprompted, auto-approved. The
+    // decision VALUE is unchanged (granted→granted), but the row must STILL be
+    // updated: a swapped binary that re-hashes identically is a fresh
+    // authorization, so /mcp show + the forever history must record who approved
+    // the new identity (auto_approve) and when (t=2000) — not the stale grant.
+    const fake2 = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr2 = createMcpManager({
+      db,
+      registry: createToolRegistry(),
+      config: config([
+        serverConfig({
+          transport: {
+            transport: 'stdio',
+            command: 'fake-bin-v2',
+            args: [],
+            rawArgv: ['fake-bin-v2'],
+          },
+        }),
+      ]),
+      autoApprove: new Set(['db']),
+      now: () => 2000,
+      makeClient: fake2.makeClient,
+    });
+    await mgr2.init();
+    await mgr2.cleanup();
+
+    // Still exactly ONE history row (same hash → UNIQUE → updated in place).
+    const history = listManifestHistory(db, SCOPE, 'db');
+    expect(history.length).toBe(1);
+    const after = history[0];
+    expect(after?.decision).toBe('granted');
+    expect(after?.decided_by).toBe('auto_approve'); // refreshed from 'user'
+    expect(after?.decided_at).toBe(2000); // refreshed from 1000 (was NOT updated before the fix)
   });
 
   test('two tools that sanitize to the same wire name are de-duplicated, not dropped', async () => {

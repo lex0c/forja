@@ -35,6 +35,7 @@ const config = (servers: McpServerConfig[]): LoadedMcpConfig => ({
   servers,
   warnings: [],
   paths: { user: null, project: '/p/mcp.toml', local: '/p/mcp.local.toml' },
+  incompleteSources: new Set(),
 });
 
 // Poll for the tee'd file to contain `needle` — the stderr drain flushes

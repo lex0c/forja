@@ -32,6 +32,13 @@ export interface LoadedMcpConfig {
   servers: McpServerConfig[];
   warnings: string[];
   paths: { user: string | null; project: string; local: string };
+  // Sources whose layer did NOT load cleanly — the file failed to parse (bad
+  // TOML) or at least one `[servers.<name>]` entry was skipped. Such a layer's
+  // `servers` list is PARTIAL: a server the operator still has configured may be
+  // missing. The manager consults this to avoid sweeping the storage scope of an
+  // incompletely-loaded layer as "orphaned" (a temporary typo must not erase a
+  // trusted server's persisted state/identity). Empty ⇒ every layer loaded fully.
+  incompleteSources: ReadonlySet<McpServerSource>;
 }
 
 export interface LoadMcpConfigInput {
@@ -406,25 +413,32 @@ const parseServerEntry = (
   };
 };
 
+// `complete` is false when this layer may have DROPPED a server the operator
+// still has configured: the file failed to parse, or an individual entry was
+// skipped. The loader propagates it so the manager won't sweep an incompletely-
+// loaded layer's scope (a typo must not erase a trusted server's persisted row).
+// An ABSENT file is complete (legitimately no servers — an intentional removal).
 const parseLayer = (
   path: string | null,
   source: McpServerSource,
   sourceLabel: string,
   env: NodeJS.ProcessEnv,
   warnings: string[],
-): McpServerConfig[] => {
+): { servers: McpServerConfig[]; complete: boolean } => {
   const section = loadTomlSection(path, 'servers', sourceLabel);
   if (section.kind === 'invalid') {
     warnings.push(section.warning);
-    return [];
+    return { servers: [], complete: false };
   }
-  if (section.kind !== 'found') return [];
+  if (section.kind !== 'found') return { servers: [], complete: true };
   const out: McpServerConfig[] = [];
+  let complete = true;
   for (const [name, raw] of Object.entries(section.section)) {
     const parsed = parseServerEntry(name, raw, source, env, warnings);
     if (parsed !== null) out.push(parsed);
+    else complete = false; // a skipped entry — the layer's server set is partial
   }
-  return out;
+  return { servers: out, complete };
 };
 
 export const loadMcpConfig = (input: LoadMcpConfigInput): LoadedMcpConfig => {
@@ -439,10 +453,27 @@ export const loadMcpConfig = (input: LoadMcpConfigInput): LoadedMcpConfig => {
   // Merge by name with increasing precedence: user < project < local.
   // A later layer overriding an earlier one is a warning, not an error.
   const merged = new Map<string, McpServerConfig>();
+  const incompleteSources = new Set<McpServerSource>();
+  const collect = (
+    layer: { servers: McpServerConfig[]; complete: boolean },
+    source: McpServerSource,
+  ): McpServerConfig[] => {
+    if (!layer.complete) incompleteSources.add(source);
+    return layer.servers;
+  };
   const layers: Array<[McpServerConfig[], string]> = [
-    [parseLayer(userPath, 'user', 'mcp user', env, warnings), 'user'],
-    [parseLayer(projectPath, 'project_shared', 'mcp project', env, warnings), 'project'],
-    [parseLayer(localPath, 'project_local', 'mcp local', env, warnings), 'local'],
+    [collect(parseLayer(userPath, 'user', 'mcp user', env, warnings), 'user'), 'user'],
+    [
+      collect(
+        parseLayer(projectPath, 'project_shared', 'mcp project', env, warnings),
+        'project_shared',
+      ),
+      'project',
+    ],
+    [
+      collect(parseLayer(localPath, 'project_local', 'mcp local', env, warnings), 'project_local'),
+      'local',
+    ],
   ];
   for (const [servers, layerLabel] of layers) {
     for (const server of servers) {
@@ -459,5 +490,10 @@ export const loadMcpConfig = (input: LoadMcpConfigInput): LoadedMcpConfig => {
     a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
   );
 
-  return { servers, warnings, paths: { user: userPath, project: projectPath, local: localPath } };
+  return {
+    servers,
+    warnings,
+    paths: { user: userPath, project: projectPath, local: localPath },
+    incompleteSources,
+  };
 };
