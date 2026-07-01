@@ -328,33 +328,49 @@ const stdioCommandIdentity = (t: McpStdioConfig, sessionCwd: string): string => 
 // authority), and userinfo (`user:pass@`) is rejected at parse — so persisting +
 // showing the origin leaks nothing while catching an origin change. Only the auth
 // NAME (never the token) enters the identity.
-const remoteUrlIdentity = (t: McpRemoteConfig): string => {
-  let origin: string;
+// The resolved endpoint's ORIGIN (scheme://host:port) — non-secret: a `$VAR`
+// token expands into the path/query, never the authority, and userinfo is
+// rejected at parse. Safe to persist + show.
+const resolvedOrigin = (t: McpRemoteConfig): string => {
   try {
-    origin = new URL(t.url).origin;
+    return new URL(t.url).origin;
   } catch {
     // parseRemoteTransport already validated http(s) at load; defensive fallback.
-    origin = t.url;
+    return t.url;
   }
-  return JSON.stringify({
+};
+
+const remoteUrlIdentity = (t: McpRemoteConfig): string =>
+  JSON.stringify({
     url: t.rawUrl,
-    origin,
+    origin: resolvedOrigin(t),
     ...(t.authEnv !== undefined ? { auth: t.authEnv } : {}),
   });
+
+// Operator-facing form for the trust modal: the RAW (unexpanded) URL, plus the
+// resolved ORIGIN when the raw form doesn't already reveal it — e.g. `url =
+// "$MCP_URL"` shows `$MCP_URL → https://actual-host` so the operator can verify
+// WHICH host will receive the connection + bearer before approving. The origin is
+// non-secret (see `resolvedOrigin`); a `$VAR` in the raw form stays literal, so no
+// path/query secret leaks either way.
+const remoteDisplay = (t: McpRemoteConfig): string => {
+  const origin = resolvedOrigin(t);
+  return t.rawUrl.startsWith(origin) ? t.rawUrl : `${t.rawUrl} → ${origin}`;
 };
 
 // The trust IDENTITY of a transport — what persists to mcp_servers and what a
 // change re-triggers trust on. Secrets never land at rest — stdio: the raw argv +
 // the effective cwd + the UNRESOLVED env bindings; remote: the raw (unexpanded)
 // URL + the auth env-var NAME. `display` is the operator-facing form for the
-// trust modal (always the RAW argv / URL, no folded metadata).
+// trust modal — the RAW argv (stdio) / the RAW URL + the resolved origin when the
+// raw form hides it (remote); no folded metadata otherwise.
 const transportIdentity = (
   t: McpTransportConfig,
   sessionCwd: string,
 ): { command: string | null; url: string | null; display: string } =>
   t.transport === 'stdio'
     ? { command: stdioCommandIdentity(t, sessionCwd), url: null, display: t.rawArgv.join(' ') }
-    : { command: null, url: remoteUrlIdentity(t), display: t.rawUrl };
+    : { command: null, url: remoteUrlIdentity(t), display: remoteDisplay(t) };
 
 // Did the persisted server's transport identity change vs the configured one (a
 // swapped binary / re-pointed URL / changed transport kind / moved cwd for a

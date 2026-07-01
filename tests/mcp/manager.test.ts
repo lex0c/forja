@@ -2463,6 +2463,37 @@ describe('McpManager: remote transport', () => {
     await mgr.cleanup();
   });
 
+  test('the trust modal shows the RESOLVED origin when the url is an env var ($MCP_URL)', async () => {
+    // The whole URL is a `$VAR`, so the raw form hides the host — the operator must
+    // still see WHICH host receives the connection + bearer before approving.
+    const cfg = remoteServerConfig({
+      transport: {
+        transport: 'http',
+        url: 'https://actual-host.example.com/mcp?token=RESOLVED-SECRET', // $MCP_URL resolved
+        rawUrl: '$MCP_URL',
+        authEnv: 'MCP_TOKEN',
+      },
+    });
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    let modalCommand: string | undefined;
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([cfg]),
+      confirmTrust: async (req) => {
+        modalCommand = req.command;
+        return 'yes';
+      },
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(modalCommand).toContain('$MCP_URL'); // the raw (unexpanded) form still shown
+    expect(modalCommand).toContain('https://actual-host.example.com'); // + the resolved ORIGIN
+    expect(modalCommand).not.toContain('RESOLVED-SECRET'); // the query secret is hidden
+    expect(modalCommand).not.toContain('?token='); // path/query stripped — origin only
+    await mgr.cleanup();
+  });
+
   test("a remote server's trust identity is its URL (a second session reuses the cached grant)", async () => {
     const f1 = fakeClientFactory({ tools: [toolDef('query')] });
     const m1 = createMcpManager({
