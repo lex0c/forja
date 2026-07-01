@@ -28,6 +28,26 @@ const tailLines = async (path: string, maxLines: number, maxBytes = 65536): Prom
   return (dropPartial ? lines.slice(1) : lines).filter((l) => l.length > 0).slice(-maxLines);
 };
 
+// The persisted remote identity in `mcp_servers.url` is the raw endpoint, or a
+// `{ url, auth }` JSON blob when the server binds a bearer env var (manager.ts
+// `remoteUrlIdentity`). Render the endpoint the operator approved, naming the
+// bound auth env var when present; fall back to the raw value if it isn't that
+// shape. The value is config-derived (unresolved `rawUrl`), not server-authored,
+// so no sanitization is needed here.
+const renderEndpoint = (raw: string): string => {
+  try {
+    const parsed = JSON.parse(raw) as { url?: unknown; auth?: unknown };
+    if (parsed !== null && typeof parsed === 'object' && typeof parsed.url === 'string') {
+      return typeof parsed.auth === 'string'
+        ? `${parsed.url} (auth env: $${parsed.auth})`
+        : parsed.url;
+    }
+  } catch {
+    // Not JSON — a plain raw URL string.
+  }
+  return raw;
+};
+
 const handleShow = (ctx: SlashContext, name: string): SlashResult => {
   const row = getServer(ctx.db, name);
   if (row === null) {
@@ -40,7 +60,12 @@ const handleShow = (ctx: SlashContext, name: string): SlashResult => {
     `mcp server '${name}':`,
     `  state:    ${live ?? row.state}`,
     `  source:   ${row.source}`,
-    `  command:  ${row.command ?? '—'}`,
+    // stdio persists its identity in `command` (url null); a remote server in
+    // `url` (command null). Show whichever this transport uses so a remote
+    // server's approved endpoint is visible instead of `command: —`.
+    row.transport === 'stdio'
+      ? `  command:  ${row.command ?? '—'}`
+      : `  url:      ${row.url !== null ? renderEndpoint(row.url) : '—'}`,
     `  manifest: ${row.current_manifest_hash ?? '—'}`,
     `  protocol: ${row.protocol_version ?? '—'}${row.server_version !== null ? ` (server ${row.server_version})` : ''}`,
     `  calls:    ${row.total_calls}`,

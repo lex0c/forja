@@ -119,6 +119,42 @@ describe('/mcp slash command', () => {
     expect(text).toContain('abc123def456'); // hash prefix
   });
 
+  test('show <remote> renders the trusted URL (not command: —)', async () => {
+    insertServer(db, {
+      name: 'gh',
+      transport: 'http',
+      command: null, // remote servers carry no command
+      url: 'https://mcp.example.com/v1',
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    const r = await mcpCommand.exec(['show', 'gh'], buildCtx());
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = r.notes?.join('\n') ?? '';
+    expect(text).toContain('url:');
+    expect(text).toContain('https://mcp.example.com/v1'); // the approved endpoint is visible
+    expect(text).not.toContain('command:'); // no misleading empty command line
+  });
+
+  test('show <remote> unwraps the {url, auth} identity blob', async () => {
+    insertServer(db, {
+      name: 'gh',
+      transport: 'sse',
+      command: null,
+      url: JSON.stringify({ url: 'https://mcp.example.com/v1', auth: 'GH_TOKEN' }),
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    const r = await mcpCommand.exec(['show', 'gh'], buildCtx());
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = r.notes?.join('\n') ?? '';
+    expect(text).toContain('https://mcp.example.com/v1');
+    expect(text).toContain('auth env: $GH_TOKEN'); // the bound env var name, not the token
+    expect(text).not.toContain('{'); // the raw JSON blob is not shown
+  });
+
   test('show <unknown> errors', async () => {
     const r = await mcpCommand.exec(['show', 'nope'], buildCtx());
     expect(r.kind).toBe('error');

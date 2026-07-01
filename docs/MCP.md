@@ -235,7 +235,7 @@ Two tables (migration `081-mcp-servers.ts`, repo `repos/mcp-servers.ts`):
 
 - **Warnings** from config parsing and trust (`server 'x' redefined…`, `'url' must be http(s)…`, `bearer token env var $Y is not set…`) surface on the startup banner.
 - **Managing servers in-session:** `/mcp` lists every server with its live state + tool count;
-  `/mcp show <server>` adds the command, manifest hash, and trust history; `/mcp revoke <server>`
+  `/mcp show <server>` adds the command (or the endpoint URL for a remote server), manifest hash, and trust history; `/mcp revoke <server>`
   denies a server and removes its tools (durable — it stays denied across a relaunch until you
   reconnect); `/mcp reconnect <server>` re-runs the trust handshake — on success it re-registers the
   tools + clears any revocation (no restart needed), and a **declined or failed** reconnect leaves the
