@@ -863,3 +863,61 @@ describe('executeCase — httpStub seam', () => {
     expect(r.passed).toBe(true);
   });
 });
+
+describe('executeCase: MCP seam (setup.mcp)', () => {
+  test('injects a hermetic, auto-approved MCP server the model can call', async () => {
+    const c = baseCase({
+      prompt: 'call the echo tool and report its output',
+      setup: {
+        // Autonomous posture auto-approves the mcp.egress policy-confirm (the fake
+        // server is unsandboxed) without needing a real sandbox tool.
+        approvalPosture: 'autonomous',
+        mcp: {
+          fixture: {
+            tools: [{ name: 'echo', description: 'echo back text' }],
+            result: 'MCP_MARKER_9x2',
+          },
+        },
+      },
+      expect: [
+        { kind: 'tool_called', tool: 'mcp__fixture__echo' },
+        { kind: 'status', status: 'done' },
+      ],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: {
+        providerOverride: mockProvider([
+          { tool_uses: [{ id: 't1', name: 'mcp__fixture__echo', input: { text: 'hi' } }] },
+          { text: 'the tool returned MCP_MARKER_9x2' },
+        ]),
+      },
+    });
+    expect(r.passed).toBe(true);
+    expect(r.expectations.every((e) => e.passed)).toBe(true);
+  });
+
+  test('a declared server without auto-approve fails closed (tool never registers)', async () => {
+    const c = baseCase({
+      prompt: 'call the echo tool',
+      setup: {
+        // Declared via mcp.toml but NOT via setup.mcp, so it is not auto-approved:
+        // a headless run (no confirmer) denies it pre-connect and never registers
+        // its tools. The command is never spawned (denied before connect).
+        files: {
+          '.forja/mcp.toml':
+            '[servers.fixture]\ntransport = "stdio"\ncommand = ["mcp-eval", "fixture"]\nsurface = "base"\n',
+        },
+      },
+      expect: [
+        { kind: 'tool_not_called', tool: 'mcp__fixture__echo' },
+        { kind: 'status', status: 'done' },
+      ],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'no echo tool is available' }]),
+      },
+    });
+    expect(r.passed).toBe(true);
+  });
+});

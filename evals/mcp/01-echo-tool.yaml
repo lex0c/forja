@@ -1,0 +1,26 @@
+name: mcp echo tool round-trip
+# Model-in-the-loop: a hermetic MCP server (a fake stdio server + an injected
+# McpClient, declared via setup.mcp) advertises an `echo` tool. The model must
+# discover it (mcp__fixture__echo), call it, and relay the result. No subprocess
+# and no network — the real SDK/subprocess path is covered by
+# tests/mcp/real-subprocess.test.ts + evals/smoke-mcp.sh. `autonomous` posture
+# auto-approves the mcp.egress policy-confirm (the fake server is unsandboxed) so
+# the tool is callable headlessly without a bwrap dependency.
+prompt: |
+  An "echo" tool is available to you. Call it with any short text, then reply with
+  EXACTLY what the tool returned and nothing else.
+setup:
+  approvalPosture: autonomous
+  mcp:
+    fixture:
+      tools:
+        - name: echo
+          description: Echo back the given text.
+      result: "MCP_ECHO_OK_7f3a"
+expect:
+  - tool_called: mcp__fixture__echo
+  - output_contains: MCP_ECHO_OK_7f3a
+  - status: done
+budget:
+  # Harness-use, not spend — a small step bound; no cost cap (cost is a separate axis).
+  maxSteps: 5

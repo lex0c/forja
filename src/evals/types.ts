@@ -88,6 +88,28 @@ export interface EvalSetup {
   // deterministically — the live-network alternative is both flaky and blocked
   // by the SSRF gate for local stub servers.
   httpStub?: Record<string, EvalHttpResponse>;
+  // Hermetic MCP servers for a model-in-the-loop eval. Each entry declares a
+  // fake stdio server (name → tools + a canned tools/call result); the executor
+  // writes a `.forja/mcp.toml` declaring them, auto-approves them (so the headless
+  // run trusts them without a confirmer), and injects a stubbed `McpClient` that
+  // serves the declared manifest — NO real subprocess (that path is covered by
+  // tests/mcp/real-subprocess.test.ts + evals/smoke-mcp.sh). Lets an eval measure
+  // whether the model discovers + calls an MCP tool and uses its result.
+  // Pair with `approvalPosture: 'autonomous'` so the `mcp.egress` policy-confirm
+  // (unsandboxed fake server) auto-approves headlessly without a bwrap dependency.
+  mcp?: Record<string, EvalMcpServer>;
+}
+
+// One hermetic MCP server for `EvalSetup.mcp`.
+export interface EvalMcpServer {
+  // The tools the fake server advertises via `tools/list`.
+  tools: { name: string; description: string; writes?: boolean }[];
+  // Canned text every `tools/call` returns (default 'ok'). A distinctive marker
+  // here lets `output_contains` verify the result round-tripped to the model.
+  result?: string;
+  // Model surface for the tools — 'base' (on the wire) or 'deferred' (via
+  // tool_search). Default 'base' so the model can call directly.
+  surface?: 'base' | 'deferred';
 }
 
 // One canned HTTP response for `EvalSetup.httpStub`.
