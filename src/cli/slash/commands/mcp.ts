@@ -7,6 +7,7 @@
 // BETWEEN turns (they hot-swap the live tool registry).
 
 import { existsSync } from 'node:fs';
+import { stripControlKeepLines } from '../../../sanitize/ansi.ts';
 import { getServer, listManifestHistory, listServers } from '../../../storage/repos/mcp-servers.ts';
 import { localTimestamp } from '../../local-date.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
@@ -194,7 +195,10 @@ const handleLogs = async (ctx: SlashContext, name: string): Promise<SlashResult>
     kind: 'ok',
     notes: [
       `mcp '${name}' stderr — last ${tail.length} line${tail.length === 1 ? '' : 's'} (${path}):`,
-      ...tail,
+      // Untrusted server output landing in the operator's scrollback — strip ANSI
+      // + control bytes (ESC / \r / \b / bell …) so a hostile server can't repaint
+      // the terminal or forge UI text when its logs are inspected.
+      ...tail.map(stripControlKeepLines),
     ],
   };
 };

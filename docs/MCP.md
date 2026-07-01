@@ -245,6 +245,8 @@ Two tables (migration `081-mcp-servers.ts`, repo `repos/mcp-servers.ts`):
 - **Server stderr** is captured to `<dataDir>/traces/mcp-<name>.log` (operator-only, lazily created
   on the first byte, rotated at 10 MB with one kept generation). It is *always drained* even when no
   trace dir is configured — an unread pipe would otherwise block the server on its next stderr write.
+  `/mcp logs` **sanitizes** each tailed line (strips ANSI + control bytes) before rendering, so a hostile
+  server can't repaint the terminal or forge UI text through its stderr when you inspect it.
 - **Sandbox.** When a sandbox tool (Linux `bwrap`, macOS `sandbox-exec`) is present, every stdio server is confined **by default** — host filesystem read-only, the cwd read-write, no network — unless you set `sandbox = false` or grant `network`. The trust modal shows the effective posture; a server that can't be sandboxed (no tool, or your opt-out) is flagged **UNSANDBOXED**. If a tool was present at boot and later vanishes, the server fails closed rather than running exposed. bwrap network is all-or-nothing — `allow_hosts` is advisory, not kernel-enforced (§8), and a network-granted server's tools are treated as egress (always confirmed).
 - **Secrets** belong in the environment + the gitignored `mcp.local.toml`. The persisted command and the trust modal both use the unresolved argv, so a `$VAR` secret is never written to the DB or shown on screen.
 - **End-to-end proof.** `tests/mcp/real-subprocess.test.ts` drives the real SDK adapter against `evals/mcp/fixtures/echo-server.ts` (a real stdio server) — the happy path, the headless fail-closed path, and the cached-grant path — so the whole stack is exercised over real pipes in CI without a model in the loop.

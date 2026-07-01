@@ -356,6 +356,38 @@ describe('/mcp slash command', () => {
     }
   });
 
+  test('logs strips ANSI + control bytes from server stderr (anti-repaint)', async () => {
+    seed('db', 'trusted');
+    const dir = mkdtempSync(join(tmpdir(), 'mcp-logs-'));
+    const path = join(dir, 'mcp-db.log');
+    // A hostile server writes a terminal-clear + a colored forgery + a CR overwrite
+    // + a bell/backspace to its stderr; none must reach the operator's scrollback.
+    writeFileSync(
+      path,
+      '\x1b[2J\x1b[Hcleared\n\x1b[31mFAKE\x1b[0m error\nreal\rFORGED\n\x07bell\x08\n',
+    );
+    try {
+      const r = await mcpCommand.exec(
+        ['logs', 'db'],
+        buildCtx(fakeManager([], { logPath: () => path })),
+      );
+      expect(r.kind).toBe('ok');
+      if (r.kind !== 'ok') return;
+      const text = r.notes?.join('\n') ?? '';
+      // No raw control bytes reach the rendered notes.
+      expect(text.includes('\x1b')).toBe(false);
+      expect(text.includes('\r')).toBe(false);
+      expect(text.includes('\x07')).toBe(false);
+      expect(text.includes('\x08')).toBe(false);
+      // The printable content survives (stripped, not dropped wholesale).
+      expect(text).toContain('cleared');
+      expect(text).toContain('FAKE error');
+      expect(text).toContain('FORGED');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('logs of a server whose last record exceeds 64 KiB shows the truncated tail, not "empty"', async () => {
     seed('db', 'trusted');
     const dir = mkdtempSync(join(tmpdir(), 'mcp-logs-'));
