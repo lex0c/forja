@@ -51,7 +51,7 @@ Everything lives under `src/mcp/`. The rest of the harness sees MCP tools only a
         └──────────────────┘ └────────────────┘ └──────────────────┘
 
    storage:  migrations/081-mcp-servers.ts + repos/mcp-servers.ts
-             mcp_servers          = per-server STATE (swept when it leaves config)
+             mcp_servers          = per-server STATE (user-scoped rows swept when they leave config)
              mcp_manifest_history = trust decisions, APPEND-ONLY FOREVER
 ```
 
@@ -226,7 +226,7 @@ A server moves through eight states (`STATE_MACHINE §6.5`); the current value i
 
 Two tables (migration `081-mcp-servers.ts`, repo `repos/mcp-servers.ts`):
 
-- **`mcp_servers`** — per-server STATE: transport, the redacted command, source layer, current state + manifest hash, counters. This is mutable state, so it is **swept when the server leaves config**: `manager.init()` deletes any `mcp_servers` row whose name is in neither the enabled nor disabled config set (toggling `disabled` keeps the row).
+- **`mcp_servers`** — per-server STATE: transport, the redacted command, source layer, current state + manifest hash, counters. This is mutable state, so a **`user`-scoped** row is **swept when the server leaves config**: `manager.init()` deletes any `user`-source row whose name is in neither the enabled nor disabled config set (toggling `disabled` keeps the row). A **project-scoped** row (`project_shared` / `project_local`) is **never** swept this way, because `sessions.db` is user-global while the config is only the current repo's — a project row absent here may belong to another repo, and sweeping it would delete that project's cached trust. A genuinely-removed project server just leaves a harmless stale row; a re-add with a changed command/URL still re-trusts via the identity comparison. Revoked rows always survive (the revocation must outlast a config round-trip).
 - **`mcp_manifest_history`** — every trust decision, **append-only forever**. It is deliberately absent from `GC_TABLES`, so `forja gc` never prunes it; the forever-retention holds by construction. The server's history survives even after its `mcp_servers` row is swept — but the manager will **not** reuse a grant by name once the identity row is gone: the row is what records the command/URL a grant authorized, so a re-added server re-trusts through the identity gate rather than silently inheriting the grant.
 
 ---

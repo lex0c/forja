@@ -1088,14 +1088,15 @@ describe('McpManager: code-review hardening', () => {
 });
 
 describe('McpManager: stale-row sweep (AUDIT §1.5)', () => {
-  test('init removes mcp_servers rows for servers no longer in config (history survives)', async () => {
-    // A row + granted manifest from a prior session for a server now GONE.
+  test('init removes a USER-source row for a server no longer in config (history survives)', async () => {
+    // A user-scoped row + granted manifest from a prior session for a server now
+    // GONE from the (global) user config → swept.
     insertServer(db, {
       name: 'gone',
       transport: 'stdio',
       command: '["x"]',
       url: null,
-      source: 'project_shared',
+      source: 'user',
       state: 'trusted',
     });
     seedTrusted(db, 'gone', [toolDef('q')]);
@@ -1111,6 +1112,39 @@ describe('McpManager: stale-row sweep (AUDIT §1.5)', () => {
     expect(getServer(db, 'gone')).toBeNull(); // orphan STATE row swept
     expect(latestTrustedManifest(db, 'gone')).not.toBeNull(); // history is forever
     expect(getServer(db, 'db')).not.toBeNull(); // configured server kept
+  });
+
+  test('init PRESERVES a project-scoped row absent from this repo (user-global db)', async () => {
+    // sessions.db is user-global; a project_shared/project_local row not in THIS
+    // repo's config may belong to ANOTHER repo. Sweeping it would delete that
+    // project's cached trust, so it must survive.
+    insertServer(db, {
+      name: 'other-repo-server',
+      transport: 'stdio',
+      command: '["x"]',
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    insertServer(db, {
+      name: 'other-repo-local',
+      transport: 'stdio',
+      command: '["y"]',
+      url: null,
+      source: 'project_local',
+      state: 'trusted',
+    });
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]), // only 'db' is configured in this repo
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(getServer(db, 'other-repo-server')).not.toBeNull(); // NOT swept
+    expect(getServer(db, 'other-repo-local')).not.toBeNull(); // NOT swept
   });
 
   test('a granted manifest whose server row was swept is re-trusted, not reused by name', async () => {
@@ -1891,6 +1925,34 @@ describe('McpManager: per-server budget (MCP.md §5)', () => {
     // A success would never have incremented past 0 — attempts must count, or a
     // hanging server loops uncapped forever. The 3rd is refused by the cap.
     await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.budget\.exceeded/);
+    await mgr.cleanup();
+  });
+
+  test('a server that FAILS its handshake every call still hits the call cap (no infinite respawn)', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      connectError: new Error('handshake refused'),
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          budget: { timeoutMs: 30_000, maxCallsPerSession: 2, maxTokensInPerSession: 50_000 },
+        }),
+      ]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    // Each failed handshake charges the cap (the fix) — otherwise the increment
+    // past the handshake never runs and a broken/malicious server is respawned on
+    // every model retry, uncapped.
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow('handshake refused'); // 1
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow('handshake refused'); // 2
+    // The 3rd is refused by the cap BEFORE any respawn.
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.budget\.exceeded/);
+    expect(fake.stats.made).toBe(2); // only two spawn attempts — the cap stopped the third
     await mgr.cleanup();
   });
 

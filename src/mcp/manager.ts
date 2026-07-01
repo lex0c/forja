@@ -499,6 +499,14 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       );
     }
 
+    // Charge the ATTEMPT against the per-session cap BEFORE (re)connecting or
+    // calling. A handshake that FAILS (connect/listTools throws or times out)
+    // must consume the budget too — otherwise the increment below (past the
+    // handshake) never runs, and a broken/malicious server that dies during every
+    // handshake would be respawned on each model retry indefinitely, never
+    // tripping the budget-disconnect above. Counts once per callTool invocation.
+    rt.sessionCalls += 1;
+
     if (!rt.connected) {
       const client = clientFor(rt);
       setState(rt, 'handshaking');
@@ -556,11 +564,6 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
     const client = rt.client;
     if (client === null) throw new Error(`mcp: server '${server}' has no live client`);
     const { signal, timeout } = callSignal(budget.timeoutMs, ctx.signal);
-    // Charge the ATTEMPT against the in-memory cap BEFORE the call — a server
-    // that times out on every call still has to hit the call cap (a successful
-    // call never reaches the increment otherwise, so a runaway-timeout server
-    // would loop forever uncapped).
-    rt.sessionCalls += 1;
     try {
       const res = await client.callTool(toolName, args, signal);
       // Successful call: charge tokens to the in-memory budget + the lifetime DB
@@ -1012,18 +1015,24 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
       }
 
       // AUDIT §1.5: an mcp_servers row is STATE — removed once the server leaves
-      // config. Sweep orphans here. The append-only-forever manifest history
-      // stays, but the row (which holds the command/URL) goes — so a re-added
-      // server re-trusts through the identity gate rather than silently inheriting
-      // the grant by name (a swapped command/URL must be re-confirmed; see the
-      // `existing === null` cache guard above). Compared against ALL configured
-      // names (incl. disabled), so toggling `disabled` keeps the row.
+      // config. But `sessions.db` is USER-GLOBAL while `config.servers` is only
+      // THIS repo's merged config, so a PROJECT-scoped row absent here may simply
+      // belong to ANOTHER repo. Sweeping it would delete that project's cached
+      // trust (its headless runs would then fail-closed, and its interactive runs
+      // would have to re-authorize on the next boot). So only sweep `user`-source
+      // orphans — a user-scoped row absent from the (global) user config really
+      // was removed. A project-scoped orphan is left in place: a genuinely-removed
+      // project server just leaves a harmless stale row, and a re-add pointing at a
+      // CHANGED command/URL still re-trusts via the identity comparison
+      // (`commandChanged`, above) rather than inheriting the grant. Revoked rows
+      // always survive (the revocation must outlast a config round-trip).
+      // Compared against ALL configured names (incl. disabled), so toggling
+      // `disabled` keeps the row.
       const configNames = new Set(config.servers.map((s) => s.name));
       for (const row of listServers(db)) {
-        // Keep a REVOKED row even when its server leaves config: the revocation
-        // must survive a config round-trip (remove + re-add), or the cached
-        // forever-grant would silently re-register it. Non-revoked orphans sweep.
-        if (!configNames.has(row.name) && row.revoked_at == null) deleteServer(db, row.name);
+        if (!configNames.has(row.name) && row.revoked_at == null && row.source === 'user') {
+          deleteServer(db, row.name);
+        }
       }
 
       return { registered, servers, warnings };
