@@ -161,6 +161,8 @@ forja --auto-approve-mcp <comma-separated-server-names>
 
 The flag lists servers by name; it rejects an empty list and rejects `*` (no blanket auto-approve — `ANTI_PATTERNS §6.6`). A denied server is never spawned and its tools never register.
 
+`--auto-approve-mcp` clears **trust**, but it does not override the **per-call** permission decision. A **sandboxed** stdio server's tools are the `mcp` category (auto-allowed), so they run headless. But a server that is **unsandboxed** (`sandbox = false`, or no sandbox tool available) or **remote** produces `mcp.egress` tools — `confirm` by default, which headless resolves to **deny** (egress never auto-approves). To call such a tool headless, pre-authorize it in policy with a `[tools.mcp]` `allow` rule for its `mcp__<server>__<tool>` name.
+
 A **refusing** permission boot (a broken audit chain without `--accept-broken-chain`, or a required-but-unavailable sandbox) skips MCP init entirely: no server is loaded, connected, or spawned — not even an `--auto-approve-mcp` one — since that boot is meant to run nothing at all. This holds in interactive runs too, not just headless.
 
 ### 3.5 History
