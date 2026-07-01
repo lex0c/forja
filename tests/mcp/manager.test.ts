@@ -722,7 +722,11 @@ describe('McpManager.init: credential bindings in the trust identity', () => {
       name: 'gh',
       transport: 'http',
       command: null,
-      url: JSON.stringify({ url: 'https://mcp.example.com/v1', auth: 'TOKEN_A' }),
+      url: JSON.stringify({
+        url: 'https://mcp.example.com/v1',
+        origin: 'https://mcp.example.com',
+        auth: 'TOKEN_A',
+      }),
       source: 'project_shared',
       state: 'trusted',
     });
@@ -748,6 +752,79 @@ describe('McpManager.init: credential bindings in the trust identity', () => {
     expect(report.registered).toBe(0);
     expect(mgr.state('gh')).toBe('denied');
     expect(fake.stats.connects).toBe(0); // never connected with the new token
+  });
+
+  test('re-pointing an env-expanded URL to a different ORIGIN re-triggers trust', async () => {
+    // url = "$MCP_URL" trusted at origin a.example.com; the env var now resolves to
+    // a DIFFERENT origin. rawUrl ("$MCP_URL") is unchanged, but the bearer would be
+    // sent to a new endpoint — the resolved-origin fold must force a re-trust.
+    recordGrantOnly(db, 'gh', [toolDef('query')]);
+    insertServer(db, {
+      name: 'gh',
+      transport: 'http',
+      command: null,
+      url: JSON.stringify({ url: '$MCP_URL', origin: 'https://a.example.com' }),
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        remoteServerConfig({
+          transport: {
+            transport: 'http',
+            url: 'https://evil.example.com/v1', // $MCP_URL now resolves HERE
+            rawUrl: '$MCP_URL', // unchanged raw form
+          },
+        }),
+      ]),
+      // Headless + not auto-approved → the required re-trust fails closed.
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(0);
+    expect(mgr.state('gh')).toBe('denied');
+    expect(fake.stats.connects).toBe(0); // never connected / sent a bearer to the new origin
+  });
+
+  test('an env-expanded URL whose ORIGIN is unchanged (query token rotates) reuses the cached grant', async () => {
+    // Same origin; a $VAR token in the query resolves to a new value. The origin +
+    // raw identity is stable, so the cached grant is honored (no spurious re-trust,
+    // and the resolved token never entered the identity to begin with).
+    recordGrantOnly(db, 'gh', [toolDef('query')]);
+    insertServer(db, {
+      name: 'gh',
+      transport: 'http',
+      command: null,
+      url: JSON.stringify({
+        url: 'https://a.example.com/v1?token=$TOKEN',
+        origin: 'https://a.example.com',
+      }),
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        remoteServerConfig({
+          transport: {
+            transport: 'http',
+            url: 'https://a.example.com/v1?token=ROTATED-VALUE', // resolved token changed
+            rawUrl: 'https://a.example.com/v1?token=$TOKEN', // unchanged raw
+          },
+        }),
+      ]),
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(1); // origin + raw unchanged → cached grant honored
+    expect(fake.stats.made).toBe(0); // no re-connect
   });
 });
 
@@ -2320,8 +2397,10 @@ describe('McpManager: remote transport', () => {
     });
     await mgr.init();
     expect(modalCommand).toBe('https://mcp.example.com/v1?token=$TOKEN'); // modal shows the RAW url
-    expect(getServer(db, 'gh')?.url).toBe('https://mcp.example.com/v1?token=$TOKEN'); // persisted = RAW
-    expect(getServer(db, 'gh')?.url).not.toContain('RESOLVED-SECRET'); // the secret never lands at rest
+    const persisted = getServer(db, 'gh')?.url ?? '';
+    expect(persisted).toContain('token=$TOKEN'); // identity keeps the RAW (unexpanded) url
+    expect(persisted).toContain('"origin":"https://mcp.example.com"'); // + the resolved origin (non-secret)
+    expect(persisted).not.toContain('RESOLVED-SECRET'); // the secret never lands at rest
     await mgr.cleanup();
   });
 
@@ -2386,7 +2465,7 @@ describe('McpManager: remote transport', () => {
     const row2 = getServer(db, 'sw');
     expect(row2?.transport).toBe('http'); // persisted identity flipped to the remote URL
     expect(row2?.command).toBeNull();
-    expect(row2?.url).toBe('https://mcp.example.com/v1');
+    expect(row2?.url).toContain('https://mcp.example.com/v1'); // identity blob carries the remote URL
     await m2.cleanup();
   });
 });

@@ -303,13 +303,31 @@ const stdioCommandIdentity = (t: McpStdioConfig, sessionCwd: string): string => 
   });
 };
 
-// The persisted remote URL identity: the raw (unexpanded) URL, plus the bearer
-// auth env-var NAME when the server binds one — so re-pointing or adding an
-// `auth = { env = "X" }` re-triggers trust before the next connection sends a
-// newly-resolved token to a previously-approved endpoint. Only the NAME (never
-// the token) enters the identity; the no-auth case stays the bare rawUrl string.
-const remoteUrlIdentity = (t: McpRemoteConfig): string =>
-  t.authEnv === undefined ? t.rawUrl : JSON.stringify({ url: t.rawUrl, auth: t.authEnv });
+// The persisted remote URL identity: the raw (unexpanded) URL + the RESOLVED
+// ORIGIN + the bearer auth env-var NAME (when bound).
+//
+// The `origin` (scheme://host:port of the resolved endpoint) is folded in because
+// a `url = "$MCP_URL"` re-pointed to a different origin keeps the SAME rawUrl
+// (`$MCP_URL`), so the raw form alone wouldn't re-trigger trust — and the next
+// connection would send the configured bearer to a new, unreviewed endpoint. The
+// origin is NON-secret: a `$VAR` token expands into the path/query (never the
+// authority), and userinfo (`user:pass@`) is rejected at parse — so persisting +
+// showing the origin leaks nothing while catching an origin change. Only the auth
+// NAME (never the token) enters the identity.
+const remoteUrlIdentity = (t: McpRemoteConfig): string => {
+  let origin: string;
+  try {
+    origin = new URL(t.url).origin;
+  } catch {
+    // parseRemoteTransport already validated http(s) at load; defensive fallback.
+    origin = t.url;
+  }
+  return JSON.stringify({
+    url: t.rawUrl,
+    origin,
+    ...(t.authEnv !== undefined ? { auth: t.authEnv } : {}),
+  });
+};
 
 // The trust IDENTITY of a transport — what persists to mcp_servers and what a
 // change re-triggers trust on. Secrets never land at rest — stdio: the raw argv +

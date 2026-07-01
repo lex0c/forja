@@ -151,6 +151,8 @@ Every string in the modal is sanitized at the render boundary (a hostile manifes
 
 > **Credential bindings are part of the identity.** The trust identity also folds in a server's **unresolved** credential bindings — a stdio `env` table (e.g. `SECRET = "$SECRET"`) and a remote `auth`'s env-var **name**. Adding or re-pointing a binding re-triggers trust before the next spawn/connection hands the newly-resolved secret to a previously-approved command or endpoint. Only the `$VAR` literal / the env-var name enters the identity — never the resolved token. (As with `$VAR` in a command, changing what the *same* `$SECRET` resolves to in your environment is trust over the literal binding and does not re-prompt.)
 
+> **An env-expanded remote URL is trust *per resolved origin*.** A remote `url` may itself be a `$VAR` (`url = "$MCP_URL"`), so the raw form alone can't detect a re-point. The identity therefore also folds in the **resolved origin** (`scheme://host:port`) — a non-secret value: a `$VAR` token expands into the path/query (never the authority), and embedded credentials (`user:pass@`) are rejected at parse. Re-pointing `$MCP_URL` to a **different origin** re-triggers trust before the configured bearer is sent to the new endpoint; a token that rotates *within the same origin* (a `?token=$VAR` in the query) does not re-prompt (the origin + raw form are unchanged, and the token never entered the identity).
+
 ### 3.4 Headless: fail-closed
 
 With no interactive confirmer (one-shot `run`, evals, CI), a server is **denied unless explicitly allowed** via:
