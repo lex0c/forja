@@ -1,5 +1,4 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
-import { resolve } from 'node:path';
 import {
   type EmitFailureEventInput,
   type FailureEventSink,
@@ -195,6 +194,28 @@ const recordGrantOnly = (
   return hash;
 };
 
+// Mirrors manager.ts stdioCommandIdentity: the persisted stdio identity is the
+// raw argv + the effective cwd (+ sorted env when present). `cwd` defaults to
+// process.cwd() — the manager's sessionCwd default when `deps.cwd` is unset.
+const stdioIdentity = (
+  argv: string[],
+  opts: { cwd?: string; env?: Record<string, string> } = {},
+): string => {
+  const cwd = opts.cwd ?? process.cwd();
+  const env = opts.env;
+  return JSON.stringify(
+    env !== undefined && Object.keys(env).length > 0
+      ? {
+          argv,
+          cwd,
+          env: Object.fromEntries(
+            Object.entries(env).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+          ),
+        }
+      : { argv, cwd },
+  );
+};
+
 // A REAL granted server: the forever grant PLUS its identity-bearing mcp_servers
 // row (the manager reuses a cached grant only when the row is present). The row
 // matches serverConfig (stdio fake-bin); idempotent so a caller that inserts its
@@ -205,7 +226,7 @@ const seedTrusted = (db: DB, server: string, tools: McpManifestTool[]): string =
     insertServer(db, {
       name: server,
       transport: 'stdio',
-      command: JSON.stringify(['fake-bin']),
+      command: stdioIdentity(['fake-bin']),
       url: null,
       source: 'project_shared',
       state: 'trusted',
@@ -444,14 +465,12 @@ describe('McpManager.init: auto-approve wins over the interactive prompt', () =>
   });
 });
 
-describe('McpManager.init: stdio trust identity includes cwd (relative executable)', () => {
+describe('McpManager.init: stdio trust identity includes the effective cwd', () => {
   const relativeConfig = (over: Partial<McpServerConfig> = {}): McpServerConfig =>
     serverConfig({
       transport: { transport: 'stdio', command: './server', args: [], rawArgv: ['./server'] },
       ...over,
     });
-  // The persisted identity for `./server` resolved against a given directory.
-  const relIdentity = (cwd: string): string => JSON.stringify([resolve(cwd, './server')]);
   const seedRow = (command: string) => {
     recordGrantOnly(db, 'db', [toolDef('query')]);
     insertServer(db, {
@@ -465,7 +484,7 @@ describe('McpManager.init: stdio trust identity includes cwd (relative executabl
   };
 
   test('reuses cached trust when launched from the SAME cwd', async () => {
-    seedRow(relIdentity('/dir-a'));
+    seedRow(stdioIdentity(['./server'], { cwd: '/dir-a' }));
     const fake = fakeClientFactory({ tools: [toolDef('query')] });
     const mgr = createMcpManager({
       db,
@@ -482,7 +501,7 @@ describe('McpManager.init: stdio trust identity includes cwd (relative executabl
   });
 
   test('does NOT reuse cached trust from a DIFFERENT cwd (relative binary would differ)', async () => {
-    seedRow(relIdentity('/dir-a')); // grant authorized in /dir-a
+    seedRow(stdioIdentity(['./server'], { cwd: '/dir-a' })); // grant authorized in /dir-a
     const fake = fakeClientFactory({ tools: [toolDef('query')] });
     const mgr = createMcpManager({
       db,
@@ -500,8 +519,33 @@ describe('McpManager.init: stdio trust identity includes cwd (relative executabl
     expect(fake.stats.connects).toBe(0); // never spawned the relocated binary
   });
 
-  test('an explicit cfg.cwd change re-triggers trust for a relative executable', async () => {
-    seedRow(relIdentity('/authorized'));
+  test('a bare interpreter with a relative script (node ./s.js) re-trusts on a cwd change', async () => {
+    // The finding's headline: argv[0] is a PATH binary (`node`), but the relative
+    // SCRIPT resolves against cwd, so a moved cwd runs a different script.
+    const nodeScript = {
+      transport: 'stdio' as const,
+      command: 'node',
+      args: ['./server.js'],
+      rawArgv: ['node', './server.js'],
+    };
+    seedRow(stdioIdentity(['node', './server.js'], { cwd: '/proj-a' }));
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ transport: nodeScript })]),
+      cwd: '/proj-b', // ./server.js now resolves to a different file
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(0);
+    expect(mgr.state('db')).toBe('denied');
+    expect(fake.stats.connects).toBe(0);
+  });
+
+  test('an explicit cfg.cwd change re-triggers trust', async () => {
+    seedRow(stdioIdentity(['./server'], { cwd: '/authorized' }));
     const fake = fakeClientFactory({ tools: [toolDef('query')] });
     const mgr = createMcpManager({
       db,
@@ -526,29 +570,56 @@ describe('McpManager.init: stdio trust identity includes cwd (relative executabl
     expect(mgr.state('db')).toBe('denied');
   });
 
-  test('an ABSOLUTE executable is cwd-independent (no spurious re-trust)', async () => {
-    seedRow(JSON.stringify(['/opt/mcp/server']));
-    const fake = fakeClientFactory({ tools: [toolDef('query')] });
-    const mgr = createMcpManager({
+  test('an ABSOLUTE executable STILL re-trusts on a cwd change (sandbox writable root moves)', async () => {
+    // Even though the binary doesn't move, cwd is the sandbox writable root — a
+    // cwd change lets the server write to a different directory, so re-trust.
+    const absConfig = (): McpServerConfig =>
+      serverConfig({
+        transport: {
+          transport: 'stdio',
+          command: '/opt/mcp/server',
+          args: [],
+          rawArgv: ['/opt/mcp/server'],
+        },
+      });
+    seedRow(stdioIdentity(['/opt/mcp/server'], { cwd: '/dir-a' }));
+
+    // Same cwd → cached grant honored (no spurious re-trust).
+    const same = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgrSame = createMcpManager({
       db,
       registry,
-      config: config([
-        serverConfig({
-          transport: {
-            transport: 'stdio',
-            command: '/opt/mcp/server',
-            args: [],
-            rawArgv: ['/opt/mcp/server'],
-          },
-        }),
-      ]),
-      cwd: '/somewhere-new', // different cwd, but an absolute path doesn't move
-      makeClient: fake.makeClient,
+      config: config([absConfig()]),
+      cwd: '/dir-a',
+      makeClient: same.makeClient,
     });
-    const report = await mgr.init();
+    expect((await mgrSame.init()).registered).toBe(1);
+    expect(same.stats.made).toBe(0);
 
-    expect(report.registered).toBe(1); // cached trust honored despite the cwd change
-    expect(fake.stats.made).toBe(0);
+    // Different cwd → re-trust (writable root moved).
+    const db2 = openMemoryDb();
+    migrate(db2);
+    recordGrantOnly(db2, 'db', [toolDef('query')]);
+    insertServer(db2, {
+      name: 'db',
+      transport: 'stdio',
+      command: stdioIdentity(['/opt/mcp/server'], { cwd: '/dir-a' }),
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    const moved = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgrMoved = createMcpManager({
+      db: db2,
+      registry: createToolRegistry(),
+      config: config([absConfig()]),
+      cwd: '/dir-b', // writable root moves to /dir-b
+      makeClient: moved.makeClient,
+    });
+    const report = await mgrMoved.init();
+    expect(report.registered).toBe(0);
+    expect(mgrMoved.state('db')).toBe('denied');
+    expect(moved.stats.connects).toBe(0);
   });
 });
 
@@ -625,7 +696,7 @@ describe('McpManager.init: credential bindings in the trust identity', () => {
     insertServer(db, {
       name: 'db',
       transport: 'stdio',
-      command: JSON.stringify({ argv: ['fake-bin'], env: { SECRET: '$SECRET' } }),
+      command: stdioIdentity(['fake-bin'], { env: { SECRET: '$SECRET' } }),
       url: null,
       source: 'project_shared',
       state: 'trusted',
@@ -821,7 +892,7 @@ describe('McpManager.callTool', () => {
     insertServer(db, {
       name: 'db',
       transport: 'stdio',
-      command: JSON.stringify(['fake-bin']),
+      command: stdioIdentity(['fake-bin']),
       url: null,
       source: 'project_shared',
       state: 'trusted',
@@ -914,12 +985,12 @@ describe('McpManager: disabled servers are skipped', () => {
 });
 
 describe('McpManager: code-review hardening', () => {
-  // A prior session's mcp_servers row pinning the last-trusted command.
+  // A prior session's mcp_servers row pinning the last-trusted command identity.
   const priorRow = (command: string[]) =>
     insertServer(db, {
       name: 'db',
       transport: 'stdio',
-      command: JSON.stringify(command),
+      command: stdioIdentity(command),
       url: null,
       source: 'project_shared',
       state: 'trusted',
@@ -1163,7 +1234,7 @@ describe('McpManager: review hardening', () => {
     insertServer(db, {
       name: 'db',
       transport: 'stdio',
-      command: JSON.stringify(['fake-bin']),
+      command: stdioIdentity(['fake-bin']),
       url: null,
       source: 'project_shared',
       state: 'trusted',

@@ -27,7 +27,7 @@
 // before-hard-cap budget tier + remote OAuth are future; states are set directly
 // here (the pure transition table in state.ts is the documented reference).
 
-import { isAbsolute, join, resolve } from 'node:path';
+import { join } from 'node:path';
 import type { FailureEventSink } from '../failures/index.ts';
 import { charsToTokens } from '../providers/tokens.ts';
 import type { DB } from '../storage/db.ts';
@@ -273,35 +273,34 @@ const estimateResultTokens = (res: McpCallResult): number => {
   return charsToTokens(chars);
 };
 
-// The persisted stdio command identity: the raw argv, but with a RELATIVE
-// executable resolved to its absolute path against the effective working
-// directory (`cfg.cwd`, else the session cwd — the same fallback the client
-// spawns with). A relative `argv[0]` (`./server`, `bin/mcp`) names a DIFFERENT
-// binary when the same config is launched from another directory, so folding the
-// resolved path into the identity re-triggers trust on a cwd change (the
-// pre-connect gate + manifest prompt run again) instead of silently spawning
-// whatever now sits at that relative path. An absolute path or a bare PATH name
-// (`node`, `npx`, or a `$VAR`) is cwd-independent — kept raw, so no spurious
-// re-trust and a `$VAR` never resolves at rest.
+// The persisted stdio command identity: the raw argv + the EFFECTIVE working
+// directory + the UNRESOLVED env bindings.
+//
+// `cwd` (`cfg.cwd`, else the session cwd — the same `cfg.cwd ?? process.cwd()`
+// the client spawns AND sandbox-wraps with) is folded in because it is
+// load-bearing twice over: it is the base a relative `argv[0]`/script resolves
+// against (`["node", "./server.js"]` runs a DIFFERENT script from another
+// directory) AND it is the sandbox's writable root (`cwd-rw` makes only the cwd
+// writable). So ANY cwd change — even for an absolute or PATH-binary `argv[0]` —
+// moves what runs or what the server can write, and must re-trigger the
+// pre-connect gate + manifest prompt rather than ride the cached grant. The argv
+// stays RAW (a `$VAR` binary never resolves at rest; the modal shows the literal).
+//
+// The env bindings are the UNRESOLVED table (`SECRET = "$SECRET"`) so adding or
+// changing a credential re-trusts before the next spawn passes the newly-resolved
+// secret to an approved command — without persisting the resolved value. Sorted
+// for a determinism-stable identity; omitted entirely when there is no env.
 const stdioCommandIdentity = (t: McpStdioConfig, sessionCwd: string): string => {
-  const [exe, ...rest] = t.rawArgv;
-  const relative = exe !== undefined && !isAbsolute(exe) && /[/\\]/.test(exe);
-  const argv =
-    exe === undefined
-      ? [...t.rawArgv]
-      : [relative ? resolve(t.cwd ?? sessionCwd, exe) : exe, ...rest];
-  // Fold the UNRESOLVED env bindings in when present, so adding/changing a
-  // credential entry (`SECRET = "$SECRET"`) re-triggers trust before the next
-  // spawn passes the newly-resolved secret to a previously-approved command —
-  // WITHOUT persisting the resolved value (only the `$VAR` literal). Sorted for a
-  // determinism-stable identity. The no-env case stays a bare argv array so
-  // existing identities don't churn.
   const rawEnv = t.rawEnv;
-  if (rawEnv === undefined || Object.keys(rawEnv).length === 0) return JSON.stringify(argv);
-  const env = Object.fromEntries(
-    Object.entries(rawEnv).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
-  );
-  return JSON.stringify({ argv, env });
+  const env =
+    rawEnv !== undefined && Object.keys(rawEnv).length > 0
+      ? Object.fromEntries(Object.entries(rawEnv).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+      : undefined;
+  return JSON.stringify({
+    argv: t.rawArgv,
+    cwd: t.cwd ?? sessionCwd,
+    ...(env !== undefined ? { env } : {}),
+  });
 };
 
 // The persisted remote URL identity: the raw (unexpanded) URL, plus the bearer
@@ -313,10 +312,10 @@ const remoteUrlIdentity = (t: McpRemoteConfig): string =>
   t.authEnv === undefined ? t.rawUrl : JSON.stringify({ url: t.rawUrl, auth: t.authEnv });
 
 // The trust IDENTITY of a transport — what persists to mcp_servers and what a
-// change re-triggers trust on. Secrets never land at rest — stdio: the raw argv
-// (relative executable resolved) + the UNRESOLVED env bindings; remote: the raw
-// (unexpanded) URL + the auth env-var NAME. `display` is the operator-facing form
-// for the trust modal (always the RAW argv / URL, no folded metadata).
+// change re-triggers trust on. Secrets never land at rest — stdio: the raw argv +
+// the effective cwd + the UNRESOLVED env bindings; remote: the raw (unexpanded)
+// URL + the auth env-var NAME. `display` is the operator-facing form for the
+// trust modal (always the RAW argv / URL, no folded metadata).
 const transportIdentity = (
   t: McpTransportConfig,
   sessionCwd: string,
