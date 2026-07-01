@@ -1653,7 +1653,20 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       ...(input.autoApproveMcp !== undefined ? { autoApprove: input.autoApproveMcp } : {}),
       ...(input.mcpMakeClient !== undefined ? { makeClient: input.mcpMakeClient } : {}),
     });
-    mcpInit = await mcpManager.init();
+    // Fail-closed boot short-circuit. When `permResult.state === 'refusing'`
+    // (broken audit chain without --accept-broken-chain, or
+    // sandbox-required-but-unavailable) the permission engine is a
+    // deny-everything stub and run.ts exits non-zero — but `init()` would still
+    // connect to a remote server (sending its bearer) or spawn an arbitrary
+    // stdio binary BEFORE that exit, both interactively and headless with
+    // --auto-approve-mcp. That leaks exactly the side effects the refusal
+    // exists to prevent. Skip init on a refusing boot; the manager is still
+    // constructed (registers nothing, connects nothing) so cleanup() and the
+    // HarnessConfig wiring stay valid.
+    mcpInit =
+      permResult.state === 'refusing'
+        ? { registered: 0, servers: [], warnings: [] }
+        : await mcpManager.init();
   } catch (e) {
     closeDb(db);
     throw e;

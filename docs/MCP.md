@@ -157,6 +157,8 @@ forja --auto-approve-mcp <comma-separated-server-names>
 
 The flag lists servers by name; it rejects an empty list and rejects `*` (no blanket auto-approve — `ANTI_PATTERNS §6.6`). A denied server is never spawned and its tools never register.
 
+A **refusing** permission boot (a broken audit chain without `--accept-broken-chain`, or a required-but-unavailable sandbox) skips MCP init entirely: no server is loaded, connected, or spawned — not even an `--auto-approve-mcp` one — since that boot is meant to run nothing at all. This holds in interactive runs too, not just headless.
+
 ### 3.5 History
 
 Every decision (`granted` / `denied` / `revoked` / `superseded`) appends to `mcp_manifest_history`, which is **append-only and never pruned**. A re-**seen** server whose identity row is still present (a restart, a `disabled` toggle) with a matching command + hash re-uses its cached grant with no fresh prompt. A server **removed from config and re-added** — its identity row swept — re-trusts through the pre-connect identity gate: the grant is not inherited by name, so a re-added entry pointing at a different command/URL can't ride the old trust.
