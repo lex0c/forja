@@ -830,18 +830,22 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         };
         runtime.set(server.name, rt);
 
-        // Ensure a row exists (stdio command stored RAW/redacted; remote URL).
-        // On an EXISTING server whose configured transport identity differs from
-        // the last-trusted one, bypass the cache + force a re-trust — the binary
-        // was swapped or the URL re-pointed.
-        const id = transportIdentity(server.transport);
+        // Ensure a row exists so the trust flow's state transitions persist — but
+        // WITHOUT an identity yet (command + url null). The real identity is written
+        // only when a grant succeeds (syncTrustedCommand). Persisting the configured
+        // identity HERE would survive a DENIED re-add (the row is inserted before the
+        // pre-connect identity gate runs), and the next boot — seeing `existing !==
+        // null` with a matching command — would reuse the old `mcp_manifest_history`
+        // grant by name, running the very command the operator just declined. With a
+        // null identity, `transportChanged` reports a mismatch until a grant lands, so
+        // a never-granted (or declined) server always re-trusts through the gate.
         const existing = getServer(db, server.name);
         if (existing === null) {
           insertServer(db, {
             name: server.name,
             transport: server.transport.transport,
-            command: id.command,
-            url: id.url,
+            command: null,
+            url: null,
             source: server.source,
             state: 'disconnected',
           });

@@ -664,6 +664,48 @@ describe('McpManager: stale-row sweep (AUDIT §1.5)', () => {
     expect(fake.stats.made).toBe(0); // declined at the gate → never connected
   });
 
+  test('a DECLINED re-add leaves no approved identity for the NEXT boot to reuse', async () => {
+    // The init "ensure a row" insert runs BEFORE the identity gate. If it persisted
+    // the configured identity, a declined re-add would leave an approved-looking row,
+    // and the next boot (existing !== null, matching command) would reuse the old
+    // grant by name. The row is inserted with a NULL identity until a grant lands.
+    recordGrantOnly(db, 'db', [toolDef('query')]); // grant, no row (swept state)
+
+    // Boot 1: re-added, operator DECLINES.
+    const f1 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m1 = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      confirmTrust: async () => 'no',
+      makeClient: f1.makeClient,
+    });
+    await m1.init();
+    expect(m1.state('db')).toBe('denied');
+    await m1.cleanup();
+
+    // Boot 2 (fresh manager + registry, same DB): the row boot 1 left must NOT let
+    // the cached grant register the declined server — the identity gate fires again.
+    const reg2 = createToolRegistry();
+    const f2 = fakeClientFactory({ tools: [toolDef('query')] });
+    let boot2Prompted = false;
+    const m2 = createMcpManager({
+      db,
+      registry: reg2,
+      config: config([serverConfig()]),
+      confirmTrust: async () => {
+        boot2Prompted = true;
+        return 'no';
+      },
+      makeClient: f2.makeClient,
+    });
+    await m2.init();
+    expect(boot2Prompted).toBe(true); // re-trusted (gate fired), not silently cached
+    expect(reg2.has('mcp__db__query')).toBe(false); // NOT registered from the stale grant
+    expect(f2.stats.made).toBe(0); // declined again → never connected
+    await m2.cleanup();
+  });
+
   test('a disabled server keeps its row (still in config, just off)', async () => {
     insertServer(db, {
       name: 'db',
