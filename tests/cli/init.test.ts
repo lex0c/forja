@@ -214,13 +214,14 @@ describe('runInit — gitignore step', () => {
     expect(existsSync(target)).toBe(true);
     const body = readFileSync(target, 'utf8');
     // Pins the default content surface — sessions.db,
-    // sessions.db-*, traces/, checkpoints/, memory/local/, *.log
-    // (per MEMORY.md §2.5).
+    // sessions.db-*, traces/, checkpoints/, memory/local/,
+    // mcp.local.toml, *.log (per MEMORY.md §2.5 + MCP.md §2.1).
     expect(body).toContain('sessions.db');
     expect(body).toContain('sessions.db-*');
     expect(body).toContain('traces/');
     expect(body).toContain('checkpoints/');
     expect(body).toContain('memory/local/');
+    expect(body).toContain('mcp.local.toml');
     expect(body).toContain('*.log');
   });
 
