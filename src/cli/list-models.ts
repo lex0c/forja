@@ -10,9 +10,13 @@
 // per model, then a `{ count, ready_count }` summary line.
 //
 // Two deliberate honesty rules:
-//   - Readiness is key-PRESENCE only. It does NOT probe a local Ollama
+//   - Readiness is key-PRESENCE only, and it does NOT probe a local Ollama
 //     daemon — that stays a reactive error at generate time (a listing
-//     shouldn't hang on a network/daemon check).
+//     shouldn't hang on a network/daemon check). A missing `api_key_env`
+//     counts as "ready" ONLY for a local keyless family (ollama / llama_cpp);
+//     an SDK-backed family without one still needs a key from an
+//     adapter-default env we can't name or verify here, so it shows
+//     `needs key` rather than a false `ready`.
 //   - Pricing values are dollars-per-MILLION tokens despite the
 //     `cost_per_1k_*` field names (see `<family>/capabilities.ts`), so the
 //     display and the JSON label them `/1M` (`cost_per_1m_*`).
@@ -57,10 +61,19 @@ interface ModelRow {
   isDefault: boolean;
 }
 
+// Families that run locally with NO API key. A missing `api_key_env` means
+// "no key needed" only for these; for an SDK-backed family the adapter falls
+// back to its own default env (types.ts §ModelProviderEntry) — a key this
+// catalog-only view can neither name nor verify — so a keyless SDK-backed
+// entry must NOT be reported ready (selecting it would fail at boot/generate).
+const KEYLESS_FAMILIES: ReadonlySet<string> = new Set(['ollama', 'llama_cpp']);
+
 const isReady = (entry: ModelProviderEntry, env: NodeJS.ProcessEnv): boolean => {
-  // No configured key env ⇒ nothing to set (local inference). We do not
-  // reach out to confirm a daemon is up; that surfaces reactively.
-  if (entry.api_key_env === undefined) return true;
+  if (entry.api_key_env === undefined) {
+    // Keyless: genuinely ready only for a local keyless family. We do not
+    // probe the daemon — reachability surfaces reactively at generate time.
+    return KEYLESS_FAMILIES.has(entry.family);
+  }
   const value = env[entry.api_key_env];
   return value !== undefined && value.length > 0;
 };
@@ -81,7 +94,9 @@ const toRow = (entry: ModelProviderEntry, env: NodeJS.ProcessEnv): ModelRow => (
 });
 
 const statusText = (r: ModelRow): string => {
-  if (r.apiKeyEnv === undefined) return r.family === 'ollama' ? 'ready (local)' : 'ready';
+  // Keyless local family → ready (local); keyless SDK-backed family → its
+  // key comes from an adapter-default env we can't confirm, so `needs key`.
+  if (r.apiKeyEnv === undefined) return r.ready ? 'ready (local)' : 'needs key';
   return r.ready ? 'ready' : `needs ${r.apiKeyEnv}`;
 };
 

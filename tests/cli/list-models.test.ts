@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { runListModelsCli } from '../../src/cli/list-models.ts';
+import { modelProvidersPath, serializeModelProviders } from '../../src/providers/catalog-io.ts';
 import { CANONICAL_MODEL_PROVIDERS } from '../../src/providers/seed-catalog.ts';
+import type { ModelProviderEntry } from '../../src/providers/types.ts';
 import { seedModelCatalog } from '../helpers/seed-catalog.ts';
 
 // The handler takes an explicit `env`, so we build an isolated one
@@ -138,5 +140,58 @@ describe('runListModelsCli — missing catalog', () => {
     expect(code).toBe(1);
     expect(outBuf).toBe('');
     expect(errBuf).toContain('forja init');
+  });
+});
+
+describe('runListModelsCli — keyless entries', () => {
+  // Write a hand-authored catalog (not the canonical seed) so we can craft
+  // the keyless-SDK edge case the seed never ships.
+  const writeCatalog = (entries: ModelProviderEntry[]): void => {
+    const path = modelProvidersPath(baseEnv);
+    if (path === null) throw new Error('no catalog path resolvable in test env');
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, serializeModelProviders(entries));
+  };
+
+  test('a keyless SDK-backed family (openai, no api_key_env) is NOT ready', () => {
+    const openai = CANONICAL_MODEL_PROVIDERS.find((e) => e.family === 'openai');
+    if (openai === undefined) throw new Error('expected an openai seed entry');
+    // The loader only validates api_key_env when present, so an operator can
+    // omit it; the adapter would then rely on its own default env, which this
+    // catalog-only view can neither name nor verify. Craft that entry.
+    const keyless: ModelProviderEntry = {
+      id: openai.id,
+      family: openai.family,
+      model_name: openai.model_name,
+      capabilities: openai.capabilities,
+    };
+    writeCatalog([keyless]); // baseEnv has no provider keys (cleared in beforeEach)
+
+    const jsonCode = runListModelsCli({ json: true, env: baseEnv, out, err });
+    expect(jsonCode).toBe(0);
+    const model = JSON.parse(outBuf.trim().split('\n')[0] ?? '{}');
+    expect(model.family).toBe('openai');
+    expect(model.api_key_env).toBeUndefined();
+    expect(model.ready).toBe(false);
+
+    outBuf = '';
+    runListModelsCli({ json: false, env: baseEnv, out, err });
+    const line = outBuf.split('\n').find((l) => l.startsWith('openai/'));
+    expect(line).toBeDefined();
+    expect(line).toContain('needs key');
+  });
+
+  test('a keyless local family (ollama, no api_key_env) IS ready (local)', () => {
+    const localOllama = CANONICAL_MODEL_PROVIDERS.find(
+      (e) => e.family === 'ollama' && e.api_key_env === undefined,
+    );
+    if (localOllama === undefined) throw new Error('expected a local ollama seed entry');
+    writeCatalog([localOllama]);
+
+    const code = runListModelsCli({ json: true, env: baseEnv, out, err });
+    expect(code).toBe(0);
+    const model = JSON.parse(outBuf.trim().split('\n')[0] ?? '{}');
+    expect(model.ready).toBe(true);
+    expect(model.api_key_env).toBeUndefined();
   });
 });
