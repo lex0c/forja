@@ -786,6 +786,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       sandboxConfigWarnings,
       verifyConfigWarnings,
       mcpConfigWarnings,
+      meshConfigWarnings,
       permissionState,
       permissionRefusingReason,
       permissionChain,
@@ -917,6 +918,9 @@ export const run = async (options: RunOptions): Promise<number> => {
       // payload could otherwise repaint the banner.
       for (const w of mcpConfigWarnings) {
         errSink(`forja: mcp: ${flattenControlToLine(w)}\n`);
+      }
+      for (const w of meshConfigWarnings) {
+        errSink(`forja: mesh: ${flattenControlToLine(w)}\n`);
       }
     }
 

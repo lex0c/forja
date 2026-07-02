@@ -72,5 +72,10 @@ proactive_inject = ${m.proactiveInject}
 
 [recap]
 enabled = true
+
+[mesh]
+max_rounds = 8
+max_message_bytes = 32768
+max_concurrent_conversations = 4
 `;
 };

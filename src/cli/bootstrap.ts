@@ -53,6 +53,9 @@ import {
   resolveScopeRoots,
 } from '../memory/index.ts';
 import type { ProbeSharedTrustResult } from '../memory/index.ts';
+import { loadMeshConfig } from '../mesh/config.ts';
+import { createMeshManager } from '../mesh/manager.ts';
+import { meshRuntimeDir } from '../mesh/registry.ts';
 import { createSqliteOutcomeSink } from '../outcomes/index.ts';
 import {
   type ApprovalPosture,
@@ -189,6 +192,12 @@ export interface BootstrapInput {
   // userAgentsDir: `null` disables the user layer (keeps a developer's real
   // ~/.config/forja/mcp.toml out of a test's bootstrap), absent = default.
   userMcpPath?: string | null;
+  // Test seams for the mesh subsystem (MESH.md). `meshConfigPath` overrides the
+  // [mesh] config.toml lookup (null ⇒ defaults); `meshSocketDir` overrides the
+  // runtime dir where sockets + descriptors live, isolating tests from the real
+  // $XDG_RUNTIME_DIR.
+  meshConfigPath?: string | null;
+  meshSocketDir?: string;
   // --auto-approve-mcp <list>: MCP servers granted trust without a prompt
   // (CI/headless). Threaded into the MCP manager's `autoApprove`.
   autoApproveMcp?: ReadonlySet<string>;
@@ -442,6 +451,9 @@ export interface BootstrapResult {
   // handshake failures, unreadable cached manifests — surfaced on the stderr
   // banner so an operator whose MCP server was skipped sees why.
   mcpConfigWarnings: readonly string[];
+  // Warnings from the [mesh] config loader (unknown key / over-ceiling value /
+  // invalid alias), surfaced on the same stderr banner.
+  meshConfigWarnings: readonly string[];
   // Final state of the permission engine after bootstrap walked
   // init → loading-policy → validating-chain → ready/refusing.
   // When this is `refusing`, the engine is a deny-everything stub
@@ -1718,6 +1730,21 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     projectConfigCwd,
   );
 
+  // Mesh subsystem (MESH.md §10). No init()/DB: constructed at boot so /relay
+  // and the mesh tools reach the handle; the server socket only binds on /relay,
+  // the client dials on-demand. Branch is best-effort (cosmetic in the
+  // descriptor). Fail-soft: config warnings ride the stderr banner, never abort.
+  const meshLoaded = loadMeshConfig({
+    cwd: projectConfigCwd,
+    ...(input.meshConfigPath !== undefined ? { configPathOverride: input.meshConfigPath } : {}),
+  });
+  const meshManager = createMeshManager({
+    dir: input.meshSocketDir ?? meshRuntimeDir(),
+    config: meshLoaded.config,
+    repoRoot: projectConfigCwd,
+    branch: probeGitContext(projectConfigCwd)?.branch ?? 'unknown',
+  });
+
   const config: HarnessConfig = {
     provider,
     // Model catalog (PLAYBOOKS.md §1.1), threaded so the `task` tool's spawn
@@ -1733,6 +1760,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     bgLogDir,
     broker,
     mcpManager,
+    meshManager,
     userPrompt: input.prompt,
     // Checkpoints (M3 §12): enabled for every CLI run by default
     // so users get `--undo` for free.
@@ -1930,6 +1958,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     sandboxConfigWarnings: sandboxLoaded.warnings,
     verifyConfigWarnings: verifyLoaded.warnings,
     mcpConfigWarnings: mcpInit.warnings,
+    meshConfigWarnings: meshLoaded.warnings,
     permissionState: permResult.state,
     ...(permResult.refusingReason !== undefined
       ? { permissionRefusingReason: permResult.refusingReason }

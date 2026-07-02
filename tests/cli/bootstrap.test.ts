@@ -163,6 +163,29 @@ describe('bootstrap', () => {
     db.close();
   });
 
+  test('wires a mesh manager (constructed, not serving until /relay)', async () => {
+    const { config, db } = await bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      userMcpPath: null,
+      // Isolate the mesh runtime dir from the real $XDG_RUNTIME_DIR, and take
+      // [mesh] defaults (no config file).
+      meshSocketDir: join(workdir, 'mesh-runtime'),
+      meshConfigPath: null,
+    });
+    // Constructed and reachable, but the server socket does not bind until
+    // /relay, and there are no peers in the isolated runtime dir (MESH.md §6.1).
+    expect(config.meshManager).toBeDefined();
+    expect(config.meshManager?.isServing()).toBe(false);
+    expect(config.meshManager?.listPeers()).toEqual([]);
+    expect((config.meshManager?.alias ?? '').length).toBeGreaterThan(0);
+    db.close();
+  });
+
   test('registers trusted MCP tools from mcp.toml into the registry', async () => {
     const mcpTomlPath = join(workdir, '.forja', 'mcp.toml');
     mkdirSync(dirname(mcpTomlPath), { recursive: true });

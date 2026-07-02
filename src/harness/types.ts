@@ -1241,6 +1241,10 @@ export interface HarnessConfig {
   // tool — but the CLI holds it to `cleanup()` (disconnect all) at teardown.
   // Optional so headless / SDK callers without MCP don't construct one.
   mcpManager?: import('../mcp/manager.ts').McpManager;
+  // Mesh subsystem manager (MESH.md). Unlike MCP, no init()/DB — the server
+  // socket only binds on /relay, the client dials on-demand. The CLI holds it
+  // so /relay + the mesh tools reach it, and to shutdown() at teardown.
+  meshManager?: import('../mesh/manager.ts').MeshManager;
   // §18 telemetry sink (slice 111, R10 #48). When wired, the
   // harness emits structured events for cross-cutting signals
   // that don't fit the audit row shape — currently `sandbox

@@ -655,6 +655,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     sandboxConfigWarnings,
     verifyConfigWarnings,
     mcpConfigWarnings,
+    meshConfigWarnings,
     sandboxEnforcement,
     permissionState,
     permissionRefusingReason,
@@ -871,6 +872,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // HTTP body), so an unsanitized ANSI/control payload could repaint the banner.
   for (const w of mcpConfigWarnings) {
     errSink(`forja: mcp: ${flattenControlToLine(w)}\n`);
+  }
+  for (const w of meshConfigWarnings) {
+    errSink(`forja: mesh: ${flattenControlToLine(w)}\n`);
   }
   // Shared-corpus trust probe outcome (S5/T5.2 + T5.3). Render a
   // single summary line so operators see what the modal decision

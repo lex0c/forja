@@ -16,6 +16,7 @@
 //      descarta a linha".
 //
 import { safeJsonParse } from '../broker/safe-json.ts';
+import { createLineFramer } from '../wire/ndjson.ts';
 
 export const IPC_PROTOCOL_VERSION = 1;
 
@@ -429,109 +430,9 @@ export interface IpcTransport {
   close(): void;
 }
 
-// Per-line cap (UTF-16 code units in the partial-line buffer).
-// Spec §2.2: "Limite por mensagem: 1 MB. Acima disso, fragmentar
-// em chunks ou referenciar via SQLite." 1Mi chars holds the spec
-// cap with ASCII-heavy JSON (≈ 1 byte/char) and ~2-4 MiB UTF-16
-// in RAM in the worst case — bounded.
-//
-// Without this cap, a peer that sends bytes without a `\n` (buggy
-// child in a loop, or compromised binary crafting an OOM
-// payload) would grow the framer's buffer indefinitely until the
-// JS heap dies. The cap is the OOM seatbelt.
-//
-// Tunable via `lineCap` argument for tests that want to exercise
-// the resync path quickly without allocating a megabyte.
-const DEFAULT_LINE_CAP = 1 << 20; // 1 MiB (UTF-16 code units)
-
-// Frame raw byte chunks into complete UTF-8 lines. Stateful — the
-// caller pushes chunks (which may span line boundaries arbitrarily)
-// and the framer emits whole lines via the callback. Trailing
-// partial line is held in the buffer until the next push or a
-// `flush()` call.
-//
-// UTF-8 safety: TextDecoder with `{ stream: true }` handles
-// multi-byte sequences split across chunks. Without `stream: true`
-// a single 4-byte emoji split across two chunks would corrupt
-// into U+FFFD replacement chars.
-//
-// Overflow safety: the partial-line buffer is capped (default
-// 1 MiB UTF-16 code units). When a line exceeds the cap the
-// framer drops the buffer, fires `onOverflow(droppedChars)`, and
-// enters a resync state — discarding bytes until the next `\n`,
-// then resuming normal framing. Spec §4.5 mandates the channel
-// survives a malformed line; "line too long" is the same shape
-// of survivable diagnostic.
-const createLineFramer = (
-  onLine: (line: string) => void,
-  options: { onOverflow?: (droppedChars: number) => void; lineCap?: number } = {},
-) => {
-  const decoder = new TextDecoder('utf-8');
-  const lineCap = options.lineCap ?? DEFAULT_LINE_CAP;
-  let buf = '';
-  // True after an overflow, until we observe the next `\n` and
-  // resume framing. While resyncing, every chunk is scanned for
-  // the boundary and discarded otherwise.
-  let resyncing = false;
-  return {
-    push(chunk: Uint8Array): void {
-      const decoded = decoder.decode(chunk, { stream: true });
-      let pending: string;
-      if (resyncing) {
-        const boundary = decoded.indexOf('\n');
-        if (boundary === -1) {
-          // Still hunting for the end of the over-cap line.
-          // Don't grow the buffer — we know we're discarding.
-          return;
-        }
-        // Found end of bad line; resume normal framing from
-        // after it. Anything before is dropped.
-        resyncing = false;
-        pending = decoded.slice(boundary + 1);
-      } else {
-        pending = decoded;
-      }
-      buf += pending;
-      // Walk buffer for LFs. The remainder after the last LF is
-      // the partial line; keep it for the next push. A buffer
-      // with no LF this round just accumulates.
-      let nl = buf.indexOf('\n');
-      while (nl !== -1) {
-        const line = buf.slice(0, nl);
-        buf = buf.slice(nl + 1);
-        if (line.length > 0) onLine(line);
-        nl = buf.indexOf('\n');
-      }
-      // Cap check: if the trailing partial line outgrew the cap
-      // without finding `\n`, drop it and resync. The dropped
-      // count goes through the diagnostic channel so operators
-      // can investigate; the wire stays open.
-      if (buf.length > lineCap) {
-        const dropped = buf.length;
-        buf = '';
-        resyncing = true;
-        options.onOverflow?.(dropped);
-      }
-    },
-    flush(): void {
-      // Stream end may or may not include a trailing LF. If a
-      // partial line is held, emit it now — the framer's
-      // contract is to deliver every byte the peer wrote.
-      // (Spec §2.2: "Mensagens com caracteres binários" are
-      // base64-encoded — partial UTF-8 sequences at flush time
-      // are decoder errors, not silent drops.)
-      // If we ended mid-resync (peer broke the pipe before the
-      // next `\n` boundary), the remaining buffer is empty —
-      // nothing to flush, no diagnostic to repeat.
-      const tail = buf + decoder.decode();
-      if (tail.length > 0) onLine(tail);
-      buf = '';
-    },
-    reset(): void {
-      buf = '';
-    },
-  };
-};
+// Line framing (byte chunks → LF-delimited UTF-8 lines) lives in the shared
+// wire module — `createLineFramer` is imported at the top so the mesh
+// transport reuses the exact same framer (cap + resync + UTF-8 streaming).
 
 // In-memory transport pair for tests. Each side's `write` enqueues
 // lines onto the OTHER side's onLine listeners; `close` propagates
