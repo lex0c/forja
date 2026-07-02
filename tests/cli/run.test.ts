@@ -19,6 +19,7 @@ const baseArgs = (overrides: Partial<ParsedArgs> = {}): ParsedArgs => ({
   listSessions: false,
   includeSubagents: false,
   explainPermissions: false,
+  listModels: false,
   yes: false,
   ...overrides,
 });

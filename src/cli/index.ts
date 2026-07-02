@@ -217,6 +217,11 @@ const main = async (): Promise<number> => {
     args.worktrees !== undefined ||
     args.memory !== undefined ||
     args.explainPermissions ||
+    // `forja --list-models` — catalog-only inspection. No prompt, no
+    // provider, no REPL; same lifecycle-mode shape as the info flags
+    // above. Without this the empty-prompt branch would reject
+    // `--list-models --json` as "--json requires a prompt".
+    args.listModels ||
     // `forja recap [args]` is the headless surface for the recap
     // slash (RECAP §9). It carries its own positional verbs in
     // `args.recap.args` and never expects a free-text prompt — the

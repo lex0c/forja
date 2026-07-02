@@ -39,6 +39,12 @@ export interface ParsedArgs {
   // setup, or scripting policy checks in CI. DB-only path; no
   // provider, no API key.
   explainPermissions: boolean;
+  // List-models mode: print the operator catalog
+  // (`~/.config/forja/model_providers.json`) — each model's
+  // capabilities and whether its api_key_env is set — and exit.
+  // Catalog-only path; no provider, no DB, no API key required.
+  // Honors --json for NDJSON.
+  listModels: boolean;
   // When --list-sessions is set, fan each parent into its subagent
   // children one level deep. Default false: most users want the
   // top-level view; subagent rows are forensic detail.
@@ -579,6 +585,7 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
           listSessions: false,
           includeSubagents: false,
           explainPermissions: false,
+          listModels: false,
           yes: false,
         },
       };
@@ -623,6 +630,7 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
       listSessions: false,
       includeSubagents: false,
       explainPermissions: false,
+      listModels: false,
       yes: false,
       init: initArgs,
     },
@@ -664,6 +672,7 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
           listSessions: false,
           includeSubagents: false,
           explainPermissions: false,
+          listModels: false,
           yes: false,
         },
       };
@@ -734,6 +743,7 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
       listSessions: false,
       includeSubagents: false,
       explainPermissions: false,
+      listModels: false,
       yes: false,
       recap: { args: recapArgs },
       ...(model !== undefined ? { model } : {}),
@@ -787,6 +797,7 @@ const parseWelcomeSubcommand = (argv: readonly string[]): ParseResult | null => 
           listSessions: false,
           includeSubagents: false,
           explainPermissions: false,
+          listModels: false,
           yes: false,
         },
       };
@@ -810,6 +821,7 @@ const parseWelcomeSubcommand = (argv: readonly string[]): ParseResult | null => 
       listSessions: false,
       includeSubagents: false,
       explainPermissions: false,
+      listModels: false,
       yes: false,
       welcome: true,
       ...(iKnow ? { iKnowWhatImDoing: true } : {}),
@@ -855,6 +867,7 @@ const parseSandboxSubcommand = (argv: readonly string[]): ParseResult | null => 
           listSessions: false,
           includeSubagents: false,
           explainPermissions: false,
+          listModels: false,
           yes: false,
         },
       };
@@ -878,6 +891,7 @@ const parseSandboxSubcommand = (argv: readonly string[]): ParseResult | null => 
       listSessions: false,
       includeSubagents: false,
       explainPermissions: false,
+      listModels: false,
       yes: false,
       sandbox: { verb: 'setup', json },
     },
@@ -904,6 +918,7 @@ const parseDoctorSubcommand = (argv: readonly string[]): ParseResult | null => {
           listSessions: false,
           includeSubagents: false,
           explainPermissions: false,
+          listModels: false,
           yes: false,
         },
       };
@@ -927,6 +942,7 @@ const parseDoctorSubcommand = (argv: readonly string[]): ParseResult | null => {
       listSessions: false,
       includeSubagents: false,
       explainPermissions: false,
+      listModels: false,
       yes: false,
       doctor: { json },
     },
@@ -1034,6 +1050,7 @@ const parsePurgeSubcommand = (argv: readonly string[]): ParseResult | null => {
           listSessions: false,
           includeSubagents: false,
           explainPermissions: false,
+          listModels: false,
           yes: false,
         },
       };
@@ -1065,6 +1082,7 @@ const parsePurgeSubcommand = (argv: readonly string[]): ParseResult | null => {
       listSessions: false,
       includeSubagents: false,
       explainPermissions: false,
+      listModels: false,
       yes: false,
       purge: { force, json, noAudit },
     },
@@ -1108,6 +1126,7 @@ const parseGcSubcommand = (argv: readonly string[]): ParseResult | null => {
           listSessions: false,
           includeSubagents: false,
           explainPermissions: false,
+          listModels: false,
           yes: false,
         },
       };
@@ -1154,6 +1173,7 @@ const parseGcSubcommand = (argv: readonly string[]): ParseResult | null => {
       listSessions: false,
       includeSubagents: false,
       explainPermissions: false,
+      listModels: false,
       yes: false,
       gc: { force, json, tables },
     },
@@ -1191,6 +1211,7 @@ const parseCacheSubcommand = (argv: readonly string[]): ParseResult | null => {
           listSessions: false,
           includeSubagents: false,
           explainPermissions: false,
+          listModels: false,
           yes: false,
         },
       };
@@ -1218,6 +1239,7 @@ const parseCacheSubcommand = (argv: readonly string[]): ParseResult | null => {
       listSessions: false,
       includeSubagents: false,
       explainPermissions: false,
+      listModels: false,
       yes: false,
       cache: { verb: 'clear', force, json },
     },
@@ -1268,6 +1290,7 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
           listSessions: false,
           includeSubagents: false,
           explainPermissions: false,
+          listModels: false,
           yes: false,
         },
       };
@@ -1578,6 +1601,7 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       listSessions: false,
       includeSubagents: false,
       explainPermissions: false,
+      listModels: false,
       yes: false,
       permission: {
         verb,
@@ -1624,6 +1648,7 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
     listSessions: false,
     includeSubagents: false,
     explainPermissions: false,
+    listModels: false,
     yes: false,
   };
   const promptParts: string[] = [];
@@ -1662,6 +1687,10 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         break;
       case '--explain-permissions':
         args.explainPermissions = true;
+        i += 1;
+        break;
+      case '--list-models':
+        args.listModels = true;
         i += 1;
         break;
       case '--resume': {
@@ -2300,6 +2329,7 @@ export const usage = (): string =>
     '  --worktrees <verb>     Inspect / gc subagent worktrees (verb: list, gc)',
     '  --memory <verb>        Inspect cross-session memory (verb: list [scope] | show <name> [scope])',
     '  --explain-permissions  Print the resolved permission policy + per-section layer attribution and exit (pair with --json for NDJSON output)',
+    '  --list-models          Print the installed model catalog (capabilities + which are ready to use) and exit (pair with --json for NDJSON)',
     '  --checkpoints <cmd>    Checkpoint subcommands: list <session> | diff <session> <ckpt>',
     '                          | restore <session> <ckpt> | purge <session>',
     '  --yes, -y              Skip the bash-side-effect confirm on undo/restore',

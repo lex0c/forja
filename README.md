@@ -169,6 +169,10 @@ its `api_key_env` (which env var holds the key) and an optional `base_url` for
 custom endpoints. See [`docs/PROVIDERS.md` §2.1](docs/PROVIDERS.md) for the full
 how-to.
 
+Run `forja --list-models` to print the installed catalog — each model's context
+window, price per-1M, and whether it's ready to use (its API key is set). Add
+`--json` for NDJSON.
+
 ### Effort
 
 One knob, two axes: it sets the provider's **reasoning depth** *and* a set of
