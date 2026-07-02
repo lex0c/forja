@@ -14,6 +14,7 @@ import {
   MAX_MCP_TOOLS,
   MAX_TOOL_RESULT_CHARS,
   abortableConnect,
+  boundStructuredContent,
   buildSpawnEnv,
   callErrorToResult,
   createStdioMcpClient,
@@ -142,6 +143,36 @@ describe('flattenContent', () => {
     const exact = 'a'.repeat(MAX_TOOL_RESULT_CHARS);
     const out = flattenContent([{ type: 'text', text: exact }]);
     expect(out).toBe(exact); // no marker
+  });
+});
+
+describe('boundStructuredContent — bounds the structured channel', () => {
+  test('a small structured value passes through unchanged', () => {
+    const v = { rows: [1, 2, 3], ok: true };
+    expect(boundStructuredContent(v)).toEqual({ structured: v });
+  });
+
+  test('falsy JSON values (null / false / 0) are kept, not dropped', () => {
+    expect(boundStructuredContent(null)).toEqual({ structured: null });
+    expect(boundStructuredContent(false)).toEqual({ structured: false });
+    expect(boundStructuredContent(0)).toEqual({ structured: 0 });
+  });
+
+  test('an over-cap structured blob is DROPPED with a marker (not truncated)', () => {
+    // A small text + a colossal structured would otherwise bypass the text cap.
+    const huge = { blob: 'a'.repeat(MAX_TOOL_RESULT_CHARS + 100) };
+    const out = boundStructuredContent(huge);
+    expect(out.structured).toBeUndefined();
+    expect(out.note).toContain('structured content dropped');
+    expect(out.note).toContain('exceeded');
+  });
+
+  test('an unserializable (circular) structured value is dropped defensively', () => {
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    const out = boundStructuredContent(circular);
+    expect(out.structured).toBeUndefined();
+    expect(out.note).toContain('not serializable');
   });
 });
 

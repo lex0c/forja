@@ -171,6 +171,30 @@ export const narrowManifestTools = (rawTools: unknown): McpManifestTool[] => {
   return tools;
 };
 
+// Bound the `structuredContent` channel the same way `flattenContent` bounds the
+// text: the harness JSON.stringifys the WHOLE result (structured included) for the
+// model + DB, so a small text + a colossal structured blob would bypass the text
+// cap and blow memory/context/cost on a single call. Arbitrary JSON can't be
+// truncated without corrupting its shape, so an over-cap (or unserializable) blob
+// is DROPPED with a marker folded into the text. Returns `{ structured }` to keep,
+// or `{ note }` to drop. Exported for direct testing.
+export const boundStructuredContent = (
+  structured: unknown,
+): { structured?: unknown; note?: string } => {
+  let size: number;
+  try {
+    size = JSON.stringify(structured)?.length ?? 0;
+  } catch {
+    return { note: '[mcp: structured content dropped — not serializable]' };
+  }
+  if (size > MAX_TOOL_RESULT_CHARS) {
+    return {
+      note: `[mcp: structured content dropped — ${size} chars exceeded the ${MAX_TOOL_RESULT_CHARS} cap]`,
+    };
+  }
+  return { structured };
+};
+
 // Decide how a REJECTED `client.callTool` surfaces. The SDK rejects on a JSON-RPC
 // ERROR RESPONSE too (an McpError the server SENT — InvalidParams / MethodNotFound
 // / a custom server code), not only on a transport fault: that means the
@@ -451,7 +475,14 @@ const sdkClientFrom = (makeTransport: () => SdkTransport): McpClient => {
         isError: res.isError === true,
         content: flattenContent(res.content),
       };
-      if (res.structuredContent !== undefined) result.structured = res.structuredContent;
+      if (res.structuredContent !== undefined) {
+        const bounded = boundStructuredContent(res.structuredContent);
+        if (bounded.note !== undefined) {
+          result.content = result.content ? `${result.content}\n${bounded.note}` : bounded.note;
+        } else {
+          result.structured = bounded.structured;
+        }
+      }
       if (isInvalidOutput(res.content, res.isError === true)) {
         result.invalid = true;
         // Preserve the malformed raw (flattenContent above already discarded its
