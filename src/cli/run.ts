@@ -1,6 +1,7 @@
 import { type HarnessResult, type SessionContext, runAgent } from '../harness/index.ts';
 import { RESUME_FULL_WARN_THRESHOLD } from '../harness/resume.ts';
 import { effectiveBudget } from '../harness/types.ts';
+import { flattenControlToLine } from '../sanitize/ansi.ts';
 import {
   type DB,
   closeDb,
@@ -784,6 +785,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       auditConfigWarnings,
       sandboxConfigWarnings,
       verifyConfigWarnings,
+      mcpConfigWarnings,
       permissionState,
       permissionRefusingReason,
       permissionChain,
@@ -905,6 +907,17 @@ export const run = async (options: RunOptions): Promise<number> => {
       for (const w of verifyConfigWarnings) {
         errSink(`forja: verify config: ${w}\n`);
       }
+      // mcp.toml + manager.init() warnings — a skipped/denied/drifted server is
+      // otherwise an invisible missing tool. (MCP.md §9.3 / FAILURE_MODES §15.)
+      // Prefix is `mcp:` (not `mcp config:`): these mix parse warnings with
+      // runtime handshake/trust failures, and the parse ones already carry their
+      // `mcp.toml [servers.x]` context — mislabeling a handshake fault as config
+      // sends the operator hunting in the wrong place. Sanitize each: a handshake
+      // warning embeds the server's error text (a remote HTTP body), so an ANSI
+      // payload could otherwise repaint the banner.
+      for (const w of mcpConfigWarnings) {
+        errSink(`forja: mcp: ${flattenControlToLine(w)}\n`);
+      }
     }
 
     // Resume-mode (headless): full/summary hydrate the WHOLE log (and summary
@@ -1003,6 +1016,16 @@ export const run = async (options: RunOptions): Promise<number> => {
       // that may construct a HarnessConfig without a broker.
       if (cfg.broker !== undefined) {
         await cfg.broker.close();
+      }
+      // MCP stdio clients (MCP.md §1.7): disconnect all before storage close.
+      // Guarded so a surprise throw can't skip closeDb (cleanup is per-client
+      // fail-soft, but defense in depth).
+      if (cfg.mcpManager !== undefined) {
+        try {
+          await cfg.mcpManager.cleanup();
+        } catch {
+          // Swallow — teardown must not skip closeDb on a stubborn server.
+        }
       }
       closeDb(db);
     }

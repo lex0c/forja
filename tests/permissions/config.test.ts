@@ -32,6 +32,35 @@ describe('parsePolicy', () => {
     ).toThrow(/trusted_hosts must be a string array/);
   });
 
+  test('parses a tools.mcp section (allow/confirm/deny + locked over wire-name patterns)', () => {
+    const p = parsePolicy({
+      tools: {
+        mcp: {
+          allow: ['mcp__github__*'],
+          confirm: ['mcp__github__delete_*'],
+          deny: ['mcp__dangerous__*'],
+          locked: true,
+        },
+      },
+    });
+    expect(p.tools.mcp?.allow).toEqual(['mcp__github__*']);
+    expect(p.tools.mcp?.confirm).toEqual(['mcp__github__delete_*']);
+    expect(p.tools.mcp?.deny).toEqual(['mcp__dangerous__*']);
+    expect(p.tools.mcp?.locked).toBe(true);
+  });
+
+  test('mcp.deny must be a string array', () => {
+    expect(() =>
+      parsePolicy({ tools: { mcp: { deny: 'mcp__x__*' as unknown as string[] } } }),
+    ).toThrow(/mcp.deny must be a string array/);
+  });
+
+  test('mcp section rejects unknown keys (typo defense)', () => {
+    expect(() => parsePolicy({ tools: { mcp: { allwo: ['mcp__x__*'] } } })).toThrow(
+      /unknown key 'allwo'/,
+    );
+  });
+
   test('preserves mode-omitted as undefined (engine/resolver applies the default downstream)', () => {
     // parsePolicy used to inject mode='strict' as a default. Doing
     // so made "user file silent on mode" indistinguishable from

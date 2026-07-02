@@ -16,6 +16,8 @@ import {
   type HarnessResult,
   runAgent,
 } from '../harness/index.ts';
+import type { McpClient, McpTransportConfig } from '../mcp/types.ts';
+import type { SandboxAvailability } from '../permissions/sandbox-availability.ts';
 import { maybeWrapSandboxArgv } from '../permissions/sandbox-runner.ts';
 import { closeDb } from '../storage/db.ts';
 import { BUILTIN_TOOLS, createFetchUrlTool } from '../tools/builtin/index.ts';
@@ -24,9 +26,54 @@ import type {
   EvalCase,
   EvalCaseResult,
   EvalHttpResponse,
+  EvalMcpServer,
   EvalSummary,
   ExpectationOutcome,
 } from './types.ts';
+
+// A hermetic "sandbox available" verdict pinned for setup.mcp cases so the fake
+// server resolves to the non-egress `cwd-rw` profile (plain `mcp` category,
+// default-allow) rather than `host` (`mcp.egress`, which autonomous won't
+// auto-approve → a headless call is denied). Deterministic (independent of the
+// host's real bwrap); the stub client never spawns, so the wrap is never applied.
+// Mirrors the tests' own HERMETIC_SANDBOX.
+const EVAL_MCP_SANDBOX: SandboxAvailability = {
+  available: true,
+  tool: 'bwrap',
+  path: '/usr/bin/bwrap',
+  trustLevel: 'canonical',
+  reason: '',
+  trustWarnings: [],
+};
+
+// A stubbed `McpClient` factory for `setup.mcp` (hermetic model-in-loop MCP): NO
+// subprocess — it serves each declared server's manifest + a canned tools/call
+// result. Routes to the right server by the marker argv the executor writes
+// (`command = ["mcp-eval", "<name>"]`). The real SDK/subprocess path is covered
+// by tests/mcp/real-subprocess.test.ts + evals/smoke-mcp.sh.
+const makeEvalMcpClient =
+  (servers: Record<string, EvalMcpServer>) =>
+  (cfg: McpTransportConfig): McpClient => {
+    const name = cfg.transport === 'stdio' ? (cfg.rawArgv[1] ?? '') : '';
+    const spec = servers[name];
+    const tools = (spec?.tools ?? []).map((t) => ({
+      name: t.name,
+      description: t.description,
+      inputSchema: { type: 'object' as const, properties: { text: { type: 'string' } } },
+      meta: { writes: t.writes ?? false },
+    }));
+    const result = spec?.result ?? 'ok';
+    return {
+      connect: async () => ({
+        protocolVersion: '2024-11-05',
+        serverName: name,
+        serverVersion: '0.0.1',
+      }),
+      listTools: async () => tools,
+      callTool: async () => ({ isError: false, content: result }),
+      close: async () => {},
+    };
+  };
 
 // TEST-NET-3 (RFC 5737) — a public, non-routable address that passes the
 // SSRF blocklist. The stubbed DNS resolves every host to it.
@@ -225,6 +272,27 @@ const setupCwd = (caseDef: EvalCase): SetupResult => {
       if (!existsSync(targetDir)) mkdirSync(targetDir, { recursive: true });
       writeFileSync(target, body);
     }
+  }
+  // Hermetic MCP servers (setup.mcp): write a `.forja/mcp.toml` declaring each
+  // fake server. `command = ["mcp-eval", "<name>"]` is a marker the injected stub
+  // client routes on (never spawned). We deliberately DON'T set `sandbox = false`:
+  // that resolves the server to the `host` profile, which the manager classifies as
+  // `mcp.egress` — and egress is NOT auto-approved under `approvalPosture:
+  // autonomous`, so a headless model-in-loop case's tool call would be denied
+  // before the canned result returns. Left at the default + paired with a hermetic
+  // "sandbox available" verdict below, the server resolves to `cwd-rw` (non-egress,
+  // plain `mcp` category, default-allow). The stub never spawns, so no wrap is ever
+  // applied — this only steers the classification. `surface` per the case.
+  if (caseDef.setup?.mcp !== undefined) {
+    const forjaDir = join(dir, '.forja');
+    if (!existsSync(forjaDir)) mkdirSync(forjaDir, { recursive: true });
+    const toml = Object.entries(caseDef.setup.mcp)
+      .map(
+        ([name, s]) =>
+          `[servers.${name}]\ntransport = "stdio"\ncommand = ["mcp-eval", "${name}"]\nsurface = "${s.surface ?? 'base'}"\n`,
+      )
+      .join('\n');
+    writeFileSync(join(forjaDir, 'mcp.toml'), toml);
   }
   // git work-tree init for tools that require a repo (git_apply_patch). Done
   // after fixture+files so the tree has the case's content. Fails loud — a
@@ -611,6 +679,19 @@ export const executeCase = async (
       // falls through to the default model and will need ANTHROPIC_API_KEY.
       enterprisePolicyPath: null,
       userPolicyPath: null,
+      // Never read the dev's real ~/.config/forja/mcp.toml in an eval. A case opts
+      // INTO MCP via `setup.mcp` (fake, auto-approved servers + a stub client).
+      userMcpPath: null,
+      ...(caseDef.setup?.mcp !== undefined
+        ? {
+            autoApproveMcp: new Set(Object.keys(caseDef.setup.mcp)),
+            mcpMakeClient: makeEvalMcpClient(caseDef.setup.mcp),
+            // Classify the fake server's tools as non-egress `mcp` (default-allow),
+            // not `mcp.egress` — else autonomous won't auto-approve the headless
+            // call. A case that needs a different verdict overrides it below.
+            sandboxAvailabilityOverride: EVAL_MCP_SANDBOX,
+          }
+        : {}),
       // Default temperature 0 makes evals deterministic. Cases or
       // callers can override via `bootstrapOverride.temperature`
       // when stochasticity is the property under test.
@@ -694,6 +775,17 @@ export const executeCase = async (
       };
       result = await runAgent(cfg);
     } finally {
+      // Disconnect any live MCP stdio clients before closing the per-case DB —
+      // the executor runs many cases per process, so a leaked child would
+      // corrupt later cases. `config` (not the inner `cfg`) is in scope here;
+      // both carry the same manager.
+      if (config.mcpManager !== undefined) {
+        try {
+          await config.mcpManager.cleanup();
+        } catch {
+          // Swallow — must not skip closeDb (which would corrupt later cases).
+        }
+      }
       closeDb(db);
     }
   } catch (e) {

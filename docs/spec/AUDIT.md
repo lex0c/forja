@@ -342,11 +342,14 @@ Cobre o ponto cego de auditabilidade de MCP — antes deste schema, trust histor
 
 #### 1.5.1 Schema — `mcp_servers`
 
-Estado **atual** de cada server em config (1 row per `<name>`).
+Estado **atual** de cada server em config (1 row per `(scope, name)`).
+
+`scope` isola a linha **por projeto**. `sessions.db` é user-global, mas a config MCP de projeto é per-repo, então o mesmo `<name>` (`db`, `postgres`) definido em repos diferentes precisa de linhas distintas — senão aprovar o server de um repo sobrescreve a identidade + o cached-trust do outro (o `<name>` como chave global colide). `scope` = **project root** do repo (`project_shared` / `project_local`); `''` (sentinela global) pra servers `user`, que são compartilhados entre repos de propósito. `(scope, name)` é a identidade real.
 
 ```sql
 CREATE TABLE mcp_servers (
-  name TEXT PRIMARY KEY,                 -- ex: "postgres"
+  scope TEXT NOT NULL DEFAULT '',        -- project root (project servers) | '' (user, global)
+  name TEXT NOT NULL,                    -- ex: "postgres"
   transport TEXT NOT NULL CHECK (transport IN ('stdio','sse','http')),
   command TEXT,                          -- JSON array, stdio only; redacted env values
   url TEXT,                              -- SSE/HTTP only
@@ -362,13 +365,14 @@ CREATE TABLE mcp_servers (
   last_error TEXT,                       -- last failure reason, classed
   total_calls INTEGER NOT NULL DEFAULT 0,
   total_tokens_in INTEGER NOT NULL DEFAULT 0,
-  audit_schema_version INTEGER NOT NULL DEFAULT 1
+  audit_schema_version INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (scope, name)
 );
 ```
 
-Sensitivity: **low**. Redaction: env values em `command` substituídos por `${VAR_NAME}` antes de persistir; URL em `url` é literal (esperado público). Retention: enquanto server estiver em config; remoção de config → row removida no próximo `agent gc` (excepcional pra audit table; razão: estado, não history).
+Sensitivity: **low**. Redaction: env values em `command` substituídos por `${VAR_NAME}` antes de persistir; URL em `url` é literal (esperado público). `scope` é um path de projeto local (mesma classe que o `cwd` já embutido em `command`). Retention: enquanto server estiver em config; remoção de config → row removida no próximo `agent gc` (excepcional pra audit table; razão: estado, não history). O sweep é **scope-aware**: remove só órfãos cujo `scope` pertence à invocação atual (o repo corrente + o global `''`), nunca linhas de outro repo.
 
-UPDATE permitido em: `state`, `current_manifest_hash`, `last_connected_at`, `last_error`, contadores. **Imutável**: `name`, `transport`, `command`, `url`, `source`. Mudança de transport ou command = remove + insert.
+UPDATE permitido em: `state`, `current_manifest_hash`, `last_connected_at`, `last_error`, contadores. **Imutável**: `scope`, `name`, `transport`, `command`, `url`, `source`. Mudança de transport ou command = remove + insert.
 
 #### 1.5.2 Schema — `mcp_manifest_history`
 
@@ -377,9 +381,10 @@ History de manifests. **Append-only, forever retention** (igual a `prompt_versio
 ```sql
 CREATE TABLE mcp_manifest_history (
   id INTEGER PRIMARY KEY,
+  scope TEXT NOT NULL DEFAULT '',        -- mesmo scope de mcp_servers (per-repo | '' global)
   server_name TEXT NOT NULL,
   hash TEXT NOT NULL,
-  previous_hash TEXT,                    -- hash imediatamente anterior pra esse server
+  previous_hash TEXT,                    -- hash imediatamente anterior pra esse (scope, server)
   manifest_json TEXT NOT NULL,           -- conteúdo canonical
   protocol_version TEXT NOT NULL,
   server_version TEXT,
@@ -391,10 +396,10 @@ CREATE TABLE mcp_manifest_history (
 );
 
 CREATE UNIQUE INDEX idx_mcp_manifest_unique
-  ON mcp_manifest_history(server_name, hash);
+  ON mcp_manifest_history(scope, server_name, hash);
 
 CREATE INDEX idx_mcp_manifest_decided
-  ON mcp_manifest_history(server_name, decided_at DESC);
+  ON mcp_manifest_history(scope, server_name, decided_at DESC);
 ```
 
 Sensitivity: **low**. Redaction: nenhuma (manifest é spec, não dado de usuário; mesmo princípio de `prompt_versions`).
@@ -412,7 +417,7 @@ para cada server em config (mcp.toml):
    ▼ initialize + tools/list
    ▼ hash = SHA256(canonical(manifest))
    │
-   ▼ SELECT current_manifest_hash FROM mcp_servers WHERE name=?
+   ▼ SELECT current_manifest_hash FROM mcp_servers WHERE scope=? AND name=?
    │
    ├─── match: state ← 'trusted' (skip prompt)
    │
@@ -434,7 +439,8 @@ Trigger restritivo:
 
 ```sql
 CREATE TRIGGER mcp_servers_immutable_keys BEFORE UPDATE ON mcp_servers
-WHEN OLD.name != NEW.name
+WHEN OLD.scope != NEW.scope
+  OR OLD.name != NEW.name
   OR OLD.transport != NEW.transport
   OR (OLD.command IS NOT NULL AND OLD.command != NEW.command)
   OR (OLD.url IS NOT NULL AND OLD.url != NEW.url)
@@ -472,7 +478,9 @@ WHERE s.last_connected_at > unixepoch('now', '-30 days')
 ORDER BY s.total_calls DESC;
 
 -- "Manifest history de um server específico"
-SELECT decided_at, decision, hash, previous_hash, decided_by
+-- `scope` distingue o mesmo <name> entre repos; omita o filtro de scope pra ver
+-- o histórico cross-repo, ou fixe um scope pra um projeto específico.
+SELECT scope, decided_at, decision, hash, previous_hash, decided_by
 FROM mcp_manifest_history
 WHERE server_name = 'postgres'
 ORDER BY decided_at DESC;
@@ -524,7 +532,7 @@ Permite query: "quando esse server estava nesse manifest, quais tools foram cham
 
 - **Server-side audit não captura.** O que o server faz internamente (queries SQL, FS reads) é problema do server, não do harness. Audit cobre interface, não implementação.
 - **Hash de manifest, não de comportamento.** Server pode ter mesmo manifest mas comportamento diferente (mudou implementação interna). Trust é em manifest, não em binary; documented.
-- **`source` do server pode mudar entre sessões.** Mesmo `<name>` aparecendo em fontes diferentes (user → project → local) não é detectado como event; rastrear via git/config diff.
+- **`source` do server pode mudar entre sessões, dentro do mesmo `scope`.** Um `<name>` que troca de camada de config no MESMO projeto (`project_shared` ↔ `project_local`) reusa a linha (mesmo `scope`) e não é detectado como event; rastrear via git/config diff. O mesmo `<name>` em **repos diferentes** já é linha distinta (via `scope`), então não colide. Um `<name>` que migra entre `user` (`scope=''`) e um projeto (`scope=<repo>`) é linha distinta — a identidade é re-confirmada pelo trust gate.
 - **Sem audit de `prompts/get` ou `resources/read`.** v1 só consome `tools/*` (ver `MCP.md §11`).
 
 ### 1.6 Feature flags ativas (`feature_flags_active`)

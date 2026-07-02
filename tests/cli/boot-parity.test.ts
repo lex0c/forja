@@ -50,6 +50,17 @@ describe('operatorBootstrapFlags', () => {
     });
   });
 
+  // --auto-approve-mcp must thread identically from both entrypoints so a CI
+  // operator's MCP trust opt-in works whether they invoke run.ts or repl.ts.
+  test('forwards --auto-approve-mcp', () => {
+    const servers = new Set(['postgres', 'github']);
+    expect(operatorBootstrapFlags(makeArgs({ autoApproveMcp: servers }))).toEqual({
+      autoApproveMcp: servers,
+    });
+    // Absent ⇒ key omitted (no accidental opt-in via the spread).
+    expect('autoApproveMcp' in operatorBootstrapFlags(makeArgs())).toBe(false);
+  });
+
   // Gate 2 of host passthrough (SECURITY.md §4.1/§4.7). The opt-in must be
   // forwarded by the SHARED flag map so the one-shot (run.ts) and REPL
   // paths thread it identically — pairs with --sandbox-host above.

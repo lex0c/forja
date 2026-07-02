@@ -447,6 +447,33 @@ export type SharedTrustAskEvent = BaseEvent & {
   corpusFiles: readonly { name: string; bytes: number }[];
 };
 
+// MCP server manifest-trust modal (MCP.md §1.5). Trusting authorizes SPAWNING
+// the server's `command` (arbitrary local code — the real risk) plus exposing
+// its declared tools to the model. The strings (server / command / tool
+// names+descriptions) flow from an untrusted server manifest (or a config a
+// hostile commit could edit), so the reducer sanitizes them at its boundary.
+export type McpTrustAskEvent = BaseEvent & {
+  type: 'mcp-trust:ask';
+  promptId: string;
+  server: string;
+  command: string;
+  // 'first-visit': never-seen manifest hash. 'drift': previously-trusted
+  // server whose hash (tools or command) changed.
+  mode: import('../mcp/types.ts').McpTrustMode;
+  // A stdio server's UNRESOLVED env bindings + explicit cwd, rendered on their own
+  // lines (a length-capped `command` could otherwise hide an injected env var).
+  env?: readonly { name: string; value: string }[];
+  cwd?: string;
+  // Effective sandbox posture (MCP.md §2.3) — shown so the operator sees the
+  // containment of the server they're authorizing.
+  sandbox: import('../mcp/types.ts').McpSandboxStatus;
+  tools: readonly { name: string; description: string; writes: boolean }[];
+  manifestHash: string;
+  // Pre-connect identity gate (MCP.md §1.5): authorize reaching the server before
+  // the handshake. When true the modal shows only the identity (no tools/hash).
+  preConnect?: boolean;
+};
+
 // `scope` mirrors `MemoryScope` from `src/memory/types.ts`. We re-declare
 // instead of importing so the TUI layer doesn't depend on memory's
 // internal types — but the values must stay in sync. If memory adds a
@@ -931,6 +958,7 @@ export type UIEvent =
   | ClarifyAskEvent
   | TrustAskEvent
   | SharedTrustAskEvent
+  | McpTrustAskEvent
   | MemoryWriteAskEvent
   | ResumeModeAskEvent
   | MemoryUserScopeAskEvent

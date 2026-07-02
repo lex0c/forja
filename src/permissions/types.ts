@@ -6,7 +6,22 @@
 // section.
 import type { SandboxProfile } from './sandbox-plan.ts';
 
-export type PolicyCategory = 'fs.read' | 'fs.write' | 'bash' | 'web.fetch' | 'misc';
+// 'mcp' gates tools from an MCP server (the `mcp__<server>__<tool>` wire form)
+// that CANNOT reach the network — a server confined to the no-network sandbox
+// profile (`cwd-rw`, the default when a sandbox tool is present — MCP.md §2.3).
+// It is NOT egress. 'mcp.egress' is the category for any MCP server that CAN
+// reach the network: one GRANTED network (`[servers.<name>.network]`), one
+// running UNCONFINED (operator opt-out, or no sandbox tool — both inherit the
+// full host network), and the future remote (sse/http) transport. Network reach
+// ⇒ exfil risk ⇒ egress treatment (default confirm, never auto-approved).
+export type PolicyCategory =
+  | 'fs.read'
+  | 'fs.write'
+  | 'bash'
+  | 'web.fetch'
+  | 'misc'
+  | 'mcp'
+  | 'mcp.egress';
 
 // Categories that send bytes OUT of the machine to an operator-unconfined
 // destination. Egress is special-cased by the autonomous posture: a
@@ -17,7 +32,8 @@ export type PolicyCategory = 'fs.read' | 'fs.write' | 'bash' | 'web.fetch' | 'mi
 // (a POST/webhook tool, an MCP egress) must be added here, not re-pattern-
 // matched as `category === 'web.fetch'` at each guard site (which would
 // silently auto-approve the new category and reopen the exfil hole).
-export const categoryIsEgress = (category: PolicyCategory): boolean => category === 'web.fetch';
+export const categoryIsEgress = (category: PolicyCategory): boolean =>
+  category === 'web.fetch' || category === 'mcp.egress';
 
 export type PolicyMode = 'strict' | 'acceptEdits' | 'bypass';
 
@@ -84,6 +100,21 @@ export interface FetchPolicy {
   locked?: boolean;
 }
 
+// Per-tool MCP policy (MCP.md §8). Glob/prefix patterns over the wire name
+// `mcp__<server>__<tool>` (NO regex — same matcher as `bash`). Layered ON TOP of
+// the manifest-trust gate (which already approved the server's whole tool set):
+// an operator `deny` blocks a specific tool, `confirm` forces a prompt, `allow`
+// permits it silently. Precedence deny > allow > confirm; the default (no match)
+// is the CATEGORY default — `mcp` → allow, `mcp.egress` → confirm. An explicit
+// `allow` therefore opts an egress tool out of its default confirm (the operator
+// pre-authorized that exact tool), mirroring `fetch_url`'s allow_hosts.
+export interface McpPolicy {
+  allow?: readonly string[];
+  confirm?: readonly string[];
+  deny?: readonly string[];
+  locked?: boolean;
+}
+
 export interface PolicyToolsSection {
   bash?: BashPolicy;
   read_file?: PathPolicy;
@@ -92,6 +123,9 @@ export interface PolicyToolsSection {
   glob?: PathPolicy;
   grep?: PathPolicy;
   fetch_url?: FetchPolicy;
+  // MCP tools (`mcp__<server>__<tool>`). One section governs every server's
+  // tools; the manifest-trust gate is per-server, this is per-tool-pattern.
+  mcp?: McpPolicy;
   // Future tools fall back to category-level policy until a section exists.
 }
 

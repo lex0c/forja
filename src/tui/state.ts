@@ -258,6 +258,7 @@ export interface ConfirmState {
     | 'permission'
     | 'trust'
     | 'shared-trust'
+    | 'mcp-trust'
     | 'memory-write'
     | 'memory-user-scope'
     | 'memory-action'
@@ -2132,6 +2133,148 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             // hitting Enter without reading chooses "No, revoke" —
             // safer outcome for a corpus that just changed under
             // their feet (or that they haven't reviewed).
+            selectedIndex: options.length - 1,
+            hints: ['Enter to confirm', 'Esc to cancel'],
+            queueDepth: 0,
+          },
+        },
+        permanent: [],
+      };
+    }
+
+    case 'mcp-trust:ask': {
+      // MCP server manifest-trust modal (MCP.md §1.5). Trust authorizes TWO
+      // things: spawning the server's `command` (arbitrary local code — the
+      // real risk) and exposing its declared tools to the model. 'first-visit'
+      // = never-seen manifest hash; 'drift' = a previously-trusted server whose
+      // hash (tools or command) changed.
+      const options: ConfirmOption[] = [
+        {
+          key: '1',
+          label:
+            event.mode === 'first-visit'
+              ? 'Yes, I trust this server'
+              : 'Yes, I trust the updated server',
+          value: 'yes',
+        },
+        { key: '2', label: 'No, do not run it', value: 'no' },
+      ];
+
+      // SECURITY (mirrors the shared-trust P0/F1 hardening): server name,
+      // command, and every tool name/description come from an UNTRUSTED server
+      // manifest (or a config a hostile commit could edit). Sanitize each
+      // before display so a `\x1b[2J\x1b[H…` payload can't repaint/forge the
+      // modal.
+      const safeServer = sanitizeOneLineForDisplay(event.server);
+      const safeCommand = sanitizeOneLineForDisplay(event.command);
+
+      // Sandbox posture (MCP.md §2.3) — the containment the operator authorizes.
+      // The two unsandboxed states lead with a warning glyph (full host access).
+      const sandboxLine =
+        event.sandbox === 'sandboxed'
+          ? 'sandbox: ON (cwd-rw, no network)'
+          : event.sandbox === 'sandboxed-net'
+            ? '⚠ sandbox: ON + network egress (allowlist advisory — NOT host-filtered)'
+            : event.sandbox === 'opt-out'
+              ? '⚠ sandbox: OFF (operator opt-out) — full host access'
+              : event.sandbox === 'remote'
+                ? '⚠ remote endpoint — network egress, no sandbox (every call is confirmed)'
+                : '⚠ sandbox: OFF (no sandbox tool available) — full host access';
+
+      const previewLines: PreviewLine[] = [`server:  ${safeServer}`, `command: ${safeCommand}`];
+      // The explicit cwd (writable root / relative-binary base) and the env
+      // bindings each get their OWN line — the `command` above is length-capped, so
+      // folding these in would let a hostile config pad the argv to push an injected
+      // `LD_PRELOAD` / `NODE_OPTIONS` past the cutoff and hide it. Each is sanitized
+      // independently; env shows the UNRESOLVED `$VAR` binding, never the resolved
+      // value, and leads with ⚠ (it injects code into the spawned process).
+      if (event.cwd !== undefined) {
+        previewLines.push(`cwd:     ${sanitizeOneLineForDisplay(event.cwd)}`);
+      }
+      if (event.env !== undefined && event.env.length > 0) {
+        previewLines.push('⚠ env (injected into the server process):');
+        for (const b of event.env) {
+          previewLines.push(`    ${sanitizeOneLineForDisplay(`${b.name}=${b.value}`)}`);
+        }
+      }
+      previewLines.push(sandboxLine, '');
+      if (event.preConnect) {
+        // PRE-CONNECT identity gate (MCP.md §1.5): the tools aren't fetched yet —
+        // fetching them IS the spawn/connect we're gating, so a hostile config
+        // can't run code or leak a bearer token before this approval. Authorize
+        // the IDENTITY (command/URL) here; the tool list is reviewed in the
+        // manifest-trust prompt that follows the (now-authorized) connect.
+        previewLines.push(
+          event.mode === 'first-visit'
+            ? 'A configured MCP server has NOT been reached yet. Authorizing lets'
+            : 'A configured MCP server changed. Re-authorizing lets',
+          'Forja RUN this command / connect to this URL (with any configured auth)',
+          'and load its tools — which you then REVIEW before they become callable.',
+        );
+        previewLines.push('');
+        previewLines.push(
+          'If you authorize: Forja connects; the tool list is shown for review next.',
+        );
+        previewLines.push(
+          'If you decline: the server is never run or connected (nothing is sent).',
+        );
+      } else {
+        const MAX_LIST = 8;
+        const visible = event.tools.slice(0, MAX_LIST);
+        const overflow = event.tools.length - visible.length;
+        if (event.mode === 'first-visit') {
+          previewLines.push(
+            'An MCP server wants to run the command above and expose these tools',
+            'to the model. Trusting it AUTHORIZES RUNNING THAT BINARY. Review the',
+            'tools it declares before confirming:',
+          );
+        } else {
+          previewLines.push(
+            'A previously-trusted MCP server changed (its command or tool set).',
+            'Trusting again RE-AUTHORIZES running the command above. Review the',
+            'current tools before confirming:',
+          );
+        }
+        previewLines.push('');
+
+        if (visible.length === 0) {
+          previewLines.push('(the server declares no tools)');
+        } else {
+          for (const t of visible) {
+            // Mark side-effecting tools so the operator sees which ones write —
+            // and, by omission, which the server claims are read-only (the
+            // `writes:false` it is asking them to trust).
+            const marker = t.writes ? ' [writes]' : '';
+            previewLines.push(
+              `  ${sanitizeOneLineForDisplay(t.name)}${marker} — ${sanitizeOneLineForDisplay(t.description)}`,
+            );
+          }
+          if (overflow > 0) {
+            previewLines.push(`  …and ${overflow} more tool${overflow === 1 ? '' : 's'} not shown`);
+          }
+        }
+        previewLines.push('');
+        previewLines.push(`manifest hash: ${sanitizeOneLineForDisplay(event.manifestHash)}`);
+        previewLines.push('');
+        previewLines.push('If you trust: the server runs on next use; its tools become callable.');
+        previewLines.push('If you decline: the server is not run and its tools stay hidden.');
+      }
+
+      return {
+        state: {
+          ...state,
+          modal: {
+            promptId: event.promptId,
+            flavor: 'mcp-trust',
+            title:
+              event.mode === 'first-visit'
+                ? 'MCP server trust (first visit):'
+                : 'MCP server trust (changed):',
+            subject: null,
+            preview: previewLines,
+            question: null,
+            options,
+            // Conservative default (last) = "No, do not run it".
             selectedIndex: options.length - 1,
             hints: ['Enter to confirm', 'Esc to cancel'],
             queueDepth: 0,

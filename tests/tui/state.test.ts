@@ -2707,6 +2707,201 @@ describe('state immutability', () => {
   });
 });
 
+describe('mcp-trust:ask reducer', () => {
+  const mcpTrustEvent = (overrides: {
+    mode: 'first-visit' | 'drift';
+    server?: string;
+    command?: string;
+    env?: readonly { name: string; value: string }[];
+    cwd?: string;
+    sandbox?: 'sandboxed' | 'sandboxed-net' | 'opt-out' | 'unavailable' | 'remote';
+    tools?: readonly { name: string; description: string; writes: boolean }[];
+    manifestHash?: string;
+    preConnect?: boolean;
+  }): UIEvent => ({
+    type: 'mcp-trust:ask',
+    ts: 1,
+    promptId: 'm1',
+    server: overrides.server ?? 'postgres',
+    command: overrides.command ?? 'mcp-server-postgres --dsn $X',
+    ...(overrides.env !== undefined ? { env: overrides.env } : {}),
+    ...(overrides.cwd !== undefined ? { cwd: overrides.cwd } : {}),
+    mode: overrides.mode,
+    sandbox: overrides.sandbox ?? 'sandboxed',
+    tools: overrides.tools ?? [{ name: 'query', description: 'run a query', writes: false }],
+    manifestHash: overrides.manifestHash ?? 'abc123',
+    preConnect: overrides.preConnect ?? false,
+  });
+
+  test('pre-connect identity gate shows the identity only — no tools, no manifest hash', () => {
+    const r = applyEvent(
+      createInitialState(),
+      mcpTrustEvent({
+        mode: 'first-visit',
+        preConnect: true,
+        tools: [{ name: 'query', description: 'run a query', writes: true }],
+      }),
+    );
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    const text = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+    expect(text).toContain('mcp-server-postgres'); // the identity (command) IS shown
+    expect(text).toContain('REVIEW before they become callable'); // identity-gate prose
+    expect(text).not.toContain('run a query'); // the tool entry (description) is NOT shown pre-connect
+    expect(text).not.toContain('manifest hash'); // nor the hash (not fetched yet)
+    expect(text).not.toContain('[writes]');
+  });
+
+  test('env bindings + cwd render on their OWN lines (not folded into the capped command)', () => {
+    // Regression guard for the disclosure-bypass: env must NOT ride the `command`
+    // line (length-capped in the render) — a hostile config could pad the argv to
+    // push an injected LD_PRELOAD past the cutoff. Each binding is its own line.
+    const r = applyEvent(
+      createInitialState(),
+      mcpTrustEvent({
+        mode: 'first-visit',
+        preConnect: true,
+        command: 'node ./server.js',
+        cwd: '/work',
+        env: [
+          { name: 'LD_PRELOAD', value: '/evil.so' },
+          { name: 'SECRET', value: '$SECRET' },
+        ],
+      }),
+    );
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    const lines = modal.preview.map((p) => (typeof p === 'string' ? p : p.text));
+    expect(lines.some((l) => l.includes('LD_PRELOAD=/evil.so'))).toBe(true); // the injected surface
+    expect(lines.some((l) => l.includes('SECRET=$SECRET'))).toBe(true); // unresolved binding
+    expect(lines.some((l) => l.includes('cwd:') && l.includes('/work'))).toBe(true);
+    // The command line itself carries ONLY the argv — env is not crammed into it.
+    const commandLine = lines.find((l) => l.startsWith('command:'));
+    expect(commandLine).toContain('node ./server.js');
+    expect(commandLine).not.toContain('LD_PRELOAD');
+  });
+
+  test('first-visit shows the spawn-this-binary prose, the command, and the tools', () => {
+    const r = applyEvent(createInitialState(), mcpTrustEvent({ mode: 'first-visit' }));
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    expect(modal.flavor).toBe('mcp-trust');
+    expect(modal.title).toBe('MCP server trust (first visit):');
+    const text = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+    expect(text).toContain('AUTHORIZES RUNNING THAT BINARY');
+    expect(text).toContain('mcp-server-postgres'); // the command (risk surface) is shown
+    expect(text).toContain('query — run a query'); // tool inventory
+    expect(modal.options[0]?.label).toBe('Yes, I trust this server');
+  });
+
+  test('drift shows the re-authorize prose + label', () => {
+    const r = applyEvent(createInitialState(), mcpTrustEvent({ mode: 'drift' }));
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    expect(modal.title).toBe('MCP server trust (changed):');
+    const text = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+    expect(text).toContain('RE-AUTHORIZES');
+    expect(modal.options[0]?.label).toBe('Yes, I trust the updated server');
+  });
+
+  test('conservative default points at "No, do not run it" in BOTH modes', () => {
+    // A regression flipping the drift modal's default to index 0 would
+    // rubber-stamp a re-authorization of a CHANGED binary — so check both.
+    for (const mode of ['first-visit', 'drift'] as const) {
+      const r = applyEvent(createInitialState(), mcpTrustEvent({ mode }));
+      const modal = r.state.modal;
+      if (modal === null) throw new Error('expected modal');
+      expect(modal.selectedIndex).toBe(modal.options.length - 1);
+      expect(modal.options[modal.selectedIndex]?.value).toBe('no');
+    }
+  });
+
+  test('a server declaring no tools renders the explicit empty line', () => {
+    const r = applyEvent(createInitialState(), mcpTrustEvent({ mode: 'first-visit', tools: [] }));
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    const text = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+    expect(text).toContain('(the server declares no tools)');
+  });
+
+  test('ANSI escapes + CR/LF/TAB in the untrusted strings are stripped/collapsed', () => {
+    const evil = '\x1b[2J\x1b[H\x1b]0;PWNED\x07';
+    const r = applyEvent(
+      createInitialState(),
+      mcpTrustEvent({
+        mode: 'first-visit',
+        server: `${evil}srv`,
+        command: `${evil}evil-bin`,
+        // CR/LF/TAB in a tool name would break the bounded one-row-per-tool
+        // layout if not collapsed to spaces.
+        tools: [{ name: 'a\r\nb\tc', description: `${evil}d`, writes: false }],
+      }),
+    );
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    const text = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+    expect(text).not.toContain('\x1b');
+    expect(text).not.toContain('\x07');
+    expect(text).not.toContain('\r'); // the join uses \n only; a raw \r would be the tool name's
+    expect(text).not.toContain('\t');
+    expect(text).toContain('evil-bin'); // printable portion survives
+  });
+
+  test('caps the tool inventory with an overflow line', () => {
+    const tools = Array.from({ length: 12 }, (_, i) => ({
+      name: `t${i}`,
+      description: 'd',
+      writes: false,
+    }));
+    const r = applyEvent(createInitialState(), mcpTrustEvent({ mode: 'first-visit', tools }));
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    const text = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+    expect(text).toContain('…and 4 more tools not shown'); // 12 − 8 cap
+  });
+
+  test('write tools are marked [writes]; read-only tools are not', () => {
+    const r = applyEvent(
+      createInitialState(),
+      mcpTrustEvent({
+        mode: 'first-visit',
+        tools: [
+          { name: 'mutate', description: 'changes things', writes: true },
+          { name: 'peek', description: 'reads things', writes: false },
+        ],
+      }),
+    );
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    const text = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+    expect(text).toContain('mutate [writes] — changes things');
+    expect(text).toContain('peek — reads things'); // no marker for the read-only tool
+    expect(text).not.toContain('peek [writes]');
+  });
+
+  test('shows the sandbox posture; both unsandboxed states warn', () => {
+    const cases: Array<
+      ['sandboxed' | 'sandboxed-net' | 'opt-out' | 'unavailable' | 'remote', string]
+    > = [
+      ['sandboxed', 'sandbox: ON (cwd-rw, no network)'],
+      ['sandboxed-net', 'sandbox: ON + network'],
+      ['opt-out', '⚠ sandbox: OFF (operator opt-out)'],
+      ['unavailable', '⚠ sandbox: OFF (no sandbox tool available)'],
+      ['remote', '⚠ remote endpoint — network egress, no sandbox'],
+    ];
+    for (const [status, expected] of cases) {
+      const r = applyEvent(
+        createInitialState(),
+        mcpTrustEvent({ mode: 'first-visit', sandbox: status }),
+      );
+      const modal = r.state.modal;
+      if (modal === null) throw new Error('expected modal');
+      const text = modal.preview.map((p) => (typeof p === 'string' ? p : p.text)).join('\n');
+      expect(text).toContain(expected);
+    }
+  });
+});
+
 describe('shared-trust:ask reducer (P0/F1 + P1/M2-rel)', () => {
   // Helpers to drive the reducer with a minimal `shared-trust:ask`
   // event. The flavor's full contract: title, options, preview

@@ -47,6 +47,7 @@ import { installIdPath } from '../permissions/paths.ts';
 import type { SandboxProfile } from '../permissions/sandbox-plan.ts';
 import type { SealPolicy } from '../permissions/types.ts';
 import { closeDb, defaultDbPath, openDb } from '../storage/index.ts';
+import { listServers as listMcpServers } from '../storage/repos/mcp-servers.ts';
 import { type DoctorCheckCache, getSharedDoctorCache, withDoctorCache } from './doctor-cache.ts';
 import { forjaCommand } from './forja-command.ts';
 
@@ -427,6 +428,60 @@ interface ChainCheckOptions {
   env: NodeJS.ProcessEnv;
   dbPath: string;
 }
+
+// MCP servers (MCP.md §7): a read-only DB probe (the manager isn't built in a
+// doctor run) listing configured/trusted servers and flagging any stuck in a
+// degraded/error state. `ok`/no-server is the common case.
+const mcpCheck = (opts: { dbPath: string }): DoctorCheck => {
+  // No DB yet (fresh install — the most common doctor invocation): MCP simply
+  // isn't set up. Skip the open entirely (mirrors chainCheck's existsSync guard;
+  // avoids the alarming "unable to open database file" detail + a wasted open).
+  if (!existsSync(opts.dbPath)) {
+    return { name: 'mcp', status: 'ok', detail: 'no MCP servers (no database yet)' };
+  }
+  let db: ReturnType<typeof openDb> | null = null;
+  try {
+    db = openDb(opts.dbPath, { readonly: true });
+    const servers = listMcpServers(db);
+    if (servers.length === 0) {
+      return { name: 'mcp', status: 'ok', detail: 'no MCP servers configured' };
+    }
+    const summary = servers.map((s) => `${s.name}(${s.state})`).join(', ');
+    const bad = servers.filter((s) => s.state === 'error' || s.state === 'degraded');
+    if (bad.length > 0) {
+      return {
+        name: 'mcp',
+        status: 'warn',
+        detail: `${servers.length} server(s): ${summary}`,
+        remediation: `reconnect / re-trust the degraded or errored server(s): ${bad.map((s) => s.name).join(', ')}`,
+      };
+    }
+    return { name: 'mcp', status: 'ok', detail: `${servers.length} server(s): ${summary}` };
+  } catch (e) {
+    const msg = (e as Error).message;
+    // An unmigrated DB has no mcp_servers table — MCP isn't set up (clean 'ok').
+    // ANY other read failure (notably a corrupt DB, which openDb surfaces via
+    // its integrity_check) is NOT 'ok' — defer the severity to the hash_chain
+    // check and merely warn here, rather than print a self-contradictory
+    // "ok … DB is corrupted".
+    if (msg.includes('no such table')) {
+      return { name: 'mcp', status: 'ok', detail: 'no MCP servers (not initialized)' };
+    }
+    return {
+      name: 'mcp',
+      status: 'warn',
+      detail: `could not read MCP state (see hash_chain): ${msg}`,
+    };
+  } finally {
+    if (db !== null) {
+      try {
+        closeDb(db);
+      } catch {
+        // ignore — readonly close errors don't invalidate the result above
+      }
+    }
+  }
+};
 
 const chainCheck = (options: ChainCheckOptions): DoctorCheck => {
   let identity: { install_id: string; created_at_ms: number };
@@ -1055,6 +1110,7 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
       ...(options.userPath !== undefined ? { userPath: options.userPath } : {}),
     }),
     chainCheck({ env, dbPath }),
+    mcpCheck({ dbPath }),
     // §13.7 enforcement honesty — re-probes sandbox availability
     // locally (not derived from `sandboxResult`, see the check's
     // header for the reasoning) and the compiled-binary signature.

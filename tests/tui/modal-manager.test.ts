@@ -1119,6 +1119,50 @@ describe('askTrust (trust:ask producer, spec §9.1) — slice 135 P1 ops-3', () 
   });
 });
 
+describe('askMcpTrust (mcp-trust:ask producer, MCP.md §1.5)', () => {
+  const req = {
+    server: 'postgres',
+    command: 'mcp-server-postgres --dsn $X',
+    mode: 'first-visit' as const,
+    sandbox: 'sandboxed' as const,
+    tools: [{ name: 'query', description: 'run a query', writes: false }],
+    manifestHash: 'abc123',
+  };
+
+  test('emits mcp-trust:ask carrying the server, command, tools, and hash', () => {
+    const s = make();
+    s.manager.askMcpTrust(req);
+    const ask = s.events.find((e) => e.type === 'mcp-trust:ask');
+    expect(ask).toBeDefined();
+    if (ask?.type !== 'mcp-trust:ask') throw new Error('wrong event type');
+    expect(ask.server).toBe('postgres');
+    expect(ask.command).toBe('mcp-server-postgres --dsn $X'); // the binary being authorized
+    expect(ask.manifestHash).toBe('abc123');
+    expect(ask.tools).toEqual([{ name: 'query', description: 'run a query', writes: false }]);
+  });
+
+  test('hotkey "1" resolves "yes"', async () => {
+    const s = make();
+    const promise = s.manager.askMcpTrust(req);
+    s.fs.dispatch(charKey('1'));
+    await expect(promise).resolves.toBe('yes');
+  });
+
+  test('hotkey "2" resolves "no"', async () => {
+    const s = make();
+    const promise = s.manager.askMcpTrust(req);
+    s.fs.dispatch(charKey('2'));
+    await expect(promise).resolves.toBe('no');
+  });
+
+  test('Esc resolves "cancel" (→ the MCP manager denies)', async () => {
+    const s = make();
+    const promise = s.manager.askMcpTrust(req);
+    s.fs.dispatch(key('escape'));
+    await expect(promise).resolves.toBe('cancel');
+  });
+});
+
 describe('askResumeMode (resume "from summary" feature)', () => {
   test('emits resumemode:ask and resolves "summary" on default Enter (recommended, cursor on option 0)', async () => {
     const s = make();

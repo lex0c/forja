@@ -1235,6 +1235,12 @@ export interface HarnessConfig {
   // have to construct one; bash surfaces `bash.spawn_failed` when
   // absent.
   broker?: Broker;
+  // MCP client subsystem manager (MCP.md). Built broker-style in bootstrap;
+  // owns the live stdio connections. The harness loop never reads this —
+  // MCP tools dispatch via the `call` closure baked into each registered
+  // tool — but the CLI holds it to `cleanup()` (disconnect all) at teardown.
+  // Optional so headless / SDK callers without MCP don't construct one.
+  mcpManager?: import('../mcp/manager.ts').McpManager;
   // §18 telemetry sink (slice 111, R10 #48). When wired, the
   // harness emits structured events for cross-cutting signals
   // that don't fit the audit row shape — currently `sandbox

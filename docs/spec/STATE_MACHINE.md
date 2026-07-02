@@ -729,7 +729,7 @@ Server crash mid-tool-call: cobre `§7.1` linha "tool_exec (durante invocação)
 
 ### O que **não** garantimos
 
-- **Reentrant calls:** se modelo chama `mcp:foo:bar` e `mcp:foo:baz` em paralelo (parallel_safe tools), server precisa suportar JSON-RPC concorrente — harness não serializa pra ele. Server não-reentrant declara `parallel_safe: false` em manifest extension (campo `_meta.agentic_cli.parallel_safe`)
+- **Reentrant calls:** se modelo chama `mcp__foo__bar` e `mcp__foo__baz` em paralelo (parallel_safe tools), server precisa suportar JSON-RPC concorrente — harness não serializa pra ele. Server não-reentrant declara `parallel_safe: false` em manifest extension (campo `_meta.agentic_cli.parallel_safe`)
 - **State entre `tools/call`:** server pode manter estado interno; harness não garante isolamento. Se o user precisa de isolamento, é problema do server (ex: spawn worker per call)
 - **Server-side persistência:** server pode escrever em FS/DB próprios; harness não captura em `checkpoints`. Tool MCP que escreve algo persistente é **fora do contrato de checkpoint** — `/undo` não cobre
 

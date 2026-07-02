@@ -324,7 +324,7 @@ auth = { kind = "bearer", env = "GITHUB_MCP_TOKEN" }
 
 ### 6.9 Slash command auto-promotion para tools MCP
 
-**O que é:** harness cria `/<server>:<tool>` automaticamente como slash command pra cada tool MCP.
+**O que é:** harness cria `/<server>__<tool>` automaticamente como slash command pra cada tool MCP.
 
 **Por que rejeita:**
 - Slash commands são **UX curados** (`AGENTIC_CLI.md §2.5`).

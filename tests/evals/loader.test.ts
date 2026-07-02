@@ -649,3 +649,62 @@ describe('loadEvalCase', () => {
     expect(() => loadEvalCase('/nonexistent/forja/case.yaml')).toThrow();
   });
 });
+
+describe('parseEvalCase: setup.mcp', () => {
+  test('parses a fake MCP server declaration', () => {
+    const yaml = `
+name: c
+prompt: p
+setup:
+  mcp:
+    fixture:
+      tools:
+        - name: echo
+          description: Echo text.
+          writes: false
+      result: MARK
+      surface: base
+expect:
+  - tool_called: mcp__fixture__echo
+`;
+    const c = parseEvalCase(yaml, '/tmp/c.yaml');
+    expect(c.setup?.mcp).toEqual({
+      fixture: {
+        tools: [{ name: 'echo', description: 'Echo text.', writes: false }],
+        result: 'MARK',
+        surface: 'base',
+      },
+    });
+  });
+
+  test('rejects non-array tools', () => {
+    const yaml = `
+name: c
+prompt: p
+setup:
+  mcp:
+    fixture:
+      tools: nope
+expect:
+  - status: done
+`;
+    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(/tools must be an array/);
+  });
+
+  test('rejects an invalid surface', () => {
+    const yaml = `
+name: c
+prompt: p
+setup:
+  mcp:
+    fixture:
+      tools:
+        - name: echo
+          description: e
+      surface: bogus
+expect:
+  - status: done
+`;
+    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(/surface must be/);
+  });
+});

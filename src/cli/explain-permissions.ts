@@ -167,6 +167,10 @@ export const renderExplainPermissions = (
       ),
     );
   }
+  if (t.mcp !== undefined) {
+    // Renders like bash — the same allow/confirm/deny lists, over wire-name patterns.
+    lines.push(...renderSection('mcp', provenance.mcp, formatBash(t.mcp), t.mcp.locked === true));
+  }
 
   // §6.5 sandbox section. Per-field attribution per slice 35: each
   // line carries its own writer. The lock is rendered as a footer

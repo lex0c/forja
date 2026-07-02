@@ -12,6 +12,7 @@ import type {
   EvalCase,
   EvalExpectation,
   EvalHttpResponse,
+  EvalMcpServer,
   EvalSetup,
 } from './types.ts';
 
@@ -41,6 +42,7 @@ const SETUP_KEYS: ReadonlySet<string> = new Set([
   'approvalPosture',
   'gitInit',
   'httpStub',
+  'mcp',
 ]);
 
 const BUDGET_KEYS: ReadonlySet<string> = new Set([
@@ -207,6 +209,44 @@ const parseSetup = (raw: unknown): EvalSetup | undefined => {
       out[url] = entry;
     }
     setup.httpStub = out;
+  }
+  if (r.mcp !== undefined) {
+    const servers = requireRecord(r.mcp, 'setup.mcp');
+    const out: Record<string, EvalMcpServer> = {};
+    for (const [name, raw] of Object.entries(servers)) {
+      const rr = requireRecord(raw, `setup.mcp['${name}']`);
+      if (!Array.isArray(rr.tools)) {
+        throw new Error(`eval: setup.mcp['${name}'].tools must be an array`);
+      }
+      const tools = rr.tools.map((t, i) => {
+        const tr = requireRecord(t, `setup.mcp['${name}'].tools[${i}]`);
+        const tool: EvalMcpServer['tools'][number] = {
+          name: requireString(tr.name, `setup.mcp['${name}'].tools[${i}].name`),
+          description: requireString(
+            tr.description,
+            `setup.mcp['${name}'].tools[${i}].description`,
+          ),
+        };
+        if (tr.writes !== undefined) {
+          if (typeof tr.writes !== 'boolean') {
+            throw new Error(`eval: setup.mcp['${name}'].tools[${i}].writes must be a boolean`);
+          }
+          tool.writes = tr.writes;
+        }
+        return tool;
+      });
+      const entry: EvalMcpServer = { tools };
+      if (rr.result !== undefined)
+        entry.result = requireString(rr.result, `setup.mcp['${name}'].result`);
+      if (rr.surface !== undefined) {
+        if (rr.surface !== 'base' && rr.surface !== 'deferred') {
+          throw new Error(`eval: setup.mcp['${name}'].surface must be 'base' or 'deferred'`);
+        }
+        entry.surface = rr.surface;
+      }
+      out[name] = entry;
+    }
+    setup.mcp = out;
   }
   return setup;
 };

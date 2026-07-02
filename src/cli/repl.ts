@@ -621,6 +621,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
             { path: a.path, mode: a.mode, corpusFiles: a.corpusFiles },
             { timeoutMs: 5 * 60 * 1000 },
           ),
+        // MCP manifest-trust modal — thin adapter, same 5-minute fail-closed
+        // window as the cwd / shared-corpus trust modals.
+        confirmMcpTrust: (req) => modalManager.askMcpTrust(req, { timeoutMs: 5 * 60 * 1000 }),
       } satisfies BootstrapInput));
   } catch (e) {
     const msg = e instanceof Error ? e.message || e.name || String(e) : String(e);
@@ -651,6 +654,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     auditConfigWarnings,
     sandboxConfigWarnings,
     verifyConfigWarnings,
+    mcpConfigWarnings,
     sandboxEnforcement,
     permissionState,
     permissionRefusingReason,
@@ -856,6 +860,17 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // claim-time verification OFF, so surface the typo instead of hiding it.
   for (const w of verifyConfigWarnings) {
     errSink(`forja: verify config: ${w}\n`);
+  }
+  // mcp.toml + manager.init() warnings — a skipped/denied/drifted server is
+  // otherwise an invisible missing tool. (MCP.md §9.3 / FAILURE_MODES §15.)
+  // Prefix is `mcp:` (not `mcp config:`): these mix parse warnings with runtime
+  // handshake/trust failures, and the config-parse ones already carry their
+  // `mcp.toml [servers.x]` context in the text — labeling a handshake fault as a
+  // config problem sends the operator hunting in the wrong place. Sanitize each:
+  // a handshake-failed warning embeds the server's error text (a remote server's
+  // HTTP body), so an unsanitized ANSI/control payload could repaint the banner.
+  for (const w of mcpConfigWarnings) {
+    errSink(`forja: mcp: ${flattenControlToLine(w)}\n`);
   }
   // Shared-corpus trust probe outcome (S5/T5.2 + T5.3). Render a
   // single summary line so operators see what the modal decision
@@ -2331,6 +2346,16 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       } catch {
         // Swallow — exit must not hang on a stubborn child; the audit
         // row stays 'running' and `forja doctor` can surface it.
+      }
+    }
+    // MCP stdio clients (MCP.md §1.7): disconnect all at session exit.
+    // Best-effort — exit must not hang on a stubborn server.
+    if (baseConfig.mcpManager !== undefined) {
+      try {
+        await baseConfig.mcpManager.cleanup();
+      } catch {
+        // Swallow — cleanup() is already per-client fail-soft; this guards a
+        // surprise throw from blocking exit.
       }
     }
     // Session-scoped reminders (ORCHESTRATION.md §3B.9): clear every

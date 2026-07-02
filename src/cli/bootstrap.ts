@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { loadRetentionConfig } from '../audit/config-loader.ts';
 import {
   type Broker,
@@ -31,6 +31,15 @@ import {
   resolveHookPaths,
   resolveHookShell,
 } from '../hooks/index.ts';
+import { loadMcpConfig } from '../mcp/config.ts';
+import { type McpInitReport, type McpManager, createMcpManager } from '../mcp/manager.ts';
+import type {
+  ConfirmMcpTrust,
+  McpClient,
+  McpSandboxArg,
+  McpSandboxWrap,
+  McpTransportConfig,
+} from '../mcp/types.ts';
 import {
   computeSharedFingerprint,
   createMemoryRegistry,
@@ -176,6 +185,13 @@ export interface BootstrapInput {
   // the permission-layer test seams above.
   userAgentsDir?: string | null;
   projectAgentsDir?: string | null;
+  // Test seam for the mcp.toml user layer. Mirrors userPolicyPath /
+  // userAgentsDir: `null` disables the user layer (keeps a developer's real
+  // ~/.config/forja/mcp.toml out of a test's bootstrap), absent = default.
+  userMcpPath?: string | null;
+  // --auto-approve-mcp <list>: MCP servers granted trust without a prompt
+  // (CI/headless). Threaded into the MCP manager's `autoApprove`.
+  autoApproveMcp?: ReadonlySet<string>;
   // Test seam for trust-list discovery. Mirrors the REPL's
   // `trustListPathOverride`:
   //   - undefined → use `trustListPath()` (production default)
@@ -287,6 +303,21 @@ export interface BootstrapInput {
     mode: import('../memory/index.ts').SharedTrustModalMode;
     corpusFiles: readonly { name: string; bytes: number }[];
   }) => Promise<'yes' | 'no' | 'cancel'>;
+  // Interactive MCP manifest-trust callback (the askMcpTrust modal). The REPL
+  // adapter that supplies it lands in a follow-up slice; until then it is
+  // undefined everywhere ⇒ the MCP manager fails closed (deny unless the
+  // server is in autoApproveMcp), the safe intermediate state.
+  confirmMcpTrust?: ConfirmMcpTrust;
+  // Test seam: inject a fake MCP client factory so a test can exercise the
+  // bootstrap → manager → registration path without spawning a real stdio
+  // subprocess. Production leaves it absent (the SDK stdio adapter is used).
+  // Mirrors the manager's `makeClient` (cfg, sandbox?, stderrLogPath?) so a
+  // bootstrap-level fake can observe the sandbox + stderr-log threading.
+  mcpMakeClient?: (
+    cfg: McpTransportConfig,
+    sandbox?: McpSandboxArg,
+    stderrLogPath?: string,
+  ) => McpClient;
 }
 
 // §13.7 sandbox-enforcement snapshot — captured at bootstrap time so
@@ -407,6 +438,10 @@ export interface BootstrapResult {
   // dropped non-string entries, surfaced on the same stderr banner so an
   // operator whose gate config was silently ignored sees why.
   verifyConfigWarnings: readonly string[];
+  // Warnings from the mcp.toml loader + manager.init() — bad server entries,
+  // handshake failures, unreadable cached manifests — surfaced on the stderr
+  // banner so an operator whose MCP server was skipped sees why.
+  mcpConfigWarnings: readonly string[];
   // Final state of the permission engine after bootstrap walked
   // init → loading-policy → validating-chain → ready/refusing.
   // When this is `refusing`, the engine is a deny-everything stub
@@ -1550,6 +1585,101 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // collide with the parent repo's.
   const bgLogDir = join(cwd, projectDirName(), 'bg');
 
+  // MCP client subsystem (MCP.md). Built broker-style: eager here (no
+  // sessionId needed); trusted MCP tools register into `toolRegistry` BEFORE
+  // the HarnessConfig literal below, so they're on the wire from turn 1.
+  // `loadMcpConfig` + `manager.init()` are fail-soft for the EXPECTED failures
+  // (bad entries / handshake failures → warnings), but `init()` does
+  // unguarded DB writes, so a runtime SQLite fault (or the mcpMakeClient test
+  // seam) can still throw — this block sits AFTER the system-prompt try-block
+  // that owns `closeDb(db)`, so wrap it to close the handle on a throw.
+  // Headless (no confirmMcpTrust) fails closed unless a server is in
+  // autoApproveMcp.
+  let mcpManager: McpManager;
+  let mcpInit: McpInitReport;
+  try {
+    const mcpConfig = loadMcpConfig({
+      // Repo-root cwd (like every other project-scoped loader above), so running
+      // forja from a subdirectory still finds <repo>/.forja/mcp.toml + mcp.local.toml
+      // — NOT the raw invocation cwd, which would silently drop project MCP servers.
+      cwd: projectConfigCwd,
+      ...(input.userMcpPath !== undefined ? { userPathOverride: input.userMcpPath } : {}),
+    });
+    // Sandbox wrap for spawned stdio servers (MCP.md §2.3). Reuses the bash
+    // sandbox machinery: `available` (boot detection) drives default-on + the
+    // modal status; the closure prefixes bwrap/sandbox-exec, anchoring the
+    // foreign-`.forja/` read-floor at the repo root and forwarding the per-run
+    // scoped tmpdir. `failClosed` = present-at-boot, so a mid-session tool loss
+    // throws (→ server error) rather than a silent unconfined spawn.
+    const mcpSandbox = {
+      available: sandboxAvail.available,
+      wrap: ({
+        profile,
+        cwd: serverCwd,
+        innerArgv,
+        env,
+        passthroughEnv,
+      }: Parameters<McpSandboxWrap>[0]) =>
+        maybeWrapSandboxArgv({
+          profile,
+          cwd: serverCwd,
+          // Reuse the already-resolved repo root + operator home (the latter has
+          // the passwd fallback for $HOME-unset CI/containers) rather than
+          // recomputing or letting the runner fall back to env.HOME.
+          projectRoot: projectConfigCwd,
+          home,
+          innerArgv,
+          env,
+          ...(sandboxTmpdirHandle.tmpdir !== undefined
+            ? { tmpdir: sandboxTmpdirHandle.tmpdir }
+            : {}),
+          ...(passthroughEnv !== undefined ? { passthroughEnv } : {}),
+          failClosed: sandboxAvail.available,
+        }),
+    };
+    mcpManager = createMcpManager({
+      db,
+      registry: toolRegistry,
+      config: mcpConfig,
+      // Session cwd — folds into a stdio server's trust identity so a relative
+      // executable launched from a different directory re-triggers trust. Matches
+      // the client's `process.cwd()` spawn fallback (run.ts passes the same).
+      cwd,
+      // Repo root — the STORAGE scope for project servers (AUDIT §1.5), so the
+      // user-global sessions.db isolates the same server name across repos. Same
+      // repo-root resolution every other project-scoped loader uses.
+      projectRoot: projectConfigCwd,
+      sandbox: mcpSandbox,
+      // Per-server stderr logs land in a `traces/` dir beside the DB — under
+      // the default absolute dbPath that is `<dataDir>/traces/`, and a test's
+      // dbPath override isolates them along with the DB.
+      traceDir: join(dirname(dbPath), 'traces'),
+      // Budget/timeout failure_events ride the same audit chain as the rest of
+      // the session (mcp.budget.exceeded / mcp.timeout, MCP.md §5/§15).
+      failureSink,
+      ...(input.confirmMcpTrust !== undefined ? { confirmTrust: input.confirmMcpTrust } : {}),
+      ...(input.autoApproveMcp !== undefined ? { autoApprove: input.autoApproveMcp } : {}),
+      ...(input.mcpMakeClient !== undefined ? { makeClient: input.mcpMakeClient } : {}),
+    });
+    // Fail-closed boot short-circuit. When `permResult.state === 'refusing'`
+    // (broken audit chain without --accept-broken-chain, or
+    // sandbox-required-but-unavailable) the permission engine is a
+    // deny-everything stub and run.ts exits non-zero — but `init()` would still
+    // connect to a remote server (sending its bearer) or spawn an arbitrary
+    // stdio binary BEFORE that exit, both interactively and headless with
+    // --auto-approve-mcp. That leaks exactly the side effects the refusal
+    // exists to prevent. Skip init on a refusing boot; the manager is still
+    // constructed (registers nothing, connects nothing) so cleanup() and the
+    // HarnessConfig wiring stay valid.
+    mcpInit =
+      permResult.state === 'refusing'
+        ? { registered: 0, servers: [], warnings: [] }
+        : await mcpManager.init();
+  } catch (e) {
+    closeDb(db);
+    throw e;
+  }
+
   // (`trustPath` and `isCwdTrusted` resolved above the try-block
   // so the project-context section can gate on them at prompt-
   // assembly time; both are still consumed below — memory_write
@@ -1602,6 +1732,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     cwd,
     bgLogDir,
     broker,
+    mcpManager,
     userPrompt: input.prompt,
     // Checkpoints (M3 §12): enabled for every CLI run by default
     // so users get `--undo` for free.
@@ -1798,6 +1929,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     auditConfigWarnings: auditLoaded.warnings,
     sandboxConfigWarnings: sandboxLoaded.warnings,
     verifyConfigWarnings: verifyLoaded.warnings,
+    mcpConfigWarnings: mcpInit.warnings,
     permissionState: permResult.state,
     ...(permResult.refusingReason !== undefined
       ? { permissionRefusingReason: permResult.refusingReason }

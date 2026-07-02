@@ -1,0 +1,2839 @@
+import { beforeEach, describe, expect, test } from 'bun:test';
+import {
+  type EmitFailureEventInput,
+  type FailureEventSink,
+  createSqliteFailureSink,
+} from '../../src/failures/index.ts';
+import type { LoadedMcpConfig } from '../../src/mcp/config.ts';
+import { createMcpManager } from '../../src/mcp/manager.ts';
+import {
+  canonicalManifestJson,
+  canonicalizeManifest,
+  hashManifest,
+} from '../../src/mcp/manifest.ts';
+import type {
+  McpCallResult,
+  McpClient,
+  McpManifestTool,
+  McpSandboxArg,
+  McpSandboxWrap,
+  McpServerConfig,
+  McpServerSource,
+  McpTransportConfig,
+} from '../../src/mcp/types.ts';
+import { type DB, openMemoryDb } from '../../src/storage/db.ts';
+import { migrate } from '../../src/storage/migrate.ts';
+import { listFailureEventsBySession } from '../../src/storage/repos/failure-events.ts';
+import {
+  getServer,
+  insertServer,
+  latestTrustedManifest,
+  listManifestHistory,
+  recordManifestDecision,
+} from '../../src/storage/repos/mcp-servers.ts';
+import { type ToolRegistry, createToolRegistry } from '../../src/tools/registry.ts';
+import type { ToolContext } from '../../src/tools/types.ts';
+
+const ctx = {
+  signal: new AbortController().signal,
+  sessionId: 'sess-1',
+} as unknown as ToolContext;
+
+// The storage scope a project server resolves to when the manager gets no
+// `projectRoot` dep: projectRoot ?? sessionCwd ?? process.cwd(). Every seed below
+// uses it so the rows match what the manager looks up. (Tests that pass an
+// explicit `cwd` also pass `projectRoot: SCOPE` to keep the scope constant while
+// only the command identity varies.)
+const SCOPE = process.cwd();
+
+// Capturing failure_event sink — records every emit for assertion.
+const captureSink = (): { sink: FailureEventSink; emits: EmitFailureEventInput[] } => {
+  const emits: EmitFailureEventInput[] = [];
+  const sink: FailureEventSink = {
+    emit: (i) => {
+      emits.push(i);
+      return { id: 'fake', this_chain_hash: 'fake' };
+    },
+    verifyChain: () => ({ ok: true, rows: 0 }),
+  };
+  return { sink, emits };
+};
+
+const toolDef = (name: string): McpManifestTool => ({
+  name,
+  description: `the ${name} tool`,
+  inputSchema: { type: 'object' },
+  meta: { writes: false },
+});
+
+const serverConfig = (over: Partial<McpServerConfig> = {}): McpServerConfig => ({
+  name: 'db',
+  enabled: true,
+  surface: 'deferred',
+  source: 'project_shared',
+  transport: { transport: 'stdio', command: 'fake-bin', args: [], rawArgv: ['fake-bin'] },
+  ...over,
+});
+
+const remoteServerConfig = (over: Partial<McpServerConfig> = {}): McpServerConfig => ({
+  name: 'gh',
+  enabled: true,
+  surface: 'deferred',
+  source: 'project_shared',
+  transport: {
+    transport: 'http',
+    url: 'https://mcp.example.com/v1',
+    rawUrl: 'https://mcp.example.com/v1',
+  },
+  ...over,
+});
+
+const config = (
+  servers: McpServerConfig[],
+  incompleteSources: ReadonlySet<McpServerSource> = new Set(),
+): LoadedMcpConfig => ({
+  servers,
+  warnings: [],
+  paths: { user: null, project: '/p/mcp.toml', local: '/p/mcp.local.toml' },
+  incompleteSources,
+});
+
+// A fake McpClient + a spy on the makeClient factory.
+interface FakeSpec {
+  tools: McpManifestTool[];
+  callResult?: McpCallResult;
+  connectError?: Error;
+  listToolsError?: Error;
+  // The server's self-reported `initialize.serverInfo.name` — feeds the manifest
+  // hash (spec §3.2). Defaults to null (reports no name), matching recordGrantOnly.
+  serverName?: string | null;
+  // callTool rejects immediately with this (a non-timeout transport fault), to
+  // exercise the disconnect-and-reap branch.
+  callError?: Error;
+  // callTool never resolves on its own — only rejects when the passed signal
+  // aborts (exercises the per-call timeout path).
+  callHangs?: boolean;
+  // Per-call results in order (falls back to callResult / default when drained).
+  // Lets a test sequence invalid→valid outputs for the §15.5 recovery loop.
+  callResultsQueue?: McpCallResult[];
+}
+const fakeClientFactory = (spec: FakeSpec) => {
+  const stats = {
+    made: 0,
+    connects: 0,
+    closes: 0,
+    calls: 0,
+    lastConnectSignal: undefined as AbortSignal | undefined,
+    lastSandbox: undefined as McpSandboxArg | undefined,
+    lastLogPath: undefined as string | undefined,
+  };
+  const makeClient = (
+    _cfg: McpTransportConfig,
+    sandbox?: McpSandboxArg,
+    stderrLogPath?: string,
+  ): McpClient => {
+    stats.made += 1;
+    stats.lastSandbox = sandbox;
+    stats.lastLogPath = stderrLogPath;
+    return {
+      async connect(signal) {
+        stats.connects += 1;
+        stats.lastConnectSignal = signal;
+        if (spec.connectError) throw spec.connectError;
+        return {
+          protocolVersion: '2024-11-05',
+          serverName: spec.serverName ?? null,
+          serverVersion: '1.0.0',
+        };
+      },
+      async listTools() {
+        if (spec.listToolsError) throw spec.listToolsError;
+        return spec.tools;
+      },
+      async callTool(_tool, _args, signal) {
+        stats.calls += 1;
+        if (spec.callError) throw spec.callError;
+        if (spec.callHangs) {
+          return new Promise<McpCallResult>((_res, rej) => {
+            signal?.addEventListener('abort', () => rej(new Error('aborted')));
+          });
+        }
+        if (spec.callResultsQueue && spec.callResultsQueue.length > 0) {
+          return spec.callResultsQueue.shift() as McpCallResult;
+        }
+        return spec.callResult ?? { isError: false, content: 'ok' };
+      },
+      async close() {
+        stats.closes += 1;
+      },
+    };
+  };
+  return { makeClient, stats };
+};
+
+// Seed a granted manifest so init() takes the cached (no-connect) path.
+// Record a GRANTED manifest in the append-only history WITHOUT an mcp_servers
+// row — i.e. the "swept" state a removed server leaves behind (the row is gone,
+// the forever grant survives). The manager must NOT reuse such a grant by name.
+// `serverName` is the server's self-reported name folded into the hash (spec
+// §3.2); defaults to null (matching the fake client), so a caller seeding a grant
+// that must survive a live handshake leaves it null unless testing name drift.
+const recordGrantOnly = (
+  db: DB,
+  server: string,
+  tools: McpManifestTool[],
+  serverName: string | null = null,
+): string => {
+  const canonical = canonicalizeManifest({
+    serverName,
+    protocolVersion: '2024-11-05',
+    serverVersion: '1.0.0',
+    tools,
+  });
+  const hash = hashManifest(canonical);
+  recordManifestDecision(db, {
+    scope: SCOPE,
+    server_name: server,
+    hash,
+    previous_hash: null,
+    manifest_json: canonicalManifestJson(canonical),
+    protocol_version: '2024-11-05',
+    server_version: '1.0.0',
+    decision: 'granted',
+    decided_by: 'user',
+    decided_at: 1,
+    approval_id: null,
+  });
+  return hash;
+};
+
+// Mirrors manager.ts stdioCommandIdentity: the persisted stdio identity is the
+// raw argv + the effective cwd (+ sorted env when present). `cwd` defaults to
+// process.cwd() — the manager's sessionCwd default when `deps.cwd` is unset.
+const stdioIdentity = (
+  argv: string[],
+  opts: { cwd?: string; env?: Record<string, string> } = {},
+): string => {
+  const cwd = opts.cwd ?? process.cwd();
+  const env = opts.env;
+  return JSON.stringify(
+    env !== undefined && Object.keys(env).length > 0
+      ? {
+          argv,
+          cwd,
+          env: Object.fromEntries(
+            Object.entries(env).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+          ),
+        }
+      : { argv, cwd },
+  );
+};
+
+// A REAL granted server: the forever grant PLUS its identity-bearing mcp_servers
+// row (the manager reuses a cached grant only when the row is present). The row
+// matches serverConfig (stdio fake-bin); idempotent so a caller that inserts its
+// own row first (the orphan-sweep test) isn't double-inserted.
+const seedTrusted = (db: DB, server: string, tools: McpManifestTool[]): string => {
+  const hash = recordGrantOnly(db, server, tools);
+  if (getServer(db, SCOPE, server) === null) {
+    insertServer(db, {
+      scope: SCOPE,
+      name: server,
+      transport: 'stdio',
+      command: stdioIdentity(['fake-bin']),
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
+    });
+  }
+  return hash;
+};
+
+let db: DB;
+let registry: ToolRegistry;
+
+beforeEach(() => {
+  db = openMemoryDb();
+  migrate(db);
+  registry = createToolRegistry();
+});
+
+describe('McpManager.init: fresh trust', () => {
+  test('auto-approve grants, registers tools, persists trusted state + history', async () => {
+    const { makeClient } = fakeClientFactory({ tools: [toolDef('query'), toolDef('list')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient,
+      now: () => 100,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(2);
+    expect(registry.has('mcp__db__query')).toBe(true);
+    expect(registry.has('mcp__db__list')).toBe(true);
+    expect(mgr.state('db')).toBe('trusted');
+    expect(getServer(db, SCOPE, 'db')?.state).toBe('trusted');
+    expect(latestTrustedManifest(db, SCOPE, 'db')?.decided_by).toBe('auto_approve');
+  });
+
+  test('headless without auto-approve fails closed (denied, no tools)', async () => {
+    const { makeClient } = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({ db, registry, config: config([serverConfig()]), makeClient });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(0);
+    expect(registry.has('mcp__db__query')).toBe(false);
+    expect(mgr.state('db')).toBe('denied');
+    expect(latestTrustedManifest(db, SCOPE, 'db')).toBeNull();
+  });
+
+  test('confirmTrust "yes" grants, "no" denies', async () => {
+    const yes = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgrYes = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      confirmTrust: async () => 'yes',
+      makeClient: yes.makeClient,
+    });
+    await mgrYes.init();
+    expect(mgrYes.state('db')).toBe('trusted');
+    expect(registry.has('mcp__db__query')).toBe(true);
+
+    const db2 = openMemoryDb();
+    migrate(db2);
+    const reg2 = createToolRegistry();
+    const no = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgrNo = createMcpManager({
+      db: db2,
+      registry: reg2,
+      config: config([serverConfig()]),
+      confirmTrust: async () => 'no',
+      makeClient: no.makeClient,
+    });
+    await mgrNo.init();
+    expect(mgrNo.state('db')).toBe('denied');
+    expect(reg2.has('mcp__db__query')).toBe(false);
+  });
+});
+
+describe('McpManager.init: pre-connect identity gate (MCP.md §1.5)', () => {
+  test('declining the identity gate denies WITHOUT connecting (no spawn, no token sent)', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const preConnectFlags: boolean[] = [];
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      confirmTrust: async (req) => {
+        preConnectFlags.push(req.preConnect === true);
+        return 'no'; // decline at the identity gate
+      },
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(mgr.state('db')).toBe('denied');
+    expect(fake.stats.made).toBe(0); // never built a client → never spawned / connected
+    expect(preConnectFlags).toEqual([true]); // only the pre-connect identity prompt fired
+  });
+
+  test('the identity gate precedes the manifest prompt; approving both connects + registers', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const preConnectFlags: boolean[] = [];
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      confirmTrust: async (req) => {
+        preConnectFlags.push(req.preConnect === true);
+        return 'yes';
+      },
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(mgr.state('db')).toBe('trusted');
+    expect(registry.has('mcp__db__query')).toBe(true);
+    expect(preConnectFlags).toEqual([true, false]); // identity gate FIRST, then the manifest review
+    expect(fake.stats.connects).toBe(1); // connected only AFTER the identity was authorized
+  });
+
+  test('a remote server: the bearer URL is not opened until the identity is authorized', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([remoteServerConfig()]),
+      confirmTrust: async () => 'no',
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(mgr.state('gh')).toBe('denied');
+    expect(fake.stats.made).toBe(0); // no connect → the Authorization: Bearer header is never sent
+  });
+
+  test('approving the identity then declining the manifest review denies (after connecting)', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    let call = 0;
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      // 'yes' to the identity gate, 'no' to the manifest review that follows.
+      confirmTrust: async () => (call++ === 0 ? 'yes' : 'no'),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(mgr.state('db')).toBe('denied');
+    expect(registry.has('mcp__db__query')).toBe(false);
+    expect(fake.stats.connects).toBe(1); // identity approved → connected, THEN the tools declined
+    expect(call).toBe(2); // both prompts fired
+  });
+
+  test('headless auto-approve connects + trusts with NO identity prompt', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      // No confirmTrust (headless) + auto-approved → neither the identity gate nor
+      // the manifest prompt can fire; the server still connects + trusts.
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(mgr.state('db')).toBe('trusted');
+    expect(registry.has('mcp__db__query')).toBe(true);
+    expect(fake.stats.connects).toBe(1);
+  });
+
+  test('a modal fault during the identity gate fails closed (denied, not uncaught)', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      confirmTrust: async () => {
+        throw new Error('modal crashed');
+      },
+      makeClient: fake.makeClient,
+    });
+    // init must not reject — the per-server fault is contained + fails closed.
+    await mgr.init();
+    expect(mgr.state('db')).toBe('denied');
+    expect(fake.stats.made).toBe(0); // faulted at the gate → never connected
+  });
+});
+
+describe('McpManager.init: auto-approve wins over the interactive prompt', () => {
+  test('an auto-approved server grants without any confirmTrust prompt, even interactively', async () => {
+    // Regression: --auto-approve-mcp <name> must skip BOTH the identity gate and
+    // the manifest prompt in an INTERACTIVE run (confirmTrust present), not only
+    // headless — otherwise the flag never works with a TTY and still blocks boot
+    // on the two modals.
+    let prompts = 0;
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      confirmTrust: async () => {
+        prompts += 1;
+        return 'yes';
+      },
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+
+    expect(prompts).toBe(0); // neither the identity gate nor the manifest prompt fired
+    expect(mgr.state('db')).toBe('trusted');
+    expect(registry.has('mcp__db__query')).toBe(true);
+    expect(fake.stats.connects).toBe(1); // still connected + registered
+    expect(latestTrustedManifest(db, SCOPE, 'db')?.decided_by).toBe('auto_approve');
+  });
+
+  test('a NON-auto-approved server in the same run still prompts', async () => {
+    // The short-circuit is scoped to listed servers only — an unlisted server
+    // must still go through the trust modals.
+    let prompts = 0;
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ name: 'other' })]),
+      confirmTrust: async () => {
+        prompts += 1;
+        return 'yes';
+      },
+      autoApprove: new Set(['db']), // 'other' is NOT listed
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+
+    expect(prompts).toBeGreaterThan(0); // identity gate (+ manifest) still fired
+    expect(mgr.state('other')).toBe('trusted');
+    expect(latestTrustedManifest(db, SCOPE, 'other')?.decided_by).toBe('user');
+  });
+});
+
+describe('McpManager.init: stdio trust identity includes the effective cwd', () => {
+  const relativeConfig = (over: Partial<McpServerConfig> = {}): McpServerConfig =>
+    serverConfig({
+      transport: { transport: 'stdio', command: './server', args: [], rawArgv: ['./server'] },
+      ...over,
+    });
+  const seedRow = (command: string) => {
+    recordGrantOnly(db, 'db', [toolDef('query')]);
+    insertServer(db, {
+      scope: SCOPE,
+      name: 'db',
+      transport: 'stdio',
+      command,
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
+    });
+  };
+
+  test('reuses cached trust when launched from the SAME cwd', async () => {
+    seedRow(stdioIdentity(['./server'], { cwd: '/dir-a' }));
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([relativeConfig()]),
+      cwd: '/dir-a', // same directory the grant was authorized in
+      projectRoot: SCOPE,
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(1);
+    expect(mgr.state('db')).toBe('trusted');
+    expect(fake.stats.made).toBe(0); // cached → no connect
+  });
+
+  test('does NOT reuse cached trust from a DIFFERENT cwd (relative binary would differ)', async () => {
+    seedRow(stdioIdentity(['./server'], { cwd: '/dir-a' })); // grant authorized in /dir-a
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([relativeConfig()]),
+      cwd: '/dir-b', // launched elsewhere → ./server resolves to a DIFFERENT binary
+      projectRoot: SCOPE,
+      // Headless + not auto-approved → the required re-trust fails closed BEFORE spawning.
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(0); // the old manifest is NOT registered
+    expect(registry.has('mcp__db__query')).toBe(false);
+    expect(mgr.state('db')).toBe('denied'); // re-trust required, none available
+    expect(fake.stats.connects).toBe(0); // never spawned the relocated binary
+  });
+
+  test('a bare interpreter with a relative script (node ./s.js) re-trusts on a cwd change', async () => {
+    // The finding's headline: argv[0] is a PATH binary (`node`), but the relative
+    // SCRIPT resolves against cwd, so a moved cwd runs a different script.
+    const nodeScript = {
+      transport: 'stdio' as const,
+      command: 'node',
+      args: ['./server.js'],
+      rawArgv: ['node', './server.js'],
+    };
+    seedRow(stdioIdentity(['node', './server.js'], { cwd: '/proj-a' }));
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ transport: nodeScript })]),
+      cwd: '/proj-b', // ./server.js now resolves to a different file
+      projectRoot: SCOPE,
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(0);
+    expect(mgr.state('db')).toBe('denied');
+    expect(fake.stats.connects).toBe(0);
+  });
+
+  test('an explicit cfg.cwd change re-triggers trust', async () => {
+    seedRow(stdioIdentity(['./server'], { cwd: '/authorized' }));
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        relativeConfig({
+          transport: {
+            transport: 'stdio',
+            command: './server',
+            args: [],
+            rawArgv: ['./server'],
+            cwd: '/moved', // cfg.cwd overrides the session cwd
+          },
+        }),
+      ]),
+      cwd: '/authorized', // session cwd unchanged, but cfg.cwd moved
+      projectRoot: SCOPE,
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(0);
+    expect(mgr.state('db')).toBe('denied');
+  });
+
+  test('an ABSOLUTE executable STILL re-trusts on a cwd change (sandbox writable root moves)', async () => {
+    // Even though the binary doesn't move, cwd is the sandbox writable root — a
+    // cwd change lets the server write to a different directory, so re-trust.
+    const absConfig = (): McpServerConfig =>
+      serverConfig({
+        transport: {
+          transport: 'stdio',
+          command: '/opt/mcp/server',
+          args: [],
+          rawArgv: ['/opt/mcp/server'],
+        },
+      });
+    seedRow(stdioIdentity(['/opt/mcp/server'], { cwd: '/dir-a' }));
+
+    // Same cwd → cached grant honored (no spurious re-trust).
+    const same = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgrSame = createMcpManager({
+      db,
+      registry,
+      config: config([absConfig()]),
+      cwd: '/dir-a',
+      projectRoot: SCOPE,
+      makeClient: same.makeClient,
+    });
+    expect((await mgrSame.init()).registered).toBe(1);
+    expect(same.stats.made).toBe(0);
+
+    // Different cwd → re-trust (writable root moved).
+    const db2 = openMemoryDb();
+    migrate(db2);
+    recordGrantOnly(db2, 'db', [toolDef('query')]);
+    insertServer(db2, {
+      scope: SCOPE,
+      name: 'db',
+      transport: 'stdio',
+      command: stdioIdentity(['/opt/mcp/server'], { cwd: '/dir-a' }),
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    const moved = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgrMoved = createMcpManager({
+      db: db2,
+      registry: createToolRegistry(),
+      config: config([absConfig()]),
+      cwd: '/dir-b', // writable root moves to /dir-b
+      projectRoot: SCOPE,
+      makeClient: moved.makeClient,
+    });
+    const report = await mgrMoved.init();
+    expect(report.registered).toBe(0);
+    expect(mgrMoved.state('db')).toBe('denied');
+    expect(moved.stats.connects).toBe(0);
+  });
+});
+
+describe('McpManager.init: credential bindings in the trust identity', () => {
+  test('adding a stdio env binding forces re-trust (no silent cached grant)', async () => {
+    // Previously trusted with no env; the operator adds `SECRET = "$SECRET"`.
+    // The raw argv is unchanged, but the new binding must re-trigger trust before
+    // the next spawn passes the resolved secret to the approved command.
+    seedTrusted(db, 'db', [toolDef('query')]); // row identity = ["fake-bin"], no env
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          transport: {
+            transport: 'stdio',
+            command: 'fake-bin',
+            args: [],
+            rawArgv: ['fake-bin'],
+            env: { SECRET: 'super-secret-value' },
+            rawEnv: { SECRET: '$SECRET' },
+          },
+        }),
+      ]),
+      // Headless + not auto-approved → the required re-trust fails closed.
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(0);
+    expect(mgr.state('db')).toBe('denied');
+    expect(fake.stats.connects).toBe(0); // never spawned with the new secret
+  });
+
+  test('the persisted env identity holds the $VAR literal, never the resolved secret', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          transport: {
+            transport: 'stdio',
+            command: 'fake-bin',
+            args: [],
+            rawArgv: ['fake-bin'],
+            env: { SECRET: 'super-secret-value' },
+            rawEnv: { SECRET: '$SECRET' },
+          },
+        }),
+      ]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+
+    const command = getServer(db, SCOPE, 'db')?.command ?? '';
+    expect(command).toContain('$SECRET'); // the binding is recorded
+    expect(command).not.toContain('super-secret-value'); // the resolved secret is NOT
+  });
+
+  test('an unchanged env binding reuses the cached grant (no re-trust)', async () => {
+    const envTransport = {
+      transport: 'stdio' as const,
+      command: 'fake-bin',
+      args: [] as string[],
+      rawArgv: ['fake-bin'],
+      env: { SECRET: 'super-secret-value' },
+      rawEnv: { SECRET: '$SECRET' },
+    };
+    // Seed the row with the env-inclusive identity a prior grant would have written.
+    recordGrantOnly(db, 'db', [toolDef('query')]);
+    insertServer(db, {
+      scope: SCOPE,
+      name: 'db',
+      transport: 'stdio',
+      command: stdioIdentity(['fake-bin'], { env: { SECRET: '$SECRET' } }),
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ transport: envTransport })]),
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(1);
+    expect(fake.stats.made).toBe(0); // identity matched → cached, no connect
+  });
+
+  test('changing a remote auth env binding forces re-trust', async () => {
+    // Trusted at rawUrl with auth env TOKEN_A; the operator re-points auth to
+    // TOKEN_B. The URL is unchanged, but the new credential binding must re-trust.
+    recordGrantOnly(db, 'gh', [toolDef('query')]);
+    insertServer(db, {
+      scope: SCOPE,
+      name: 'gh',
+      transport: 'http',
+      command: null,
+      url: JSON.stringify({
+        url: 'https://mcp.example.com/v1',
+        origin: 'https://mcp.example.com',
+        auth: 'TOKEN_A',
+      }),
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        remoteServerConfig({
+          transport: {
+            transport: 'http',
+            url: 'https://mcp.example.com/v1',
+            rawUrl: 'https://mcp.example.com/v1',
+            authEnv: 'TOKEN_B', // re-pointed
+          },
+        }),
+      ]),
+      // Headless + not auto-approved → the required re-trust fails closed.
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(0);
+    expect(mgr.state('gh')).toBe('denied');
+    expect(fake.stats.connects).toBe(0); // never connected with the new token
+  });
+
+  test('re-pointing an env-expanded URL to a different ORIGIN re-triggers trust', async () => {
+    // url = "$MCP_URL" trusted at origin a.example.com; the env var now resolves to
+    // a DIFFERENT origin. rawUrl ("$MCP_URL") is unchanged, but the bearer would be
+    // sent to a new endpoint — the resolved-origin fold must force a re-trust.
+    recordGrantOnly(db, 'gh', [toolDef('query')]);
+    insertServer(db, {
+      scope: SCOPE,
+      name: 'gh',
+      transport: 'http',
+      command: null,
+      url: JSON.stringify({ url: '$MCP_URL', origin: 'https://a.example.com' }),
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        remoteServerConfig({
+          transport: {
+            transport: 'http',
+            url: 'https://evil.example.com/v1', // $MCP_URL now resolves HERE
+            rawUrl: '$MCP_URL', // unchanged raw form
+          },
+        }),
+      ]),
+      // Headless + not auto-approved → the required re-trust fails closed.
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(0);
+    expect(mgr.state('gh')).toBe('denied');
+    expect(fake.stats.connects).toBe(0); // never connected / sent a bearer to the new origin
+  });
+
+  test('an env-expanded URL whose ORIGIN is unchanged (query token rotates) reuses the cached grant', async () => {
+    // Same origin; a $VAR token in the query resolves to a new value. The origin +
+    // raw identity is stable, so the cached grant is honored (no spurious re-trust,
+    // and the resolved token never entered the identity to begin with).
+    recordGrantOnly(db, 'gh', [toolDef('query')]);
+    insertServer(db, {
+      scope: SCOPE,
+      name: 'gh',
+      transport: 'http',
+      command: null,
+      url: JSON.stringify({
+        url: 'https://a.example.com/v1?token=$TOKEN',
+        origin: 'https://a.example.com',
+      }),
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        remoteServerConfig({
+          transport: {
+            transport: 'http',
+            url: 'https://a.example.com/v1?token=ROTATED-VALUE', // resolved token changed
+            rawUrl: 'https://a.example.com/v1?token=$TOKEN', // unchanged raw
+          },
+        }),
+      ]),
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(1); // origin + raw unchanged → cached grant honored
+    expect(fake.stats.made).toBe(0); // no re-connect
+  });
+});
+
+describe('McpManager.init: containment posture is part of the trust identity', () => {
+  test('flipping sandbox=false → default re-triggers trust (containment downgrade)', async () => {
+    // Boot 1: trusted WITH sandbox=false (opt-out) — the identity row folds it.
+    const f1 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m1 = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ sandbox: false })]),
+      autoApprove: new Set(['db']),
+      makeClient: f1.makeClient,
+    });
+    await m1.init();
+    expect(m1.state('db')).toBe('trusted');
+    await m1.cleanup();
+
+    // Boot 2 (same db): the SAME command but now sandboxed (opt-out removed) →
+    // the identity differs, so the cached grant must NOT be reused; headless
+    // re-trust fails closed instead of silently downgrading containment.
+    const reg2 = createToolRegistry();
+    const f2 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m2 = createMcpManager({
+      db,
+      registry: reg2,
+      config: config([serverConfig()]), // sandbox default (on when available)
+      makeClient: f2.makeClient,
+    });
+    await m2.init();
+    expect(m2.state('db')).toBe('denied'); // re-trust required, none available
+    expect(f2.stats.made).toBe(0); // not reused from cache
+  });
+
+  test('adding network.allow_hosts re-triggers trust (egress grant)', async () => {
+    const f1 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m1 = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]), // no network
+      autoApprove: new Set(['db']),
+      makeClient: f1.makeClient,
+    });
+    await m1.init();
+    await m1.cleanup();
+
+    const reg2 = createToolRegistry();
+    const f2 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m2 = createMcpManager({
+      db,
+      registry: reg2,
+      config: config([serverConfig({ network: { allowHosts: ['api.example.com'] } })]),
+      makeClient: f2.makeClient,
+    });
+    await m2.init();
+    expect(m2.state('db')).toBe('denied'); // egress posture changed → re-trust
+    expect(f2.stats.made).toBe(0);
+  });
+
+  test('an UNCHANGED sandbox=false posture reuses the cached grant (no spurious re-trust)', async () => {
+    const f1 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m1 = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ sandbox: false })]),
+      autoApprove: new Set(['db']),
+      makeClient: f1.makeClient,
+    });
+    await m1.init();
+    await m1.cleanup();
+
+    const reg2 = createToolRegistry();
+    const f2 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m2 = createMcpManager({
+      db,
+      registry: reg2,
+      config: config([serverConfig({ sandbox: false })]), // identical posture
+      makeClient: f2.makeClient,
+    });
+    await m2.init();
+    expect(m2.state('db')).toBe('trusted');
+    expect(f2.stats.made).toBe(0); // identity matched → cached, no re-connect
+  });
+});
+
+describe('McpManager.init: the trust modal discloses env + cwd (not just argv)', () => {
+  test('the identity gate carries env bindings + cwd as their OWN fields, never the resolved secret', async () => {
+    // The stdio env (LD_PRELOAD / NODE_OPTIONS) is a code-execution surface that
+    // survives even the sandbox --clearenv, yet argv alone hides it. It must be
+    // disclosed — and NOT folded into `command` (which the render length-caps, so a
+    // padded argv could push an injected var past the cutoff): env/cwd ride their
+    // own request fields, showing the UNRESOLVED $VAR, never the resolved secret.
+    let gate: { command: string; env?: unknown; cwd?: unknown } | undefined;
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          transport: {
+            transport: 'stdio',
+            command: 'node',
+            args: ['./s.js'],
+            rawArgv: ['node', './s.js'],
+            env: { LD_PRELOAD: '/evil.so', SECRET: 'super-secret-value' },
+            rawEnv: { LD_PRELOAD: '/evil.so', SECRET: '$SECRET' },
+            cwd: '/work',
+          },
+        }),
+      ]),
+      confirmTrust: async (req) => {
+        if (req.preConnect) gate = { command: req.command, env: req.env, cwd: req.cwd };
+        return 'no';
+      },
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(gate?.command).toBe('node ./s.js'); // command is argv ONLY — no env crammed in
+    expect(gate?.cwd).toBe('/work');
+    // Sorted, unresolved bindings as structured entries.
+    expect(gate?.env).toEqual([
+      { name: 'LD_PRELOAD', value: '/evil.so' },
+      { name: 'SECRET', value: '$SECRET' }, // the binding, not the resolved token
+    ]);
+    expect(JSON.stringify(gate)).not.toContain('super-secret-value'); // resolved secret never sent
+  });
+
+  test('a stdio server with no env/cwd carries no extras; a remote server carries none', async () => {
+    let gate: { env?: unknown; cwd?: unknown } | undefined;
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]), // plain stdio, no env/cwd
+      confirmTrust: async (req) => {
+        if (req.preConnect) gate = { env: req.env, cwd: req.cwd };
+        return 'no';
+      },
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(gate?.env).toBeUndefined();
+    expect(gate?.cwd).toBeUndefined();
+  });
+});
+
+describe('McpManager.init: a re-approved manifest persists durably', () => {
+  test('a decline then --auto-approve grant is not lost on the next boot', async () => {
+    // Boot 1: pass the identity gate, decline the manifest → a `denied` history
+    // row for (db, hash). (yes → gate, no → manifest.)
+    let call = 0;
+    const decline = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr1 = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      confirmTrust: async () => (call++ === 0 ? 'yes' : 'no'),
+      makeClient: decline.makeClient,
+    });
+    await mgr1.init();
+    expect(mgr1.state('db')).toBe('denied');
+    expect(latestTrustedManifest(db, SCOPE, 'db')).toBeNull(); // only a denied row so far
+
+    // Boot 2 (same db): the operator auto-approves the SAME manifest. The prior
+    // denied row can't be re-inserted (UNIQUE) — it must be UPDATED to granted so
+    // the approval is durable.
+    const reg2 = createToolRegistry();
+    const approve = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr2 = createMcpManager({
+      db,
+      registry: reg2,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: approve.makeClient,
+    });
+    await mgr2.init();
+    expect(mgr2.state('db')).toBe('trusted');
+    expect(reg2.has('mcp__db__query')).toBe(true);
+    const grant = latestTrustedManifest(db, SCOPE, 'db');
+    expect(grant?.decision).toBe('granted');
+    expect(grant?.decided_by).toBe('auto_approve');
+
+    // Boot 3 (same db): headless, NO auto-approve — the durable grant is honored
+    // from cache without a prompt or a connection.
+    const reg3 = createToolRegistry();
+    const boot3 = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr3 = createMcpManager({
+      db,
+      registry: reg3,
+      config: config([serverConfig()]),
+      makeClient: boot3.makeClient,
+    });
+    await mgr3.init();
+    expect(mgr3.state('db')).toBe('trusted');
+    expect(reg3.has('mcp__db__query')).toBe(true);
+    expect(boot3.stats.made).toBe(0); // cached grant → no connect
+  });
+});
+
+describe('McpManager.init: a trusted zero-tool manifest is a valid cache', () => {
+  test('registers nothing but stays trusted without re-handshaking', async () => {
+    // A server that legitimately exposes NO tools: the cached manifest is valid
+    // (hash verifies) and empty — it must not be treated as unreadable and
+    // re-handshaked (which would re-spawn the server) on every boot.
+    seedTrusted(db, 'db', []); // granted, zero-tool manifest + its row
+    const fake = fakeClientFactory({ tools: [] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(0); // nothing to register
+    expect(mgr.state('db')).toBe('trusted'); // but still trusted
+    expect(fake.stats.made).toBe(0); // and NOT re-handshaked
+  });
+});
+
+describe('McpManager.init: cached-trusted is lazy (no connect)', () => {
+  test('registers from cache without ever constructing a client', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+
+    expect(report.registered).toBe(1);
+    expect(registry.has('mcp__db__query')).toBe(true);
+    expect(mgr.state('db')).toBe('trusted');
+    expect(fake.stats.made).toBe(0); // never connected at init
+  });
+});
+
+describe('McpManager.callTool', () => {
+  test('lazy-connects on first call, reuses the connection, bumps counters', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: 'rows' },
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+
+    const r1 = await mgr.callTool('db', 'query', { sql: 'x' }, ctx);
+    expect(r1.content).toBe('rows');
+    expect(fake.stats.connects).toBe(1);
+    expect(mgr.state('db')).toBe('active');
+
+    await mgr.callTool('db', 'query', { sql: 'y' }, ctx);
+    expect(fake.stats.connects).toBe(1); // reused
+    expect(getServer(db, SCOPE, 'db')?.total_calls).toBe(2);
+  });
+
+  test('manifest drift on first call → degraded + throws', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]); // cached hash from {query}
+    const fake = fakeClientFactory({ tools: [toolDef('query'), toolDef('SNEAKY')] }); // live differs
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/manifest_drift/);
+    expect(mgr.state('db')).toBe('degraded');
+  });
+
+  test('a changed serverInfo.name (same tools + version) drifts on first call', async () => {
+    // The finding: a replaced server at the same command that keeps its tool
+    // schemas + version but re-brands its reported serverInfo.name must
+    // re-trigger trust rather than ride the cached grant.
+    recordGrantOnly(db, 'db', [toolDef('query')], 'server-old'); // granted at name 'server-old'
+    insertServer(db, {
+      scope: SCOPE,
+      name: 'db',
+      transport: 'stdio',
+      command: stdioIdentity(['fake-bin']),
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    // Live server reports a DIFFERENT name, identical tools + version.
+    const fake = fakeClientFactory({ tools: [toolDef('query')], serverName: 'server-new' });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init(); // cached (no connect) → trusted at the old hash
+    expect(mgr.state('db')).toBe('trusted');
+    expect(fake.stats.made).toBe(0);
+
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/manifest_drift/);
+    expect(mgr.state('db')).toBe('degraded');
+  });
+
+  test('a non-timeout call fault reaps the failed client (no leak across retries)', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callError: new Error('transport fault'),
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow('transport fault');
+    expect(mgr.state('db')).toBe('disconnected');
+    expect(fake.stats.closes).toBe(1); // the failed client was closed, not orphaned
+
+    // The model retries: a fresh client is built (the old one was reaped) and the
+    // next fault reaps it too — closes track made, so children don't accumulate.
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow('transport fault');
+    expect(fake.stats.made).toBe(2); // one client per attempt
+    expect(fake.stats.closes).toBe(2); // each attempt reaps its own — no leak
+  });
+
+  test('a denied server is not callable', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init(); // headless → denied
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/denied/);
+  });
+});
+
+describe('McpManager.cleanup', () => {
+  test('closes a live client', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx); // opens a connection
+    await mgr.cleanup();
+    expect(fake.stats.closes).toBeGreaterThanOrEqual(1);
+  });
+
+  test('drops a live server to disconnected so a later callTool re-handshakes legally', async () => {
+    // The broker outlives sessions. cleanup() used to leave rt.state at `active`,
+    // so a later callTool's `active → handshaking` hit an illegal transition throw.
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: 'ok' },
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx); // → active
+    expect(mgr.state('db')).toBe('active');
+    await mgr.cleanup();
+    expect(mgr.state('db')).toBe('disconnected'); // NOT left at active
+
+    // A later call re-handshakes through a legal edge instead of throwing.
+    const r = await mgr.callTool('db', 'query', {}, ctx);
+    expect(r.content).toBe('ok');
+    expect(mgr.state('db')).toBe('active');
+  });
+});
+
+describe('McpManager: disabled servers are skipped', () => {
+  test('a disabled server registers nothing', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ enabled: false })]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+    expect(report.registered).toBe(0);
+    expect(fake.stats.made).toBe(0);
+  });
+});
+
+describe('McpManager: code-review hardening', () => {
+  // A prior session's mcp_servers row pinning the last-trusted command identity.
+  const priorRow = (command: string[]) =>
+    insertServer(db, {
+      scope: SCOPE,
+      name: 'db',
+      transport: 'stdio',
+      command: stdioIdentity(command),
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
+    });
+
+  test('headless fail-closed denies WITHOUT spawning the binary', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init(); // no confirmTrust, no autoApprove
+    expect(fake.stats.made).toBe(0); // never executed the untrusted server
+    expect(mgr.state('db')).toBe('denied');
+  });
+
+  test('a swapped command bypasses the cache and re-validates (auto-approve re-grants)', async () => {
+    priorRow(['old-bin']); // last-trusted command differs from config's 'fake-bin'
+    seedTrusted(db, 'db', [toolDef('query')]); // same tools → same manifest hash
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(fake.stats.made).toBe(1); // re-handshaked rather than trusting the swap from cache
+    expect(mgr.state('db')).toBe('trusted');
+  });
+
+  test('a swapped command in headless fails closed WITHOUT spawning', async () => {
+    priorRow(['old-bin']);
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(fake.stats.made).toBe(0); // never ran the swapped binary
+    expect(mgr.state('db')).toBe('denied');
+  });
+
+  test('an unchanged command restart uses the cache (no re-handshake)', async () => {
+    priorRow(['fake-bin']); // matches serverConfig's rawArgv
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(fake.stats.made).toBe(0); // cached — no spurious re-validation
+    expect(mgr.state('db')).toBe('trusted');
+  });
+
+  test('after drift, a second call does NOT reconnect (pinned)', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({ tools: [toolDef('query'), toolDef('SNEAKY')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/manifest_drift/);
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/manifest_drift/);
+    expect(fake.stats.connects).toBe(1); // pinned — did not reconnect on the 2nd call
+  });
+
+  test('init threads a bounded handshake signal into connect (no unbounded hang)', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(fake.stats.connects).toBe(1);
+    // Was `undefined` before the fix — init now bounds the handshake so a
+    // wedged server can't hang bootstrap.
+    expect(fake.stats.lastConnectSignal).toBeInstanceOf(AbortSignal);
+  });
+});
+
+describe('McpManager: stale-row sweep (AUDIT §1.5)', () => {
+  test('init removes a USER-source row for a server no longer in config (history survives)', async () => {
+    // A user-scoped row + granted manifest from a prior session for a server now
+    // GONE from the (global) user config → swept.
+    insertServer(db, {
+      scope: SCOPE,
+      name: 'gone',
+      transport: 'stdio',
+      command: '["x"]',
+      url: null,
+      source: 'user',
+      state: 'trusted',
+    });
+    seedTrusted(db, 'gone', [toolDef('q')]);
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]), // only 'db' is configured now
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(getServer(db, SCOPE, 'gone')).toBeNull(); // orphan STATE row swept
+    expect(latestTrustedManifest(db, SCOPE, 'gone')).not.toBeNull(); // history is forever
+    expect(getServer(db, SCOPE, 'db')).not.toBeNull(); // configured server kept
+  });
+
+  test('init PRESERVES rows in ANOTHER project scope (user-global db)', async () => {
+    // sessions.db is user-global; a project row in a DIFFERENT scope (another
+    // repo) must never be swept by THIS repo's init — even a same-name collision.
+    const OTHER = '/another/repo';
+    insertServer(db, {
+      scope: OTHER,
+      name: 'db', // same name as this repo's server — must NOT collide
+      transport: 'stdio',
+      command: '["other-bin"]',
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    insertServer(db, {
+      scope: OTHER,
+      name: 'other-only',
+      transport: 'stdio',
+      command: '["y"]',
+      url: null,
+      source: 'project_local',
+      state: 'trusted',
+    });
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]), // only 'db' is configured in THIS repo (scope SCOPE)
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    // The other scope's rows survive; the same-named 'db' there is a distinct row.
+    expect(getServer(db, OTHER, 'db')?.command).toBe('["other-bin"]'); // NOT overwritten
+    expect(getServer(db, OTHER, 'other-only')).not.toBeNull(); // NOT swept
+  });
+
+  test('a user server SHADOWED by a same-named project server keeps its cached trust', async () => {
+    // sessions.db is user-global. A user 'db' (scope '') was trusted before; now
+    // THIS repo defines a PROJECT 'db' (which wins the config merge, so the user
+    // entry is invisible in config.servers). The user row must NOT be swept — a '')
+    // row is orphaned only when the NAME is absent from config entirely, not when
+    // merely shadowed — or opening a repo that reuses the name would lose the user
+    // server's trust.
+    insertServer(db, {
+      scope: '', // the user-global row
+      name: 'db',
+      transport: 'stdio',
+      command: '["user-bin"]',
+      url: null,
+      source: 'user',
+      state: 'trusted',
+    });
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]), // a PROJECT 'db' (source project_shared → scope SCOPE)
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(getServer(db, '', 'db')?.command).toBe('["user-bin"]'); // user row PRESERVED (shadowed)
+    expect(getServer(db, SCOPE, 'db')).not.toBeNull(); // the project 'db' is its own row
+  });
+
+  test('a granted manifest whose server row was swept is re-trusted, not reused by name', async () => {
+    // The swept state: the forever grant survives in history, but the identity-
+    // bearing mcp_servers row is gone (the server left config). Re-adding the name
+    // with a DIFFERENT command must go through the pre-connect identity gate — it
+    // must NOT silently inherit the old grant by name.
+    recordGrantOnly(db, 'db', [toolDef('query')]); // grant, NO row
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    let gateCommand: string | undefined;
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          transport: { transport: 'stdio', command: 'evil-bin', args: [], rawArgv: ['evil-bin'] },
+        }),
+      ]),
+      confirmTrust: async (req) => {
+        if (req.preConnect) gateCommand = req.command;
+        return 'no'; // the operator sees the swapped command and declines
+      },
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(gateCommand).toBe('evil-bin'); // the identity gate re-confirmed the NEW command
+    expect(registry.has('mcp__db__query')).toBe(false); // NOT registered from the stale grant
+    expect(mgr.state('db')).toBe('denied');
+    expect(fake.stats.made).toBe(0); // declined at the gate → never connected
+  });
+
+  test('a DECLINED re-add leaves no approved identity for the NEXT boot to reuse', async () => {
+    // The init "ensure a row" insert runs BEFORE the identity gate. If it persisted
+    // the configured identity, a declined re-add would leave an approved-looking row,
+    // and the next boot (existing !== null, matching command) would reuse the old
+    // grant by name. The row is inserted with a NULL identity until a grant lands.
+    recordGrantOnly(db, 'db', [toolDef('query')]); // grant, no row (swept state)
+
+    // Boot 1: re-added, operator DECLINES.
+    const f1 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m1 = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      confirmTrust: async () => 'no',
+      makeClient: f1.makeClient,
+    });
+    await m1.init();
+    expect(m1.state('db')).toBe('denied');
+    await m1.cleanup();
+
+    // Boot 2 (fresh manager + registry, same DB): the row boot 1 left must NOT let
+    // the cached grant register the declined server — the identity gate fires again.
+    const reg2 = createToolRegistry();
+    const f2 = fakeClientFactory({ tools: [toolDef('query')] });
+    let boot2Prompted = false;
+    const m2 = createMcpManager({
+      db,
+      registry: reg2,
+      config: config([serverConfig()]),
+      confirmTrust: async () => {
+        boot2Prompted = true;
+        return 'no';
+      },
+      makeClient: f2.makeClient,
+    });
+    await m2.init();
+    expect(boot2Prompted).toBe(true); // re-trusted (gate fired), not silently cached
+    expect(reg2.has('mcp__db__query')).toBe(false); // NOT registered from the stale grant
+    expect(f2.stats.made).toBe(0); // declined again → never connected
+    await m2.cleanup();
+  });
+
+  test('a disabled server keeps its row (still in config, just off)', async () => {
+    insertServer(db, {
+      scope: SCOPE,
+      name: 'db',
+      transport: 'stdio',
+      command: '["fake-bin"]',
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ enabled: false })]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(getServer(db, SCOPE, 'db')).not.toBeNull(); // disabled ≠ removed from config
+  });
+
+  test('a parse-failed layer is NOT swept — a still-configured server keeps its row', async () => {
+    // A temporary typo makes loadMcpConfig fail-soft that layer: the server drops
+    // out of config.servers even though the operator never removed it. The sweep
+    // must skip the project scope (incompleteSources flags project_shared), so the
+    // trusted row + counters survive until the config parses cleanly again.
+    seedTrusted(db, 'db', [toolDef('query')]); // trusted project row at SCOPE
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      // config.servers is empty (the layer failed to parse) but its source is flagged.
+      config: config([], new Set(['project_shared'])),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(getServer(db, SCOPE, 'db')).not.toBeNull(); // NOT swept — the layer was incomplete
+    expect(latestTrustedManifest(db, SCOPE, 'db')).not.toBeNull();
+  });
+
+  test('a CLEANLY-loaded empty layer still sweeps a genuinely removed server', async () => {
+    // Contrast: config.servers is empty AND the load was clean (an intentional
+    // removal, no incomplete source) → the orphan STATE row is swept as before.
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([]), // clean load, server genuinely gone
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(getServer(db, SCOPE, 'db')).toBeNull(); // swept
+    expect(latestTrustedManifest(db, SCOPE, 'db')).not.toBeNull(); // history is forever
+  });
+
+  test('a failed OTHER layer does not block sweeping a cleanly-loaded scope', async () => {
+    // The user layer failed to parse (flags '') but the project layer loaded
+    // cleanly. A removed PROJECT server is still swept — only the '' scope is
+    // spared. Proves the guard is per-scope, not global.
+    seedTrusted(db, 'db', [toolDef('query')]); // project row at SCOPE, now unconfigured
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([], new Set(['user'])), // only the user layer is incomplete
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(getServer(db, SCOPE, 'db')).toBeNull(); // project scope was clean → swept
+  });
+});
+
+describe('McpManager: review hardening', () => {
+  test('cached manifest with a tampered JSON fails its hash check and re-handshakes', async () => {
+    // Record a granted row whose stored manifest_json does NOT hash to its
+    // `hash` column — a DB tamper (e.g. flipping a tool's writes:false while
+    // leaving the hash). The cached path must reject it, not register from it.
+    const goodTools = [toolDef('query')];
+    const canonical = canonicalizeManifest({
+      serverName: null,
+      protocolVersion: '2024-11-05',
+      serverVersion: '1.0.0',
+      tools: goodTools,
+    });
+    recordManifestDecision(db, {
+      scope: SCOPE,
+      server_name: 'db',
+      hash: hashManifest(canonical),
+      previous_hash: null,
+      manifest_json: '{"serverInfo":{"name":"db","version":"1.0.0"},"tools":[]}', // mismatched
+      protocol_version: '2024-11-05',
+      server_version: '1.0.0',
+      decision: 'granted',
+      decided_by: 'user',
+      decided_at: 1,
+      approval_id: null,
+    });
+    // The identity-bearing row must be present for the cached grant to be taken at
+    // all (a swept row → re-trust, not the hash-check path this test exercises).
+    insertServer(db, {
+      scope: SCOPE,
+      name: 'db',
+      transport: 'stdio',
+      command: stdioIdentity(['fake-bin']),
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    const fake = fakeClientFactory({ tools: goodTools });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+    expect(report.warnings.some((w) => w.includes('failed its hash check'))).toBe(true);
+    expect(fake.stats.connects).toBeGreaterThan(0); // re-handshaked instead of trusting the row
+    expect(registry.has('mcp__db__query')).toBe(true);
+    await mgr.cleanup();
+  });
+
+  test('a changed-manifest re-grant chains previous_hash to the prior trusted hash', async () => {
+    // Session 1: grant manifest A.
+    const fake1 = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr1 = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake1.makeClient,
+    });
+    await mgr1.init();
+    const hashA = latestTrustedManifest(db, SCOPE, 'db')?.hash;
+    await mgr1.cleanup();
+
+    // Session 2: the command AND the tool set changed → manifest B, force-
+    // reprompted (command swap), auto-approved.
+    const fake2 = fakeClientFactory({ tools: [toolDef('query'), toolDef('mutate')] });
+    const mgr2 = createMcpManager({
+      db,
+      registry: createToolRegistry(),
+      config: config([
+        serverConfig({
+          transport: {
+            transport: 'stdio',
+            command: 'fake-bin-v2',
+            args: [],
+            rawArgv: ['fake-bin-v2'],
+          },
+        }),
+      ]),
+      autoApprove: new Set(['db']),
+      makeClient: fake2.makeClient,
+    });
+    await mgr2.init();
+    await mgr2.cleanup();
+
+    const history = listManifestHistory(db, SCOPE, 'db');
+    expect(history.length).toBe(2);
+    const hashB = latestTrustedManifest(db, SCOPE, 'db')?.hash;
+    expect(hashB).not.toBe(hashA);
+    const rowB = history.find((h) => h.hash === hashB);
+    expect(rowB?.previous_hash).toBe(hashA ?? null); // the chain forms (was always null before)
+  });
+
+  test('an identity change with an UNCHANGED manifest refreshes the trust decision', async () => {
+    // Session 1: grant manifest A at command fake-bin (decided_by user, at t=1000).
+    const fake1 = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr1 = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      confirmTrust: async () => 'yes',
+      now: () => 1000,
+      makeClient: fake1.makeClient,
+    });
+    await mgr1.init();
+    const before = latestTrustedManifest(db, SCOPE, 'db');
+    expect(before?.decided_by).toBe('user');
+    expect(before?.decided_at).toBe(1000);
+    await mgr1.cleanup();
+
+    // Session 2: the command changed (fake-bin → fake-bin-v2) but the tool set is
+    // IDENTICAL → the SAME manifest hash, force-reprompted, auto-approved. The
+    // decision VALUE is unchanged (granted→granted), but the row must STILL be
+    // updated: a swapped binary that re-hashes identically is a fresh
+    // authorization, so /mcp show + the forever history must record who approved
+    // the new identity (auto_approve) and when (t=2000) — not the stale grant.
+    const fake2 = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr2 = createMcpManager({
+      db,
+      registry: createToolRegistry(),
+      config: config([
+        serverConfig({
+          transport: {
+            transport: 'stdio',
+            command: 'fake-bin-v2',
+            args: [],
+            rawArgv: ['fake-bin-v2'],
+          },
+        }),
+      ]),
+      autoApprove: new Set(['db']),
+      now: () => 2000,
+      makeClient: fake2.makeClient,
+    });
+    await mgr2.init();
+    await mgr2.cleanup();
+
+    // Still exactly ONE history row (same hash → UNIQUE → updated in place).
+    const history = listManifestHistory(db, SCOPE, 'db');
+    expect(history.length).toBe(1);
+    const after = history[0];
+    expect(after?.decision).toBe('granted');
+    expect(after?.decided_by).toBe('auto_approve'); // refreshed from 'user'
+    expect(after?.decided_at).toBe(2000); // refreshed from 1000 (was NOT updated before the fix)
+  });
+
+  test('two tools that sanitize to the same wire name are de-duplicated, not dropped', async () => {
+    const collide = (name: string): McpManifestTool => ({
+      name,
+      description: 'd',
+      inputSchema: { type: 'object' },
+      meta: {},
+    });
+    const fake = fakeClientFactory({ tools: [collide('foo.bar'), collide('foo/bar')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+    expect(report.registered).toBe(2); // both registered, no throw
+    expect(registry.has('mcp__db__foo_bar')).toBe(true);
+    expect(registry.has('mcp__db__foo_bar_2')).toBe(true);
+    await mgr.cleanup();
+  });
+
+  test('a connect failure lands the server in error state with a warning', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')], connectError: new Error('boom') });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+    expect(report.registered).toBe(0);
+    expect(mgr.state('db')).toBe('error');
+    expect(report.warnings.some((w) => w.includes('handshake failed'))).toBe(true);
+    await mgr.cleanup();
+  });
+
+  test('lazy-connect reaps the child when listTools fails after connect (no leak)', async () => {
+    // Cached-trusted so init does not connect; the first callTool lazily
+    // connects, then listTools throws — the manager must close() the client.
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      listToolsError: new Error('malformed tools/list'),
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(fake.stats.connects).toBe(0); // registered from cache, no connect
+
+    // The manager rethrows the lazy-connect fault (the tool-factory wraps it
+    // into a tool error); what matters here is that the child was reaped.
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow();
+    expect(fake.stats.connects).toBe(1);
+    expect(fake.stats.closes).toBe(1); // the fix: child reaped on the fault path, not orphaned
+    await mgr.cleanup();
+  });
+});
+
+describe('McpManager: sandbox profile resolution (MCP.md §2.3)', () => {
+  // A spy wrap: the fake client never spawns, so we assert which profile the
+  // manager resolved + passed to makeClient (the actual bwrap exec is proven by
+  // the real-subprocess integration test).
+  const wrap: McpSandboxWrap = (a) => ['bwrap', a.profile, '--', ...a.innerArgv];
+
+  test('default-on: an available sandbox wraps a plain server as cwd-rw', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+      sandbox: { available: true, wrap },
+    });
+    await mgr.init();
+    expect(fake.stats.lastSandbox?.profile).toBe('cwd-rw');
+    await mgr.cleanup();
+  });
+
+  test('a server with network resolves to cwd-rw-net', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ network: { allowHosts: ['api.example.com'] } })]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+      sandbox: { available: true, wrap },
+    });
+    await mgr.init();
+    expect(fake.stats.lastSandbox?.profile).toBe('cwd-rw-net');
+    await mgr.cleanup();
+  });
+
+  test('sandbox=false opts out — no wrap passed (runs host)', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ sandbox: false })]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+      sandbox: { available: true, wrap },
+    });
+    await mgr.init();
+    expect(fake.stats.lastSandbox).toBeUndefined();
+    await mgr.cleanup();
+  });
+
+  test('no sandbox tool available → host + an UNSANDBOXED boot warning', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+      sandbox: { available: false, wrap },
+    });
+    const report = await mgr.init();
+    expect(fake.stats.lastSandbox).toBeUndefined();
+    expect(report.warnings.some((w) => w.includes('UNSANDBOXED'))).toBe(true);
+    await mgr.cleanup();
+  });
+
+  test('no sandbox dep wired → host, no warning (feature off, e.g. tests)', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    const report = await mgr.init();
+    expect(fake.stats.lastSandbox).toBeUndefined();
+    expect(report.warnings.some((w) => w.includes('UNSANDBOXED'))).toBe(false);
+    await mgr.cleanup();
+  });
+});
+
+describe('McpManager: network server → mcp.egress category (MCP.md §2.3)', () => {
+  test("a network-granted server's tools register under the egress category", async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('fetch')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ network: { allowHosts: ['api.example.com'] } })]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(registry.get('mcp__db__fetch')?.metadata.category).toBe('mcp.egress');
+    await mgr.cleanup();
+  });
+
+  test('a SANDBOXED plain (no-network) server stays in the mcp category', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+      // Available sandbox ⇒ cwd-rw (no network) ⇒ non-egress.
+      sandbox: { available: true, wrap: (a) => ['bwrap', a.profile, '--', ...a.innerArgv] },
+    });
+    await mgr.init();
+    expect(registry.get('mcp__db__query')?.metadata.category).toBe('mcp');
+    await mgr.cleanup();
+  });
+
+  test('an UNSANDBOXED server (no tool / opt-out) IS egress — it has full host network', async () => {
+    // No sandbox dep ⇒ host profile ⇒ the server can reach the network even
+    // with no [network] grant ⇒ egress (the finder-caught hole).
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(registry.get('mcp__db__query')?.metadata.category).toBe('mcp.egress');
+    await mgr.cleanup();
+  });
+
+  test('opt-out (sandbox=false) server IS egress + warns at boot', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ sandbox: false })]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+      sandbox: { available: true, wrap: (a) => ['bwrap', a.profile, '--', ...a.innerArgv] },
+    });
+    const report = await mgr.init();
+    expect(registry.get('mcp__db__query')?.metadata.category).toBe('mcp.egress');
+    expect(report.warnings.some((w) => w.includes('UNSANDBOXED (sandbox=false)'))).toBe(true);
+    await mgr.cleanup();
+  });
+});
+
+describe('McpManager.status()', () => {
+  test('returns live name/state/tool-count for each runtime server', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query'), toolDef('list')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(mgr.status()).toEqual([{ name: 'db', state: 'trusted', tools: 2 }]);
+    await mgr.cleanup();
+  });
+
+  test('a denied (headless fail-closed) server appears with 0 tools', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(mgr.status()).toEqual([{ name: 'db', state: 'denied', tools: 0 }]);
+    await mgr.cleanup();
+  });
+});
+
+describe('McpManager: revoke / reconnect (registry hot-swap)', () => {
+  test('revoke unregisters the tools, denies, and persists revoked_at', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query'), toolDef('list')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(registry.has('mcp__db__query')).toBe(true);
+
+    const r = await mgr.revoke('db');
+    expect(r).toEqual({ ok: true, tools: 2 });
+    expect(registry.has('mcp__db__query')).toBe(false); // unregistered (next turn drops them)
+    expect(registry.has('mcp__db__list')).toBe(false);
+    expect(mgr.state('db')).toBe('denied');
+    expect(getServer(db, SCOPE, 'db')?.revoked_at).not.toBeNull(); // durable
+    await mgr.cleanup();
+  });
+
+  test('a revoked server stays DENIED across a relaunch (init skips the cached grant)', async () => {
+    const f1 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m1 = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: f1.makeClient,
+    });
+    await m1.init();
+    await m1.revoke('db');
+    await m1.cleanup();
+
+    // Relaunch: a fresh registry + manager over the SAME db must NOT re-register
+    // the revoked server's tools from the cached (forever) grant.
+    const reg2 = createToolRegistry();
+    const f2 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m2 = createMcpManager({
+      db,
+      registry: reg2,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: f2.makeClient,
+    });
+    const report = await m2.init();
+    expect(report.registered).toBe(0);
+    expect(reg2.has('mcp__db__query')).toBe(false);
+    expect(m2.state('db')).toBe('denied');
+    expect(latestTrustedManifest(db, SCOPE, 'db')).not.toBeNull(); // the grant survives forever (durability builds on it)
+    expect(f2.stats.made).toBe(0); // never even spawned
+    await m2.cleanup();
+  });
+
+  test('reconnect clears the revocation and re-registers the tools', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    await mgr.revoke('db');
+    expect(registry.has('mcp__db__query')).toBe(false);
+
+    const r = await mgr.reconnect('db');
+    expect(r.ok).toBe(true);
+    expect(r.registered).toBe(1);
+    expect(registry.has('mcp__db__query')).toBe(true); // re-registered
+    expect(mgr.state('db')).toBe('trusted');
+    expect(getServer(db, SCOPE, 'db')?.revoked_at).toBeNull(); // revocation cleared
+    await mgr.cleanup();
+  });
+
+  test('a FAILED reconnect (server unreachable) stays revoked — revoked_at NOT cleared', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]); // init registers from cache (no connect)
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      connectError: new Error('ECONNREFUSED'),
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      // autoApprove so reconnect's resolveFreshTrust passes the fail-closed
+      // pre-check and actually ATTEMPTS the connect (which then fails).
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+      now: () => 999,
+    });
+    await mgr.init();
+    await mgr.revoke('db');
+    expect(getServer(db, SCOPE, 'db')?.revoked_at).toBe(999);
+
+    // reconnect hits the connect error → error state. The revocation must NOT be
+    // cleared, or the next relaunch silently re-registers from the cached grant.
+    const r = await mgr.reconnect('db');
+    expect(r.ok).toBe(false);
+    expect(mgr.state('db')).toBe('error');
+    expect(getServer(db, SCOPE, 'db')?.revoked_at).toBe(999); // still revoked
+    await mgr.cleanup();
+  });
+
+  test('a DENIED reconnect of a NEVER-revoked (drifted) server revokes it durably', async () => {
+    // A trusted server with a cached "forever" grant, never revoked. The operator
+    // reconnects (e.g. after drift) and DECLINES — the stale grant must not survive
+    // to the next launch, or a later call would spawn/connect to the declined server.
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      confirmTrust: async () => 'no', // decline the re-trust at the identity gate
+      makeClient: fake.makeClient,
+      now: () => 777,
+    });
+    await mgr.init(); // registers from cache (no connect, no prompt)
+    expect(getServer(db, SCOPE, 'db')?.revoked_at).toBeNull(); // never revoked
+
+    const r = await mgr.reconnect('db');
+    expect(r.ok).toBe(false);
+    expect(mgr.state('db')).toBe('denied');
+    expect(getServer(db, SCOPE, 'db')?.revoked_at).toBe(777); // NOW revoked durably
+    expect(fake.stats.made).toBe(0); // declined at the identity gate → never connected
+    await mgr.cleanup();
+
+    // Next launch (fresh manager + registry, same DB): the declined server must
+    // NOT come back from the cached grant.
+    const reg2 = createToolRegistry();
+    const fake2 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m2 = createMcpManager({
+      db,
+      registry: reg2,
+      config: config([serverConfig()]),
+      makeClient: fake2.makeClient,
+    });
+    await m2.init();
+    expect(m2.state('db')).toBe('denied'); // revoked_at → skipped, not re-registered
+    expect(reg2.has('mcp__db__query')).toBe(false);
+    expect(fake2.stats.made).toBe(0);
+    await m2.cleanup();
+  });
+
+  test('revoke records revoked_at from the injected clock', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+      now: () => 12345,
+    });
+    await mgr.init();
+    await mgr.revoke('db');
+    expect(getServer(db, SCOPE, 'db')?.revoked_at).toBe(12345);
+    await mgr.cleanup();
+  });
+
+  test('a revoked server removed from config keeps its revocation (orphan sweep spares it)', async () => {
+    // Session 1: grant + revoke 'db'.
+    const f1 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m1 = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: f1.makeClient,
+    });
+    await m1.init();
+    await m1.revoke('db');
+    await m1.cleanup();
+
+    // Session 2: 'db' is GONE from config. The orphan sweep must NOT delete its
+    // revoked row (else a re-add would re-register from the cached grant).
+    const m2 = createMcpManager({ db, registry: createToolRegistry(), config: config([]) });
+    await m2.init();
+    expect(getServer(db, SCOPE, 'db')?.revoked_at).not.toBeNull(); // spared by the sweep
+    await m2.cleanup();
+  });
+
+  test('revoke of an unknown server fails', async () => {
+    const mgr = createMcpManager({ db, registry, config: config([]) });
+    expect(await mgr.revoke('nope')).toEqual({ ok: false, reason: 'unknown server', tools: 0 });
+    await mgr.cleanup();
+  });
+
+  test('reconnect of an unknown/disabled server fails', async () => {
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ enabled: false })]),
+    });
+    await mgr.init();
+    const r = await mgr.reconnect('db');
+    expect(r.ok).toBe(false);
+    await mgr.cleanup();
+  });
+});
+
+describe('McpManager: stderr log path (/mcp logs + tee)', () => {
+  test('logPath returns <traceDir>/mcp-<name>.log when a traceDir is set', () => {
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      traceDir: '/data/traces',
+    });
+    expect(mgr.logPath('db')).toBe('/data/traces/mcp-db.log');
+  });
+
+  test('logPath is null without a traceDir (headless/test)', () => {
+    const mgr = createMcpManager({ db, registry, config: config([serverConfig()]) });
+    expect(mgr.logPath('db')).toBeNull();
+  });
+
+  test('the manager threads the per-server log path to the client factory', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+      traceDir: '/data/traces',
+    });
+    await mgr.init(); // fresh-trust path connects → clientFor → makeClient(cfg, _, logPath)
+    expect(fake.stats.lastLogPath).toBe('/data/traces/mcp-db.log');
+    await mgr.cleanup();
+  });
+
+  test('without a traceDir the factory gets an undefined log path (drain-to-discard)', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      autoApprove: new Set(['db']),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(fake.stats.lastLogPath).toBeUndefined();
+    await mgr.cleanup();
+  });
+
+  test('logPath defends against a traversal name even with a traceDir', () => {
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([]),
+      traceDir: '/data/traces',
+    });
+    expect(mgr.logPath('../../etc/passwd')).toBeNull();
+    expect(mgr.logPath('a/b')).toBeNull();
+  });
+});
+
+describe('McpManager: per-server budget (MCP.md §5)', () => {
+  test('a per-call timeout surfaces mcp.timeout, stays ACTIVE, and the connection stays reusable', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({ tools: [toolDef('query')], callHangs: true });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          budget: { timeoutMs: 40, maxCallsPerSession: 200, maxTokensInPerSession: 50_000 },
+        }),
+      ]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.timeout/);
+    expect(mgr.state('db')).toBe('active'); // §15.3: a timeout is not a transport fault
+    // The next call REUSES the live connection (a timeout doesn't tear it down);
+    // the SDK discards the aborted call's late reply by request id.
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.timeout/);
+    expect(fake.stats.connects).toBe(1); // one connect, reused across both timeouts
+    await mgr.cleanup();
+  });
+
+  test('the absolute CALL cap disconnects the server for the session', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: 'ok' },
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          budget: { timeoutMs: 30_000, maxCallsPerSession: 2, maxTokensInPerSession: 50_000 },
+        }),
+      ]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx); // 1
+    await mgr.callTool('db', 'query', {}, ctx); // 2 → at the configured cap
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.budget\.exceeded/);
+    expect(mgr.state('db')).toBe('disconnected');
+    // The cap check runs BEFORE reconnect: a capped server must not re-spawn.
+    expect(fake.stats.connects).toBe(1); // only the initial connect, none for the refused call
+    await mgr.cleanup();
+  });
+
+  test('the configured TOKEN cap disconnects the server', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: 'x'.repeat(80) }, // ~20 tokens
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          budget: { timeoutMs: 30_000, maxCallsPerSession: 200, maxTokensInPerSession: 10 },
+        }),
+      ]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx); // ~20 tokens charged > cap 10
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.budget\.exceeded/);
+    expect(mgr.state('db')).toBe('disconnected');
+    await mgr.cleanup();
+  });
+
+  test('a server that TIMES OUT every call still hits the call cap (attempts counted)', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({ tools: [toolDef('query')], callHangs: true });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          budget: { timeoutMs: 30, maxCallsPerSession: 2, maxTokensInPerSession: 50_000 },
+        }),
+      ]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.timeout/); // attempt 1
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.timeout/); // attempt 2
+    // A success would never have incremented past 0 — attempts must count, or a
+    // hanging server loops uncapped forever. The 3rd is refused by the cap.
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.budget\.exceeded/);
+    await mgr.cleanup();
+  });
+
+  test('a server that FAILS its handshake every call still hits the call cap (no infinite respawn)', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      connectError: new Error('handshake refused'),
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          budget: { timeoutMs: 30_000, maxCallsPerSession: 2, maxTokensInPerSession: 50_000 },
+        }),
+      ]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    // Each failed handshake charges the cap (the fix) — otherwise the increment
+    // past the handshake never runs and a broken/malicious server is respawned on
+    // every model retry, uncapped.
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow('handshake refused'); // 1
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow('handshake refused'); // 2
+    // The 3rd is refused by the cap BEFORE any respawn.
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.budget\.exceeded/);
+    expect(fake.stats.made).toBe(2); // only two spawn attempts — the cap stopped the third
+    await mgr.cleanup();
+  });
+
+  test('a successful call charges the lifetime DB counters (calls + estimated tokens)', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: 'rows-and-more-rows' },
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx);
+    const row = getServer(db, SCOPE, 'db');
+    expect(row?.total_calls).toBe(1);
+    expect(row?.total_tokens_in ?? 0).toBeGreaterThan(0); // estimated from the result content
+    await mgr.cleanup();
+  });
+
+  test('the budget-cap disconnect emits an mcp.budget.exceeded audit row', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: 'ok' },
+    });
+    const audit = captureSink();
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          budget: { timeoutMs: 30_000, maxCallsPerSession: 1, maxTokensInPerSession: 50_000 },
+        }),
+      ]),
+      makeClient: fake.makeClient,
+      failureSink: audit.sink,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx); // 1 → at the cap
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.budget\.exceeded/);
+    const row = audit.emits.find((e) => e.code === 'mcp.budget.exceeded');
+    expect(row).toBeDefined();
+    expect(row?.classe).toBe('mcp');
+    expect(row?.recovery_action).toBe('pending_repair');
+    expect(row?.session_id).toBe('sess-1');
+    expect(row?.user_visible).toBe(true);
+    const payload = row?.payload as Record<string, unknown> | undefined;
+    expect(payload?.server).toBe('db');
+    expect(payload?.calls).toBe(1);
+    expect(payload?.max_calls).toBe(1);
+    expect(payload).toHaveProperty('tokens_in');
+    expect(payload).toHaveProperty('max_tokens_in');
+    await mgr.cleanup();
+  });
+
+  test('a per-call timeout emits an mcp.timeout audit row (not user-visible)', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({ tools: [toolDef('query')], callHangs: true });
+    const audit = captureSink();
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          budget: { timeoutMs: 40, maxCallsPerSession: 200, maxTokensInPerSession: 50_000 },
+        }),
+      ]),
+      makeClient: fake.makeClient,
+      failureSink: audit.sink,
+    });
+    await mgr.init();
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.timeout/);
+    const row = audit.emits.find((e) => e.code === 'mcp.timeout');
+    expect(row).toBeDefined();
+    expect(row?.recovery_action).toBe('ignored');
+    expect(row?.user_visible).toBe(false);
+    const payload = row?.payload as Record<string, unknown> | undefined;
+    expect(payload?.tool).toBe('query');
+    expect(payload?.timeout_ms).toBe(40);
+    await mgr.cleanup();
+  });
+
+  test('the audit row persists through the REAL sqlite sink with an intact chain', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: 'ok' },
+    });
+    const sink = createSqliteFailureSink({ db });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          budget: { timeoutMs: 30_000, maxCallsPerSession: 1, maxTokensInPerSession: 50_000 },
+        }),
+      ]),
+      makeClient: fake.makeClient,
+      failureSink: sink,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx);
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.budget\.exceeded/);
+    const rows = listFailureEventsBySession(db, 'sess-1');
+    expect(rows.some((r) => r.code === 'mcp.budget.exceeded' && r.classe === 'mcp')).toBe(true);
+    expect(sink.verifyChain('sess-1').ok).toBe(true); // the registered code + chain hold end-to-end
+    await mgr.cleanup();
+  });
+
+  const capOneConfig = () =>
+    config([
+      serverConfig({
+        budget: { timeoutMs: 30_000, maxCallsPerSession: 1, maxTokensInPerSession: 50_000 },
+      }),
+    ]);
+
+  test('the per-session budget RESETS when a new session calls the server (§15.6 block lifts)', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: 'ok' },
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: capOneConfig(),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx); // sess-1: at the cap
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.budget\.exceeded/);
+    // A NEW session resets the broker-shared counters — the disconnect lifts and
+    // the server reconnects with a fresh budget.
+    const ctx2 = {
+      signal: new AbortController().signal,
+      sessionId: 'sess-2',
+    } as unknown as ToolContext;
+    expect((await mgr.callTool('db', 'query', {}, ctx2)).content).toBe('ok');
+    await mgr.cleanup();
+  });
+
+  test('mcp.budget.exceeded emits ONCE per trip, not per refused call', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: 'ok' },
+    });
+    const audit = captureSink();
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: capOneConfig(),
+      makeClient: fake.makeClient,
+      failureSink: audit.sink,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx); // at the cap
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/budget/); // refused (emit)
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/budget/); // refused again
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/budget/); // and again
+    expect(audit.emits.filter((e) => e.code === 'mcp.budget.exceeded')).toHaveLength(1);
+    await mgr.cleanup();
+  });
+
+  test('an emit that THROWS never breaks the tool call (best-effort audit)', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: 'ok' },
+    });
+    const throwingSink: FailureEventSink = {
+      emit: () => {
+        throw new Error('sink down');
+      },
+      verifyChain: () => ({ ok: true, rows: 0 }),
+    };
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: capOneConfig(),
+      makeClient: fake.makeClient,
+      failureSink: throwingSink,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx); // at the cap
+    // The call surfaces ITS OWN budget error, not the sink's 'sink down'.
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.budget\.exceeded/);
+    await mgr.cleanup();
+  });
+
+  test('mcp.timeout emits per timed-out call (each is a distinct failure)', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({ tools: [toolDef('query')], callHangs: true });
+    const audit = captureSink();
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([
+        serverConfig({
+          budget: { timeoutMs: 30, maxCallsPerSession: 200, maxTokensInPerSession: 50_000 },
+        }),
+      ]),
+      makeClient: fake.makeClient,
+      failureSink: audit.sink,
+    });
+    await mgr.init();
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.timeout/);
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/mcp\.timeout/);
+    expect(audit.emits.filter((e) => e.code === 'mcp.timeout')).toHaveLength(2);
+    await mgr.cleanup();
+  });
+});
+
+describe('McpManager: output-validity recovery (§15.5)', () => {
+  test('a malformed output degrades the server, emits mcp.output.invalid, returns an error to the model', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: '', invalid: true, invalidRaw: '"not an array"' },
+    });
+    const audit = captureSink();
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+      failureSink: audit.sink,
+    });
+    await mgr.init();
+    const r = await mgr.callTool('db', 'query', {}, ctx);
+    expect(r.isError).toBe(true); // returned as an error, not thrown
+    expect(r.content).toContain('mcp.output.invalid');
+    expect(r.content).toContain('not an array'); // the raw, not lost to flattening
+    expect(mgr.state('db')).toBe('degraded'); // active → degraded
+    const row = audit.emits.find((e) => e.code === 'mcp.output.invalid');
+    expect(row).toBeDefined();
+    expect(row?.recovery_action).toBe('degraded');
+    expect((row?.payload as Record<string, unknown> | undefined)?.raw_truncated).toBe(
+      '"not an array"',
+    );
+    await mgr.cleanup();
+  });
+
+  test('3 consecutive well-formed outputs recover a degraded server to active', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResultsQueue: [
+        { isError: false, content: 'bad', invalid: true }, // → degraded
+        { isError: false, content: 'ok' }, // valid 1
+        { isError: false, content: 'ok' }, // valid 2
+        { isError: false, content: 'ok' }, // valid 3 → recover
+      ],
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx); // invalid → degraded
+    expect(mgr.state('db')).toBe('degraded');
+    await mgr.callTool('db', 'query', {}, ctx); // valid 1
+    await mgr.callTool('db', 'query', {}, ctx); // valid 2
+    expect(mgr.state('db')).toBe('degraded'); // streak 2 — not yet
+    await mgr.callTool('db', 'query', {}, ctx); // valid 3 → recover
+    expect(mgr.state('db')).toBe('active');
+    await mgr.cleanup();
+  });
+
+  test('an invalid output resets the recovery streak (no premature recover)', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResultsQueue: [
+        { isError: false, content: 'bad', invalid: true }, // → degraded
+        { isError: false, content: 'ok' }, // valid 1
+        { isError: false, content: 'ok' }, // valid 2
+        { isError: false, content: 'bad', invalid: true }, // resets streak
+        { isError: false, content: 'ok' }, // valid 1 again
+        { isError: false, content: 'ok' }, // valid 2
+      ],
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    for (let i = 0; i < 6; i++) await mgr.callTool('db', 'query', {}, ctx);
+    expect(mgr.state('db')).toBe('degraded'); // only 2 valid since the reset → still degraded
+    await mgr.cleanup();
+  });
+
+  test('a DRIFT-degraded server does NOT auto-recover via the output-validity path', async () => {
+    seedTrusted(db, 'db', [toolDef('query')]); // trusted = [query]
+    // The live manifest has an extra tool → the hash drifts on the first connect.
+    const fake = fakeClientFactory({ tools: [toolDef('query'), toolDef('extra')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    // First call connects, detects drift → degraded + pinned.
+    await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/manifest_drift/);
+    expect(mgr.state('db')).toBe('degraded');
+    // Further calls throw drift BEFORE the call — they never reach the valid-output
+    // recovery counter, so the drift never auto-recovers (only /mcp reconnect does).
+    for (let i = 0; i < 4; i++) {
+      await expect(mgr.callTool('db', 'query', {}, ctx)).rejects.toThrow(/manifest_drift/);
+    }
+    expect(mgr.state('db')).toBe('degraded');
+    await mgr.cleanup();
+  });
+});
+
+describe('McpManager: remote transport', () => {
+  test('a remote server registers its tools as egress + gets no sandbox / stderr log', async () => {
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([remoteServerConfig()]),
+      autoApprove: new Set(['gh']),
+      makeClient: fake.makeClient,
+      traceDir: '/data/traces', // present, but a remote server still gets no log
+    });
+    const report = await mgr.init();
+    expect(report.registered).toBe(1);
+    expect(registry.has('mcp__gh__query')).toBe(true);
+    // A remote server reaches the network → its tools are egress (mcp.egress).
+    expect(registry.get('mcp__gh__query')?.metadata.category).toBe('mcp.egress');
+    expect(fake.stats.lastSandbox).toBeUndefined(); // no subprocess → no sandbox wrap
+    expect(fake.stats.lastLogPath).toBeUndefined(); // no subprocess → no stderr log
+    await mgr.cleanup();
+  });
+
+  test('the trust modal + persisted identity use the RAW url, not the resolved secret', async () => {
+    const cfg = remoteServerConfig({
+      transport: {
+        transport: 'http',
+        url: 'https://mcp.example.com/v1?token=RESOLVED-SECRET', // the live connection target
+        rawUrl: 'https://mcp.example.com/v1?token=$TOKEN', // the identity (unexpanded)
+      },
+    });
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    let modalCommand: string | undefined;
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([cfg]),
+      confirmTrust: async (req) => {
+        modalCommand = req.command; // identity gate + manifest both show transportIdentity.display
+        return 'yes';
+      },
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(modalCommand).toBe('https://mcp.example.com/v1?token=$TOKEN'); // modal shows the RAW url
+    const persisted = getServer(db, SCOPE, 'gh')?.url ?? '';
+    expect(persisted).toContain('token=$TOKEN'); // identity keeps the RAW (unexpanded) url
+    expect(persisted).toContain('"origin":"https://mcp.example.com"'); // + the resolved origin (non-secret)
+    expect(persisted).not.toContain('RESOLVED-SECRET'); // the secret never lands at rest
+    await mgr.cleanup();
+  });
+
+  test('the trust modal shows the RESOLVED origin when the url is an env var ($MCP_URL)', async () => {
+    // The whole URL is a `$VAR`, so the raw form hides the host — the operator must
+    // still see WHICH host receives the connection + bearer before approving.
+    const cfg = remoteServerConfig({
+      transport: {
+        transport: 'http',
+        url: 'https://actual-host.example.com/mcp?token=RESOLVED-SECRET', // $MCP_URL resolved
+        rawUrl: '$MCP_URL',
+        authEnv: 'MCP_TOKEN',
+      },
+    });
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    let modalCommand: string | undefined;
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([cfg]),
+      confirmTrust: async (req) => {
+        modalCommand = req.command;
+        return 'yes';
+      },
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(modalCommand).toContain('$MCP_URL'); // the raw (unexpanded) form still shown
+    expect(modalCommand).toContain('https://actual-host.example.com'); // + the resolved ORIGIN
+    expect(modalCommand).not.toContain('RESOLVED-SECRET'); // the query secret is hidden
+    expect(modalCommand).not.toContain('?token='); // path/query stripped — origin only
+    await mgr.cleanup();
+  });
+
+  test("a remote server's trust identity is its URL (a second session reuses the cached grant)", async () => {
+    const f1 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m1 = createMcpManager({
+      db,
+      registry,
+      config: config([remoteServerConfig()]),
+      autoApprove: new Set(['gh']),
+      makeClient: f1.makeClient,
+    });
+    await m1.init();
+    await m1.cleanup();
+
+    // Same URL → cached grant, no fresh connect.
+    const reg2 = createToolRegistry();
+    const f2 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m2 = createMcpManager({
+      db,
+      registry: reg2,
+      config: config([remoteServerConfig()]),
+      makeClient: f2.makeClient,
+    });
+    await m2.init();
+    expect(reg2.has('mcp__gh__query')).toBe(true);
+    expect(f2.stats.made).toBe(0); // URL unchanged → registered from cache, never connected
+    await m2.cleanup();
+  });
+
+  test('a server that switches stdio→remote in config is re-trusted (identity flips command→url)', async () => {
+    // Session 1: trust the server as a stdio subprocess.
+    const f1 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m1 = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig({ name: 'sw' })]),
+      autoApprove: new Set(['sw']),
+      makeClient: f1.makeClient,
+    });
+    await m1.init();
+    await m1.cleanup();
+    expect(f1.stats.made).toBeGreaterThan(0); // connected to fetch + grant the stdio manifest
+    const row1 = getServer(db, SCOPE, 'sw');
+    expect(row1?.transport).toBe('stdio');
+    expect(row1?.url).toBeNull();
+
+    // Session 2: SAME name, now a remote http endpoint. The transport-kind change
+    // must force a re-handshake — NOT a register from the stale stdio grant.
+    const reg2 = createToolRegistry();
+    const f2 = fakeClientFactory({ tools: [toolDef('query')] });
+    const m2 = createMcpManager({
+      db,
+      registry: reg2,
+      config: config([remoteServerConfig({ name: 'sw' })]),
+      autoApprove: new Set(['sw']),
+      makeClient: f2.makeClient,
+    });
+    await m2.init();
+    expect(f2.stats.made).toBeGreaterThan(0); // re-handshook, not served from the stdio cache
+    expect(reg2.has('mcp__sw__query')).toBe(true);
+    const row2 = getServer(db, SCOPE, 'sw');
+    expect(row2?.transport).toBe('http'); // persisted identity flipped to the remote URL
+    expect(row2?.command).toBeNull();
+    expect(row2?.url).toContain('https://mcp.example.com/v1'); // identity blob carries the remote URL
+    await m2.cleanup();
+  });
+});

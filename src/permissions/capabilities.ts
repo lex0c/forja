@@ -529,6 +529,10 @@ export const TOOL_CAPABILITY_FOOTPRINTS: Record<
   glob: ['read-fs'],
   grep: ['read-fs'],
   fetch_url: ['net-egress'],
+  // MCP tools are parent-session-scoped (MCP.md §8 — subagent access is a later
+  // slice) and not a capability-grant kind, so a `tools.mcp` allow projects NO
+  // capability footprint to a subagent.
+  mcp: [],
 };
 
 // True when a policy section has any allow-shaped rule. The

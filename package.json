@@ -23,6 +23,8 @@
     "eval:fetch-url": "bun run src/evals/cli.ts evals/fetch-url --model anthropic/claude-opus-4-8",
     "eval:long-horizon": "bun run src/evals/cli.ts evals/long-horizon --model anthropic/claude-opus-4-8",
     "eval:long-horizon:ab": "bun run src/evals/ab.ts evals/long-horizon --model anthropic/claude-opus-4-8 --repeat 10 --thinking-budget 4096",
+    "eval:smoke:mcp": "bash evals/smoke-mcp.sh",
+    "eval:mcp": "bun run src/evals/cli.ts evals/mcp --model anthropic/claude-opus-4-8",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "format": "biome format --write .",
@@ -53,6 +55,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "~0.91.1",
     "@google/genai": "~1.50.1",
+    "@modelcontextprotocol/sdk": "~1.29.0",
     "openai": "~6.34.0",
     "remark": "^15.0.1",
     "remark-gfm": "^4.0.1",

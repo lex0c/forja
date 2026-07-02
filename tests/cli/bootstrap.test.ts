@@ -4,10 +4,12 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { DEFAULT_MODEL, bootstrap } from '../../src/cli/bootstrap.ts';
 import { userConfigPath } from '../../src/config/loaders.ts';
+import { createSqliteSink, ensureInstallId } from '../../src/permissions/index.ts';
 import { setWritableCacheDirsOverride } from '../../src/permissions/sandbox-cache-dirs.ts';
 import { setCachePersistenceOverride } from '../../src/permissions/sandbox-cache-env.ts';
 import type { Provider } from '../../src/providers/index.ts';
 import { flattenSystemSegments } from '../../src/providers/types.ts';
+import { MIGRATIONS, migrate, openDb } from '../../src/storage/index.ts';
 import { forjaCacheDir } from '../../src/storage/paths.ts';
 import { seedModelCatalog } from '../helpers/seed-catalog.ts';
 
@@ -92,6 +94,9 @@ describe('bootstrap', () => {
       dbPath,
       enterprisePolicyPath: null,
       userPolicyPath: null,
+      // Hermetic: no user mcp.toml leaks in, so the builtin list below is
+      // load-bearing rather than incidentally isolated by XDG.
+      userMcpPath: null,
     });
     expect(modelId).toBe(DEFAULT_MODEL);
     expect(policyLayers).toEqual([]);
@@ -155,6 +160,176 @@ describe('bootstrap', () => {
         'write_file',
       ].sort(),
     );
+    db.close();
+  });
+
+  test('registers trusted MCP tools from mcp.toml into the registry', async () => {
+    const mcpTomlPath = join(workdir, '.forja', 'mcp.toml');
+    mkdirSync(dirname(mcpTomlPath), { recursive: true });
+    writeFileSync(
+      mcpTomlPath,
+      `[servers.fixture]
+transport = "stdio"
+command = ["fake-bin"]
+surface = "base"
+`,
+    );
+    // Fake MCP client — exercises the bootstrap → manager → registration path
+    // without spawning a real stdio subprocess.
+    const makeFakeClient = (): import('../../src/mcp/types.ts').McpClient => ({
+      connect: async () => ({
+        protocolVersion: '2024-11-05',
+        serverName: null,
+        serverVersion: '1.0.0',
+      }),
+      listTools: async () => [
+        {
+          name: 'echo',
+          description: 'echo back text',
+          inputSchema: { type: 'object', properties: { text: { type: 'string' } } },
+          meta: { writes: false },
+        },
+      ],
+      callTool: async () => ({ isError: false, content: 'ok' }),
+      close: async () => {},
+    });
+    const { config, db } = await bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      userMcpPath: null,
+      autoApproveMcp: new Set(['fixture']),
+      mcpMakeClient: makeFakeClient,
+    });
+    const names = config.toolRegistry.list().map((t) => t.name);
+    expect(names).toContain('mcp__fixture__echo'); // MCP tool registered
+    expect(names).toContain('read_file'); // builtins still present (adds, not replaces)
+    expect(names.filter((n) => n.startsWith('mcp__'))).toEqual(['mcp__fixture__echo']);
+    db.close();
+  });
+
+  test('a refusing permission boot skips MCP init (no connect, no registration)', async () => {
+    // Fail-closed boot must not spawn stdio servers or connect to a remote MCP
+    // endpoint (sending its bearer) before run.ts aborts on the refusing state.
+    // Seed a tampered audit chain so bootstrapPermissionEngine comes up
+    // `refusing`, then assert the MCP client was never touched and no mcp__
+    // tool reached the wire — even with the server auto-approved.
+    const mcpTomlPath = join(workdir, '.forja', 'mcp.toml');
+    mkdirSync(dirname(mcpTomlPath), { recursive: true });
+    writeFileSync(
+      mcpTomlPath,
+      `[servers.fixture]\ntransport = "stdio"\ncommand = ["fake-bin"]\nsurface = "base"\n`,
+    );
+
+    // Break the chain in the SAME db + install identity bootstrap resolves
+    // (XDG_CONFIG_HOME is pinned to workdir in beforeEach), so its boot-time
+    // verifyChain refuses.
+    const identity = ensureInstallId({ env: process.env });
+    const seedDb = openDb(dbPath);
+    migrate(seedDb, MIGRATIONS);
+    const sink = createSqliteSink({ db: seedDb, identity });
+    sink.emit({
+      session_id: 'pre',
+      tool_name: 'bash',
+      args: {},
+      decision: 'allow',
+      policy_hash: 'sha256:x',
+      reason_chain: [],
+      capabilities: [],
+      score: 0,
+      score_components: {},
+      classifier_hash: 'none',
+      classifier_adjust: null,
+      sandbox_profile: null,
+      ttl_expires_at: null,
+      ts: 1,
+    });
+    seedDb.run('UPDATE approvals_log SET decision = ? WHERE seq = 1', ['deny']);
+    seedDb.close();
+
+    let connected = false;
+    const makeFakeClient = (): import('../../src/mcp/types.ts').McpClient => ({
+      connect: async () => {
+        connected = true;
+        return { protocolVersion: '2024-11-05', serverName: null, serverVersion: '1.0.0' };
+      },
+      listTools: async () => [
+        {
+          name: 'echo',
+          description: 'echo back text',
+          inputSchema: { type: 'object', properties: { text: { type: 'string' } } },
+          meta: { writes: false },
+        },
+      ],
+      callTool: async () => ({ isError: false, content: 'ok' }),
+      close: async () => {},
+    });
+
+    const { config, db, permissionState } = await bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      userMcpPath: null,
+      autoApproveMcp: new Set(['fixture']), // auto-approved, yet the refusal wins
+      mcpMakeClient: makeFakeClient,
+    });
+
+    expect(permissionState).toBe('refusing');
+    expect(connected).toBe(false); // never spawned/connected the server
+    const names = config.toolRegistry.list().map((t) => t.name);
+    expect(names.filter((n) => n.startsWith('mcp__'))).toEqual([]);
+    db.close();
+  });
+
+  test('finds the repo-root .forja/mcp.toml when launched from a subdirectory', async () => {
+    // Regression: MCP project config must resolve from the REPO ROOT (like every
+    // other project-scoped loader), not the raw invocation cwd — otherwise a
+    // repo-root mcp.toml is silently dropped when forja runs from a subdir.
+    Bun.spawnSync({ cmd: ['git', 'init', workdir] }); // resolveRepoRoot maps subdir → root
+    const mcpTomlPath = join(workdir, '.forja', 'mcp.toml');
+    mkdirSync(dirname(mcpTomlPath), { recursive: true });
+    writeFileSync(
+      mcpTomlPath,
+      `[servers.fixture]\ntransport = "stdio"\ncommand = ["fake-bin"]\nsurface = "base"\n`,
+    );
+    const subdir = join(workdir, 'pkg', 'nested');
+    mkdirSync(subdir, { recursive: true });
+    const makeFakeClient = (): import('../../src/mcp/types.ts').McpClient => ({
+      connect: async () => ({
+        protocolVersion: '2024-11-05',
+        serverName: null,
+        serverVersion: '1.0.0',
+      }),
+      listTools: async () => [
+        {
+          name: 'echo',
+          description: 'echo back text',
+          inputSchema: { type: 'object', properties: { text: { type: 'string' } } },
+          meta: { writes: false },
+        },
+      ],
+      callTool: async () => ({ isError: false, content: 'ok' }),
+      close: async () => {},
+    });
+    const { config, db } = await bootstrap({
+      prompt: 'hi',
+      cwd: subdir, // launched from a nested subdirectory
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      userMcpPath: null,
+      autoApproveMcp: new Set(['fixture']),
+      mcpMakeClient: makeFakeClient,
+    });
+    const names = config.toolRegistry.list().map((t) => t.name);
+    expect(names).toContain('mcp__fixture__echo'); // repo-root mcp.toml found from the subdir
     db.close();
   });
 

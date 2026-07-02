@@ -13,9 +13,11 @@ import { projectDirName } from '../config/app-namespace.ts';
 // Default contents are intentionally minimal: the rules cover
 // runtime data (sessions.db, traces, checkpoints), the
 // per-developer memory + skills subtrees (`memory/local/` and
-// `skills/local/`), and generic log noise. Anything else (dotenvs,
-// build artifacts) belongs in the project's top-level `.gitignore`
-// because it isn't agent state.
+// `skills/local/`), the machine-local MCP layer (`mcp.local.toml` —
+// reserved for private endpoints / secret env names, MCP.md §2.1),
+// and generic log noise. Anything else (dotenvs, build artifacts)
+// belongs in the project's top-level `.gitignore` because it isn't
+// agent state.
 
 export const DEFAULT_AGENT_GITIGNORE = `# .forja/.gitignore (auto-generated; safe to edit)
 sessions.db
@@ -24,6 +26,7 @@ traces/
 checkpoints/
 memory/local/
 skills/local/
+mcp.local.toml
 *.log
 `;
 

@@ -115,6 +115,25 @@ export const CODE_VOCABULARY: ReadonlyMap<string, FailureClass> = new Map<string
   // model only acted on the last 500" — without this row that
   // discrepancy is invisible to any post-hoc query.
   ['storage.resume_truncated', 'storage'],
+  // MCP subsystem (per-server budget, MCP.md §5/§15). Emitted from the manager's
+  // callTool.
+  // mcp.budget.exceeded: a server crossed its per-session call or token cap and
+  // was disconnected for the rest of the session (§15.6). Emitted ONCE per trip
+  // (the cap check re-fires on every refused call, but the breach happened once).
+  // recovery_action = 'pending_repair' (the server is down, awaiting the next
+  // session or an operator /mcp reconnect), user_visible.
+  ['mcp.budget.exceeded', 'mcp'],
+  // mcp.timeout: a single tools/call exceeded the server's timeout_ms (§15.3).
+  // The server stays active + the connection reusable; the timeout is surfaced
+  // to the model as a tool error. recovery_action = 'ignored' (handed to the
+  // model to decide), not user_visible (per-call, the audit row is for forensics).
+  ['mcp.timeout', 'mcp'],
+  // mcp.output.invalid: a tools/call result was malformed — a clear protocol
+  // violation (§15.5). The server transitions active→degraded and the model gets
+  // an error result to retry/fall back on; 3 consecutive valid outputs recover it
+  // to active. recovery_action = 'degraded', not user_visible (the §15.5 banner
+  // only fires if it persists > 5 min, which is a later concern).
+  ['mcp.output.invalid', 'mcp'],
 ]);
 
 export const isFailureCode = (code: string): boolean => CODE_VOCABULARY.has(code);

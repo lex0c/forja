@@ -41,4 +41,23 @@ describe('createToolRegistry', () => {
     reg.register(dummyTool('c'));
     expect(reg.list().map((t) => t.name)).toEqual(['a', 'b', 'c']);
   });
+
+  test('unregister removes a tool and reports whether it was present', () => {
+    const reg = createToolRegistry();
+    reg.register(dummyTool('foo'));
+    expect(reg.unregister('foo')).toBe(true);
+    expect(reg.has('foo')).toBe(false);
+    expect(reg.get('foo')).toBeNull();
+    expect(reg.list()).toEqual([]);
+    // Idempotent: removing an absent name is a no-op returning false.
+    expect(reg.unregister('foo')).toBe(false);
+  });
+
+  test('a name can be re-registered after unregister (no duplicate throw)', () => {
+    const reg = createToolRegistry();
+    reg.register(dummyTool('foo'));
+    reg.unregister('foo');
+    expect(() => reg.register(dummyTool('foo'))).not.toThrow();
+    expect(reg.has('foo')).toBe(true);
+  });
 });

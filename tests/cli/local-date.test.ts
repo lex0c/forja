@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { localIsoDate } from '../../src/cli/local-date.ts';
+import { localIsoDate, localTimestamp } from '../../src/cli/local-date.ts';
 
 describe('localIsoDate', () => {
   test('returns YYYY-MM-DD shape', () => {
@@ -55,5 +55,25 @@ describe('localIsoDate', () => {
     const expectedM = String(utcMidnight.getMonth() + 1).padStart(2, '0');
     const expectedD = String(utcMidnight.getDate()).padStart(2, '0');
     expect(localIsoDate(utcMidnight)).toBe(`${expectedY}-${expectedM}-${expectedD}`);
+  });
+});
+
+describe('localTimestamp', () => {
+  test('formats a valid ms as local YYYY-MM-DD HH:MM', () => {
+    const ms = new Date(2026, 4, 7, 9, 5).getTime(); // May 7 2026 09:05 local
+    expect(localTimestamp(ms)).toBe('2026-05-07 09:05');
+  });
+
+  test('null / zero / negative ms → "—" (unknown, not a false 1970 date)', () => {
+    expect(localTimestamp(null)).toBe('—');
+    expect(localTimestamp(0)).toBe('—');
+    expect(localTimestamp(-1)).toBe('—');
+  });
+
+  test('an out-of-range ms → "—" rather than a thrown RangeError', () => {
+    // `new Date(8.7e15)` is an Invalid Date; using toISOString() would throw —
+    // localTimestamp uses the local getters + an isNaN guard, so it degrades.
+    expect(localTimestamp(8.7e15)).toBe('—');
+    expect(localTimestamp(Number.NaN)).toBe('—');
   });
 });

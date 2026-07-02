@@ -73,6 +73,23 @@ describe('renderExplainPermissions', () => {
     expect(text).toContain('bash: [from enterprise policy] (locked)');
   });
 
+  test('renders the mcp section (deny/confirm patterns + lock)', () => {
+    const lines = renderExplainPermissions(
+      {
+        defaults: { mode: 'strict' },
+        tools: {
+          mcp: { deny: ['mcp__github__delete_*'], confirm: ['mcp__proxy__*'], locked: true },
+        },
+      },
+      { defaults: 'project', mcp: 'project' },
+      [{ layer: 'project', path: '/r/.forja/permissions.yaml' }],
+    );
+    const text = lines.join('\n');
+    expect(text).toContain('mcp: [from project policy] (locked)');
+    expect(text).toContain("deny: 'mcp__github__delete_*'");
+    expect(text).toContain("confirm: 'mcp__proxy__*'");
+  });
+
   test('multi-section policy with mixed-layer provenance', () => {
     const lines = renderExplainPermissions(
       {

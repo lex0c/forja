@@ -12,7 +12,7 @@ Sem este doc, MCP fica como folclore espalhado por 7 docs — cada implementador
 
 1. **Server é não-confiável até prova em contrário.** Princípio 11 do `AGENTIC_CLI.md`. Trust é per-manifest-hash, não per-name.
 2. **Server declara tools, não policy.** MCP fornece capacidades; harness decide políticas (`SECURITY_GUIDELINE.md §5` invariant 9).
-3. **Namespacing explícito.** `mcp:<server>:<tool>` em todo audit, output, e UI. Sem ambiguidade com canônicos.
+3. **Namespacing explícito.** `mcp__<server>__<tool>` em todo audit, output, e UI. Sem ambiguidade com canônicos.
 4. **Failure visível.** Server caído ≠ tool ausente silenciosa; UI sinaliza, audit registra.
 5. **Hash do manifest é load-bearing.** Mudança de manifest = re-trust mandatório.
 6. **Lazy activation.** Server só conecta quando modelo efetivamente vai chamar uma tool; conexões pré-emptivas são waste.
@@ -26,11 +26,13 @@ Sem este doc, MCP fica como folclore espalhado por 7 docs — cada implementador
 ### 1.1 Visão geral
 
 ```
-discover → handshake → trust_prompt → register → activate → call → degrade? → disconnect
-   │           │             │            │          │        │        │           │
-config     initialize    user input  tools/list  first    tools/  schema     transport
-file       /protocol     + hash      registered  use      call     err        broken
+discover → identity_gate → handshake → manifest_prompt → register → activate → call → degrade? → disconnect
+   │            │              │              │              │           │        │        │           │
+config      autoriza       initialize     tools/list +   tools       first    tools/  schema    transport
+arquivo     comando/URL    /protocolo     hash + review  registradas uso      call     err       quebrado
 ```
+
+O `identity_gate` (§1.5) é **pré-connect**: o operador autoriza ALCANÇAR o server — rodar o comando / abrir a URL com auth — ANTES do handshake. Um `mcp.toml` hostil não pode spawnar código nem vazar um bearer token só pra buscar o manifesto, mesmo que o operador recuse depois.
 
 Estados formais em `STATE_MACHINE.md §6.5`. Esta seção é narrativa.
 
@@ -68,7 +70,7 @@ Variáveis `$VAR` resolvem do env do agent (não do user shell genérico — env
 
 ### 1.3 Handshake
 
-Conexão lazy: harness não conecta até modelo efetivamente chamar `mcp:<name>:*`. Em `SessionStart`, harness apenas:
+Conexão lazy: harness não conecta até modelo efetivamente chamar `mcp__<name>__*`. Em `SessionStart`, harness apenas:
 
 1. Lê `mcp.toml`
 2. Para cada server **ativo** (não `disabled`): consulta `mcp_servers` em SQLite pra estado anterior
@@ -119,7 +121,11 @@ Mismatch em `protocolVersion` exato → `mcp.initialize_protocol_mismatch` → `
 
 ### 1.5 Trust prompt
 
-Após `initialize`, harness chama `tools/list`, computa hash, e compara com `mcp_manifest_history`.
+Trust é em **dois passos**, pra nunca rodar/conectar antes da aprovação:
+
+**Passo 1 — identity gate (pré-connect).** Pra um server não-cacheado (novo, comando/URL mudou, `/mcp reconnect`, ou **re-adicionado após remoção do config** — o orphan-sweep varreu a row identitária, então o grant forever não é reusado por nome), ANTES do handshake o operador autoriza a IDENTIDADE: o modal mostra só `<name>` + o comando RAW / a URL + a postura de sandbox (sem tools — ainda não buscadas, e buscá-las É o spawn/connect que estamos gateando). Recusa → `denied`, sem spawn e **sem token enviado**. Aprova → segue pro handshake. Headless: skip se `--auto-approve-mcp` (o fail-closed abaixo já negou o caso sem-grant).
+
+**Passo 2 — manifest prompt (pós-connect).** Após `initialize`, harness chama `tools/list`, computa hash, e compara com `mcp_manifest_history` (é aqui que o operador revê a lista de tools + os marcadores `[writes]`):
 
 | Caso | Comportamento |
 |---|---|
@@ -137,14 +143,14 @@ Headless / CI: trust prompt é **fail-closed** — se `--auto-approve-mcp` não 
 `tools/list` resposta vira `register` no Tool Registry com namespacing:
 
 ```
-mcp:postgres:query
-mcp:postgres:list_tables
-mcp:github:create_issue
+mcp__postgres__query
+mcp__postgres__list_tables
+mcp__github__create_issue
 ```
 
 Tools registradas com `visible_to_model: true` (se `trusted`) entram no `tool_schemas` cache breakpoint #2. Modelo as vê com nome completo namespaced.
 
-Quando modelo emite `tool_use` com `name: "mcp:postgres:query"`:
+Quando modelo emite `tool_use` com `name: "mcp__postgres__query"`:
 1. Harness valida input contra `inputSchema`
 2. Permission engine aplica policy (mesmas regras de tools canônicas)
 3. Se `disconnected`: handshake on-demand (transição para `active`)
@@ -174,7 +180,7 @@ Server crash mid-session: tudo que estava em vôo recebe error; server transita 
 ### 2.1 Stdio
 
 - Spawn: `spawn(command[0], command.slice(1), { env: cleanEnv, cwd, stdio: ["pipe", "pipe", "pipe"] })`
-- Env limpa: apenas `PATH`, `HOME`, `USER`, `MCP_*` vars do user, vars declaradas em `[servers.<name>.env]`
+- Env do child: unsandboxed → apenas `PATH`/`HOME`/`USER` + vars declaradas em `[servers.<name>.env]`; sandboxed → o mesmo allowlist seguro do bash (`SANDBOX_SAFE_ENV_VARS`: + `LANG`/`TERM`/`TZ`/`TMPDIR`/…) + as declaradas. Em ambos, **sem passthrough por prefixo** — um `MCP_*_TOKEN` destinado a um server não vaza para os outros.
 - `setsid` para evitar processo órfão (Linux/macOS)
 - stderr capturado, redirected para `traces/mcp-<name>.log` (rotacionado em 10MB)
 - Detected dead via `kill(pid, 0)` ou `EPIPE` em writes
@@ -189,11 +195,23 @@ Server crash mid-session: tudo que estava em vôo recebe error; server transita 
 
 ### 2.3 Sandbox (stdio)
 
-Mesmo profile que `bash` sandboxing (`SECURITY_GUIDELINE.md §8.1`):
-- Mount: `cwd` declarado read-write; `~/.config/agent` read; `/tmp` read-write isolado; resto read-only
-- Network: per-server allowlist (`[servers.<name>.network.allow_hosts]`); default DENY
-- Ulimits: CPU 30s soft, memory 512MB soft, file size 100MB
-- Linux: `bwrap` opt-in; macOS: `sandbox-exec` opt-in; opt-in via `[servers.<name>.sandbox = true]`
+Server stdio é código local **não-confiável** (§0.1). Mesmo profile que `bash` sandboxing
+(`SECURITY_GUIDELINE.md §8.1`):
+- Mount: `cwd` read-write; `~/.config/agent` read; `/tmp` read-write isolado; resto read-only.
+- Network: **DENY por default**; `[servers.<name>.network.allow_hosts]` concede. **Caveat (§8.1):**
+  bwrap dá rede tudo-ou-nada (`cwd-rw-net` omite `unshare-net`); o allowlist é **advisory** (alimenta
+  confirm/score/auditoria + o modal), **não há filtro por-host no kernel hoje** — filtro real
+  (proxy/nftables) é futuro. A spec não promete confinamento por-host.
+- Egress: server com rede concedida → suas tools contam como **egress** (`categoryIsEgress`), nunca
+  auto-aprovadas sob postura autônoma, mesmo após o trust do manifesto.
+- Ulimits: CPU 30s soft, memory 512MB soft, file size 100MB.
+
+**Default-ON quando há ferramenta** (Linux `bwrap`, macOS `sandbox-exec`); **opt-out** por server via
+`[servers.<name>.sandbox = false]`. Mais agressivo que o sandbox de bash (§9.2, opt-in): o bash é o
+próprio operador, um server MCP é terceiro não-confiável. Sem ferramenta de sandbox → degrada para
+unsandboxed **com warning no boot**; se a ferramenta existia no boot e sumiu, **fail-closed** (recusa
+rodar sem sandbox, não roda silenciosamente exposto). O modal de trust exibe o status efetivo
+(sandboxed / unsandboxed por opt-out / unsandboxed por falta de ferramenta).
 
 Sandbox em SSE/HTTP servers: N/A (server roda fora; agente só faz HTTP). Trust boundary é a rede.
 
@@ -209,7 +227,7 @@ Sandbox em SSE/HTTP servers: N/A (server roda fora; agente só faz HTTP). Trust 
 {
   "tools": [
     {
-      "name": "query",                     // sem namespace; harness adiciona "mcp:postgres:"
+      "name": "query",                     // sem namespace; harness adiciona "mcp__postgres__"
       "description": "Run a read-only SELECT against the configured database.",
       "inputSchema": {
         "type": "object",
@@ -283,8 +301,9 @@ Diff computed comparando manifest cacheado vs novo. Display em `UI.md` (TBD: com
 
 ### 4.1 Regras
 
-- Tools MCP **sempre** aparecem como `mcp:<server>:<tool>` no registry, audit, slash commands, output
-- `<server>` vem de `[servers.<name>]` em config; `<tool>` vem de `tools/list`
+- Tools MCP **sempre** aparecem como `mcp__<server>__<tool>` no registry, audit, slash commands, output
+- **Por que `__` e não `:`** — o nome vai *as-is* na wire da API (Anthropic/OpenAI exigem `^[a-zA-Z0-9_-]{1,64}$`; dois-pontos é rejeitado) e `:` colidiria com a gramática de capabilities `<kind>:<scope>` e com as regras de permissão `Bash(...)`/`Edit(...)`. Duplo-underscore é o separador seguro em todas as superfícies
+- `<server>` vem de `[servers.<name>]` em config; `<tool>` vem de `tools/list`; ambos sanitizados para o charset acima (colisão pós-sanitização resolvida por sufixo)
 - Colisão com tool canônica (`§2.6` em `CONTRACTS.md`): registro **rejeitado** com `mcp.namespace.shadow_canonical`
 - Colisão entre dois MCP servers: ambos sobrevivem (namespacing por server resolve); sem fallback
 
@@ -318,9 +337,31 @@ Limites operacionais (`PERFORMANCE.md §8`):
 | `timeout_ms` | 30000 | 60000 | per-call |
 | `heartbeat_max_age_ms` | 60000 | 300000 | SSE/HTTP only |
 
-Excedeu cap absoluto → server transita para `disconnected` com `failure_event` `mcp.budget.exceeded`. Soft cap → warning em audit, sem ação.
+**Modelo de enforcement (implementado).** O valor **configurado** por server (`[servers.<name>]
+timeout_ms` / `max_calls_per_session` / `max_tokens_in_per_session`) é o **cap enforçado**; a coluna
+"Cap absoluto" é o **teto** ao qual o loader faz clamp do valor configurado (um `max_calls = 99999`
+vira 1000), não um segundo limiar. Defaults aplicados quando o campo é omitido; valor `< 1` ou
+não-numérico → warning + default.
 
-Budget herda de step parent em `orchestrated` profile (cascading via `ORCHESTRATION.md §11`).
+- **`timeout_ms`** limita uma única `tools/call`. Estouro → `failure_event` `mcp.timeout` (classe
+  `mcp`, recovery `ignored`); o server **fica `active`** e a conexão reusável (§15.3) — não é fault de
+  transporte —, e o timeout volta ao modelo como tool error pra ele decidir.
+- **`max_calls_per_session` / `max_tokens_in_per_session`** são contados **per-sessão** (in-memory;
+  distintos dos contadores cumulativos `total_*` do DB que alimentam `/mcp show`). Como o manager é
+  broker-style (uma instância pro processo inteiro, e cada prompt do REPL é uma sessão nova, §1.1), os
+  contadores **resetam quando uma nova sessão chama o server** — é isso que torna o cap per-sessão e
+  **levanta o bloqueio** da sessão anterior. As chamadas contam **tentativas** (incluindo timeouts,
+  senão um server que trava em toda chamada loopa sem nunca bater o cap); tokens-in só acumulam em
+  chamada bem-sucedida. Cruzar o cap → `disconnected` + `failure_event` `mcp.budget.exceeded` (recovery
+  `pending_repair`, user-visible, **uma vez por trip** — o cap-check re-dispara em toda chamada recusada
+  da sessão, mas a violação aconteceu uma vez), checado **antes de qualquer reconexão** pra um server
+  capado não re-spawnar. Bloqueio até a próxima sessão (§15.6) — ou um `/mcp reconnect` do operador.
+
+Um tier mais fino de **soft-warning antes do hard cap** é slice futuro. A auto-recuperação
+`degraded`→`active` por **output inválido** (§15.5) está implementada (3 outputs bem-formados
+consecutivos → `active`); um degrade por **drift** de manifesto fica pinado até um `/mcp reconnect`
+(re-trust), não auto-recupera. Budget herda de step parent em `orchestrated` profile (cascading via
+`ORCHESTRATION.md §11`).
 
 ---
 
@@ -353,6 +394,14 @@ Anti-pattern: server que muda manifest a cada minuto (ex: server "dynamic" que a
 
 Implementação compartilha pipeline com slash commands canônicos (`AGENTIC_CLI.md §2.5`). Output JSON via `--json` flag.
 
+**Modelo de revoke/reconnect (durabilidade + auditoria).** `revoke` é **durável**: precisa sobreviver a um relaunch, senão o `init` re-registra do grant cacheado (que vive no `mcp_manifest_history` append-only para sempre). A revogação é gravada como **estado** — uma coluna `revoked_at` (epoch-ms) na row mutável `mcp_servers`, NÃO uma decisão de manifesto — porque o `UNIQUE(scope, server_name, hash)` do history proíbe uma 2ª decision row para o hash já concedido. Semântica:
+
+- `revoke`: `unregister` das tools do registry vivo (o próximo turno cai), `state = denied`, `revoked_at = now()`. O orphan-sweep do `init` **preserva** rows revogadas (sobrevive a um round-trip de config). As subcommands mutantes rodam **entre turnos** (gate `runExclusive`) — mutar o registry no meio de um turno entregaria um tool-set meio-aplicado.
+- `init`: enquanto `revoked_at` está setado, pula o cache e fica `denied` (não re-registra, não re-pergunta headless).
+- `reconnect`: reseta o runtime e força um re-trust (`resolveFreshTrust`); limpa `revoked_at` **somente após sucesso** (state `trusted`). Um reconnect negado/sem-conexão **fica revogado** — seta `revoked_at` mesmo num server **nunca-revogado** (ex.: reconnect pós-drift que o operador recusa), senão o grant cacheado (forever) resurgiria no próximo launch e uma call spawnaria/conectaria no server recusado.
+
+Limitação consciente: como a revogação é estado (não evento), após `revoke→reconnect` bem-sucedido não sobra registro durável de QUE/QUANDO foi revogado. Os valores `'revoked'`/`'superseded'` do enum `decision` ficam **reservados** para uma auditoria-de-revogações futura (exigiria relaxar o `UNIQUE` + lógica de "última decisão"). O grant em si nunca some (forever).
+
 ---
 
 ## 8. Failure modes (cross-ref)
@@ -377,7 +426,7 @@ Implementação compartilha pipeline com slash commands canônicos (`AGENTIC_CLI
 
 ### 9.1 Tabelas (ver `AUDIT.md §1.5`)
 
-- `mcp_servers` — config + estado atual (1 row per server name)
+- `mcp_servers` — config + estado atual (1 row per `(scope, name)`; `scope` = project root pra servers de projeto, `''` global pra `user` — isola o mesmo `<name>` entre repos num `sessions.db` user-global)
 - `mcp_manifest_history` — versions de manifest (append-only, forever retention)
 - `tool_calls` ganha coluna `mcp_server` para distinguir canônico vs MCP
 

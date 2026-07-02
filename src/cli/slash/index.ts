@@ -14,6 +14,7 @@ import { effortCommand } from './commands/effort.ts';
 import { buildHelpCommand } from './commands/help.ts';
 import { historyCommand } from './commands/history.ts';
 import { hooksCommand } from './commands/hooks.ts';
+import { mcpCommand } from './commands/mcp.ts';
 import { memoryCommand } from './commands/memory.ts';
 import { modelCommand } from './commands/model.ts';
 import { permsCommand } from './commands/perms.ts';
@@ -59,6 +60,7 @@ export const createBuiltinRegistry = (): SlashRegistry => {
     permsCommand,
     historyCommand,
     memoryCommand,
+    mcpCommand,
     // `/pin` withdrawn: with pin_context also pulled from the model,
     // no surface creates context pins anymore. pinCommand + its test
     // and the context_pins store/infra stay intact (dormant) — only

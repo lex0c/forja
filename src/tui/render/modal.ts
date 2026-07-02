@@ -122,6 +122,7 @@ const trimBlankEnds = (preview: readonly PreviewLine[]): readonly PreviewLine[] 
 export const TRUST_GATE_FLAVORS: ReadonlySet<ConfirmState['flavor']> = new Set([
   'trust',
   'shared-trust',
+  'mcp-trust',
 ]);
 
 export const renderModal = (modal: ConfirmState, caps: Capabilities): string[] => {

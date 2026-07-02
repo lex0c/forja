@@ -33,6 +33,9 @@ describe('ensureAgentGitignore', () => {
     expect(DEFAULT_AGENT_GITIGNORE).toContain('traces/');
     expect(DEFAULT_AGENT_GITIGNORE).toContain('checkpoints/');
     expect(DEFAULT_AGENT_GITIGNORE).toContain('memory/local/');
+    // The machine-local MCP layer holds private endpoints / secret env names
+    // (MCP.md §2.1) — it must never be staged by `git add .forja`.
+    expect(DEFAULT_AGENT_GITIGNORE).toContain('mcp.local.toml');
   });
 
   test('is idempotent: second call is a no-op', () => {

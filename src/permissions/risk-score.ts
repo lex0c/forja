@@ -22,6 +22,7 @@
 import type { Capability } from './capabilities.ts';
 import type { Confidence } from './grant-types.ts';
 import { containsShellInjection, matchHost } from './matcher.ts';
+import { MCP_TOOL_PREFIX } from './mcp-naming.ts';
 import type { EngineState } from './state-machine.ts';
 
 // Same domain as `ApprovalLogConfidence` in
@@ -312,4 +313,4 @@ export const mergeTrustedHosts = (policyTrustedHosts: readonly string[]): readon
 // `mcp__<server>__<tool>` from the MCP loader. The detector is
 // caller-overridable; this default is the fallback when no
 // override is supplied to the engine.
-export const defaultIsMcpTool = (name: string): boolean => name.startsWith('mcp__');
+export const defaultIsMcpTool = (name: string): boolean => name.startsWith(MCP_TOOL_PREFIX);

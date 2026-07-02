@@ -863,3 +863,89 @@ describe('executeCase — httpStub seam', () => {
     expect(r.passed).toBe(true);
   });
 });
+
+describe('executeCase: MCP seam (setup.mcp)', () => {
+  test('injects a hermetic, auto-approved MCP server the model can call', async () => {
+    const c = baseCase({
+      prompt: 'call the echo tool and report its output',
+      setup: {
+        // The fake server's tools are plain `mcp` (default-allow), NOT mcp.egress:
+        // the executor pins a hermetic sandbox verdict so it resolves to `cwd-rw`.
+        // (autonomous is set for any score-based confirm; egress it is not.)
+        approvalPosture: 'autonomous',
+        mcp: {
+          fixture: {
+            tools: [{ name: 'echo', description: 'echo back text' }],
+            result: 'MCP_MARKER_9x2',
+          },
+        },
+      },
+      expect: [
+        { kind: 'tool_called', tool: 'mcp__fixture__echo' },
+        { kind: 'status', status: 'done' },
+      ],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: {
+        providerOverride: mockProvider([
+          { tool_uses: [{ id: 't1', name: 'mcp__fixture__echo', input: { text: 'hi' } }] },
+          { text: 'the tool returned MCP_MARKER_9x2' },
+        ]),
+      },
+    });
+    expect(r.passed).toBe(true);
+    expect(r.expectations.every((e) => e.passed)).toBe(true);
+  });
+
+  test('the fixture tool is NON-egress: a headless autonomous call is ALLOWED, not denied', async () => {
+    // Regression guard. Writing `sandbox = false` classified the fake server as
+    // mcp.egress, which autonomous does NOT auto-approve → the call was denied
+    // before the canned result returned (the model-in-loop `output_contains`
+    // failed). With the server non-egress, a `tool_denied` expectation must FAIL
+    // with "invoked but allowed" — proving the call was permitted.
+    const c = baseCase({
+      prompt: 'call echo',
+      setup: {
+        approvalPosture: 'autonomous',
+        mcp: { fixture: { tools: [{ name: 'echo', description: 'echo' }], result: 'OK' } },
+      },
+      expect: [{ kind: 'tool_denied', tool: 'mcp__fixture__echo' }],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: {
+        providerOverride: mockProvider([
+          { tool_uses: [{ id: 't1', name: 'mcp__fixture__echo', input: { text: 'hi' } }] },
+          { text: 'done' },
+        ]),
+      },
+    });
+    const denied = r.expectations[0];
+    expect(denied?.passed).toBe(false); // invoked but ALLOWED → the deny expectation fails
+    expect(denied?.detail).toContain('invoked but allowed');
+  });
+
+  test('a declared server without auto-approve fails closed (tool never registers)', async () => {
+    const c = baseCase({
+      prompt: 'call the echo tool',
+      setup: {
+        // Declared via mcp.toml but NOT via setup.mcp, so it is not auto-approved:
+        // a headless run (no confirmer) denies it pre-connect and never registers
+        // its tools. The command is never spawned (denied before connect).
+        files: {
+          '.forja/mcp.toml':
+            '[servers.fixture]\ntransport = "stdio"\ncommand = ["mcp-eval", "fixture"]\nsurface = "base"\n',
+        },
+      },
+      expect: [
+        { kind: 'tool_not_called', tool: 'mcp__fixture__echo' },
+        { kind: 'status', status: 'done' },
+      ],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'no echo tool is available' }]),
+      },
+    });
+    expect(r.passed).toBe(true);
+  });
+});

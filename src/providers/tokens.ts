@@ -1,5 +1,12 @@
 import type { ProviderMessage, ProviderToolDef } from './types.ts';
 
+// The shared chars→tokens heuristic (~4 chars/token). Single source so a
+// divisor change lands everywhere (the message/prompt estimators below + MCP's
+// per-call token budget in src/mcp/manager.ts). ~10-25% conservative vs a real
+// tokenizer; English compresses tighter, CJK/emoji run denser — fine for the
+// safety-threshold / soft-budget uses, not for billing.
+export const charsToTokens = (chars: number): number => Math.ceil(chars / 4);
+
 // Local chars/4 heuristic for prompt token estimation. Used where a
 // real per-provider tokenizer would be expensive or unavailable:
 //   - OpenAI provider's `countTokens` (no server-side endpoint until
@@ -60,7 +67,7 @@ export const estimateMessagesTokens = (
   const countReasoning = options.countReasoning === true;
   let chars = 0;
   for (const m of messages) chars += charsInMessage(m, countReasoning);
-  return Math.ceil(chars / 4);
+  return charsToTokens(chars);
 };
 
 // Estimate the WHOLE outbound prompt: messages plus the optional
@@ -88,5 +95,5 @@ export const estimatePromptTokens = (
     for (const t of options.tools) chars += charsInTool(t);
   }
   for (const m of messages) chars += charsInMessage(m, countReasoning);
-  return Math.ceil(chars / 4);
+  return charsToTokens(chars);
 };

@@ -104,6 +104,9 @@ export const formatSections = (tools: PolicyToolsSection): string[] => {
   if (tools.glob !== undefined) pushSection(out, 'glob', formatPath(tools.glob));
   if (tools.grep !== undefined) pushSection(out, 'grep', formatPath(tools.grep));
   if (tools.fetch_url !== undefined) pushSection(out, 'fetch_url', formatFetch(tools.fetch_url));
+  // MCP renders like bash — the same allow/confirm/deny lists, over wire-name
+  // patterns instead of commands.
+  if (tools.mcp !== undefined) pushSection(out, 'mcp', formatBash(tools.mcp));
   return out;
 };
 

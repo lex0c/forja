@@ -661,7 +661,7 @@ Tente: /mcp reconnect {name}
 
 ### 15.5 `mcp.output.invalid`
 
-**Detecção:** server retornou output que **não valida** contra `outputSchema` (se declarado). Se schema ausente: heurística mínima — não-string em campo `text`, content array vazio, etc.
+**Detecção:** server retornou output que **não valida** contra `outputSchema` (se declarado). Se schema ausente (caso v1 — o manifest não captura `outputSchema`): heurística **conservadora**, só violações claras de protocolo — `content` **não-array**, ou um text-block com `text` **não-string**. Um array vazio ou content só-de-imagem **NÃO** é flagado: ambos podem ser legítimos (ação void, tool de imagem), e degradar um server saudável por falso-positivo é pior que perder um caso. Um result `isError` explícito é erro válido, não malformado.
 
 **Recovery:**
 1. Harness loga; devolve ao modelo `{ error: "mcp.output.invalid", hint, raw_output_truncated }` (raw com truncate em 1KB).
