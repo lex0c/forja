@@ -833,6 +833,8 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           promptId,
           server: req.server,
           command: req.command,
+          ...(req.env !== undefined ? { env: req.env } : {}),
+          ...(req.cwd !== undefined ? { cwd: req.cwd } : {}),
           mode: req.mode,
           sandbox: req.sandbox,
           tools: req.tools,

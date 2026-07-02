@@ -7,7 +7,11 @@
 // BETWEEN turns (they hot-swap the live tool registry).
 
 import { existsSync } from 'node:fs';
-import { sanitizeOneLineForDisplay, stripControlKeepLines } from '../../../sanitize/ansi.ts';
+import {
+  flattenControlToLine,
+  sanitizeOneLineForDisplay,
+  stripControlKeepLines,
+} from '../../../sanitize/ansi.ts';
 import {
   getServer,
   getServerAnyScope,
@@ -231,7 +235,13 @@ const handleReconnect = async (ctx: SlashContext, name: string): Promise<SlashRe
     // Surface the CAPTURED warnings (the real fault — a handshake error, a
     // declined prompt) instead of discarding them, and point an unreachable
     // server at its logs, so the failure is a next step rather than a dead end.
-    const detail = r.warnings.length > 0 ? `\n${r.warnings.map((w) => `  ${w}`).join('\n')}` : '';
+    // Sanitize each warning: a handshake-failed warning embeds the server's error
+    // text (a remote server's HTTP body), so an unsanitized ANSI/control payload
+    // could repaint the terminal when it lands in this operator-facing message.
+    const detail =
+      r.warnings.length > 0
+        ? `\n${r.warnings.map((w) => `  ${flattenControlToLine(w)}`).join('\n')}`
+        : '';
     const logsHint = r.reason === 'error' ? ` — see /mcp logs ${name}` : '';
     return {
       kind: 'error',
@@ -242,7 +252,7 @@ const handleReconnect = async (ctx: SlashContext, name: string): Promise<SlashRe
     kind: 'ok',
     notes: [
       `Reconnected '${name}' — ${r.registered} tool${r.registered === 1 ? '' : 's'} registered.`,
-      ...r.warnings,
+      ...r.warnings.map(flattenControlToLine),
     ],
   };
 };

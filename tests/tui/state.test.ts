@@ -2712,6 +2712,8 @@ describe('mcp-trust:ask reducer', () => {
     mode: 'first-visit' | 'drift';
     server?: string;
     command?: string;
+    env?: readonly { name: string; value: string }[];
+    cwd?: string;
     sandbox?: 'sandboxed' | 'sandboxed-net' | 'opt-out' | 'unavailable' | 'remote';
     tools?: readonly { name: string; description: string; writes: boolean }[];
     manifestHash?: string;
@@ -2722,6 +2724,8 @@ describe('mcp-trust:ask reducer', () => {
     promptId: 'm1',
     server: overrides.server ?? 'postgres',
     command: overrides.command ?? 'mcp-server-postgres --dsn $X',
+    ...(overrides.env !== undefined ? { env: overrides.env } : {}),
+    ...(overrides.cwd !== undefined ? { cwd: overrides.cwd } : {}),
     mode: overrides.mode,
     sandbox: overrides.sandbox ?? 'sandboxed',
     tools: overrides.tools ?? [{ name: 'query', description: 'run a query', writes: false }],
@@ -2746,6 +2750,35 @@ describe('mcp-trust:ask reducer', () => {
     expect(text).not.toContain('run a query'); // the tool entry (description) is NOT shown pre-connect
     expect(text).not.toContain('manifest hash'); // nor the hash (not fetched yet)
     expect(text).not.toContain('[writes]');
+  });
+
+  test('env bindings + cwd render on their OWN lines (not folded into the capped command)', () => {
+    // Regression guard for the disclosure-bypass: env must NOT ride the `command`
+    // line (length-capped in the render) — a hostile config could pad the argv to
+    // push an injected LD_PRELOAD past the cutoff. Each binding is its own line.
+    const r = applyEvent(
+      createInitialState(),
+      mcpTrustEvent({
+        mode: 'first-visit',
+        preConnect: true,
+        command: 'node ./server.js',
+        cwd: '/work',
+        env: [
+          { name: 'LD_PRELOAD', value: '/evil.so' },
+          { name: 'SECRET', value: '$SECRET' },
+        ],
+      }),
+    );
+    const modal = r.state.modal;
+    if (modal === null) throw new Error('expected modal');
+    const lines = modal.preview.map((p) => (typeof p === 'string' ? p : p.text));
+    expect(lines.some((l) => l.includes('LD_PRELOAD=/evil.so'))).toBe(true); // the injected surface
+    expect(lines.some((l) => l.includes('SECRET=$SECRET'))).toBe(true); // unresolved binding
+    expect(lines.some((l) => l.includes('cwd:') && l.includes('/work'))).toBe(true);
+    // The command line itself carries ONLY the argv — env is not crammed into it.
+    const commandLine = lines.find((l) => l.startsWith('command:'));
+    expect(commandLine).toContain('node ./server.js');
+    expect(commandLine).not.toContain('LD_PRELOAD');
   });
 
   test('first-visit shows the spawn-this-binary prose, the command, and the tools', () => {

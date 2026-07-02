@@ -338,24 +338,34 @@ const stdioCommandIdentity = (
   });
 };
 
-// The operator-facing form for the trust modal: the RAW argv, PLUS the env
-// bindings and an explicit cwd when present. The env is load-bearing risk surface
-// (`LD_PRELOAD` / `NODE_OPTIONS` inject code into the spawned process, surviving
-// even the sandbox `--clearenv`), and a relocated cwd moves the writable root / a
-// relative binary — yet neither shows in `argv` alone. Shows the UNRESOLVED
-// bindings (`SECRET=$SECRET`), so no resolved secret leaks into the prompt.
-const stdioDisplay = (t: McpStdioConfig): string => {
-  const parts = [t.rawArgv.join(' ')];
-  if (t.cwd !== undefined) parts.push(`[cwd: ${t.cwd}]`);
+// The operator-facing command form for the trust modal: just the RAW argv. The
+// env bindings + cwd are load-bearing risk surface (`LD_PRELOAD` / `NODE_OPTIONS`
+// inject code into the spawned process, surviving even the sandbox `--clearenv`;
+// a relocated cwd moves the writable root / a relative binary) — but they are
+// carried as SEPARATE modal fields (see `trustModalFields`) and rendered on their
+// own lines, NOT folded here: the command line is length-capped in the render, so
+// folding them in would let a hostile config pad the argv to hide an injected env.
+const stdioDisplay = (t: McpStdioConfig): string => t.rawArgv.join(' ');
+
+// The stdio env bindings + explicit cwd for the trust modal — the UNRESOLVED
+// bindings (`SECRET=$SECRET`), sorted, so no resolved secret enters the prompt.
+// Empty for a remote server or a stdio server with no env/cwd.
+const trustModalExtras = (
+  cfg: McpServerConfig,
+): { env?: { name: string; value: string }[]; cwd?: string } => {
+  const t = cfg.transport;
+  if (t.transport !== 'stdio') return {};
   const rawEnv = t.rawEnv;
-  if (rawEnv !== undefined && Object.keys(rawEnv).length > 0) {
-    const bindings = Object.entries(rawEnv)
-      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-      .map(([k, v]) => `${k}=${v}`)
-      .join(', ');
-    parts.push(`[env: ${bindings}]`);
-  }
-  return parts.join('  ');
+  const env =
+    rawEnv !== undefined && Object.keys(rawEnv).length > 0
+      ? Object.entries(rawEnv)
+          .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+          .map(([name, value]) => ({ name, value }))
+      : undefined;
+  return {
+    ...(env !== undefined ? { env } : {}),
+    ...(t.cwd !== undefined ? { cwd: t.cwd } : {}),
+  };
 };
 
 // The persisted remote URL identity: the raw (unexpanded) URL + the RESOLVED
@@ -838,6 +848,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         answer = await deps.confirmTrust({
           server: name,
           command: transportIdentity(rt.config, sessionCwd).display,
+          ...trustModalExtras(rt.config),
           mode: forceReprompt ? 'drift' : 'first-visit',
           sandbox:
             rt.config.transport.transport === 'stdio' ? resolveSandbox(rt.config).status : 'remote',
@@ -983,6 +994,9 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         server: name,
         // The RAW (unresolved) command / the remote URL — never a resolved secret.
         command: transportIdentity(rt.config, sessionCwd).display,
+        // Env bindings + cwd as their own fields (rendered on separate lines so a
+        // length-capped command can't hide an injected env — never resolved).
+        ...trustModalExtras(rt.config),
         mode: forceReprompt || rt.trustedHash !== null ? 'drift' : 'first-visit',
         // A remote server has no subprocess — show 'remote' (egress, no sandbox),
         // never a stdio-oriented 'sandboxed' status that would imply containment.

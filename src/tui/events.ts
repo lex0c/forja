@@ -460,6 +460,10 @@ export type McpTrustAskEvent = BaseEvent & {
   // 'first-visit': never-seen manifest hash. 'drift': previously-trusted
   // server whose hash (tools or command) changed.
   mode: import('../mcp/types.ts').McpTrustMode;
+  // A stdio server's UNRESOLVED env bindings + explicit cwd, rendered on their own
+  // lines (a length-capped `command` could otherwise hide an injected env var).
+  env?: readonly { name: string; value: string }[];
+  cwd?: string;
   // Effective sandbox posture (MCP.md §2.3) — shown so the operator sees the
   // containment of the server they're authorizing.
   sandbox: import('../mcp/types.ts').McpSandboxStatus;

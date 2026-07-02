@@ -1,6 +1,7 @@
 import { type HarnessResult, type SessionContext, runAgent } from '../harness/index.ts';
 import { RESUME_FULL_WARN_THRESHOLD } from '../harness/resume.ts';
 import { effectiveBudget } from '../harness/types.ts';
+import { flattenControlToLine } from '../sanitize/ansi.ts';
 import {
   type DB,
   closeDb,
@@ -911,9 +912,11 @@ export const run = async (options: RunOptions): Promise<number> => {
       // Prefix is `mcp:` (not `mcp config:`): these mix parse warnings with
       // runtime handshake/trust failures, and the parse ones already carry their
       // `mcp.toml [servers.x]` context — mislabeling a handshake fault as config
-      // sends the operator hunting in the wrong place.
+      // sends the operator hunting in the wrong place. Sanitize each: a handshake
+      // warning embeds the server's error text (a remote HTTP body), so an ANSI
+      // payload could otherwise repaint the banner.
       for (const w of mcpConfigWarnings) {
-        errSink(`forja: mcp: ${w}\n`);
+        errSink(`forja: mcp: ${flattenControlToLine(w)}\n`);
       }
     }
 

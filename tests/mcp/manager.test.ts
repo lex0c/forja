@@ -937,12 +937,13 @@ describe('McpManager.init: containment posture is part of the trust identity', (
 });
 
 describe('McpManager.init: the trust modal discloses env + cwd (not just argv)', () => {
-  test('the identity-gate command shows env bindings + cwd, never the resolved secret', async () => {
+  test('the identity gate carries env bindings + cwd as their OWN fields, never the resolved secret', async () => {
     // The stdio env (LD_PRELOAD / NODE_OPTIONS) is a code-execution surface that
-    // survives even the sandbox --clearenv, yet argv alone hides it. The modal
-    // `command` must disclose the bindings + an explicit cwd so the operator sees
-    // what they authorize — showing the UNRESOLVED $VAR, never the resolved secret.
-    let gateCommand: string | undefined;
+    // survives even the sandbox --clearenv, yet argv alone hides it. It must be
+    // disclosed — and NOT folded into `command` (which the render length-caps, so a
+    // padded argv could push an injected var past the cutoff): env/cwd ride their
+    // own request fields, showing the UNRESOLVED $VAR, never the resolved secret.
+    let gate: { command: string; env?: unknown; cwd?: unknown } | undefined;
     const fake = fakeClientFactory({ tools: [toolDef('query')] });
     const mgr = createMcpManager({
       db,
@@ -961,17 +962,38 @@ describe('McpManager.init: the trust modal discloses env + cwd (not just argv)',
         }),
       ]),
       confirmTrust: async (req) => {
-        if (req.preConnect) gateCommand = req.command;
+        if (req.preConnect) gate = { command: req.command, env: req.env, cwd: req.cwd };
         return 'no';
       },
       makeClient: fake.makeClient,
     });
     await mgr.init();
-    expect(gateCommand).toContain('node ./s.js');
-    expect(gateCommand).toContain('LD_PRELOAD=/evil.so'); // the injected-code surface is visible
-    expect(gateCommand).toContain('SECRET=$SECRET'); // the binding, not the resolved token
-    expect(gateCommand).not.toContain('super-secret-value'); // resolved secret never shown
-    expect(gateCommand).toContain('cwd: /work');
+    expect(gate?.command).toBe('node ./s.js'); // command is argv ONLY — no env crammed in
+    expect(gate?.cwd).toBe('/work');
+    // Sorted, unresolved bindings as structured entries.
+    expect(gate?.env).toEqual([
+      { name: 'LD_PRELOAD', value: '/evil.so' },
+      { name: 'SECRET', value: '$SECRET' }, // the binding, not the resolved token
+    ]);
+    expect(JSON.stringify(gate)).not.toContain('super-secret-value'); // resolved secret never sent
+  });
+
+  test('a stdio server with no env/cwd carries no extras; a remote server carries none', async () => {
+    let gate: { env?: unknown; cwd?: unknown } | undefined;
+    const fake = fakeClientFactory({ tools: [toolDef('query')] });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]), // plain stdio, no env/cwd
+      confirmTrust: async (req) => {
+        if (req.preConnect) gate = { env: req.env, cwd: req.cwd };
+        return 'no';
+      },
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    expect(gate?.env).toBeUndefined();
+    expect(gate?.cwd).toBeUndefined();
   });
 });
 

@@ -558,6 +558,26 @@ describe('/mcp slash command', () => {
     expect(r.message).toContain('/mcp logs db'); // reason 'error' → an unreachable server's next step
   });
 
+  test('a failed reconnect STRIPS ANSI/control bytes from the surfaced warning (anti-spoof)', async () => {
+    // A handshake-failed warning embeds the server's error text (a remote HTTP
+    // body). A hostile server that plants a terminal-repaint payload must not reach
+    // the operator's scrollback through the reconnect failure message.
+    const mgr = fakeManager([], {
+      reconnect: async () => ({
+        ok: false,
+        reason: 'error',
+        registered: 0,
+        warnings: ["mcp: server 'db' handshake failed: \x1b[2J\x1b[Hreal\rFORGED"],
+      }),
+    });
+    const r = await mcpCommand.exec(['reconnect', 'db'], buildCtx(mgr));
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message.includes('\x1b')).toBe(false);
+    expect(r.message.includes('\r')).toBe(false);
+    expect(r.message).toContain('FORGED'); // printable content survives, stripped
+  });
+
   test('a failed revoke points the operator at the list', async () => {
     const mgr = fakeManager([], {
       revoke: async () => ({ ok: false, reason: 'unknown server', tools: 0 }),

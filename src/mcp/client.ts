@@ -15,6 +15,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import type { ProviderToolInputSchema } from '../providers/types.ts';
 import type {
   McpCallResult,
@@ -168,6 +169,28 @@ export const narrowManifestTools = (rawTools: unknown): McpManifestTool[] => {
     });
   }
   return tools;
+};
+
+// Decide how a REJECTED `client.callTool` surfaces. The SDK rejects on a JSON-RPC
+// ERROR RESPONSE too (an McpError the server SENT — InvalidParams / MethodNotFound
+// / a custom server code), not only on a transport fault: that means the
+// connection is ALIVE and the model made a per-call mistake. Translate it to an
+// isError RESULT so the model sees + fixes it (a non-retryable tool error) instead
+// of the manager tearing down a healthy server and telling the model to retry.
+// Return null to RE-THROW: a real transport fault / an abort (timeout or session
+// cancel, surfaced as `aborted` or the SDK's ConnectionClosed/RequestTimeout
+// codes) must reach the manager so it disconnects or applies its §15.3 timeout
+// handling. Exported for direct testing (the live callTool needs a real SDK Client).
+export const callErrorToResult = (err: unknown, aborted: boolean): McpCallResult | null => {
+  if (aborted) return null;
+  if (
+    err instanceof McpError &&
+    err.code !== ErrorCode.ConnectionClosed &&
+    err.code !== ErrorCode.RequestTimeout
+  ) {
+    return { isError: true, content: `mcp error ${err.code}: ${err.message}` };
+  }
+  return null;
 };
 
 // normalizeInputSchema, then reject an oversized schema (a multi-MB blob a server
@@ -409,11 +432,21 @@ const sdkClientFrom = (makeTransport: () => SdkTransport): McpClient => {
     async callTool(tool, args, signal) {
       if (client === null) throw new Error('mcp client: callTool called before connect');
       const argRecord = asRecord(args) ?? {};
-      const res = await client.callTool(
-        { name: tool, arguments: argRecord },
-        undefined,
-        signal ? { signal } : undefined,
-      );
+      let res: Awaited<ReturnType<Client['callTool']>>;
+      try {
+        res = await client.callTool(
+          { name: tool, arguments: argRecord },
+          undefined,
+          signal ? { signal } : undefined,
+        );
+      } catch (err) {
+        // A server-reported JSON-RPC error means the connection is alive — return
+        // it as an isError result; a transport fault / abort re-throws so the
+        // manager disconnects or applies its timeout handling.
+        const translated = callErrorToResult(err, signal?.aborted ?? false);
+        if (translated !== null) return translated;
+        throw err;
+      }
       const result: McpCallResult = {
         isError: res.isError === true,
         content: flattenContent(res.content),

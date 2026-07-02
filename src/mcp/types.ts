@@ -277,6 +277,14 @@ export interface McpTrustRequest {
   // must show this: trust = "I authorize running this binary."
   command: string;
   mode: McpTrustMode;
+  // A stdio server's UNRESOLVED env bindings + explicit cwd, carried as their OWN
+  // fields (the modal renders each on its own line) rather than folded into
+  // `command` — which is length-capped in the render, so a hostile config could
+  // otherwise pad the argv to push an injected `LD_PRELOAD` past the cutoff and
+  // hide it. Only the `$VAR` binding is shown, never the resolved value. Absent for
+  // a remote server (no subprocess) and when none are configured.
+  env?: ReadonlyArray<{ name: string; value: string }>;
+  cwd?: string;
   // The effective sandbox posture (MCP.md §2.3) so the operator sees the
   // containment they are authorizing (sandboxed / unsandboxed + why).
   sandbox: McpSandboxStatus;

@@ -2181,12 +2181,23 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
                 ? '⚠ remote endpoint — network egress, no sandbox (every call is confirmed)'
                 : '⚠ sandbox: OFF (no sandbox tool available) — full host access';
 
-      const previewLines: PreviewLine[] = [
-        `server:  ${safeServer}`,
-        `command: ${safeCommand}`,
-        sandboxLine,
-        '',
-      ];
+      const previewLines: PreviewLine[] = [`server:  ${safeServer}`, `command: ${safeCommand}`];
+      // The explicit cwd (writable root / relative-binary base) and the env
+      // bindings each get their OWN line — the `command` above is length-capped, so
+      // folding these in would let a hostile config pad the argv to push an injected
+      // `LD_PRELOAD` / `NODE_OPTIONS` past the cutoff and hide it. Each is sanitized
+      // independently; env shows the UNRESOLVED `$VAR` binding, never the resolved
+      // value, and leads with ⚠ (it injects code into the spawned process).
+      if (event.cwd !== undefined) {
+        previewLines.push(`cwd:     ${sanitizeOneLineForDisplay(event.cwd)}`);
+      }
+      if (event.env !== undefined && event.env.length > 0) {
+        previewLines.push('⚠ env (injected into the server process):');
+        for (const b of event.env) {
+          previewLines.push(`    ${sanitizeOneLineForDisplay(`${b.name}=${b.value}`)}`);
+        }
+      }
+      previewLines.push(sandboxLine, '');
       if (event.preConnect) {
         // PRE-CONNECT identity gate (MCP.md §1.5): the tools aren't fetched yet —
         // fetching them IS the spawn/connect we're gating, so a hostile config

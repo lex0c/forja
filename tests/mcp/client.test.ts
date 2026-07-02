@@ -9,11 +9,13 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
+import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import {
   MAX_MCP_TOOLS,
   MAX_TOOL_RESULT_CHARS,
   abortableConnect,
   buildSpawnEnv,
+  callErrorToResult,
   createStdioMcpClient,
   extractMeta,
   flattenContent,
@@ -140,6 +142,43 @@ describe('flattenContent', () => {
     const exact = 'a'.repeat(MAX_TOOL_RESULT_CHARS);
     const out = flattenContent([{ type: 'text', text: exact }]);
     expect(out).toBe(exact); // no marker
+  });
+});
+
+describe('callErrorToResult — server error vs transport fault', () => {
+  test('a server-reported JSON-RPC error (InvalidParams) becomes an isError RESULT', () => {
+    // The server RESPONDED (connection alive) — the model made a bad call. Surface
+    // it as a per-call error, NOT a transport fault that would disconnect + retry.
+    const res = callErrorToResult(new McpError(ErrorCode.InvalidParams, 'missing arg'), false);
+    expect(res).not.toBeNull();
+    expect(res?.isError).toBe(true);
+    expect(res?.content).toContain('missing arg');
+  });
+
+  test('MethodNotFound + a custom server code also become isError results', () => {
+    expect(
+      callErrorToResult(new McpError(ErrorCode.MethodNotFound, 'no tool'), false),
+    ).not.toBeNull();
+    // A custom server error code (not ConnectionClosed -32000 / RequestTimeout -32001).
+    expect(callErrorToResult(new McpError(-32050, 'custom'), false)).not.toBeNull();
+  });
+
+  test('a transport-level McpError (ConnectionClosed / RequestTimeout) is RE-THROWN (null)', () => {
+    // These mean the connection is gone / timed out — the manager must disconnect
+    // or apply its timeout handling, so they propagate rather than look like a
+    // per-call error.
+    expect(callErrorToResult(new McpError(ErrorCode.ConnectionClosed, 'closed'), false)).toBeNull();
+    expect(callErrorToResult(new McpError(ErrorCode.RequestTimeout, 'slow'), false)).toBeNull();
+  });
+
+  test('a NON-McpError (raw transport fault) is re-thrown (null)', () => {
+    expect(callErrorToResult(new Error('ECONNREFUSED'), false)).toBeNull();
+  });
+
+  test('an aborted call is always re-thrown, even for an McpError', () => {
+    // A timeout / session cancel fires the signal; propagate so the manager applies
+    // its abort handling instead of swallowing it into a result.
+    expect(callErrorToResult(new McpError(ErrorCode.InvalidParams, 'x'), true)).toBeNull();
   });
 });
 

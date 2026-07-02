@@ -866,9 +866,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // Prefix is `mcp:` (not `mcp config:`): these mix parse warnings with runtime
   // handshake/trust failures, and the config-parse ones already carry their
   // `mcp.toml [servers.x]` context in the text — labeling a handshake fault as a
-  // config problem sends the operator hunting in the wrong place.
+  // config problem sends the operator hunting in the wrong place. Sanitize each:
+  // a handshake-failed warning embeds the server's error text (a remote server's
+  // HTTP body), so an unsanitized ANSI/control payload could repaint the banner.
   for (const w of mcpConfigWarnings) {
-    errSink(`forja: mcp: ${w}\n`);
+    errSink(`forja: mcp: ${flattenControlToLine(w)}\n`);
   }
   // Shared-corpus trust probe outcome (S5/T5.2 + T5.3). Render a
   // single summary line so operators see what the modal decision
