@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { buildMcpTool, mcpWireName, sanitizeMcpName } from '../../src/mcp/tool-factory.ts';
-import type { McpCallResult, McpManifestTool } from '../../src/mcp/types.ts';
+import { McpCallError, type McpCallResult, type McpManifestTool } from '../../src/mcp/types.ts';
 import { type ToolContext, isToolError } from '../../src/tools/types.ts';
 
 const ctx = { signal: new AbortController().signal } as unknown as ToolContext;
@@ -90,14 +90,30 @@ describe('buildMcpTool: execute', () => {
     expect(await t.execute({}, ctx)).toEqual({ content: 'x', structured: { a: 1 } });
   });
 
-  test('isError result → mcp.tool_error', async () => {
+  test('isError result → non-retryable mcp.tool_error by default', async () => {
     const t = build({ call: async () => ({ isError: true, content: 'boom' }) });
     const out = await t.execute({}, ctx);
     expect(isToolError(out)).toBe(true);
-    if (isToolError(out)) expect(out.error_code).toBe('mcp.tool_error');
+    if (isToolError(out)) {
+      expect(out.error_code).toBe('mcp.tool_error');
+      expect(out.retryable).toBe(false); // a genuine server error is not auto-retryable
+    }
   });
 
-  test('a thrown transport fault → retryable mcp.call_failed', async () => {
+  test('an isError result flagged retryable (output-invalid degrade) is retryable', async () => {
+    const t = build({
+      call: async (): Promise<McpCallResult> => ({
+        isError: true,
+        content: 'malformed; retry or fall back',
+        retryable: true,
+      }),
+    });
+    const out = await t.execute({}, ctx);
+    expect(isToolError(out)).toBe(true);
+    if (isToolError(out)) expect(out.retryable).toBe(true); // flag agrees with the "retry" advice
+  });
+
+  test('an unframed thrown fault → retryable mcp.server_unreachable', async () => {
     const t = build({
       call: async () => {
         throw new Error('pipe broke');
@@ -106,8 +122,38 @@ describe('buildMcpTool: execute', () => {
     const out = await t.execute({}, ctx);
     expect(isToolError(out)).toBe(true);
     if (isToolError(out)) {
-      expect(out.error_code).toBe('mcp.call_failed');
+      expect(out.error_code).toBe('mcp.server_unreachable');
       expect(out.retryable).toBe(true);
+      expect(out.error_message).toContain("MCP server 'db' is unreachable"); // framed, not bare SDK
+      expect(out.error_message).toContain('pipe broke'); // cause preserved
+    }
+  });
+
+  test('a framed McpCallError passes its code + retryability through', async () => {
+    // A pinned drift / exhausted budget / terminal state is permanent-this-session
+    // — the model must NOT be told to retry.
+    const permanent = build({
+      call: async () => {
+        throw new McpCallError('mcp.manifest_drift', 'drifted — run /mcp reconnect', false);
+      },
+    });
+    const p = await permanent.execute({}, ctx);
+    expect(isToolError(p)).toBe(true);
+    if (isToolError(p)) {
+      expect(p.error_code).toBe('mcp.manifest_drift');
+      expect(p.retryable).toBe(false);
+    }
+
+    // A timeout is transient — retryable stays true.
+    const timeout = build({
+      call: async () => {
+        throw new McpCallError('mcp.timeout', 'exceeded 30000ms', true);
+      },
+    });
+    const to = await timeout.execute({}, ctx);
+    if (isToolError(to)) {
+      expect(to.error_code).toBe('mcp.timeout');
+      expect(to.retryable).toBe(true);
     }
   });
 });

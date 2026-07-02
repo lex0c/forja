@@ -57,6 +57,35 @@ export interface LoadMcpConfigInput {
 const NAME_RE = /^[a-z][a-z0-9_]*$/;
 const NAME_MAX = 40;
 
+// The operator-facing file each layer maps to, for the warning context — a first-
+// time author can't act on the internal `project_local` enum, but CAN open
+// `.forja/mcp.local.toml`.
+const SOURCE_FILE: Record<McpServerSource, string> = {
+  user: '~/.config/forja/mcp.toml',
+  project_shared: '.forja/mcp.toml',
+  project_local: '.forja/mcp.local.toml',
+};
+const LAYER_LABEL: Record<McpServerSource, string> = {
+  user: 'user',
+  project_shared: 'project',
+  project_local: 'local',
+};
+
+// Recognized `[servers.<name>]` keys, split by applicability. Any key outside the
+// applicable set is warned on (a typo'd optional key, or a key belonging to the
+// OTHER transport) — TOML has no schema, so an unrecognized key is otherwise
+// silently dropped with the author's intent.
+const COMMON_KEYS = new Set([
+  'transport',
+  'surface',
+  'disabled',
+  'timeout_ms',
+  'max_calls_per_session',
+  'max_tokens_in_per_session',
+]);
+const STDIO_KEYS = new Set(['command', 'env', 'cwd', 'sandbox', 'network']);
+const REMOTE_KEYS = new Set(['url', 'auth']);
+
 // `$NAME` / `${NAME}` references resolved from the agent session env
 // (MCP.md §1.2). An unset var substitutes empty + warns rather than
 // leaking the literal `$NAME` into an argv the server would choke on.
@@ -231,7 +260,7 @@ const parseServerEntry = (
   env: NodeJS.ProcessEnv,
   warnings: string[],
 ): McpServerConfig | null => {
-  const where = `mcp.toml [servers.${name}] (${source})`;
+  const where = `${SOURCE_FILE[source]} [servers.${name}]`;
 
   if (!NAME_RE.test(name) || name.length > NAME_MAX) {
     warnings.push(
@@ -254,15 +283,19 @@ const parseServerEntry = (
     const remote = parseRemoteTransport(transport, entry, env, where, warnings);
     if (remote === null) return null;
     transportConfig = remote;
-    if (entry.sandbox !== undefined || entry.network !== undefined) {
-      warnings.push(
-        `${where}: 'sandbox' / 'network' do not apply to a remote server (no subprocess); ignored`,
-      );
-    }
+    // `sandbox` / `network` inapplicability is warned by the transport-aware key
+    // sweep below (it covers every stdio-only key uniformly).
   } else if (transport === 'stdio') {
     const command = asStringArray(entry.command);
     if (command === null || command.length === 0) {
-      warnings.push(`${where}: 'command' must be a non-empty array of strings; skipped`);
+      // The single most common stdio mistake is a string instead of an array;
+      // show the array form either way so the fix is obvious.
+      const example = 'e.g. command = ["npx", "-y", "@scope/server"]';
+      warnings.push(
+        typeof entry.command === 'string'
+          ? `${where}: 'command' must be an ARRAY, not a string (${example}); skipped`
+          : `${where}: 'command' must be a non-empty array of strings (${example}); skipped`,
+      );
       return null;
     }
     const resolvedArgv = command.map((part) => resolveEnvVars(part, env, warnings, where));
@@ -326,7 +359,7 @@ const parseServerEntry = (
         sandbox = entry.sandbox;
       } else {
         warnings.push(
-          `${where}: 'sandbox' must be a boolean; using the default (on when available)`,
+          `${where}: 'sandbox' must be a boolean (got ${JSON.stringify(entry.sandbox)}); using the default (on when available)`,
         );
       }
     }
@@ -348,9 +381,26 @@ const parseServerEntry = (
     }
   } else {
     warnings.push(
-      `${where}: missing or invalid transport (expected 'stdio' / 'sse' / 'http'); skipped`,
+      entry.transport === undefined
+        ? `${where}: missing 'transport' (expected 'stdio' / 'sse' / 'http'); skipped`
+        : `${where}: invalid transport ${JSON.stringify(entry.transport)} (expected 'stdio' / 'sse' / 'http'); skipped`,
     );
     return null;
+  }
+
+  // Warn on any key not recognized for this transport — a typo'd optional key
+  // (`disable`, `sanbox`, `surfce`) or a key that belongs to the OTHER transport
+  // (`auth`/`url` on stdio, `command`/`env`/`sandbox`/`network` on remote) is
+  // otherwise silently dropped, discarding the author's intent with no trace.
+  const applicable = transport === 'stdio' ? STDIO_KEYS : REMOTE_KEYS;
+  const otherKeys = transport === 'stdio' ? REMOTE_KEYS : STDIO_KEYS;
+  for (const key of Object.keys(entry)) {
+    if (COMMON_KEYS.has(key) || applicable.has(key)) continue;
+    warnings.push(
+      otherKeys.has(key)
+        ? `${where}: '${key}' does not apply to a ${transport} server; ignored`
+        : `${where}: unknown key '${key}'; ignored`,
+    );
   }
 
   // Forja-native: which model surface the server's tools sit on. Default
@@ -361,7 +411,9 @@ const parseServerEntry = (
     if (entry.surface === 'base' || entry.surface === 'deferred') {
       surface = entry.surface;
     } else {
-      warnings.push(`${where}: 'surface' must be 'base' or 'deferred'; using 'deferred'`);
+      warnings.push(
+        `${where}: 'surface' must be 'base' or 'deferred' (got ${JSON.stringify(entry.surface)}); using 'deferred'`,
+      );
     }
   }
 
@@ -477,9 +529,10 @@ export const loadMcpConfig = (input: LoadMcpConfigInput): LoadedMcpConfig => {
   ];
   for (const [servers, layerLabel] of layers) {
     for (const server of servers) {
-      if (merged.has(server.name)) {
+      const prev = merged.get(server.name);
+      if (prev !== undefined) {
         warnings.push(
-          `mcp.toml: server '${server.name}' redefined in the ${layerLabel} layer; the higher-precedence definition wins`,
+          `mcp.toml: server '${server.name}' redefined in the ${layerLabel} layer, overriding the ${LAYER_LABEL[prev.source]} layer (precedence: local > project > user)`,
         );
       }
       merged.set(server.name, server);

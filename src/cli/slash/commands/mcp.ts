@@ -17,6 +17,28 @@ import {
 import { localTimestamp } from '../../local-date.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
+// States an operator can act on with `/mcp reconnect` (re-run trust / retry the
+// handshake). Drives the recovery cue in `/mcp list`.
+const RECOVERABLE_STATES = new Set(['denied', 'degraded', 'error', 'disconnected']);
+
+// Map the bare code the manager persists to `last_error` into a one-line human
+// gloss with the recovery lever, so `/mcp show` explains the state instead of
+// printing jargon. An unrecognized value (a raw SDK / transport string) passes
+// through unchanged.
+const glossMcpError = (raw: string): string => {
+  switch (raw) {
+    case 'mcp.budget.exceeded':
+      return `${raw} — hit the per-session call/token cap (raise the server's budget, or start a new session)`;
+    case 'manifest_drift':
+    case 'mcp.manifest_drift':
+      return `${raw} — the manifest changed since it was trusted; run /mcp reconnect to re-review`;
+    case 'mcp.output.invalid':
+      return `${raw} — the server returned a malformed result`;
+    default:
+      return raw;
+  }
+};
+
 // Read the last `maxLines` non-empty lines of a (possibly large, ≤10 MB after
 // rotation) log file, scanning only the trailing `maxBytes` so `/mcp logs`
 // never slurps the whole file. A mid-file slice drops its partial first line —
@@ -75,9 +97,12 @@ const handleShow = (ctx: SlashContext, name: string): SlashResult => {
   // The remaining fields are harness-controlled (validated name, state/source/
   // decision enums, hex hash, numbers, formatted timestamps) — left as-is.
   const s = sanitizeOneLineForDisplay;
-  const lines: string[] = [
-    `mcp server '${name}':`,
-    `  state:    ${live ?? row.state}`,
+  const lines: string[] = [`mcp server '${name}':`, `  state:    ${live ?? row.state}`];
+  // The "why" leads: an operator opens `/mcp show` on a degraded/denied server to
+  // learn the cause — hoist last_error right under state (glossed from its bare
+  // code), not eight lines down. A healthy server shows no last-error line.
+  if (row.last_error !== null) lines.push(`  last error: ${glossMcpError(s(row.last_error))}`);
+  lines.push(
     `  source:   ${row.source}`,
     // stdio persists its identity in `command` (url null); a remote server in
     // `url` (command null). Show whichever this transport uses so a remote
@@ -89,8 +114,7 @@ const handleShow = (ctx: SlashContext, name: string): SlashResult => {
     `  protocol: ${row.protocol_version !== null ? s(row.protocol_version) : '—'}${row.server_version !== null ? ` (server ${s(row.server_version)})` : ''}`,
     `  calls:    ${row.total_calls}`,
     `  last connected: ${localTimestamp(row.last_connected_at)}`,
-    `  last error:     ${row.last_error !== null ? s(row.last_error) : 'none'}`,
-  ];
+  );
   const history = listManifestHistory(ctx.db, row.scope, name);
   if (history.length > 0) {
     lines.push('  trust history (newest first):');
@@ -120,7 +144,14 @@ const handleList = (ctx: SlashContext): SlashResult => {
   if (names.length === 0) {
     return { kind: 'ok', notes: ['No MCP servers configured (see docs/MCP.md).'] };
   }
-  const lines = [`MCP servers (${names.length}):`];
+  // Pad the name column to the longest ACTUAL name (names run to 40 chars), not a
+  // fixed 16 that a longer name overruns and shifts the whole table. 'SERVER' = 6.
+  const nameWidth = Math.max(6, ...names.map((n) => n.length));
+  const lines = [
+    `MCP servers (${names.length}):`,
+    `  ${'SERVER'.padEnd(nameWidth)} ${'STATE'.padEnd(13)} ${'TOOLS'.padEnd(9)} SOURCE`,
+  ];
+  let anyRecoverable = false;
   for (const n of names) {
     const s = liveByName.get(n);
     const r = rowByName.get(n);
@@ -129,10 +160,19 @@ const handleList = (ctx: SlashContext): SlashResult => {
     // that rather than its stale persisted state.
     const disabled = mgr !== undefined && s === undefined;
     const state = disabled ? 'disabled' : (s?.state ?? r?.state ?? '—');
+    if (RECOVERABLE_STATES.has(state)) anyRecoverable = true;
     const tools = s !== undefined ? `${s.tools} tool${s.tools === 1 ? '' : 's'}` : '—';
-    lines.push(`  ${n.padEnd(16)} ${state.padEnd(13)} ${tools.padEnd(9)} ${r?.source ?? '—'}`);
+    lines.push(
+      `  ${n.padEnd(nameWidth)} ${state.padEnd(13)} ${tools.padEnd(9)} ${r?.source ?? '—'}`,
+    );
   }
   lines.push('Use /mcp show <server> for details.');
+  // Surface the recovery lever for any denied/degraded/disconnected server — the
+  // list is where the operator first sees a bad state, and reconnect is otherwise
+  // undiscoverable (only `/mcp revoke` prints it).
+  if (anyRecoverable) {
+    lines.push('Re-run trust on a denied/degraded server with /mcp reconnect <server>.');
+  }
   return { kind: 'ok', notes: lines };
 };
 
@@ -169,7 +209,9 @@ const handleRevoke = async (ctx: SlashContext, name: string): Promise<SlashResul
   const gate = requireIdleManager(ctx, 'revoke');
   if ('kind' in gate) return gate;
   const r = await withExclusive(ctx, () => gate.mgr.revoke(name));
-  if (!r.ok) return { kind: 'error', message: `/mcp revoke: ${r.reason ?? 'failed'}` };
+  if (!r.ok) {
+    return { kind: 'error', message: `/mcp revoke: ${r.reason ?? 'failed'} (try /mcp to list)` };
+  }
   return {
     kind: 'ok',
     notes: [
@@ -186,9 +228,14 @@ const handleReconnect = async (ctx: SlashContext, name: string): Promise<SlashRe
   if (!r.ok) {
     // reason is the resulting state ('denied' / 'error') — a re-denied or
     // unreachable server stays revoked, so say so instead of a green "0 tools".
+    // Surface the CAPTURED warnings (the real fault — a handshake error, a
+    // declined prompt) instead of discarding them, and point an unreachable
+    // server at its logs, so the failure is a next step rather than a dead end.
+    const detail = r.warnings.length > 0 ? `\n${r.warnings.map((w) => `  ${w}`).join('\n')}` : '';
+    const logsHint = r.reason === 'error' ? ` — see /mcp logs ${name}` : '';
     return {
       kind: 'error',
-      message: `/mcp reconnect '${name}': ${r.reason ?? 'failed'} — still revoked (server denied or unreachable)`,
+      message: `/mcp reconnect '${name}': ${r.reason ?? 'failed'} — still revoked (server denied or unreachable)${logsHint}${detail}`,
     };
   }
   return {
@@ -253,14 +300,14 @@ const handleLogs = async (ctx: SlashContext, name: string): Promise<SlashResult>
 export const mcpCommand: SlashCommand = {
   name: 'mcp',
   description: 'Inspect + control MCP servers (show / revoke / reconnect / logs)',
-  argHint: '[show|revoke|reconnect|logs <server>]',
+  argHint: '[list | show|revoke|reconnect|logs <server>]',
   exec: async (args, ctx): Promise<SlashResult> => {
     const sub = args[0];
     if (sub === undefined || sub === 'list') return handleList(ctx);
     if (sub === 'show' || sub === 'revoke' || sub === 'reconnect' || sub === 'logs') {
       const name = args[1];
       if (name === undefined) {
-        return { kind: 'error', message: `/mcp ${sub} <server>: name required` };
+        return { kind: 'error', message: `/mcp ${sub} <server>: name required (try /mcp to list)` };
       }
       if (sub === 'show') return handleShow(ctx, name);
       if (sub === 'revoke') return handleRevoke(ctx, name);

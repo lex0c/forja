@@ -490,6 +490,84 @@ describe('/mcp slash command', () => {
     }
   });
 
+  test('show hoists + glosses a bare last_error code directly under state', async () => {
+    seed('db', 'degraded');
+    patchServer(db, SCOPE, 'db', { last_error: 'mcp.budget.exceeded' });
+    const r = await mcpCommand.exec(['show', 'db'], buildCtx());
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const lines = r.notes ?? [];
+    const stateIdx = lines.findIndex((l) => l.includes('state:'));
+    const errIdx = lines.findIndex((l) => l.includes('last error:'));
+    expect(errIdx).toBe(stateIdx + 1); // the "why" leads, not eight lines down
+    expect(lines[errIdx]).toContain('per-session call/token cap'); // glossed, not a bare code
+  });
+
+  test('a healthy server shows no last-error line', async () => {
+    seed('db', 'trusted'); // last_error null
+    const r = await mcpCommand.exec(['show', 'db'], buildCtx());
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    expect(r.notes?.join('\n')).not.toContain('last error');
+  });
+
+  test('list prints a labeled column header', async () => {
+    seed('db', 'trusted');
+    const r = await mcpCommand.exec(
+      [],
+      buildCtx(fakeManager([{ name: 'db', state: 'trusted', tools: 1 }])),
+    );
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = r.notes?.join('\n') ?? '';
+    expect(text).toContain('SERVER');
+    expect(text).toContain('STATE');
+    expect(text).toContain('SOURCE');
+  });
+
+  test('list surfaces the /mcp reconnect cue for a denied/degraded server, and omits it when healthy', async () => {
+    seed('db', 'trusted');
+    const degraded = await mcpCommand.exec(
+      [],
+      buildCtx(fakeManager([{ name: 'db', state: 'degraded', tools: 0 }])),
+    );
+    if (degraded.kind !== 'ok') throw new Error('expected ok');
+    expect(degraded.notes?.join('\n')).toContain('/mcp reconnect');
+
+    const healthy = await mcpCommand.exec(
+      [],
+      buildCtx(fakeManager([{ name: 'db', state: 'trusted', tools: 1 }])),
+    );
+    if (healthy.kind !== 'ok') throw new Error('expected ok');
+    expect(healthy.notes?.join('\n')).not.toContain('Re-run trust');
+  });
+
+  test('a failed reconnect surfaces the captured warnings + a logs pointer for an unreachable server', async () => {
+    const mgr = fakeManager([], {
+      reconnect: async () => ({
+        ok: false,
+        reason: 'error',
+        registered: 0,
+        warnings: ["mcp: server 'db' handshake failed: ECONNREFUSED"],
+      }),
+    });
+    const r = await mcpCommand.exec(['reconnect', 'db'], buildCtx(mgr));
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message).toContain('ECONNREFUSED'); // the real cause, not just the bare state
+    expect(r.message).toContain('/mcp logs db'); // reason 'error' → an unreachable server's next step
+  });
+
+  test('a failed revoke points the operator at the list', async () => {
+    const mgr = fakeManager([], {
+      revoke: async () => ({ ok: false, reason: 'unknown server', tools: 0 }),
+    });
+    const r = await mcpCommand.exec(['revoke', 'nope'], buildCtx(mgr));
+    expect(r.kind).toBe('error');
+    if (r.kind !== 'error') return;
+    expect(r.message).toContain('try /mcp to list');
+  });
+
   test('logs of a server whose last record exceeds 64 KiB shows the truncated tail, not "empty"', async () => {
     seed('db', 'trusted');
     const dir = mkdtempSync(join(tmpdir(), 'mcp-logs-'));

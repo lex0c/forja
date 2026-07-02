@@ -226,6 +226,29 @@ export interface McpCallResult {
   // flattens to ''), so this preserves what actually came over the wire for the
   // §15.5 audit row + the model's error.
   invalidRaw?: string;
+  // Manager→factory hint on an `isError` result: map it to a RETRYABLE tool
+  // error. Set only on the recoverable output-invalid degrade (MCP.md §15.5) —
+  // the model should retry / fall back, matching the human advice in `content`.
+  // Absent ⇒ the tool error is non-retryable (a genuine server-reported error).
+  retryable?: boolean;
+}
+
+// A tools/call failure the manager raises with a stable `code` and a
+// RETRYABILITY hint, so the tool factory can tell the model whether a retry is
+// futile. Permanent-this-session failures — a pinned manifest drift, an
+// exhausted budget, a terminal state — are `retryable:false` (retrying throws
+// the identical error until the operator runs `/mcp reconnect`); a per-call
+// TIMEOUT is `retryable:true`. Raw transport faults are deliberately NOT wrapped
+// in this — the factory frames those as retryable "server unreachable".
+export class McpCallError extends Error {
+  readonly code: string;
+  readonly retryable: boolean;
+  constructor(code: string, message: string, retryable: boolean) {
+    super(message);
+    this.name = 'McpCallError';
+    this.code = code;
+    this.retryable = retryable;
+  }
 }
 
 // The thin SDK abstraction. src/mcp/client.ts is the ONLY implementer;

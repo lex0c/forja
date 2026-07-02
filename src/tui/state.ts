@@ -2174,7 +2174,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         event.sandbox === 'sandboxed'
           ? 'sandbox: ON (cwd-rw, no network)'
           : event.sandbox === 'sandboxed-net'
-            ? 'sandbox: ON + network (allowlist advisory — NOT host-filtered)'
+            ? '⚠ sandbox: ON + network egress (allowlist advisory — NOT host-filtered)'
             : event.sandbox === 'opt-out'
               ? '⚠ sandbox: OFF (operator opt-out) — full host access'
               : event.sandbox === 'remote'

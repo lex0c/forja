@@ -908,8 +908,12 @@ export const run = async (options: RunOptions): Promise<number> => {
       }
       // mcp.toml + manager.init() warnings — a skipped/denied/drifted server is
       // otherwise an invisible missing tool. (MCP.md §9.3 / FAILURE_MODES §15.)
+      // Prefix is `mcp:` (not `mcp config:`): these mix parse warnings with
+      // runtime handshake/trust failures, and the parse ones already carry their
+      // `mcp.toml [servers.x]` context — mislabeling a handshake fault as config
+      // sends the operator hunting in the wrong place.
       for (const w of mcpConfigWarnings) {
-        errSink(`forja: mcp config: ${w}\n`);
+        errSink(`forja: mcp: ${w}\n`);
       }
     }
 

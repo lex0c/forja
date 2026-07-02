@@ -244,15 +244,16 @@ Two tables (migrations `081-mcp-servers.ts` / `083-mcp-servers-scoped.ts`, repo 
 
 ## 7. Operating notes
 
-- **Warnings** from config parsing and trust (`server 'x' redefined…`, `'url' must be http(s)…`, `bearer token env var $Y is not set…`) surface on the startup banner.
-- **Managing servers in-session:** `/mcp` lists every server with its live state + tool count;
-  `/mcp show <server>` adds the command (or the endpoint URL for a remote server), manifest hash, and trust history; `/mcp revoke <server>`
+- **Warnings** from config parsing and trust surface on the startup banner under the `mcp:` prefix. Each names the **file** it came from (`.forja/mcp.local.toml [servers.x]`, not an internal layer enum) and echoes the offending value; an **unrecognized key** (a typo'd `disable`/`sanbox`, or a key that belongs to the other transport) is flagged rather than silently dropped, since TOML has no schema. A headless run that fails a server closed for lack of an interactive prompt **says so** and names `--auto-approve-mcp` (it isn't a silent missing tool).
+- **Managing servers in-session:** `/mcp` lists every server (a labeled `SERVER / STATE / TOOLS / SOURCE` table) with its live state + tool count, and — when any server is denied/degraded — a footer pointing at `/mcp reconnect`;
+  `/mcp show <server>` **leads with the last error** (glossed from its bare code, with the recovery lever) when there is one, then the command / endpoint URL, manifest hash, and trust history; `/mcp revoke <server>`
   denies a server and removes its tools (durable — it stays denied across a relaunch until you
   reconnect); `/mcp reconnect <server>` re-runs the trust handshake — on success it re-registers the
-  tools + clears any revocation (no restart needed), and a **declined or failed** reconnect leaves the
+  tools + clears any revocation (no restart needed); a **declined or failed** reconnect leaves the
   server revoked across relaunch (a server you just re-declined never silently returns from its cached
-  grant); `/mcp logs <server>` tails the server's captured stderr. The mutating commands
+  grant) and **surfaces the underlying fault** (the handshake error) plus a `/mcp logs` pointer for an unreachable one; `/mcp logs <server>` tails the server's captured stderr. The mutating commands
   run **between turns** (they hot-swap the live tool set).
+- **Tool-call errors carry an accurate `retryable`.** A pinned manifest drift, an exhausted per-session budget, or a terminal (denied/error) state is **not retryable** — the model is told to stop rather than burn turns re-calling something that throws identically until `/mcp reconnect`; a per-call timeout and a transport fault (`mcp.server_unreachable`, framed with the server name, not a raw SDK string) stay retryable.
 - **Server stderr** is captured to `<dataDir>/traces/mcp-<name>.log` (operator-only, lazily created
   on the first byte, rotated at 10 MB with one kept generation). It is *always drained* even when no
   trace dir is configured — an unread pipe would otherwise block the server on its next stderr write.

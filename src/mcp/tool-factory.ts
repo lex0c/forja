@@ -11,7 +11,7 @@
 
 import { MCP_TOOL_PREFIX } from '../permissions/mcp-naming.ts';
 import { type Tool, type ToolContext, type ToolMetadata, toolError } from '../tools/types.ts';
-import type { McpCallResult, McpManifestTool } from './types.ts';
+import { McpCallError, type McpCallResult, type McpManifestTool } from './types.ts';
 
 const WIRE_MAX = 64; // Anthropic/OpenAI tool-name length cap.
 const PREFIX = MCP_TOOL_PREFIX;
@@ -85,7 +85,11 @@ export const buildMcpTool = (input: BuildMcpToolInput): Tool => {
       try {
         const res = await input.call(args, ctx);
         if (res.isError) {
+          // A server-reported error defaults to non-retryable; the manager marks
+          // `retryable` on the recoverable output-invalid degrade so the flag
+          // matches the "retry or fall back" advice in the text.
           return toolError('mcp.tool_error', res.content || 'MCP tool reported an error', {
+            retryable: res.retryable ?? false,
             details: detail,
           });
         }
@@ -93,12 +97,27 @@ export const buildMcpTool = (input: BuildMcpToolInput): Tool => {
           ? { content: res.content, structured: res.structured }
           : { content: res.content };
       } catch (err) {
-        // Transport/protocol fault — the manager has already transitioned the
-        // server's state; surface a retryable tool error to the model.
-        return toolError('mcp.call_failed', err instanceof Error ? err.message : String(err), {
-          retryable: true,
-          details: detail,
-        });
+        // A framed manager failure carries its own code + retryability — a pinned
+        // drift, an exhausted budget, or a terminal state is retryable:false
+        // (retrying throws identically until /mcp reconnect), a timeout is true.
+        // Passing that flag through stops the model from burning turns re-calling
+        // a permanently-failing tool.
+        if (err instanceof McpCallError) {
+          return toolError(err.code, err.message, { retryable: err.retryable, details: detail });
+        }
+        // An UNFRAMED throw is a raw transport/protocol fault — the manager has
+        // already disconnected the server; frame it as a retryable
+        // server-unreachable so the model can distinguish a dead connection from
+        // a bad-argument tool error and back off / retry rather than tweak args.
+        const cause = err instanceof Error ? err.message : String(err);
+        return toolError(
+          'mcp.server_unreachable',
+          `MCP server '${input.server}' is unreachable: ${cause}`,
+          {
+            retryable: true,
+            details: detail,
+          },
+        );
       }
     },
   };

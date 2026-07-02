@@ -587,6 +587,76 @@ sandbox = false
     const { servers, warnings } = load();
     expect(servers).toHaveLength(1);
     expect(servers[0]?.sandbox).toBeUndefined();
-    expect(warnings.some((w) => w.includes('do not apply to a remote server'))).toBe(true);
+    expect(warnings.some((w) => w.includes("'sandbox' does not apply to a sse server"))).toBe(true);
+  });
+});
+
+describe('loadMcpConfig: unknown / inapplicable key sweep + value echoes', () => {
+  test('a typo’d optional key is flagged, not silently dropped', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.db]\ntransport = "stdio"\ncommand = ["bin"]\ndisable = true\nsurfce = "base"\n`,
+    );
+    const { servers, warnings } = load();
+    expect(servers).toHaveLength(1);
+    expect(servers[0]?.enabled).toBe(true); // 'disable' did NOT disable it
+    expect(warnings.some((w) => w.includes("unknown key 'disable'"))).toBe(true);
+    expect(warnings.some((w) => w.includes("unknown key 'surfce'"))).toBe(true);
+  });
+
+  test('an other-transport key warns with the transport named', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.db]\ntransport = "stdio"\ncommand = ["bin"]\nauth = { kind = "bearer", env = "X" }\n`,
+    );
+    const { warnings } = load();
+    expect(warnings.some((w) => w.includes("'auth' does not apply to a stdio server"))).toBe(true);
+  });
+
+  test('an invalid transport echoes the offending value', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.db]\ntransport = "streamable-http"\nurl = "https://x/y"\n`,
+    );
+    const { servers, warnings } = load();
+    expect(servers).toHaveLength(0);
+    expect(warnings.some((w) => w.includes('invalid transport "streamable-http"'))).toBe(true);
+  });
+
+  test('command as a string suggests the array form', () => {
+    writeFileSync(projectPath, `[servers.db]\ntransport = "stdio"\ncommand = "npx -y server"\n`);
+    const { servers, warnings } = load();
+    expect(servers).toHaveLength(0);
+    expect(warnings.some((w) => w.includes('must be an ARRAY, not a string'))).toBe(true);
+    expect(warnings.some((w) => w.includes('command = ["npx"'))).toBe(true);
+  });
+
+  test('an invalid surface / sandbox echoes the value', () => {
+    writeFileSync(
+      projectPath,
+      `[servers.db]\ntransport = "stdio"\ncommand = ["bin"]\nsurface = "wire"\nsandbox = "yes"\n`,
+    );
+    const { warnings } = load();
+    expect(warnings.some((w) => w.includes('"wire"'))).toBe(true);
+    expect(warnings.some((w) => w.includes('"yes"'))).toBe(true);
+  });
+
+  test('warnings name the FILE, not the internal layer enum', () => {
+    writeFileSync(projectPath, `[servers.db]\ntransport = "stdio"\ncommand = "oops"\n`);
+    const { warnings } = load();
+    expect(warnings.some((w) => w.includes('.forja/mcp.toml [servers.db]'))).toBe(true);
+    expect(warnings.some((w) => w.includes('project_shared'))).toBe(false); // no internal enum leak
+  });
+
+  test('a redefinition warning names BOTH the winning and shadowed layers', () => {
+    writeFileSync(userPath, `[servers.db]\ntransport="stdio"\ncommand=["u"]\n`);
+    writeFileSync(projectPath, `[servers.db]\ntransport="stdio"\ncommand=["p"]\n`);
+    const { warnings } = load({ userPathOverride: userPath });
+    expect(
+      warnings.some(
+        (w) =>
+          w.includes('redefined in the project layer') && w.includes('overriding the user layer'),
+      ),
+    ).toBe(true);
   });
 });

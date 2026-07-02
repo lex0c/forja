@@ -56,7 +56,7 @@ import {
 } from './manifest.ts';
 import { isMcpTerminal, mcpTransition } from './state.ts';
 import { buildMcpTool, mcpWireName } from './tool-factory.ts';
-import { DEFAULT_MCP_BUDGET } from './types.ts';
+import { DEFAULT_MCP_BUDGET, McpCallError } from './types.ts';
 import type {
   ConfirmMcpTrust,
   McpCallResult,
@@ -541,14 +541,23 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
     ctx: ToolContext,
   ): Promise<McpCallResult> => {
     const rt = runtime.get(server);
-    if (rt === undefined) throw new Error(`mcp: unknown server '${server}'`);
+    if (rt === undefined)
+      throw new McpCallError('mcp.unknown_server', `mcp: unknown server '${server}'`, false);
     if (isMcpTerminal(rt.state)) {
-      throw new Error(`mcp: server '${server}' is ${rt.state}; not callable`);
+      // Terminal (denied / error): retrying is futile until the operator acts.
+      throw new McpCallError(
+        'mcp.not_callable',
+        `mcp: server '${server}' is ${rt.state}; not callable — run /mcp reconnect ${server}`,
+        false,
+      );
     }
     if (rt.drifted) {
-      // Pinned by a prior drift — do NOT reconnect/re-detect on every call.
-      throw new Error(
-        `mcp.manifest_drift: server '${server}' manifest changed since trust; reconfigure or re-trust`,
+      // Pinned by a prior drift — do NOT reconnect/re-detect on every call, and do
+      // NOT tell the model to retry (it will throw identically until a re-trust).
+      throw new McpCallError(
+        'mcp.manifest_drift',
+        `mcp.manifest_drift: server '${server}' manifest changed since trust; not retryable — run /mcp reconnect ${server}`,
+        false,
       );
     }
 
@@ -595,8 +604,10 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
           },
         });
       }
-      throw new Error(
-        `mcp.budget.exceeded: server '${server}' hit its budget cap (calls=${rt.sessionCalls}/${budget.maxCallsPerSession}, tokens_in=${rt.sessionTokensIn}/${budget.maxTokensInPerSession}); disconnected until the next session`,
+      throw new McpCallError(
+        'mcp.budget.exceeded',
+        `mcp.budget.exceeded: server '${server}' hit its budget cap (calls=${rt.sessionCalls}/${budget.maxCallsPerSession}, tokens_in=${rt.sessionTokensIn}/${budget.maxTokensInPerSession}); disconnected until the next session — not retryable this session`,
+        false,
       );
     }
 
@@ -630,8 +641,10 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
           rt.drifted = true;
           setState(rt, 'degraded', { last_error: 'manifest_drift' });
           await client.close().catch(() => {});
-          throw new Error(
-            `mcp.manifest_drift: server '${server}' manifest changed since it was trusted; reconfigure or re-trust`,
+          throw new McpCallError(
+            'mcp.manifest_drift',
+            `mcp.manifest_drift: server '${server}' manifest changed since it was trusted; not retryable — run /mcp reconnect ${server}`,
+            false,
           );
         }
         rt.client = client;
@@ -691,6 +704,11 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         });
         return {
           isError: true,
+          // A transient, recoverable degrade — the `content` advises "retry or
+          // fall back", so mark it retryable so the structured flag AGREES with
+          // the human text (the factory otherwise defaults an isError to
+          // non-retryable, which a flag-keying model would obey over the advice).
+          retryable: true,
           content:
             `mcp.output.invalid: server '${server}' tool '${toolName}' returned a malformed result` +
             `${rawTruncated ? ` (raw: ${rawTruncated})` : ''}; retry or fall back`,
@@ -721,8 +739,10 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
           sessionId: ctx.sessionId,
           payload: { server, tool: toolName, timeout_ms: budget.timeoutMs },
         });
-        throw new Error(
+        throw new McpCallError(
+          'mcp.timeout',
           `mcp.timeout: server '${server}' tool '${toolName}' exceeded ${budget.timeoutMs}ms`,
+          true, // a timeout is transient — retrying is reasonable
         );
       }
       // Reap the failed client BEFORE dropping the reference. A transport fault
@@ -797,6 +817,11 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
     // denied/untrusted server must never run — especially in CI/headless.
     if (deps.confirmTrust === undefined && deps.autoApprove?.has(name) !== true) {
       setState(rt, 'denied');
+      // Say WHY + how to fix it. Otherwise a headless/CI run just silently has no
+      // MCP tools — every other deny/fail path warns, this one must too.
+      warnings.push(
+        `mcp: server '${name}' denied — no interactive trust prompt (headless); add it to --auto-approve-mcp to enable`,
+      );
       return 0;
     }
     // PRE-CONNECT IDENTITY GATE (MCP.md §1.5): authorize REACHING this server —
@@ -878,7 +903,7 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
     } catch (err) {
       setState(rt, 'error', { last_error: err instanceof Error ? err.message : String(err) });
       warnings.push(
-        `mcp: server '${name}' handshake failed: ${err instanceof Error ? err.message : err}`,
+        `mcp: server '${name}' handshake failed: ${err instanceof Error ? err.message : err} — run /mcp reconnect ${name} to retry`,
       );
       return 0;
     } finally {
