@@ -278,12 +278,57 @@ A profile relocates **both** levels at once:
 
 ---
 
-## Status
+## Documentation
 
-**Active development, pre-1.0.** Breaking changes between minor versions
-are expected. The architectural spec under `docs/spec/` describes the
-target shape; `docs/BACKLOG.md` tracks shipped work in reverse-chronological
-order, and `docs/TODO.md` lists deferred work with pull-in signals.
+The English operator and reference docs live under `docs/`. (The authored
+architectural spec is separate — `docs/spec/`, in PT-BR; when a doc and the
+spec diverge, the spec wins.)
+
+### Operator guides
+
+| Doc | What it covers |
+|---|---|
+| [`AUDIT.md`](docs/AUDIT.md) | Audit subsystem in production: the append-only event log, post-incident review, and compliance integration. |
+| [`BUDGET.md`](docs/BUDGET.md) | Run-budget subsystem: the caps that bound an autonomous run, how they resolve, and how cost is gated. |
+| [`HOOKS.md`](docs/HOOKS.md) | Hook system: lifecycle events, wiring shell commands, the stdin/stdout JSON contract, and the security model. |
+| [`MCP.md`](docs/MCP.md) | Model Context Protocol integration: declaring servers, trust, tool exposure, and connection lifecycle. |
+| [`MEMORY.md`](docs/MEMORY.md) | Cross-session memory: what's persisted, the lifecycle state machine, and the day-to-day slash commands. |
+| [`SKILLS.md`](docs/SKILLS.md) | Authoring and invoking reusable, vetted procedures that surface when a goal matches. |
+| [`VERIFY.md`](docs/VERIFY.md) | Claim-time verify gate: the opt-in check that a run actually ran the project's tests before declaring done. |
+
+### Architecture & internals
+
+| Doc | What it covers |
+|---|---|
+| [`CONTEXT.md`](docs/CONTEXT.md) | How the fixed prefix (system prompt + tool schemas) is assembled, made window-relative, hashed, and cached. |
+| [`SESSION.md`](docs/SESSION.md) | How a session is represented and how its conversation flows through a run. |
+| [`TUI.md`](docs/TUI.md) | Terminal UI architecture: data flow, event bus, and inline render. |
+| [`SECURITY.md`](docs/SECURITY.md) | Security architecture: the permission engine, sandbox, and threat model. |
+| [`CHECKPOINT.md`](docs/CHECKPOINT.md) | Checkpoints & rollback: the git snapshot before each write that makes filesystem changes reversible. |
+| [`PROVIDERS.md`](docs/PROVIDERS.md) | The provider layer as implemented: model catalog, adapters, and per-provider capabilities. |
+| [`OUTPUT_POLICY.md`](docs/OUTPUT_POLICY.md) | Tool output reduction: keeping verbose tool output from bloating the context window. |
+
+### Reference
+
+| Doc | What it covers |
+|---|---|
+| [`CLI.md`](docs/CLI.md) | Command reference for the `forja` binary: flags, subcommands, and modes. |
+| [`TOOLS.md`](docs/TOOLS.md) | Living reference for the builtin tools available to the agent. |
+| [`CODER_PLAYBOOK.md`](docs/CODER_PLAYBOOK.md) | Patterns and anti-patterns the agent applies when writing code. |
+
+### Evaluation
+
+| Doc | What it covers |
+|---|---|
+| [`BENCHMARK.md`](docs/BENCHMARK.md) | Self-SWE-bench (capability axis): can a model driving Forja fix a real bug, verified by the project's own tests. |
+| [`RANKING.md`](docs/RANKING.md) | How models perform *inside the Forja harness* — measured on real loop behavior, not a general benchmark. |
+
+### Project tracking
+
+| Doc | What it covers |
+|---|---|
+| [`BACKLOG.md`](docs/BACKLOG.md) | Progress diary: implementation entries in reverse-chronological order. |
+| [`TODO.md`](docs/TODO.md) | Deferred work: items left for later milestones, with rationale and pull-in signals. |
 
 ---
 
