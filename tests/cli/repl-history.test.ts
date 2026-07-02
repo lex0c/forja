@@ -38,6 +38,7 @@ const makeArgs = (overrides: Partial<ParsedArgs> = {}): ParsedArgs => ({
   listSessions: false,
   includeSubagents: false,
   explainPermissions: false,
+  listModels: false,
   ...overrides,
 });
 

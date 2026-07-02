@@ -52,6 +52,22 @@ describe('parseArgs', () => {
     expect(r.args.autonomous).toBeUndefined();
   });
 
+  test('--list-models flag (prompt-optional info command)', () => {
+    const r = parseArgs(['--list-models']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.listModels).toBe(true);
+    // No positional prompt — it's an info command, gated as prompt-optional.
+    expect(r.args.prompt).toBe('');
+  });
+
+  test('--list-models absent defaults to false', () => {
+    const r = parseArgs(['hi']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.listModels).toBe(false);
+  });
+
   test('--model with value', () => {
     const r = parseArgs(['--model', 'openai/gpt-4o', 'hi']);
     expect(r.ok).toBe(true);
@@ -889,6 +905,7 @@ describe('usage', () => {
     expect(u).toContain('--model');
     expect(u).toContain('--max-steps');
     expect(u).toContain('--list-sessions');
+    expect(u).toContain('--list-models');
     expect(u).toContain('--resume');
     expect(u).toContain('--undo');
     expect(u).toContain('--checkpoints');

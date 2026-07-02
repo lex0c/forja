@@ -66,6 +66,7 @@ key (DB + git only).
 | `--undo <session>` | Restore the latest checkpoint of a session (thin alias for `--checkpoints restore <session> <latest>`). HEAD untouched. |
 | `--memory <verb>` | Inspect cross-session memory: `list [scope]` \| `show <name> [scope]`. |
 | `--explain-permissions` | Print the resolved permission policy + per-section layer attribution and exit (pair with `--json`). |
+| `--list-models` | Print the installed model catalog (`~/.config/forja/model_providers.json`) — each model's context window, max output, price per-1M, and whether it's ready to use (its `api_key_env` is set) — and exit (pair with `--json` for NDJSON). Reads the catalog file only; the built-in default is starred, Ollama Cloud shows `unmetered`, and readiness is key-presence (it does not probe a local Ollama daemon). |
 
 ### `--checkpoints <cmd>`
 

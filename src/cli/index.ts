@@ -55,6 +55,24 @@ const main = async (): Promise<number> => {
     return 0;
   }
 
+  // `forja --list-models` — print the operator model catalog
+  // (capabilities + which models are ready) and exit. Catalog-file only:
+  // no provider, no DB, no harness, no session. Dispatched HERE with a
+  // lazy import (like init/purge/gc/cache below) so reaching it never
+  // evaluates run.ts's statically-imported harness/storage/bootstrap
+  // graph — the command survives a partial/broken install and needs no
+  // API key, which is its whole contract. Placed before the first-boot
+  // nudge so an inspection command doesn't touch install_id or emit the
+  // setup hint.
+  if (args.listModels) {
+    const { runListModelsCli } = await import('./list-models.ts');
+    return runListModelsCli({
+      json: args.json,
+      out: (s) => process.stdout.write(s),
+      err: (s) => process.stderr.write(s),
+    });
+  }
+
   // §13.5 first-boot nudge (slice 46). Fires when install_id doesn't
   // exist yet, EXCEPT on §13 verbs (welcome/doctor/sandbox) — the
   // operator is already on the setup path and pointing them back to
