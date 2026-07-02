@@ -869,8 +869,9 @@ describe('executeCase: MCP seam (setup.mcp)', () => {
     const c = baseCase({
       prompt: 'call the echo tool and report its output',
       setup: {
-        // Autonomous posture auto-approves the mcp.egress policy-confirm (the fake
-        // server is unsandboxed) without needing a real sandbox tool.
+        // The fake server's tools are plain `mcp` (default-allow), NOT mcp.egress:
+        // the executor pins a hermetic sandbox verdict so it resolves to `cwd-rw`.
+        // (autonomous is set for any score-based confirm; egress it is not.)
         approvalPosture: 'autonomous',
         mcp: {
           fixture: {
@@ -894,6 +895,33 @@ describe('executeCase: MCP seam (setup.mcp)', () => {
     });
     expect(r.passed).toBe(true);
     expect(r.expectations.every((e) => e.passed)).toBe(true);
+  });
+
+  test('the fixture tool is NON-egress: a headless autonomous call is ALLOWED, not denied', async () => {
+    // Regression guard. Writing `sandbox = false` classified the fake server as
+    // mcp.egress, which autonomous does NOT auto-approve → the call was denied
+    // before the canned result returned (the model-in-loop `output_contains`
+    // failed). With the server non-egress, a `tool_denied` expectation must FAIL
+    // with "invoked but allowed" — proving the call was permitted.
+    const c = baseCase({
+      prompt: 'call echo',
+      setup: {
+        approvalPosture: 'autonomous',
+        mcp: { fixture: { tools: [{ name: 'echo', description: 'echo' }], result: 'OK' } },
+      },
+      expect: [{ kind: 'tool_denied', tool: 'mcp__fixture__echo' }],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: {
+        providerOverride: mockProvider([
+          { tool_uses: [{ id: 't1', name: 'mcp__fixture__echo', input: { text: 'hi' } }] },
+          { text: 'done' },
+        ]),
+      },
+    });
+    const denied = r.expectations[0];
+    expect(denied?.passed).toBe(false); // invoked but ALLOWED → the deny expectation fails
+    expect(denied?.detail).toContain('invoked but allowed');
   });
 
   test('a declared server without auto-approve fails closed (tool never registers)', async () => {

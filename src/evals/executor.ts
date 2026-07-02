@@ -17,6 +17,7 @@ import {
   runAgent,
 } from '../harness/index.ts';
 import type { McpClient, McpTransportConfig } from '../mcp/types.ts';
+import type { SandboxAvailability } from '../permissions/sandbox-availability.ts';
 import { maybeWrapSandboxArgv } from '../permissions/sandbox-runner.ts';
 import { closeDb } from '../storage/db.ts';
 import { BUILTIN_TOOLS, createFetchUrlTool } from '../tools/builtin/index.ts';
@@ -29,6 +30,21 @@ import type {
   EvalSummary,
   ExpectationOutcome,
 } from './types.ts';
+
+// A hermetic "sandbox available" verdict pinned for setup.mcp cases so the fake
+// server resolves to the non-egress `cwd-rw` profile (plain `mcp` category,
+// default-allow) rather than `host` (`mcp.egress`, which autonomous won't
+// auto-approve → a headless call is denied). Deterministic (independent of the
+// host's real bwrap); the stub client never spawns, so the wrap is never applied.
+// Mirrors the tests' own HERMETIC_SANDBOX.
+const EVAL_MCP_SANDBOX: SandboxAvailability = {
+  available: true,
+  tool: 'bwrap',
+  path: '/usr/bin/bwrap',
+  trustLevel: 'canonical',
+  reason: '',
+  trustWarnings: [],
+};
 
 // A stubbed `McpClient` factory for `setup.mcp` (hermetic model-in-loop MCP): NO
 // subprocess — it serves each declared server's manifest + a canned tools/call
@@ -258,16 +274,22 @@ const setupCwd = (caseDef: EvalCase): SetupResult => {
     }
   }
   // Hermetic MCP servers (setup.mcp): write a `.forja/mcp.toml` declaring each
-  // fake server. `command = ["mcp-eval", "<name>"]` is a marker the injected
-  // stub client routes on (never spawned); `sandbox = false` since there's no
-  // real process. `surface` per the case.
+  // fake server. `command = ["mcp-eval", "<name>"]` is a marker the injected stub
+  // client routes on (never spawned). We deliberately DON'T set `sandbox = false`:
+  // that resolves the server to the `host` profile, which the manager classifies as
+  // `mcp.egress` — and egress is NOT auto-approved under `approvalPosture:
+  // autonomous`, so a headless model-in-loop case's tool call would be denied
+  // before the canned result returns. Left at the default + paired with a hermetic
+  // "sandbox available" verdict below, the server resolves to `cwd-rw` (non-egress,
+  // plain `mcp` category, default-allow). The stub never spawns, so no wrap is ever
+  // applied — this only steers the classification. `surface` per the case.
   if (caseDef.setup?.mcp !== undefined) {
     const forjaDir = join(dir, '.forja');
     if (!existsSync(forjaDir)) mkdirSync(forjaDir, { recursive: true });
     const toml = Object.entries(caseDef.setup.mcp)
       .map(
         ([name, s]) =>
-          `[servers.${name}]\ntransport = "stdio"\ncommand = ["mcp-eval", "${name}"]\nsandbox = false\nsurface = "${s.surface ?? 'base'}"\n`,
+          `[servers.${name}]\ntransport = "stdio"\ncommand = ["mcp-eval", "${name}"]\nsurface = "${s.surface ?? 'base'}"\n`,
       )
       .join('\n');
     writeFileSync(join(forjaDir, 'mcp.toml'), toml);
@@ -664,6 +686,10 @@ export const executeCase = async (
         ? {
             autoApproveMcp: new Set(Object.keys(caseDef.setup.mcp)),
             mcpMakeClient: makeEvalMcpClient(caseDef.setup.mcp),
+            // Classify the fake server's tools as non-egress `mcp` (default-allow),
+            // not `mcp.egress` — else autonomous won't auto-approve the headless
+            // call. A case that needs a different verdict overrides it below.
+            sandboxAvailabilityOverride: EVAL_MCP_SANDBOX,
           }
         : {}),
       // Default temperature 0 makes evals deterministic. Cases or
