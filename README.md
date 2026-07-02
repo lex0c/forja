@@ -1,39 +1,8 @@
 # Forja
 
-> Agentic CLI — terminal-first, multi-provider, self-hostable.
->
-> **Measure twice, cut once.**
+Forja is an autonomous programming agent that runs on your terminal. It understands your codebase, reads and edits files, executes commands, coordinates tools, and analyzes various files to build features, fix bugs, and automate development work.
 
-Forja is an autonomous coding agent that runs in your terminal. It reads your
-code, runs commands, edits files, and reasons about a project — like other
-agent CLIs you may have used. The difference is in what it does between those
-actions: every decision is checkpointed, every tool call is audited, every
-inference declares what was **not** measured.
-
----
-
-## Why another agent CLI
-
-Most agent runtimes optimize for **autonomy**: give the model more tools, more
-context, more freedom, hope the answer is right. Forja's bet is different:
-
-- **Disciplined transparency over raw autonomy.** Every action with a
-  persistent side effect goes through prior verification. Every cut decision
-  has a fallback. Inferences declare confidence, not just conclusions.
-- **Audit-first, not audit-as-afterthought.** Every tool call, permission
-  decision, memory mutation, and provider request is content-addressed and
-  persisted. Replay reconstructs the exact prompt the model saw.
-- **Reversible by design.** Every write creates a checkpoint. `--undo`
-  restores the working tree to a known state, with the bash side-effects
-  caveat surfaced explicitly when it applies.
-- **Explicit trust.** A new directory is untrusted until proven. Shared
-  memory corpora need attestation. Permissions are layered (enterprise →
-  user → project → session) with attribution on every grant.
-- **Honest about token cost.** A per-tool summarization layer reduces output
-  before it enters context, and the system prompt is split across cache
-  breakpoints to minimize re-cache cost.
-
----
+What sets Forja apart is the structure surrounding the model. Every action with an effect is logged, every tool call is audited, and every inference makes its uncertainties and unmeasurable assumptions explicit. The model is not the system. Forja was designed to make autonomous programming observable, reversible, and reliable.
 
 ## Install
 
