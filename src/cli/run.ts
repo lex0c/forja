@@ -217,19 +217,6 @@ export const run = async (options: RunOptions): Promise<number> => {
       });
     }
 
-    // --list-models: print the operator model catalog (capabilities +
-    // readiness) and exit. Catalog-file-only — no provider, no DB, no
-    // harness — so it works without an API key, the right shape for an
-    // inspection tool. Sibling of --explain-permissions above.
-    if (args.listModels) {
-      const { runListModelsCli } = await import('./list-models.ts');
-      return runListModelsCli({
-        json: args.json,
-        out: (s) => process.stdout.write(s),
-        err: errSink,
-      });
-    }
-
     // `forja permission <verb>` — DB-only operator surface for the
     // v2 permission engine. Both verbs are read-only / one-shot,
     // never start a provider or session. They read the operator's

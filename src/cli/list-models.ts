@@ -17,9 +17,17 @@
 //     `cost_per_1k_*` field names (see `<family>/capabilities.ts`), so the
 //     display and the JSON label them `/1M` (`cost_per_1m_*`).
 
+// Import from the SDK-free catalog modules directly, NOT the `../providers`
+// barrel — that barrel statically re-exports the provider adapters
+// (`createAnthropicProvider` → `@anthropic-ai/sdk`, …), which would drag the
+// SDK graph into this catalog-only command and defeat its point. catalog-io
+// is deliberately SDK-free; cost-format / default-model / slash-format carry
+// no runtime deps. This is what lets the command dispatch from index.ts
+// (before run.ts's harness/storage graph) and survive a partial install.
+import { loadModelProvidersFile } from '../providers/catalog-io.ts';
 import { UNMETERED_LABEL, isUnmetered } from '../providers/cost-format.ts';
 import { DEFAULT_MODEL } from '../providers/default-model.ts';
-import { type ModelProviderEntry, loadModelProvidersFile } from '../providers/index.ts';
+import type { ModelProviderEntry } from '../providers/types.ts';
 import { formatCost } from './slash/format.ts';
 
 export interface ListModelsCliInput {
