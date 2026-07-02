@@ -33,7 +33,6 @@ const glossMcpError = (raw: string): string => {
   switch (raw) {
     case 'mcp.budget.exceeded':
       return `${raw} — hit the per-session call/token cap (raise the server's budget, or start a new session)`;
-    case 'manifest_drift':
     case 'mcp.manifest_drift':
       return `${raw} — the manifest changed since it was trusted; run /mcp reconnect to re-review`;
     case 'mcp.output.invalid':
@@ -79,6 +78,30 @@ const renderEndpoint = (raw: string): string => {
   return raw;
 };
 
+// The persisted stdio identity is `JSON.stringify({argv, cwd?, env?, sandbox?, net?})`
+// (manager.ts `stdioCommandIdentity`). Render the argv readably (+ an explicit cwd
+// and env-binding NAMES when present), like the trust modal, instead of dumping the
+// raw JSON blob at the operator. Falls back to the raw string if it isn't that shape
+// (a legacy/plain-array row, or a tampered value). Config-derived (never a resolved
+// secret); still routed through the caller's `s()` sanitizer.
+const renderCommand = (raw: string): string => {
+  try {
+    const p = JSON.parse(raw) as { argv?: unknown; cwd?: unknown; env?: unknown };
+    if (p !== null && typeof p === 'object' && Array.isArray(p.argv)) {
+      const parts = [p.argv.filter((a): a is string => typeof a === 'string').join(' ')];
+      if (typeof p.cwd === 'string') parts.push(`[cwd: ${p.cwd}]`);
+      if (p.env !== null && typeof p.env === 'object' && !Array.isArray(p.env)) {
+        const keys = Object.keys(p.env as Record<string, unknown>);
+        if (keys.length > 0) parts.push(`[env: ${keys.join(', ')}]`);
+      }
+      return parts.join('  ');
+    }
+  } catch {
+    // Not the identity-blob shape — a legacy/plain value.
+  }
+  return raw;
+};
+
 const handleShow = (ctx: SlashContext, name: string): SlashResult => {
   // Read the right `(scope, name)` row: the manager knows this server's scope
   // (from its config source); without a manager (or a server not in config) fall
@@ -112,7 +135,7 @@ const handleShow = (ctx: SlashContext, name: string): SlashResult => {
     // `url` (command null). Show whichever this transport uses so a remote
     // server's approved endpoint is visible instead of `command: —`.
     row.transport === 'stdio'
-      ? `  command:  ${row.command !== null ? s(row.command) : '—'}`
+      ? `  command:  ${row.command !== null ? s(renderCommand(row.command)) : '—'}`
       : `  url:      ${row.url !== null ? s(renderEndpoint(row.url)) : '—'}`,
     `  manifest: ${row.current_manifest_hash ?? '—'}`,
     `  protocol: ${row.protocol_version !== null ? s(row.protocol_version) : '—'}${row.server_version !== null ? ` (server ${s(row.server_version)})` : ''}`,
@@ -141,7 +164,15 @@ const handleList = (ctx: SlashContext): SlashResult => {
   const rows = mgr !== undefined ? listServers(ctx.db, mgr.scopes()) : listServers(ctx.db);
   const live = mgr?.status() ?? [];
   const liveByName = new Map(live.map((s) => [s.name, s]));
-  const rowByName = new Map(rows.map((r) => [r.name, r]));
+  // A name can persist in TWO scopes (a user '' row shadowed by a same-named
+  // project row, which the sweep keeps). Prefer the row at THIS name's ACTIVE scope
+  // so `/mcp list` shows the active server's SOURCE/state, not an arbitrary one.
+  const rowByName = new Map<string, (typeof rows)[number]>();
+  for (const r of rows) {
+    if (rowByName.get(r.name) === undefined || mgr?.scopeFor(r.name) === r.scope) {
+      rowByName.set(r.name, r);
+    }
+  }
   // Union of live (enabled, in the runtime) + persisted rows, by name. Empty
   // exactly when there are no servers at all (covers the headless / no-db case).
   const names = [...new Set([...live.map((s) => s.name), ...rows.map((r) => r.name)])].sort();

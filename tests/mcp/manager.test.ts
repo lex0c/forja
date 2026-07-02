@@ -1213,6 +1213,32 @@ describe('McpManager.cleanup', () => {
     await mgr.cleanup();
     expect(fake.stats.closes).toBeGreaterThanOrEqual(1);
   });
+
+  test('drops a live server to disconnected so a later callTool re-handshakes legally', async () => {
+    // The broker outlives sessions. cleanup() used to leave rt.state at `active`,
+    // so a later callTool's `active → handshaking` hit an illegal transition throw.
+    seedTrusted(db, 'db', [toolDef('query')]);
+    const fake = fakeClientFactory({
+      tools: [toolDef('query')],
+      callResult: { isError: false, content: 'ok' },
+    });
+    const mgr = createMcpManager({
+      db,
+      registry,
+      config: config([serverConfig()]),
+      makeClient: fake.makeClient,
+    });
+    await mgr.init();
+    await mgr.callTool('db', 'query', {}, ctx); // → active
+    expect(mgr.state('db')).toBe('active');
+    await mgr.cleanup();
+    expect(mgr.state('db')).toBe('disconnected'); // NOT left at active
+
+    // A later call re-handshakes through a legal edge instead of throwing.
+    const r = await mgr.callTool('db', 'query', {}, ctx);
+    expect(r.content).toBe('ok');
+    expect(mgr.state('db')).toBe('active');
+  });
 });
 
 describe('McpManager: disabled servers are skipped', () => {

@@ -123,8 +123,13 @@ export const getServer = (db: DB, scope: string, name: string): McpServerRow | n
 // current config). Prefer the scoped `getServer` when the scope is known. The row
 // carries its own `scope`, so a follow-up scoped read (e.g. history) is exact.
 export const getServerAnyScope = (db: DB, name: string): McpServerRow | null => {
+  // ORDER BY scope so a name present in two scopes ('' + a project root) resolves
+  // DETERMINISTICALLY (the '' user/global row wins) instead of an arbitrary SQLite
+  // row order — the degraded read then reads that same scope's history.
   return (
-    (db.query(`${SERVER_SELECT} WHERE name = ? LIMIT 1`).get(name) as McpServerRow | null) ?? null
+    (db
+      .query(`${SERVER_SELECT} WHERE name = ? ORDER BY scope ASC LIMIT 1`)
+      .get(name) as McpServerRow | null) ?? null
   );
 };
 

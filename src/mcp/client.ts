@@ -154,8 +154,19 @@ export const flattenContent = (content: unknown): string => {
 // description is truncated; an oversized inputSchema degrades to `{type:'object'}`.
 export const narrowManifestTools = (rawTools: unknown): McpManifestTool[] => {
   const list = Array.isArray(rawTools) ? rawTools : [];
+  // Sort by name BEFORE the count cap so the retained subset is deterministic
+  // regardless of the server's tools/list ORDER: a >MAX_MCP_TOOLS server that
+  // reorders its output between the trusted snapshot and a later handshake would
+  // otherwise yield a different 256-subset → a different hash → a FALSE manifest
+  // drift. Canonicalization sorts by name too, so this matches the hashed order.
+  // Comparing names is cheap; only the retained subset is heavily narrowed.
+  const byName = [...list].sort((a, b) => {
+    const an = asString((a as { name?: unknown } | null)?.name) ?? '';
+    const bn = asString((b as { name?: unknown } | null)?.name) ?? '';
+    return an < bn ? -1 : an > bn ? 1 : 0;
+  });
   const tools: McpManifestTool[] = [];
-  for (const raw of list) {
+  for (const raw of byName) {
     if (tools.length >= MAX_MCP_TOOLS) break; // bound a pathological tool count
     const rec = asRecord(raw);
     if (rec === null) continue;
@@ -195,18 +206,29 @@ export const boundStructuredContent = (
   return { structured };
 };
 
-// Decide how a REJECTED `client.callTool` surfaces. The SDK rejects on a JSON-RPC
-// ERROR RESPONSE too (an McpError the server SENT — InvalidParams / MethodNotFound
-// / a custom server code), not only on a transport fault: that means the
-// connection is ALIVE and the model made a per-call mistake. Translate it to an
-// isError RESULT so the model sees + fixes it (a non-retryable tool error) instead
-// of the manager tearing down a healthy server and telling the model to retry.
-// Return null to RE-THROW: a real transport fault / an abort (timeout or session
-// cancel, surfaced as `aborted` or the SDK's ConnectionClosed/RequestTimeout
-// codes) must reach the manager so it disconnects or applies its §15.3 timeout
-// handling. Exported for direct testing (the live callTool needs a real SDK Client).
+// Decide how a REJECTED `client.callTool` surfaces: a malformed-output ZodError or
+// a server-sent JSON-RPC error becomes a RESULT (the connection is alive); a real
+// transport fault / abort returns null to RE-THROW. Exported for direct testing
+// (the live callTool needs a real SDK Client). See the per-branch notes below.
 export const callErrorToResult = (err: unknown, aborted: boolean): McpCallResult | null => {
   if (aborted) return null;
+  // A ZodError = the SDK rejected the RESULT against CallToolResultSchema (the
+  // server returned malformed content — e.g. a non-array `content`). The SDK
+  // schema-validates BEFORE we see the result, so this is the ONLY way a malformed
+  // output surfaces in production (isInvalidOutput below never fires against the
+  // real strict schema). The connection is alive → surface it as the §15.5
+  // output-invalid degrade so the manager degrades + recovers, NOT a transport
+  // fault that disconnects and churns retries.
+  if (err instanceof Error && err.name === 'ZodError') {
+    return { isError: true, invalid: true, invalidRaw: err.message.slice(0, 1024), content: '' };
+  }
+  // A JSON-RPC ERROR RESPONSE (an McpError the server SENT — InvalidParams /
+  // MethodNotFound / a custom code) also means the connection is ALIVE: the model
+  // made a per-call mistake. Translate it to an isError RESULT so the model fixes
+  // it (a non-retryable tool error) rather than the manager tearing down a healthy
+  // server. Return null to RE-THROW: a real transport fault / an abort (surfaced as
+  // `aborted` or the SDK's ConnectionClosed/RequestTimeout codes) must reach the
+  // manager so it disconnects or applies its §15.3 timeout handling.
   if (
     err instanceof McpError &&
     err.code !== ErrorCode.ConnectionClosed &&

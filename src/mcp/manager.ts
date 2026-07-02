@@ -379,9 +379,6 @@ const trustModalExtras = (
 // authority), and userinfo (`user:pass@`) is rejected at parse — so persisting +
 // showing the origin leaks nothing while catching an origin change. Only the auth
 // NAME (never the token) enters the identity.
-// The resolved endpoint's ORIGIN (scheme://host:port) — non-secret: a `$VAR`
-// token expands into the path/query, never the authority, and userinfo is
-// rejected at parse. Safe to persist + show.
 const resolvedOrigin = (t: McpRemoteConfig): string => {
   try {
     return new URL(t.url).origin;
@@ -649,7 +646,9 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
           // close can't bounce us into the catch and mislabel the drift as a
           // transport fault. The flag stops the next call from reconnecting.
           rt.drifted = true;
-          setState(rt, 'degraded', { last_error: 'manifest_drift' });
+          // Dotted form, matching the sibling persisted codes (mcp.budget.exceeded,
+          // mcp.output.invalid) + the thrown McpCallError code — one spelling.
+          setState(rt, 'degraded', { last_error: 'mcp.manifest_drift' });
           await client.close().catch(() => {});
           throw new McpCallError(
             'mcp.manifest_drift',
@@ -1321,12 +1320,13 @@ export const createMcpManager = (deps: McpManagerDeps): McpManager => {
         const client = rt.client;
         rt.client = null;
         rt.connected = false;
+        // Drop a LIVE state to `disconnected` so a later callTool on this
+        // broker instance (it outlives sessions) re-handshakes through a legal
+        // edge — `active`/`degraded` → `handshaking` is undeclared. Set directly
+        // (like revoke): cleanup is a teardown override, not a lifecycle step.
+        if (rt.state === 'active' || rt.state === 'degraded') rt.state = 'disconnected';
         if (client !== null) await client.close().catch(() => {});
       }
     },
   };
 };
-
-// Re-export for callers building status views (/mcp, doctor) without
-// importing the repo directly.
-export { listServers as listMcpServerRows };

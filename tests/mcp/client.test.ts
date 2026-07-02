@@ -211,6 +211,24 @@ describe('callErrorToResult — server error vs transport fault', () => {
     // its abort handling instead of swallowing it into a result.
     expect(callErrorToResult(new McpError(ErrorCode.InvalidParams, 'x'), true)).toBeNull();
   });
+
+  test('a ZodError (malformed result) → an INVALID result (§15.5), not a transport fault', () => {
+    // The SDK schema-validates the result and rejects malformed content with a
+    // ZodError (the only way malformed output surfaces in production). It must
+    // become the output-invalid degrade, NOT re-thrown as a transport fault.
+    const zodErr = new Error('content: Expected array, received string');
+    zodErr.name = 'ZodError';
+    const res = callErrorToResult(zodErr, false);
+    expect(res?.invalid).toBe(true);
+    expect(res?.isError).toBe(true);
+    expect(res?.invalidRaw).toContain('Expected array');
+  });
+
+  test('a ZodError under an aborted call is still re-thrown', () => {
+    const zodErr = new Error('x');
+    zodErr.name = 'ZodError';
+    expect(callErrorToResult(zodErr, true)).toBeNull();
+  });
 });
 
 describe('narrowManifestTools — bounds an untrusted tools/list', () => {
@@ -239,6 +257,20 @@ describe('narrowManifestTools — bounds an untrusted tools/list', () => {
   test('caps the tool COUNT at MAX_MCP_TOOLS', () => {
     const many = Array.from({ length: MAX_MCP_TOOLS + 50 }, (_, i) => ({ name: `t${i}` }));
     expect(narrowManifestTools(many)).toHaveLength(MAX_MCP_TOOLS);
+  });
+
+  test('the capped subset is deterministic regardless of input order (no false drift)', () => {
+    // A >MAX_MCP_TOOLS server that REORDERS its tools/list must yield the SAME
+    // retained subset (the lexicographically-smallest names), so the manifest hash
+    // is order-invariant — a reorder must not read as drift.
+    const names = Array.from({ length: MAX_MCP_TOOLS + 44 }, (_, i) => ({
+      name: `t${String(i).padStart(3, '0')}`,
+    }));
+    const forward = narrowManifestTools(names).map((t) => t.name);
+    const reversed = narrowManifestTools([...names].reverse()).map((t) => t.name);
+    expect(forward).toHaveLength(MAX_MCP_TOOLS);
+    expect(forward).toEqual(reversed); // same subset, either input order
+    expect(forward[0]).toBe('t000'); // the smallest names are the ones kept
   });
 
   test('truncates an over-long name and description', () => {

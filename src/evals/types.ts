@@ -95,8 +95,10 @@ export interface EvalSetup {
   // serves the declared manifest — NO real subprocess (that path is covered by
   // tests/mcp/real-subprocess.test.ts + evals/smoke-mcp.sh). Lets an eval measure
   // whether the model discovers + calls an MCP tool and uses its result.
-  // Pair with `approvalPosture: 'autonomous'` so the `mcp.egress` policy-confirm
-  // (unsandboxed fake server) auto-approves headlessly without a bwrap dependency.
+  // The executor pins a hermetic "sandbox available" verdict for these, so the fake
+  // server resolves to the non-egress `mcp` category (default-allow) — a headless
+  // run can call it without a confirmer. (Egress is deliberately NOT auto-approved
+  // under `autonomous`, which is why the fake server must be non-egress.)
   mcp?: Record<string, EvalMcpServer>;
 }
 

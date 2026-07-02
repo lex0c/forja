@@ -220,6 +220,64 @@ describe('/mcp slash command', () => {
     expect(text).toContain('https://x/'); // the printable endpoint survives
   });
 
+  test('show renders the stdio command readably, not the raw identity blob', async () => {
+    // The persisted stdio identity is now a JSON blob {argv,cwd,env,…}; /mcp show
+    // must unwrap it to a readable argv, not dump the raw JSON at the operator.
+    insertServer(db, {
+      scope: SCOPE,
+      name: 'db',
+      transport: 'stdio',
+      command: JSON.stringify({ argv: ['node', './s.js'], cwd: '/w', env: { SECRET: '$SECRET' } }),
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    const r = await mcpCommand.exec(['show', 'db'], buildCtx());
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = r.notes?.join('\n') ?? '';
+    expect(text).toContain('node ./s.js'); // readable argv
+    expect(text).toContain('cwd: /w');
+    expect(text).toContain('env: SECRET'); // the binding NAME, not the raw table
+    expect(text).not.toContain('"argv"'); // the raw JSON blob is NOT shown
+  });
+
+  test('list shows the ACTIVE scope source for a name present in two scopes', async () => {
+    // A user '' row shadowed by a same-named project row (the sweep keeps both).
+    // Insert the project row FIRST so a naive last-wins map would pick the user row;
+    // the active-scope preference must show the project source instead.
+    insertServer(db, {
+      scope: '/proj',
+      name: 'db',
+      transport: 'stdio',
+      command: '["p"]',
+      url: null,
+      source: 'project_shared',
+      state: 'trusted',
+    });
+    insertServer(db, {
+      scope: '',
+      name: 'db',
+      transport: 'stdio',
+      command: '["u"]',
+      url: null,
+      source: 'user',
+      state: 'trusted',
+    });
+    const base = fakeManager([{ name: 'db', state: 'trusted', tools: 1 }]);
+    const mgr = {
+      ...base,
+      scopes: () => ['/proj', ''],
+      scopeFor: () => '/proj',
+    } as unknown as McpManager;
+    const r = await mcpCommand.exec([], buildCtx(mgr));
+    expect(r.kind).toBe('ok');
+    if (r.kind !== 'ok') return;
+    const text = r.notes?.join('\n') ?? '';
+    expect(text).toContain('project_shared'); // the ACTIVE (project) source
+    expect(text).not.toContain('user'); // NOT the shadowed user row
+  });
+
   test('show <unknown> errors', async () => {
     const r = await mcpCommand.exec(['show', 'nope'], buildCtx());
     expect(r.kind).toBe('error');
