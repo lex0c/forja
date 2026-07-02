@@ -4,6 +4,8 @@ Forja is an autonomous programming agent that runs on your terminal. It understa
 
 What sets Forja apart is the structure surrounding the model. Every action with an effect is logged, every tool call is audited, and every inference makes its uncertainties and unmeasurable assumptions explicit. The model is not the system. Forja was designed to make autonomous programming observable, reversible, and reliable.
 
+> **Measure twice, cut once.**
+
 ## Install
 
 Forja runs on [Bun](https://bun.sh) (single binary via `bun build --compile`).
