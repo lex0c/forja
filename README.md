@@ -276,6 +276,10 @@ A profile relocates **both** levels at once:
 - **No auto-commit.** Forja never creates git commits without explicit
   operator action.
 
+To report a security issue, see the [security policy](SECURITY.md). For
+the full threat model, permission-engine internals, and sandbox design,
+see [`docs/SECURITY.md`](docs/SECURITY.md).
+
 ---
 
 ## Documentation
