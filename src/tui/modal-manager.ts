@@ -98,6 +98,10 @@ export interface PermissionAskArgs {
   // so the operator distinguishes a parent confirm from a child
   // confirm. Undefined for the parent's own confirms.
   subagent?: { sessionId: string; name: string };
+  // Peer attribution (mesh). Set by the REPL when the confirm belongs to a
+  // peer-driven turn; the reducer labels the modal so a peer's effect isn't
+  // mistaken for the operator's own. Undefined for operator/self turns.
+  peer?: { alias: string };
 }
 
 // Trust flavor — first-run "is this directory safe to operate in?"
@@ -804,6 +808,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           ...(args.layer !== undefined ? { layer: args.layer } : {}),
           ...(args.reason !== undefined ? { reason: args.reason } : {}),
           ...(args.subagent !== undefined ? { subagent: args.subagent } : {}),
+          ...(args.peer !== undefined ? { peer: args.peer } : {}),
         }),
         buildPermissionOptions(),
         opts?.timeoutMs,

@@ -326,6 +326,12 @@ export type PermissionAskEvent = BaseEvent & {
   // operator distinguishes parent vs child requests. Undefined
   // for the parent's own confirms.
   subagent?: { sessionId: string; name: string };
+  // Peer attribution (mesh, MESH.md §6). Set by the REPL when the confirm fires
+  // DURING a peer-driven turn: the ask exists because a PEER's request led here,
+  // not the operator's own work. The reducer labels the modal so the operator
+  // never approves a peer's effect mistaking it for their own. Undefined for
+  // operator/self turns.
+  peer?: { alias: string };
 };
 // Modal resolution event. Renamed from `permission:answer` because
 // the same event flows for every modal flavor (trust answers `yes`/

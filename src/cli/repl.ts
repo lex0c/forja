@@ -1524,6 +1524,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // turn; consumed on `session_finished` (or the error path) to route the
   // instance's final answer back to that conversation and close it.
   let pendingPeerConversation: string | null = null;
+  // The alias of the peer whose request drives the current turn — kept in
+  // lockstep with pendingPeerConversation so a confirm firing mid-peer-turn can
+  // attribute the ask to the peer (never let a peer's effect look like the
+  // operator's own work). Null on operator turns.
+  let pendingPeerAlias: string | null = null;
   // Mesh anti-committee bound (§8): consecutive peer turns served with NO
   // operator input between them. `peer_message` is exempt from the operator
   // wake cap, so this is its real limit — capped at the manager's `maxRounds`,
@@ -1665,6 +1670,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       if (pendingPeerConversation !== null) {
         const cid = pendingPeerConversation;
         pendingPeerConversation = null;
+        pendingPeerAlias = null;
         const wasUnanswered = baseConfig.meshManager?.sendResult(
           cid,
           '[the peer ended its turn without publishing a reply]',
@@ -1826,6 +1832,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // the parent's own confirms — the reducer only branches
         // on its presence.
         ...(req.subagent !== undefined ? { subagent: req.subagent } : {}),
+        // Peer attribution: when THIS turn is peer-driven (mesh), label the modal
+        // so the operator sees the effect was requested by a PEER, not by them —
+        // approving a peer's edit as if it were your own is the worst failure the
+        // subsystem exists to prevent. The alias is ALIAS_RE-validated at ingress;
+        // flatten as defense-in-depth (mirrors the origin-header treatment).
+        ...(pendingPeerAlias !== null
+          ? { peer: { alias: flattenControlToLine(pendingPeerAlias) } }
+          : {}),
       },
       // Forward producer cancellation signal. Subagent proxy
       // wires it to the child's IPC lifetime so a child dying
@@ -2286,6 +2300,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           if (pendingPeerConversation !== null) {
             const cid = pendingPeerConversation;
             pendingPeerConversation = null;
+            pendingPeerAlias = null;
             baseConfig.meshManager?.sendResult(
               cid,
               '[the peer errored before completing the request]',
@@ -2485,6 +2500,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // peer_reply, or a coalesced non-peer run) so a non-peer turn never emits a
     // stray mesh result.
     pendingPeerConversation = peerHead !== null ? peerHead.conversationId : null;
+    pendingPeerAlias = peerHead !== null ? peerHead.peerAlias : null;
     // A peer turn: publish `working` (discovery reflects the real state) and run
     // it against FRESH context (§6.2 isolation). Any other wake stays on the
     // operator lane (reuses liveContext).

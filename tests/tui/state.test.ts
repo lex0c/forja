@@ -2325,6 +2325,74 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
     }
   });
 
+  test('a mesh_send action renders the payload excerpt (event.reason), not just the peer', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p1',
+      toolName: 'mesh_send',
+      command: 'gateway', // vocab subject is the peer alias ONLY
+      reason: "Send to mesh peer 'gateway': please bump the auth contract to v2",
+      cwd: '/p',
+    } as UIEvent);
+    expect(r.state.modal).not.toBeNull();
+    if (r.state.modal !== null) {
+      // The action must carry WHAT is leaving (the message), not just to whom —
+      // else the operator approves an egress they can't see.
+      expect(r.state.modal.preview[1]).toBe(
+        "    Send to mesh peer 'gateway': please bump the auth contract to v2",
+      );
+    }
+  });
+
+  test('a mesh_reply action renders the published output excerpt (event.reason)', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p1',
+      toolName: 'mesh_reply',
+      command: 'mesh peer', // vocab subject is static
+      reason: 'Publish to mesh peer: the contract now returns 200 on /v2',
+      cwd: '/p',
+    } as UIEvent);
+    expect(r.state.modal?.preview[1]).toBe(
+      '    Publish to mesh peer: the contract now returns 200 on /v2',
+    );
+  });
+
+  test('a peer-driven confirm labels the modal with peer attribution', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p1',
+      toolName: 'edit_file',
+      command: 'src/routes.ts',
+      cwd: '/p',
+      peer: { alias: 'checkout' },
+    } as UIEvent);
+    expect(r.state.modal).not.toBeNull();
+    if (r.state.modal !== null) {
+      // The operator must see the effect was requested by a PEER, not by them.
+      expect(r.state.modal.title).toBe('Permission required (peer: checkout)');
+      expect(r.state.modal.subject).toContain('checkout');
+      expect(r.state.modal.subject).toContain('peer');
+    }
+  });
+
+  test('peer attribution takes precedence over subagent in the modal title', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p1',
+      toolName: 'bash',
+      command: 'ls',
+      cwd: '/p',
+      peer: { alias: 'checkout' },
+      subagent: { sessionId: 's1', name: 'explore' },
+    } as UIEvent);
+    expect(r.state.modal?.title).toBe('Permission required (peer: checkout)');
+  });
+
   test('title is the fixed "Permission required" label regardless of tool', () => {
     // The per-tool category labels (Bash command / Editing file / …)
     // were dropped for a single generic title; the command itself

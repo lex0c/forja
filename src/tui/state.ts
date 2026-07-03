@@ -1810,9 +1810,11 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // `name` (from the agents/*.md frontmatter) reaches the suffix
       // — never a string the child generated.
       const titleStr =
-        event.subagent !== undefined
-          ? `Permission required (subagent: ${event.subagent.name})`
-          : 'Permission required';
+        event.peer !== undefined
+          ? `Permission required (peer: ${event.peer.alias})`
+          : event.subagent !== undefined
+            ? `Permission required (subagent: ${event.subagent.name})`
+            : 'Permission required';
 
       const previewLines: PreviewLine[] = [];
       // Action block: a blank line, then the command verbatim (no
@@ -1826,6 +1828,19 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         // it is ("fetch https://…"), not an opaque address. The verb is
         // the one emphasized token; the URL stays dim like other actions.
         previewLines.push({ verb: 'fetch', text: event.command });
+      } else if (
+        (event.toolName === 'mesh_send' || event.toolName === 'mesh_reply') &&
+        event.reason !== undefined &&
+        event.reason.length > 0
+      ) {
+        // For a mesh send/reply the vocab `command` is only the peer/target;
+        // the PAYLOAD that crosses the trust boundary lives in `event.reason`
+        // — the engine (mesh.egress/mesh.reply) builds a bounded, one-line,
+        // control-stripped "to WHOM + WHAT leaves" excerpt there precisely
+        // because the modal has no dedicated payload field. Render THAT as the
+        // action so the operator reviews what is leaving, not just to whom (the
+        // two-audiences review, MESH.md §7). Without it the send is blind.
+        previewLines.push(`    ${event.reason}`);
       } else {
         previewLines.push(`    ${event.command}`);
       }
@@ -1870,15 +1885,20 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             // single plain-language framing line for the ask.
             // (Reinstated after the redesign had dropped it — the
             // explicit framing reads better above the action block.)
-            subject: 'The agent is requesting permission for the action below.',
+            subject:
+              event.peer !== undefined
+                ? `A peer ('${event.peer.alias}') request led here — approve the action below only if you would run it yourself.`
+                : 'The agent is requesting permission for the action below.',
             // Secondary tone lifts the framing line out of the dim
             // baseline (the action + cwd rows below stay dim).
             subjectTone: 'secondary',
             preview: previewLines,
             // Question sits directly above the option list as the
-            // explicit decision prompt; the numbered Yes/No
-            // options answer it. The engine's `event.reason` (if any)
-            // still rides the source-attribution preview line.
+            // explicit decision prompt; the numbered Yes/No options
+            // answer it. `event.reason` (the engine's payload framing)
+            // is rendered as the action line for mesh tools above; for
+            // other tools the action (`event.command`) already carries
+            // the intent, so reason would only duplicate it.
             question: 'Approve this action?',
             options,
             // Per-flavor cursor default. Sourced from the same
