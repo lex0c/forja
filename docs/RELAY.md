@@ -26,13 +26,14 @@ approves anything.
 **On the instance that should answer requests (the server):**
 
 ```
-/relay
+/relay on
 ```
 
 This asks for confirmation (opening an inbound socket is a deliberate consent
-gate), then enters **relay mode**: the session serves peers and shows a
-`RELAY: <alias>` badge in the footer. The operator keeps supervising through the
-scrollback and approves effects as usual. Stop with `/relay off`.
+gate), then starts serving peers and shows a `RELAY: <alias>` badge in the
+footer. **The session is not dedicated** — you keep using it normally; peer
+requests interleave as their own isolated turns, which you supervise through the
+scrollback and approve as usual. Stop with `/relay off`.
 
 **On the instance that initiates (a normal session):**
 
@@ -53,11 +54,11 @@ small descriptor to a per-user runtime directory; peers read that directory and
 connect directly.
 
 ```
-Terminal A (normal session)              Terminal B (ran /relay)
+Terminal A (normal session)              Terminal B (ran /relay on)
   mesh_send("gateway", "...")  ──socket──▶  peer_message  (untrusted, source:system)
         ▲                                        │  wakes a fresh, isolated turn
         │  peer_reply  (untrusted-enveloped)     │  operator supervises + approves
-        └──── final answer only ◀── filter ──────┘  each effect (its own posture)
+        └──── mesh_reply(output) ◀───────────────┘  the model publishes the answer
 ```
 
 - **Discovery** — a serving Forja writes `<runtime>/forja/mesh/peers/<alias>.json`
@@ -67,9 +68,11 @@ Terminal A (normal session)              Terminal B (ran /relay)
   socket is gone is stale — it is skipped and swept on the next discovery.
 - **Ingress** — a peer's prompt becomes a `peer_message` that wakes the serving
   session and drives a system-source turn against **fresh context**.
-- **Return** — the turn's **final answer only** is sent back over the socket and
-  surfaces on the initiator as a `peer_reply` turn. If the peer crashes or stops
-  before answering, the initiator gets an explicit error, never a silent hang.
+- **Return** — when it has the answer, the receiver's model publishes it with
+  `mesh_reply(conversationId, output)`; the reply crosses back over the socket and
+  surfaces on the initiator as a `peer_reply` turn. A turn that ends without a
+  `mesh_reply` (or crashes) fails the conversation with a neutral error, so the
+  initiator always gets closure — never a silent hang.
 
 ## Security model
 
@@ -99,9 +102,10 @@ authority.
     is never auto-approved under autonomous — the exfiltration path is always a
     per-call operator confirm.
 - **Two audiences.** The local scrollback is full fidelity (the operator owns the
-  repo). What crosses the wire to the peer is only the **final answer** —
-  reading the last assistant block excludes tool outputs (they are tool-result
-  blocks), so the peer never receives this repo's paths, raw output, or secrets.
+  repo). What crosses the wire to the peer is only what the receiver **publishes**
+  via `mesh_reply` — never the raw turn. In supervised, the operator reviews that
+  output in the confirm (what leaves); in autonomous it is trusted to the posture.
+  So the peer never receives this repo's paths, raw output, or secrets.
 - **Isolation.** Each peer turn runs against fresh context and never touches the
   operator's own session, so one peer can't see another peer's request or the
   operator's local history through the model's context.
@@ -114,8 +118,9 @@ trust domain.
 
 | Command | Effect |
 |---|---|
-| `/relay` | Confirm, then start serving peers (enter relay mode). While serving, reports status. |
+| `/relay on` | Confirm, then start serving peers. The session stays interactive — **not dedicated**; you keep working while peer requests interleave. |
 | `/relay off` | Stop serving: say goodbye in-band to open conversations, close the socket, remove the descriptor. |
+| `/relay` | Report status (serving or not). `on` / `off` are the action verbs. |
 
 ## Tools
 
@@ -123,6 +128,7 @@ trust domain.
 |---|---|---|
 | `mesh_peers` | `misc` | Lists live serving instances — `alias`, `branch`, `status` (`idle` / `working`; `waiting-operator` is reserved — see follow-ups). Never the repo path. Off the base surface (discovered via tool search). |
 | `mesh_send` | `mesh.egress` | Sends a textual request to a peer. Egress → operator confirms each call, and it is never auto-approved under autonomous. Asynchronous (the reply arrives in a later turn). Refuses while **this** session is itself serving — a relay does not initiate onward sends (no transitive delegation). |
+| `mesh_reply` | `mesh.reply` | Publishes your answer back to a peer that sent you a request (the `conversationId` is the handle from the incoming message; this closes the conversation). **Respects your posture** — supervised confirms what leaves (the two-audiences review), autonomous auto-approves. NOT egress. Off the base surface. |
 
 ## Configuration
 
@@ -160,7 +166,7 @@ Two models talking freely would form an unbounded committee. The bounds:
 ## Troubleshooting
 
 - **A peer doesn't appear in `mesh_peers`.** It only appears after it runs
-  `/relay`. Confirm both instances run as the same OS user. A crashed instance's
+  `/relay on`. Confirm both instances run as the same OS user. A crashed instance's
   stale socket/descriptor is swept automatically on the next discovery.
 - **`peer_lost` in a reply.** The peer's process closed before answering (crash,
   or `/relay off` mid-request). The conversation is failed explicitly so the loop

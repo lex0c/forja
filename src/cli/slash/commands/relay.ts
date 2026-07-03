@@ -1,10 +1,11 @@
-// /relay — serve mesh peers on a local Unix socket (start / off).
+// /relay — serve mesh peers on a local Unix socket (on / off).
 //
-// `/relay` with no args opens a confirm modal (opening the listen socket is the
-// first inbound channel Forja creates, so it gets an explicit consent gate —
-// MESH.md §6.1); on yes the session starts serving peers. `/relay off` stops it.
-// `/relay` while already serving reports status. A peer prompt arrives as an
-// untrusted system turn under the operator's approval — intent, never authority.
+// `/relay on` opens a confirm modal (opening the listen socket is the first
+// inbound channel Forja creates, so it gets an explicit consent gate —
+// MESH.md §6.1); on yes the session starts serving peers WITHOUT becoming
+// dedicated — the operator keeps working, and peer prompts interleave as their
+// own isolated system turns under the operator's approval. `/relay off` stops it.
+// Bare `/relay` reports status. A peer prompt is intent, never authority.
 
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
@@ -15,14 +16,14 @@ const statusNotes = (ctx: SlashContext): SlashResult => {
     kind: 'ok',
     notes: mgr.isServing()
       ? [`relay: on — serving as '${mgr.alias}'`]
-      : ['relay: off (run /relay to start serving mesh peers)'],
+      : ['relay: off (run /relay on to start serving mesh peers)'],
   };
 };
 
 export const relayCommand: SlashCommand = {
   name: 'relay',
-  description: 'serve mesh peers on a local socket (start / off)',
-  argHint: '[off]',
+  description: 'serve mesh peers on a local socket (on / off)',
+  argHint: 'on | off',
   exec: async (args, ctx): Promise<SlashResult> => {
     const mgr = ctx.baseConfig.meshManager;
     if (mgr === undefined) {
@@ -52,30 +53,39 @@ export const relayCommand: SlashCommand = {
       }
       return { kind: 'ok', notes: ['relay: off'] };
     }
-    if (sub.length > 0) {
-      return { kind: 'error', message: `/relay: unknown arg '${args[0]}' (usage: /relay [off])` };
+
+    if (sub === 'on') {
+      if (mgr.isServing()) {
+        syncBadge();
+        return statusNotes(ctx);
+      }
+      // Consent gate before opening the socket (§6.1). Headless (no modal) → the
+      // enqueueConfirm bridge resolves 'cancel', so we simply don't start.
+      const answer = await ctx.modalManager.askRelayStart({ alias: mgr.alias });
+      if (answer !== 'yes') return { kind: 'ok', notes: ['relay: not started'] };
+      try {
+        await mgr.startServing();
+      } catch (err) {
+        // startServing rolls its socket back on failure; sync the badge to OFF.
+        syncBadge();
+        return {
+          kind: 'error',
+          message: `/relay: could not start — ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+      syncBadge();
+      return {
+        kind: 'ok',
+        notes: [`relay: on — serving as '${mgr.alias}'; keep working, peer requests interleave`],
+      };
     }
-    if (mgr.isServing()) {
+
+    // Bare `/relay` reports status — `on`/`off` are the action verbs.
+    if (sub.length === 0) {
       syncBadge();
       return statusNotes(ctx);
     }
 
-    // Consent gate before opening the socket (§6.1). Headless (no modal) → the
-    // enqueueConfirm bridge resolves 'cancel', so we simply don't start.
-    const answer = await ctx.modalManager.askRelayStart({ alias: mgr.alias });
-    if (answer !== 'yes') return { kind: 'ok', notes: ['relay: not started'] };
-
-    try {
-      await mgr.startServing();
-    } catch (err) {
-      // startServing rolls its socket back on failure; sync the badge to OFF.
-      syncBadge();
-      return {
-        kind: 'error',
-        message: `/relay: could not start — ${err instanceof Error ? err.message : String(err)}`,
-      };
-    }
-    syncBadge();
-    return { kind: 'ok', notes: [`relay: on — serving as '${mgr.alias}', waiting for peers`] };
+    return { kind: 'error', message: `/relay: unknown arg '${args[0]}' (usage: /relay on | off)` };
   },
 };

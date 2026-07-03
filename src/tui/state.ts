@@ -2051,6 +2051,9 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
               'user) can send textual prompts to. Each arrives as an untrusted',
               'system turn under YOUR approval — a peer never edits or runs',
               'anything here directly (MESH.md §0).',
+              '',
+              'The session is NOT dedicated: you keep working normally; peer',
+              'requests interleave as their own isolated turns.',
             ],
             question: null,
             // Last option is the conservative default (D65): Enter without

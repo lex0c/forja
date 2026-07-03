@@ -38,22 +38,36 @@ describe('/relay', () => {
     expect((await relayCommand.exec([], ctx)).kind).toBe('error');
   });
 
-  test('confirm yes → starts serving and emits relay:change(active)', async () => {
+  test('on: confirm yes → starts serving and emits relay:change(active)', async () => {
     const mgr = makeManager();
     const { ctx, emitted } = makeCtx({ manager: mgr, answer: 'yes' });
-    const r = await relayCommand.exec([], ctx);
+    const r = await relayCommand.exec(['on'], ctx);
     expect(r.kind).toBe('ok');
     expect(mgr.isServing()).toBe(true);
     expect(emitted.some((e) => e.type === 'relay:change' && e.active === true)).toBe(true);
   });
 
-  test('confirm no → does not start, emits nothing', async () => {
+  test('on: confirm no → does not start, emits nothing', async () => {
     const mgr = makeManager();
     const { ctx, emitted } = makeCtx({ manager: mgr, answer: 'no' });
-    const r = await relayCommand.exec([], ctx);
+    const r = await relayCommand.exec(['on'], ctx);
     expect(r.kind).toBe('ok');
     expect(mgr.isServing()).toBe(false);
     expect(emitted).toHaveLength(0);
+  });
+
+  test('bare /relay reports status without starting (on/off are the verbs)', async () => {
+    const mgr = makeManager();
+    let modalAsked = false;
+    const { ctx } = makeCtx({ manager: mgr });
+    ctx.modalManager.askRelayStart = async () => {
+      modalAsked = true;
+      return 'yes';
+    };
+    const r = await relayCommand.exec([], ctx);
+    expect(r.kind).toBe('ok');
+    expect(mgr.isServing()).toBe(false); // never started
+    expect(modalAsked).toBe(false); // no consent gate opened
   });
 
   test('off → stops serving and emits relay:change(inactive)', async () => {
@@ -69,5 +83,28 @@ describe('/relay', () => {
   test('unknown arg → error', async () => {
     const { ctx } = makeCtx({ manager: makeManager() });
     expect((await relayCommand.exec(['bogus'], ctx)).kind).toBe('error');
+  });
+
+  test('on while already serving → reports status, does not re-open the modal', async () => {
+    const mgr = makeManager();
+    await mgr.startServing();
+    let modalAsked = false;
+    const { ctx } = makeCtx({ manager: mgr });
+    ctx.modalManager.askRelayStart = async () => {
+      modalAsked = true;
+      return 'yes';
+    };
+    const r = await relayCommand.exec(['on'], ctx);
+    expect(r.kind).toBe('ok');
+    expect(mgr.isServing()).toBe(true);
+    expect(modalAsked).toBe(false);
+  });
+
+  test('off while not serving → already off', async () => {
+    const mgr = makeManager();
+    const { ctx } = makeCtx({ manager: mgr });
+    const r = await relayCommand.exec(['off'], ctx);
+    expect(r.kind).toBe('ok');
+    expect(mgr.isServing()).toBe(false);
   });
 });
