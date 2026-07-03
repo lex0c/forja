@@ -2474,6 +2474,16 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     let drained: Notification[];
     if (notifications[0]?.kind === 'peer_message') {
       drained = notifications.splice(0, 1);
+    } else if (consecutiveWakes >= MAX_CONSECUTIVE_WAKES) {
+      // The wake cap is spent and ONLY a queued peer_message lifted the return
+      // above (hasPeerMessage). Do NOT drain + re-arm the non-peer prefix — those
+      // local wakes must stay semi-pushed at the cap, and running them first would
+      // both breach the cap and delay the very peer the exemption exists to
+      // protect. Skip straight to the peer (splice it from the middle), leaving the
+      // prefix queued for a later boundary. peerIdx ≥ 1 here: hasPeerMessage is
+      // true (else the return fired) and the head is a non-peer.
+      const peerIdx = notifications.findIndex((n) => n.kind === 'peer_message');
+      drained = notifications.splice(peerIdx, 1);
     } else {
       const nextPeer = notifications.findIndex((n) => n.kind === 'peer_message');
       drained = nextPeer === -1 ? notifications.splice(0) : notifications.splice(0, nextPeer);

@@ -1902,6 +1902,61 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('at the wake cap, a queued peer prompt drains before a non-peer prefix', async () => {
+    type PeerCb = (p: { conversationId: string; peerAlias: string; text: string }) => void;
+    let firePrompt: PeerCb | null = null;
+    const meshManager = meshStub({
+      onPrompt: (cb) => {
+        firePrompt = cb;
+      },
+    });
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ meshManager }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => {},
+    });
+    await tick();
+    stdin.feed('first\r');
+    await tick();
+    const holder = ra.captured[0]?.configs[0]?.bgManagerHolder;
+    ra.finish(0);
+    await tick();
+    // Drive consecutiveWakes to the cap (3) with three bg_done wakes.
+    for (let i = 1; i <= 3; i++) {
+      holder?.onEvent({ type: 'bg_started', processId: `p${i}`, command: 'x', label: null });
+      holder?.onEvent({ type: 'bg_ended', processId: `p${i}`, status: 'exited', exitCode: 0 });
+      await tick();
+      expect(ra.captured).toHaveLength(1 + i); // each bg_done ran its own turn
+      ra.finish(i);
+      await tick();
+    }
+    // Cap now spent. Queue a LOCAL wake, then a peer_message behind it.
+    holder?.onEvent({ type: 'bg_started', processId: 'p4', command: 'x', label: null });
+    holder?.onEvent({ type: 'bg_ended', processId: 'p4', status: 'exited', exitCode: 0 });
+    (firePrompt as unknown as PeerCb)({
+      conversationId: 'c1',
+      peerAlias: 'gateway',
+      text: 'help?',
+    });
+    await tick();
+    // The exemption drains the PEER (turn 5), not the queued bg_done prefix — the
+    // local wake stays semi-pushed at the cap rather than running past it.
+    expect(ra.captured).toHaveLength(5);
+    const input = ra.captured[4]?.configs[0]?.userPrompt ?? '';
+    expect(input).toContain('UNTRUSTED MESH PEER MESSAGE');
+    expect(input).not.toContain('[background]');
+    ra.finish(4, { sessionContext: {} as unknown as SessionContext });
+    await flushFrame();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('a peer turn whose model already replied (conversation closed) fails nothing and does not warn', async () => {
     type PeerCb = (p: { conversationId: string; peerAlias: string; text: string }) => void;
     let firePrompt: PeerCb | null = null;
