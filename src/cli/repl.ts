@@ -35,6 +35,7 @@ import { RESUME_FULL_WARN_THRESHOLD } from '../harness/resume.ts';
 import { effectiveBudget, isRecapEnabled, resolveMaxOutputTokens } from '../harness/types.ts';
 import { dispatchChain } from '../hooks/dispatcher.ts';
 import type { HookChainResult, HookEventPayload } from '../hooks/types.ts';
+import { framePeerPrompt } from '../mesh/envelope.ts';
 import type { PolicySource } from '../permissions/index.ts';
 import { buildAutoTerse } from '../recap/auto-display.ts';
 import { createReminderScheduler } from '../reminders/index.ts';
@@ -767,6 +768,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   });
   baseConfig.reminderScheduler = reminderScheduler;
 
+  // Mesh peer ingress (MESH.md §6.2): a peer's prompt — only possible while
+  // serving, i.e. after /relay — lands as a `peer_message` notification, driving
+  // the same wake-when-idle path as bg_done/reminder. Forward-references
+  // `enqueueNotification` (same runtime-only rationale as the holder/timer).
+  baseConfig.meshManager?.onPrompt(({ conversationId, peerAlias, text }) => {
+    if (exiting) return;
+    enqueueNotification({ kind: 'peer_message', conversationId, peerAlias, text });
+  });
+
   // Permission engine refused to come up (PERMISSION_ENGINE.md §7.2):
   // broken audit chain, invalid policy, install_id I/O failure, or a
   // sandbox required-but-unavailable. `refusing` is terminal — every
@@ -1459,11 +1469,21 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     note: string;
     scheduledAt: number;
   };
+  type PeerMessageNotification = {
+    kind: 'peer_message';
+    // Peer alias (scrollback origin header) + conversation id (so a later slice
+    // can route the filtered reply back). `text` is the raw peer prompt —
+    // enveloped as untrusted DATA before it reaches the model.
+    peerAlias: string;
+    conversationId: string;
+    text: string;
+  };
   // Producer payload (no id yet); `enqueueNotification` stamps the id.
-  type NotificationPayload = BgDoneNotification | ReminderNotification;
+  type NotificationPayload = BgDoneNotification | ReminderNotification | PeerMessageNotification;
   type Notification =
     | (BgDoneNotification & { id: string })
-    | (ReminderNotification & { id: string });
+    | (ReminderNotification & { id: string })
+    | (PeerMessageNotification & { id: string });
   const notifications: Notification[] = [];
   let notifSeq = 0;
   let drainNotifications: () => void = () => {};
@@ -1486,15 +1506,23 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       }
       case 'reminder':
         return `[reminder] ${flattenControlToLine(n.note)}`;
+      case 'peer_message':
+        // Peer alias is attacker-controlled — flatten control/ANSI (like
+        // bg_done/reminder) so it can't spoof the operator's scrollback.
+        return `▸ remote prompt from '${flattenControlToLine(n.peerAlias)}'`;
     }
   };
   // Full text fed to the model as the wake-turn input: headline + any
   // attached body. Only bg_done carries a body (the output head-tail);
   // reminder's headline is complete on its own.
-  const formatNotification = (n: Notification): string =>
-    n.kind === 'bg_done' && n.summary !== undefined
+  const formatNotification = (n: Notification): string => {
+    // A peer prompt is fed to the model enveloped as untrusted DATA (§5.2) — NOT
+    // the operator-facing origin headline.
+    if (n.kind === 'peer_message') return framePeerPrompt(n.peerAlias, n.text);
+    return n.kind === 'bg_done' && n.summary !== undefined
       ? `${formatNotificationHeadline(n)}\n${n.summary}`
       : formatNotificationHeadline(n);
+  };
   // Head + tail caps for the inline summary. The tail is bigger: for a
   // build/test, the RESULT (pass/fail counts, errors) lives at the END.
   const enqueueNotification = (n: NotificationPayload): void => {
@@ -2254,15 +2282,29 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     if (notifications.length === 0) return;
     // Operator-typing gate: don't steal the turn while they compose.
     if (renderer.state().input.value.length > 0) return;
-    // Consecutive-wake cap: anti-loop backstop.
-    if (consecutiveWakes >= MAX_CONSECUTIVE_WAKES) return;
+    // Consecutive-wake cap: anti-loop backstop. Exempt peer_message — the mesh
+    // has its own per-conversation bound (§8), and a served peer must not be
+    // throttled by the operator's local wake budget. Skip the cap whenever ANY
+    // queued item is a peer_message (not just the head), so a non-peer at the
+    // head can't starve a peer queued behind it.
+    const hasPeerMessage = notifications.some((n) => n.kind === 'peer_message');
+    if (!hasPeerMessage && consecutiveWakes >= MAX_CONSECUTIVE_WAKES) return;
     // Budget gate → degrade to semi-push when the cap is already spent.
     const cap = baseConfig.budget?.maxCostUsd;
     if (cap !== undefined && cumulative.costUsd >= cap) return;
-    // Coalesce: every pending notification goes into ONE wake-turn, so a
-    // burst of completions doesn't fire a turn each.
-    const drained = notifications.splice(0);
-    consecutiveWakes += 1;
+    // Coalesce non-peer notifications into ONE wake-turn; a peer_message is
+    // NEVER coalesced — each peer prompt is its own turn so its reply routes to
+    // the right conversation (§6). Drain a single peer_message at the head;
+    // otherwise coalesce the run of non-peer events up to the next peer.
+    let drained: Notification[];
+    if (notifications[0]?.kind === 'peer_message') {
+      drained = notifications.splice(0, 1);
+    } else {
+      const nextPeer = notifications.findIndex((n) => n.kind === 'peer_message');
+      drained = nextPeer === -1 ? notifications.splice(0) : notifications.splice(0, nextPeer);
+    }
+    // Peer turns are exempt from the wake cap (above), so don't count them.
+    if (drained[0]?.kind !== 'peer_message') consecutiveWakes += 1;
     // Surface each notification in the scrollback as a system `info`
     // entry (distinct from an operator-submit bar — the point of a
     // separate channel) so the operator sees WHY the session woke and
@@ -2276,7 +2318,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       // bg_done body (output head-tail) rides in the same message, each
       // row indented 4sp so it sits under the headline text (frame 2sp +
       // the `● ` prefix). A reminder has no body — headline only.
-      const body = n.kind === 'bg_done' ? n.summary : undefined;
+      const body =
+        n.kind === 'bg_done'
+          ? n.summary
+          : n.kind === 'peer_message'
+            ? // Untrusted peer text on the operator's TTY — strip control/ANSI
+              // (anti-spoof, like bg_done) and cap the scrollback length.
+              stripControlKeepLines(n.text).slice(0, 2000)
+            : undefined;
       const message =
         body === undefined
           ? headline
@@ -2361,6 +2410,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // Swallow — cleanup() is already per-client fail-soft; this guards a
         // surprise throw from blocking exit.
       }
+    }
+    // Mesh teardown (MESH.md §6.5): send bye to inbound peers, close the listen
+    // socket, remove the descriptor. The CLI owns this teardown
+    // (harness/types.ts) — without it the .sock + descriptor leak on exit.
+    if (baseConfig.meshManager !== undefined) {
+      await baseConfig.meshManager.shutdown();
     }
     // Session-scoped reminders (ORCHESTRATION.md §3B.9): clear every
     // pending timer so a fired callback can't run after teardown. Pure

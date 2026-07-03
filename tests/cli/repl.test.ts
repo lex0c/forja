@@ -127,6 +127,10 @@ interface MakeBootstrapStubOptions {
   // inspectable engine here; otherwise a default supervised engine is
   // created so `baseConfig.permissionEngine` is never undefined.
   permissionEngine?: PermissionEngine;
+  // Mesh manager stub — the repl wires `meshManager?.onPrompt(...)` for peer
+  // ingress; a test injects a stub whose onPrompt captures the callback so it
+  // can drive a peer prompt into the wake path.
+  meshManager?: unknown;
 }
 
 const makeBootstrapStub = (
@@ -154,6 +158,7 @@ const makeBootstrapStub = (
       opts.permissionEngine ??
       createPermissionEngine({ defaults: { mode: 'strict' }, tools: {} }, { cwd }),
     ...(opts.broker !== undefined ? { broker: opts.broker } : {}),
+    ...(opts.meshManager !== undefined ? { meshManager: opts.meshManager } : {}),
   } as unknown as HarnessConfig;
   return {
     config,
@@ -1529,6 +1534,57 @@ describe('repl — boot + smoke', () => {
     await tick();
     stdin.feed('\x04');
     expect(await promise).toBe(130);
+  });
+
+  test('a peer prompt (relay ingress) auto-wakes a system turn, enveloped as untrusted', async () => {
+    type PeerCb = (p: { conversationId: string; peerAlias: string; text: string }) => void;
+    let fire: PeerCb | null = null;
+    let meshShutdown = false;
+    const meshManager = {
+      onPrompt: (cb: PeerCb) => {
+        fire = cb;
+      },
+      shutdown: async () => {
+        meshShutdown = true;
+      },
+    };
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ meshManager }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    expect(fire).not.toBeNull();
+    // Turn 1 (operator), finished → idle.
+    stdin.feed('first\r');
+    await tick();
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // A peer prompt arrives while idle → wake-when-idle fires a turn.
+    (fire as unknown as PeerCb)({
+      conversationId: 'c1',
+      peerAlias: 'billing',
+      text: 'inspect the contract',
+    });
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    const cfg = ra.captured[1]?.configs[0];
+    // Fed to the model enveloped as untrusted DATA, and persisted source:'system'.
+    expect(cfg?.userPrompt ?? '').toContain('UNTRUSTED MESH PEER MESSAGE');
+    expect(cfg?.userPrompt ?? '').toContain('billing');
+    expect(cfg?.userPrompt ?? '').toContain('inspect the contract');
+    expect(cfg?.userPromptSource).toBe('system');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+    expect(meshShutdown).toBe(true); // mesh torn down at REPL exit
   });
 
   test('a bg process finishing while IDLE auto-wakes a turn (wake-when-idle, §3B.4)', async () => {

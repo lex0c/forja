@@ -26,6 +26,7 @@ import {
 } from './registry.ts';
 import { type MeshServer, type MeshTransport, connectMesh, listenMesh } from './transport.ts';
 import {
+  ALIAS_RE,
   MESH_ERROR_CODES,
   MESH_PROTOCOL_VERSION,
   type MeshConfig,
@@ -134,6 +135,17 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
                   `mesh protocol v${MESH_PROTOCOL_VERSION} required`,
                 ),
               ),
+            );
+            transport.close();
+            return;
+          }
+          // Revalidate the peer's declared alias against the grammar — it feeds
+          // the operator's scrollback header, so reject a control/injection alias
+          // at the door (the local alias is validated on load; this inbound one
+          // is attacker-controlled).
+          if (!ALIAS_RE.test(msg.alias)) {
+            transport.write(
+              encodeMeshMessage(makeError(MESH_ERROR_CODES.handshakeFailed, 'invalid alias')),
             );
             transport.close();
             return;
