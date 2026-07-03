@@ -84,6 +84,11 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
     finalVerb: 'Listed',
     subject: () => 'mesh peers',
   },
+  mesh_reply: {
+    activeVerb: 'Replying',
+    finalVerb: 'Replied',
+    subject: () => 'mesh peer',
+  },
   mesh_send: {
     activeVerb: 'Sending',
     finalVerb: 'Sent',

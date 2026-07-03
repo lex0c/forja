@@ -25,3 +25,4 @@ export {
 import './fs.ts';
 import './fetch.ts';
 import './bash.ts';
+import './mesh.ts';

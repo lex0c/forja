@@ -16,6 +16,7 @@ import { memoryReadTool } from './memory-read.ts';
 import { memorySearchTool } from './memory-search.ts';
 import { memoryWriteTool } from './memory-write.ts';
 import { meshPeersTool } from './mesh-peers.ts';
+import { meshReplyTool } from './mesh-reply.ts';
 import { meshSendTool } from './mesh-send.ts';
 import { readFileTool } from './read-file.ts';
 import { reminderCancelTool } from './reminder-cancel.ts';
@@ -75,6 +76,8 @@ export { memoryWriteTool } from './memory-write.ts';
 export type { MemoryWriteInput, MemoryWriteOutput } from './memory-write.ts';
 export { meshPeersTool } from './mesh-peers.ts';
 export type { MeshPeersInput, MeshPeersOutput } from './mesh-peers.ts';
+export { meshReplyTool } from './mesh-reply.ts';
+export type { MeshReplyInput, MeshReplyOutput } from './mesh-reply.ts';
 export { meshSendTool } from './mesh-send.ts';
 export type { MeshSendInput, MeshSendOutput } from './mesh-send.ts';
 export { monitorTool } from './monitor.ts';
@@ -158,6 +161,7 @@ export const BUILTIN_TOOLS = [
   // mesh_send delivers a textual request to one (egress, confirm per call).
   // Both deferred — reached via tool_search, off the base surface.
   meshPeersTool,
+  meshReplyTool,
   meshSendTool,
   // wait_for / monitor are intentionally NOT registered: the model
   // should not see or call them. The tool modules, their re-exports

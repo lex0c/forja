@@ -77,8 +77,9 @@ export interface MeshManager {
   // REPL wiring: a peer prompted us / a peer answered our send.
   onPrompt(cb: (p: InboundPrompt) => void): void;
   onReply(cb: (r: InboundReply) => void): void;
-  // Server → answer / progress on an inbound conversation.
-  sendResult(conversationId: string, text: string): void;
+  // Server → answer / progress on an inbound conversation. Returns false if the
+  // conversation is unknown/already closed (mesh_reply surfaces that to the model).
+  sendResult(conversationId: string, text: string): boolean;
   sendProgress(conversationId: string, state: MeshProgressState, note?: string): void;
   // Published status (idle / working / waiting-operator).
   setStatus(status: PeerStatus): void;
@@ -322,9 +323,9 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     return { conversationId };
   };
 
-  const sendResult = (conversationId: string, text: string): void => {
+  const sendResult = (conversationId: string, text: string): boolean => {
     const c = inbound.get(conversationId);
-    if (c === undefined) return;
+    if (c === undefined) return false;
     c.transport.write(encodeMeshMessage(makeProgress(conversationId, 'done')));
     // Clamp the answer to the §8 cap (marked, never silent) so the receiver
     // can't push an unbounded result across — the two-audiences filter (§7)
@@ -336,6 +337,7 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     // the buffered result before FIN, then reap the entry (no inbound leak).
     c.transport.close();
     inbound.delete(conversationId);
+    return true;
   };
 
   const sendProgress = (conversationId: string, state: MeshProgressState, note?: string): void => {

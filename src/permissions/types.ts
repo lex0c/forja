@@ -22,7 +22,13 @@ export type PolicyCategory =
   | 'misc'
   | 'mcp'
   | 'mcp.egress'
-  | 'mesh.egress';
+  | 'mesh.egress'
+  // Publishing a reply to a peer that already opened a conversation (mesh_reply).
+  // Deliberately NOT egress: it closes an inbound obligation the operator took on
+  // with `/relay on`, so it follows the operator's posture (supervised confirms
+  // what leaves; autonomous auto-approves) — unlike mesh.egress (initiating
+  // outbound contact), which stays gated even in autonomous. See MESH.md §5.3/§9.
+  | 'mesh.reply';
 
 // Categories that send bytes OUT of the machine to an operator-unconfined
 // destination. Egress is special-cased by the autonomous posture: a
