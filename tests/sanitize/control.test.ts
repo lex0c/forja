@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { flattenControlToLine, stripControlKeepLines } from '../../src/sanitize/index.ts';
+import {
+  collapseBlankLines,
+  flattenControlToLine,
+  stripControlKeepLines,
+} from '../../src/sanitize/index.ts';
 
 // Build a string with a raw control byte without putting it in the source.
 const c = (code: number): string => String.fromCharCode(code);
@@ -43,5 +47,24 @@ describe('stripControlKeepLines (multi-line body anti-spoof)', () => {
 
   test('drops bare C0 control bytes (BS/BEL/CR) but not LF/TAB', () => {
     expect(stripControlKeepLines(`a${BS}b${BEL}\r\nc`)).toBe('ab\nc');
+  });
+});
+
+describe('collapseBlankLines (anti-flood for untrusted multi-line text)', () => {
+  test('collapses a run of blank lines to a single empty line', () => {
+    expect(collapseBlankLines('a\n\n\n\n\n\nb')).toBe('a\n\nb');
+  });
+
+  test('a pure-newline flood shrinks to a bounded number of rows', () => {
+    const out = collapseBlankLines('\n'.repeat(2000));
+    expect(out.split('\n').length).toBeLessThanOrEqual(2);
+  });
+
+  test('preserves content lines and single blank separators (full fidelity)', () => {
+    expect(collapseBlankLines('para one\n\npara two\nline')).toBe('para one\n\npara two\nline');
+  });
+
+  test('treats whitespace-only lines as blank', () => {
+    expect(collapseBlankLines('a\n   \n\t\n  \nb')).toBe('a\n   \nb');
   });
 });

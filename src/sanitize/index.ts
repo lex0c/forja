@@ -1,4 +1,5 @@
 export {
+  collapseBlankLines,
   flattenControlToLine,
   SAFE_ONE_LINE_MAX,
   sanitizeOneLineForDisplay,

@@ -9,7 +9,9 @@ import { type LineFramer, createLineFramer } from '../wire/ndjson.ts';
 
 export interface MeshTransport {
   // Write an already-framed line (encodeMeshMessage output, trailing LF included).
-  write(line: string): void;
+  // Returns false if the transport is already closed or the socket write errored
+  // synchronously (the bytes did NOT leave); true if accepted or buffered for drain.
+  write(line: string): boolean;
   onLine(cb: (line: string) => void): () => void;
   onClose(cb: () => void): () => void;
   onError(cb: (err: unknown) => void): () => void;
@@ -27,6 +29,10 @@ interface SocketState {
   transport: MeshTransport;
   // Invoked from the socket's `drain` handler to push buffered bytes.
   onDrain: () => void;
+  // Invoked from the socket's `close` handler so a remote FIN flips the same
+  // `closed` flag a local close() sets — otherwise write() after a remote close
+  // would keep pumping to a dead socket and report success.
+  markClosed: () => void;
 }
 
 // Per-socket state keyed off the socket object — avoids threading Bun's generic
@@ -65,8 +71,9 @@ const attachSocket = (socket: Socket<undefined>): MeshTransport => {
     }
   };
 
-  // Push `bytes` onto the socket; buffer whatever it didn't accept.
-  const pump = (bytes: Uint8Array): void => {
+  // Push `bytes` onto the socket; buffer whatever it didn't accept. Returns
+  // false if the socket write threw (socket dead) — the bytes did not leave.
+  const pump = (bytes: Uint8Array): boolean => {
     try {
       const wrote = socket.write(bytes);
       if (wrote < bytes.length) {
@@ -75,8 +82,10 @@ const attachSocket = (socket: Socket<undefined>): MeshTransport => {
         pending = null;
         if (closeAfterDrain) doEnd();
       }
+      return true;
     } catch (err) {
       for (const cb of errorCbs) cb(err);
+      return false;
     }
   };
 
@@ -87,15 +96,15 @@ const attachSocket = (socket: Socket<undefined>): MeshTransport => {
 
   const transport: MeshTransport = {
     write(line) {
-      if (closed) return;
+      if (closed) return false;
       const bytes = encoder.encode(line);
       if (pending !== null) {
         // Already backpressured — queue behind the tail (preserve order); the
         // drain handler flushes it. Don't interleave a fresh socket.write.
         pending = concat(pending, bytes);
-        return;
+        return true;
       }
-      pump(bytes);
+      return pump(bytes);
     },
     onLine(cb) {
       lineCbs.add(cb);
@@ -124,7 +133,10 @@ const attachSocket = (socket: Socket<undefined>): MeshTransport => {
       }
     },
   };
-  states.set(socket, { framer, lineCbs, closeCbs, errorCbs, transport, onDrain });
+  const markClosed = (): void => {
+    closed = true;
+  };
+  states.set(socket, { framer, lineCbs, closeCbs, errorCbs, transport, onDrain, markClosed });
   return transport;
 };
 
@@ -133,7 +145,10 @@ const pushData = (socket: object, chunk: Uint8Array): void => {
 };
 const emitClose = (socket: object): void => {
   const s = states.get(socket);
-  if (s) for (const cb of s.closeCbs) cb();
+  if (s) {
+    s.markClosed(); // flip `closed` before notifying, so a close-cb's write() is a clean no-op
+    for (const cb of s.closeCbs) cb();
+  }
 };
 const emitError = (socket: object, err: unknown): void => {
   const s = states.get(socket);

@@ -135,6 +135,12 @@ export const DEFAULT_MESH_CONFIG: MeshConfig = {
 // the mesh past these).
 export const ABSOLUTE_MESH_LIMITS = {
   maxRounds: 64,
-  maxMessageBytes: 1 << 20, // 1 MiB — matches the wire line cap
+  // 256 KiB — deliberately well BELOW the wire framer's line cap (ndjson
+  // DEFAULT_LINE_CAP, 1 MiB). A message's byte count is the RAW text; the wire
+  // line is that text JSON-string-escaped (a control byte → `\uXXXX`, 6×) and
+  // wrapped in the DATA envelope. If the ceiling equaled the line cap, a
+  // max-size message would overflow the framer and be silently dropped
+  // (→ spurious peer_lost / a hung conversation). 256 KiB leaves 4× headroom.
+  maxMessageBytes: 256 * 1024,
   maxConcurrentConversations: 16,
 } as const;

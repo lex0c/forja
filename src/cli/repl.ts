@@ -39,7 +39,12 @@ import { framePeerPrompt, framePeerReply } from '../mesh/envelope.ts';
 import type { PolicySource } from '../permissions/index.ts';
 import { buildAutoTerse } from '../recap/auto-display.ts';
 import { createReminderScheduler } from '../reminders/index.ts';
-import { flattenControlToLine, stripAnsi, stripControlKeepLines } from '../sanitize/index.ts';
+import {
+  collapseBlankLines,
+  flattenControlToLine,
+  stripAnsi,
+  stripControlKeepLines,
+} from '../sanitize/index.ts';
 import {
   HISTORY_CAP,
   appendHistory,
@@ -2458,10 +2463,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           ? n.summary
           : n.kind === 'peer_message' || n.kind === 'peer_reply'
             ? // Untrusted peer text on the operator's TTY — strip control/ANSI
-              // (anti-spoof, like bg_done) and cap the scrollback length. The
-              // operator sees the peer's prompt/answer at full local fidelity
-              // (§0.5) even though the model receives it enveloped.
-              stripControlKeepLines(n.text).slice(0, 2000)
+              // (anti-spoof, like bg_done), collapse blank-line runs (anti-flood:
+              // a peer can't paint thousands of empty rows), and cap the length.
+              // The operator still sees the peer's prompt/answer at full local
+              // fidelity (§0.5) even though the model receives it enveloped.
+              collapseBlankLines(stripControlKeepLines(n.text)).slice(0, 2000)
             : undefined;
       const message =
         body === undefined
@@ -3541,6 +3547,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         cursor: result.next.cursor,
       });
       updateSlashSuggestions(result.next.value);
+      // Re-offer queued wakes the moment the buffer clears. drainNotifications'
+      // operator-typing gate holds them (incl. peer_message) while the buffer is
+      // non-empty, and nothing else re-kicks it until the next turn boundary or a
+      // new notification — so a peer prompt queued mid-typing would hang until
+      // then if the operator just backspaces to empty and sits idle. The drain
+      // self-guards (busy / nothing-pending), so an unconditional re-kick is safe.
+      if (result.next.value.length === 0) queueMicrotask(() => drainNotifications());
     }
 
     // Enter routing (INBOX docs/spec/INBOX.md §4.1 / §4.2):

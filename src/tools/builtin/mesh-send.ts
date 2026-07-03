@@ -8,7 +8,7 @@
 // under ITS operator's approval; this tool carries intent, never authority
 // (§0, §9). Off the base surface (deferred). See MESH.md §9.
 
-import { ALIAS_RE } from '../../mesh/types.ts';
+import { ALIAS_MAX, ALIAS_RE } from '../../mesh/types.ts';
 import { ERROR_CODES, type Tool, type ToolContext, type ToolResult, toolError } from '../types.ts';
 
 export interface MeshSendInput {
@@ -59,10 +59,14 @@ export const meshSendTool: Tool<MeshSendInput, MeshSendOutput> = {
         'mesh_send: a relay session does not initiate mesh sends (no transitive delegation)',
       );
     }
-    if (typeof input.peer !== 'string' || !ALIAS_RE.test(input.peer)) {
-      // Validate against the alias grammar (not just non-empty): the peer becomes
-      // the confirm modal's command line, so reject a control/injection alias at
-      // the tool boundary.
+    if (
+      typeof input.peer !== 'string' ||
+      !ALIAS_RE.test(input.peer) ||
+      input.peer.length > ALIAS_MAX
+    ) {
+      // Validate against the alias grammar AND length (not just non-empty): the
+      // peer becomes the confirm modal's command line, so reject a control/
+      // injection or unbounded alias at the tool boundary.
       return toolError(
         ERROR_CODES.invalidArg,
         "mesh_send: 'peer' must be a valid peer alias (from mesh_peers)",

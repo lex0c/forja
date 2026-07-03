@@ -4,8 +4,25 @@
 // bootstrap sink calls `recordMeshAuditEvent`. Correlation is by conversationId.
 
 import { createHash } from 'node:crypto';
+import { safeJsonParse } from '../../broker/safe-json.ts';
 import type { MeshAuditEvent } from '../../mesh/types.ts';
 import type { DB } from '../db.ts';
+
+// mesh_events is a non-chained operational log (migration 084): a corrupt or
+// tampered payload row must not crash the forensic read. Parse defensively —
+// safeJsonParse also blocks prototype pollution from a hand-edited DB — and drop
+// an unparseable payload to null rather than throwing out the whole conversation.
+const parsePayload = (raw: string | null): Record<string, unknown> | null => {
+  if (raw === null) return null;
+  try {
+    const parsed = safeJsonParse(raw);
+    return typeof parsed === 'object' && parsed !== null
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+};
 
 export interface MeshEventRow {
   id: string;
@@ -67,8 +84,7 @@ export const listMeshEventsByConversation = (db: DB, conversationId: string): Me
     kind: r.kind,
     conversationId: r.conversation_id,
     peerAlias: r.peer_alias,
-    payload:
-      r.payload_json !== null ? (JSON.parse(r.payload_json) as Record<string, unknown>) : null,
+    payload: parsePayload(r.payload_json),
     createdAt: r.created_at,
   }));
 };

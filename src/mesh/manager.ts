@@ -26,6 +26,7 @@ import {
 } from './registry.ts';
 import { type MeshServer, type MeshTransport, connectMesh, listenMesh } from './transport.ts';
 import {
+  ALIAS_MAX,
   ALIAS_RE,
   CONVERSATION_ID_RE,
   MESH_ERROR_CODES,
@@ -47,6 +48,9 @@ export interface MeshManagerDeps {
   branch: string;
   // Defaults to process.pid; injectable for tests.
   pid?: number;
+  // Pre-conversation reap window (see HANDSHAKE_DEADLINE_MS); injectable for
+  // tests so they don't wait the full 30 s.
+  handshakeDeadlineMs?: number;
   // Optional boundary-audit sink (§8): the manager emits MeshAuditEvents at the
   // wire hub (prompt received / reply published / reply received); the sink,
   // wired in bootstrap with the DB, persists them to `mesh_events`. No-op when
@@ -120,6 +124,13 @@ const clampUtf8 = (text: string, maxBytes: number): string => {
   return s + marker;
 };
 
+// A connection that opens but never drives a conversation (never sends a valid
+// prompt) pins an fd + a partial-line framer buffer indefinitely — there is no
+// OS liveness signal across independent processes. Bound the pre-conversation
+// window generously: a real client sends hello+prompt within milliseconds, so
+// 30 s only ever reaps a stalled/half-open connection, never a legitimate one.
+const HANDSHAKE_DEADLINE_MS = 30_000;
+
 export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
   const pid = deps.pid ?? process.pid;
   const alias = resolveAlias(deps.config, deps.repoRoot);
@@ -166,6 +177,20 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     // null until a valid hello arrives — a prompt before hello is rejected so it
     // can't bypass version negotiation (§4).
     let peerAlias: string | null = null;
+    // Reap a connection that stalls before driving any conversation (see
+    // HANDSHAKE_DEADLINE_MS). Cleared once the first prompt is accepted (a real
+    // peer) and on close; unref'd so it never keeps the process alive.
+    let handshakeTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+      handshakeTimer = null;
+      transport.close();
+    }, deps.handshakeDeadlineMs ?? HANDSHAKE_DEADLINE_MS);
+    handshakeTimer.unref?.();
+    const clearHandshakeTimer = (): void => {
+      if (handshakeTimer !== null) {
+        clearTimeout(handshakeTimer);
+        handshakeTimer = null;
+      }
+    };
     transport.onLine((line) => {
       const res = parseMeshLine(line);
       if (!res.ok) return; // drop malformed, keep channel open (§4.5 lineage)
@@ -188,7 +213,11 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
           // the operator's scrollback header, so reject a control/injection alias
           // at the door (the local alias is validated on load; this inbound one
           // is attacker-controlled).
-          if (!ALIAS_RE.test(msg.alias)) {
+          if (!ALIAS_RE.test(msg.alias) || msg.alias.length > ALIAS_MAX) {
+            // Grammar AND length — ALIAS_RE's `*` is unbounded; without the cap a
+            // ~1 MiB alias (under the wire line cap) would ride into the model's
+            // envelope + scrollback + audit. The config loader and the registry
+            // both pair the grammar with ALIAS_MAX; the wire ingress must too.
             transport.write(
               encodeMeshMessage(makeError(MESH_ERROR_CODES.handshakeFailed, 'invalid alias')),
             );
@@ -217,6 +246,23 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
             transport.write(
               encodeMeshMessage(
                 makeError(MESH_ERROR_CODES.invalidConversation, 'invalid conversationId'),
+              ),
+            );
+            transport.close();
+            return;
+          }
+          if (inbound.has(msg.conversationId)) {
+            // A conversationId already in flight — accepting it would overwrite the
+            // live conversation's reply transport (the first answer would go
+            // nowhere) AND drive a second local turn + double audit for one id.
+            // The initiator mints a unique id per send; a collision is malformed.
+            transport.write(
+              encodeMeshMessage(
+                makeError(
+                  MESH_ERROR_CODES.invalidConversation,
+                  'conversationId already in flight',
+                  msg.conversationId,
+                ),
               ),
             );
             transport.close();
@@ -252,6 +298,7 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
             return;
           }
           inbound.set(msg.conversationId, { transport, peerAlias });
+          clearHandshakeTimer(); // a real conversation is in flight — connection is legit
           transport.write(encodeMeshMessage(makeProgress(msg.conversationId, 'accepted')));
           emitAudit({
             kind: 'peer_prompt_received',
@@ -269,6 +316,7 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
       }
     });
     transport.onClose(() => {
+      clearHandshakeTimer();
       for (const [cid, c] of inbound) if (c.transport === transport) inbound.delete(cid);
     });
   };
@@ -331,8 +379,13 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
       if (settled) return;
       settled = true;
       clientTransports.delete(transport);
-      replyCb?.({ conversationId, peerAlias: targetAlias, text: replyText });
-      transport.close();
+      try {
+        replyCb?.({ conversationId, peerAlias: targetAlias, text: replyText });
+      } finally {
+        // Always reclaim the socket — if the reply sink throws, skipping close()
+        // would strand the fd + leave the transport in clientTransports forever.
+        transport.close();
+      }
     };
     transport.onLine((line) => {
       const res = parseMeshLine(line);
@@ -363,18 +416,27 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
   const sendResult = (conversationId: string, text: string): boolean => {
     const c = inbound.get(conversationId);
     if (c === undefined) return false;
+    // Clamp ONCE. The §8 cap keeps the receiver from pushing an unbounded result
+    // (the two-audiences filter §7 already stripped tool output; this bounds
+    // size). Audit exactly what LEAVES on the wire — hashing the raw pre-clamp
+    // text would record bytes different from what the peer actually receives.
+    const clamped = clampUtf8(text, deps.config.maxMessageBytes);
     c.transport.write(encodeMeshMessage(makeProgress(conversationId, 'done')));
-    // Clamp the answer to the §8 cap (marked, never silent) so the receiver
-    // can't push an unbounded result across — the two-audiences filter (§7)
-    // already stripped tool output; this bounds size.
-    c.transport.write(
-      encodeMeshMessage(makeResult(conversationId, clampUtf8(text, deps.config.maxMessageBytes))),
-    );
+    const delivered = c.transport.write(encodeMeshMessage(makeResult(conversationId, clamped)));
+    if (!delivered) {
+      // The socket was already closed / the write errored synchronously: don't
+      // claim success or emit a reply_published for a result that never left.
+      // (A buffered write the peer never reads is a residual we can't observe —
+      // there is no application ACK; the initiator learns via its own peer_lost.)
+      c.transport.close();
+      inbound.delete(conversationId);
+      return false;
+    }
     emitAudit({
       kind: 'reply_published',
       conversationId,
       peerAlias: c.peerAlias,
-      output: text,
+      output: clamped,
     });
     // result is the conversation's last message (§4) — graceful close flushes
     // the buffered result before FIN, then reap the entry (no inbound leak).

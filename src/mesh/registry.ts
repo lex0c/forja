@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { safeJsonParse } from '../broker/safe-json.ts';
 import {
   ALIAS_MAX,
@@ -28,6 +28,21 @@ import {
 // forward to the model. The wire has a 1 MiB framer cap; descriptors get their
 // own, tighter one.
 const MAX_DESCRIPTOR_BYTES = 8 * 1024;
+
+// `branch` is the one model-facing descriptor field (mesh_peers, §2) whose value
+// isn't a strict grammar the way alias/status are — a git ref is too permissive.
+// Bound it and reject control bytes / newlines so a planted descriptor can't
+// smuggle a fake tool boundary or ANSI into the model's context outside the
+// nonce fence. Plain-text content past that is untrusted-but-gated, like any
+// external string a tool surfaces.
+const BRANCH_MAX = 256;
+const hasControlChars = (s: string): boolean => {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x20 || c === 0x7f) return true;
+  }
+  return false;
+};
 
 // Resolve the mesh runtime root. Prefer $XDG_RUNTIME_DIR (0700, per-user by
 // construction on Linux); fall back to a per-uid tmpdir where it is unset (the
@@ -109,9 +124,10 @@ const isAlive = (pid: number): boolean => {
 // is attacker-controllable (same-user, §0.7): `alias` must match the path-safe
 // grammar (blocks `../` traversal through descriptorPath/socketPath + removeDescriptor's
 // rmSync), `pid` must be a positive integer (pid:0 signals our own process group
-// → phantom-alive forever), and `status` must be one of the enum values (it flows
-// to the model via mesh_peers, so an arbitrary string would be an unenveloped
-// injection channel).
+// → phantom-alive forever), and `status`/`branch` are model-facing (mesh_peers)
+// so they're bounded — `status` to the enum, `branch` to BRANCH_MAX with no
+// control bytes — since an arbitrary string there is an unenveloped injection
+// channel.
 const parseDescriptor = (raw: string): PeerDescriptor | null => {
   if (raw.length > MAX_DESCRIPTOR_BYTES) return null;
   let parsed: unknown;
@@ -128,6 +144,8 @@ const parseDescriptor = (raw: string): PeerDescriptor | null => {
     !ALIAS_RE.test(o.alias) ||
     typeof o.repoRoot !== 'string' ||
     typeof o.branch !== 'string' ||
+    o.branch.length > BRANCH_MAX ||
+    hasControlChars(o.branch) ||
     typeof o.pid !== 'number' ||
     !Number.isInteger(o.pid) ||
     o.pid <= 0 ||
@@ -160,14 +178,28 @@ export const listPeers = (
   const out: PeerDescriptor[] = [];
   for (const name of entries) {
     if (!name.endsWith('.json')) continue;
+    const filePath = join(dirPath, name);
     let raw: string;
     try {
-      raw = readFileSync(join(dirPath, name), 'utf8');
+      // Bound + shape-check BEFORE reading into memory. lstat (not stat) so a
+      // symlink is caught as a non-regular file and skipped — otherwise the read
+      // would follow it to an arbitrary target, and an oversized descriptor would
+      // be slurped wholesale before parseDescriptor's post-read cap can reject it.
+      const st = lstatSync(filePath);
+      if (!st.isFile() || st.size > MAX_DESCRIPTOR_BYTES) continue;
+      raw = readFileSync(filePath, 'utf8');
     } catch {
       continue;
     }
     const desc = parseDescriptor(raw);
     if (desc === null) continue; // invalid/foreign-shaped → leave it, never act on it
+    // The sweep + discovery key on the FILE we read, NOT the alias INSIDE it
+    // (attacker-controllable). A descriptor whose filename doesn't match its own
+    // alias is malformed/planted — acting on it would sweep a DIFFERENT, possibly
+    // live, peer's <alias>.json/.sock (removeDescriptor keys on desc.alias). Skip:
+    // never surface, never sweep. With this guard, desc.alias === basename(name),
+    // so removeDescriptor targets exactly the file we read.
+    if (basename(name, '.json') !== desc.alias) continue;
     if (!isAlive(desc.pid)) {
       if (opts.sweep !== false) removeDescriptor(dir, desc.alias);
       continue;

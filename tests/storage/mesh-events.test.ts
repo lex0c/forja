@@ -63,4 +63,16 @@ describe('mesh_events repo', () => {
       recordMeshAuditEvent(db, { kind: 'bogus', conversationId: 'c1', peerAlias: 'x' } as never, 1),
     ).toThrow();
   });
+
+  test('a corrupt/tampered payload_json row reads as null, not a thrown parse error', () => {
+    // The log is non-chained (operational) — a hand-edited/truncated payload must
+    // not crash the forensic read of the whole conversation.
+    db.query(
+      `INSERT INTO mesh_events (id, kind, conversation_id, peer_alias, payload_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run('r1', 'reply_published', 'c1', 'x', '{not valid json', 1);
+    const rows = listMeshEventsByConversation(db, 'c1');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.payload).toBeNull();
+  });
 });

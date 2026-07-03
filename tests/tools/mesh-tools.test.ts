@@ -58,6 +58,12 @@ describe('mesh_send tool', () => {
     expect(isToolError(r) && r.error_code).toBe('tool.invalid_arg');
   });
 
+  test('rejects an over-length peer alias (grammar-valid but unbounded)', async () => {
+    const mgr = { isServing: () => false, send: async () => ({ conversationId: 'c1' }) };
+    const r = await meshSendTool.execute({ peer: 'a'.repeat(5000), message: 'hi' }, ctxWith(mgr));
+    expect(isToolError(r) && r.error_code).toBe('tool.invalid_arg');
+  });
+
   test('refuses to send while THIS session is serving (no transitive delegation, §8)', async () => {
     const mgr = { isServing: () => true, send: async () => ({ conversationId: 'c1' }) };
     const r = await meshSendTool.execute({ peer: 'billing', message: 'hi' }, ctxWith(mgr));
