@@ -15,6 +15,8 @@ import { memoryListTool } from './memory-list.ts';
 import { memoryReadTool } from './memory-read.ts';
 import { memorySearchTool } from './memory-search.ts';
 import { memoryWriteTool } from './memory-write.ts';
+import { meshPeersTool } from './mesh-peers.ts';
+import { meshSendTool } from './mesh-send.ts';
 import { readFileTool } from './read-file.ts';
 import { reminderCancelTool } from './reminder-cancel.ts';
 import { reminderListTool } from './reminder-list.ts';
@@ -71,6 +73,10 @@ export type {
 } from './memory-search.ts';
 export { memoryWriteTool } from './memory-write.ts';
 export type { MemoryWriteInput, MemoryWriteOutput } from './memory-write.ts';
+export { meshPeersTool } from './mesh-peers.ts';
+export type { MeshPeersInput, MeshPeersOutput } from './mesh-peers.ts';
+export { meshSendTool } from './mesh-send.ts';
+export type { MeshSendInput, MeshSendOutput } from './mesh-send.ts';
 export { monitorTool } from './monitor.ts';
 export { reminderTool } from './reminder.ts';
 export type { ReminderInput, ReminderOutput } from './reminder.ts';
@@ -148,6 +154,11 @@ export const BUILTIN_TOOLS = [
   // tool_search — reveals deferred tools (AGENTIC_CLI §7.6). Read-only
   // discovery; always visible (it's how the model reaches the deferred set).
   toolSearchTool,
+  // Mesh tools (MESH.md §9): mesh_peers discovers serving peers (read-only),
+  // mesh_send delivers a textual request to one (egress, confirm per call).
+  // Both deferred — reached via tool_search, off the base surface.
+  meshPeersTool,
+  meshSendTool,
   // wait_for / monitor are intentionally NOT registered: the model
   // should not see or call them. The tool modules, their re-exports
   // below, and the underlying `src/wait/` subsystem stay intact —

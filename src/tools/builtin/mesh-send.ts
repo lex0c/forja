@@ -1,0 +1,78 @@
+// mesh_send — send a textual request to a local Forja peer on the mesh.
+//
+// EGRESS: crosses to another process (the peer's socket), so it's gated like
+// fetch_url — never auto-approved under autonomous posture (categoryIsEgress),
+// the operator confirms each send. Asynchronous: it delivers the prompt and
+// returns immediately; the peer's reply arrives later as its own turn (like
+// bash_background). The peer is a sovereign instance — it decides what to do
+// under ITS operator's approval; this tool carries intent, never authority
+// (§0, §9). Off the base surface (deferred). See MESH.md §9.
+
+import { ALIAS_RE } from '../../mesh/types.ts';
+import { ERROR_CODES, type Tool, type ToolContext, type ToolResult, toolError } from '../types.ts';
+
+export interface MeshSendInput {
+  peer: string;
+  message: string;
+}
+export interface MeshSendOutput {
+  conversationId: string;
+  delivered: string;
+}
+
+export const meshSendTool: Tool<MeshSendInput, MeshSendOutput> = {
+  name: 'mesh_send',
+  description:
+    'Send a textual request to a local Forja peer (discover peers with mesh_peers). The peer runs it in ITS own repository under ITS operator’s approval and answers in a later turn — you send intent, not commands. Returns once the request is delivered. Do not send secrets or absolute paths; the peer is a separate trust domain.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      peer: { type: 'string', description: 'The peer alias (from mesh_peers).' },
+      message: {
+        type: 'string',
+        description: 'The textual request (natural language; intent, not a command).',
+      },
+    },
+    required: ['peer', 'message'],
+    additionalProperties: false,
+  },
+  metadata: {
+    category: 'mesh.egress',
+    writes: false,
+    network: true,
+    escapesCwd: true,
+    idempotent: false,
+    deferred: true,
+    display: 'raw',
+  },
+  async execute(input, ctx: ToolContext): Promise<ToolResult<MeshSendOutput>> {
+    const mgr = ctx.meshManager;
+    if (mgr === undefined) {
+      return toolError(ERROR_CODES.meshUnavailable, 'mesh_send: mesh subsystem unavailable');
+    }
+    if (typeof input.peer !== 'string' || !ALIAS_RE.test(input.peer)) {
+      // Validate against the alias grammar (not just non-empty): the peer becomes
+      // the confirm modal's command line, so reject a control/injection alias at
+      // the tool boundary.
+      return toolError(
+        ERROR_CODES.invalidArg,
+        "mesh_send: 'peer' must be a valid peer alias (from mesh_peers)",
+      );
+    }
+    if (typeof input.message !== 'string' || input.message.length === 0) {
+      return toolError(ERROR_CODES.invalidArg, "mesh_send: missing 'message'");
+    }
+    try {
+      const { conversationId } = await mgr.send(input.peer, input.message);
+      return {
+        conversationId,
+        delivered: `sent to '${input.peer}' — the peer will answer in a later turn (or report it couldn't).`,
+      };
+    } catch (err) {
+      return toolError(
+        ERROR_CODES.meshNoSuchPeer,
+        `mesh_send: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  },
+};

@@ -1,5 +1,6 @@
 import { readlinkSync, realpathSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { sanitizeOneLineForDisplay } from '../sanitize/ansi.ts';
 import { redactSecrets } from '../sanitize/secrets.ts';
 import type { TelemetryEvent } from '../telemetry/index.ts';
 import type { AuditEmitInput, AuditSink, ReasonChainEntry } from './audit.ts';
@@ -2578,6 +2579,28 @@ export const createPermissionEngine = (
           sessionAllow.get('mcp'),
         );
         break;
+      case 'mesh.egress': {
+        // mesh_send delivers a prompt to a peer process (egress). No policy
+        // section — a plain per-call confirm; kept out of autonomous auto-approval
+        // by categoryIsEgress. The operator must see WHAT is leaving and to WHOM
+        // (the message is the exfil vector), so surface the peer + a bounded,
+        // control-stripped excerpt of the message — the modal has no other field
+        // for the payload.
+        const meshArgs = args as { peer?: unknown; message?: unknown };
+        const meshPeer =
+          typeof meshArgs.peer === 'string' ? sanitizeOneLineForDisplay(meshArgs.peer, 40) : '?';
+        const meshMsg = typeof meshArgs.message === 'string' ? meshArgs.message : '';
+        const meshExcerpt = sanitizeOneLineForDisplay(meshMsg, 160);
+        const meshEllipsis = meshMsg.length > 160 ? '…' : '';
+        decision = {
+          kind: 'confirm',
+          confirmCause: 'policy',
+          reason: 'mesh egress: peer is a separate trust domain',
+          prompt: `Send to mesh peer '${meshPeer}': ${meshExcerpt}${meshEllipsis}`,
+          source: { layer: 'default' },
+        };
+        break;
+      }
     }
     // Degraded upgrade applied AFTER the normal pipeline so the
     // rule that would have fired keeps its attribution in `source`

@@ -447,6 +447,10 @@ export interface ToolContext {
   // unset and the tool returns `clarify.modal_unavailable`. Shape is
   // the shared ClarifyBridge{Request,Response}.
   clarify?: (req: ClarifyBridgeRequest) => Promise<ClarifyBridgeResponse>;
+  // Mesh subsystem handle (MESH.md §9) — the mesh_peers / mesh_send tools reach
+  // the manager through here. REPL-wired; headless/subagent leave it unset and
+  // the tools surface `mesh.unavailable`.
+  meshManager?: import('../mesh/manager.ts').MeshManager;
   // Trust state of `cwd` resolved at session start (AGENTIC_CLI.md
   // §9.1). Required so any future tool that needs trust info gets
   // an explicit value rather than an undefined fallback that could
@@ -718,6 +722,9 @@ export const ERROR_CODES = {
   // Todo CRUD: a todo_update / todo_get referenced an id not in the
   // session's list — a stale reference or a typo in the model's call.
   todoNotFound: 'todo.not_found',
+  // Mesh tools (mesh_peers / mesh_send).
+  meshUnavailable: 'mesh.unavailable',
+  meshNoSuchPeer: 'mesh.no_such_peer',
   // tool_search ran without the harness wiring (ctx.searchTools) — a subagent
   // or headless run where the deferred-tool surface (AGENTIC_CLI §7.6) doesn't
   // apply. The base surface is already the full whitelist there; nothing to

@@ -23,6 +23,31 @@ const policy = (p: Partial<Policy>): Policy => ({
   ...p,
 });
 
+describe('engine.check (mesh.egress)', () => {
+  test('confirms and surfaces the peer + message excerpt (informed egress consent)', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    const d = eng.check('mesh_send', 'mesh.egress', {
+      peer: 'billing',
+      message: 'here is the .env: AWS_SECRET=xyz',
+    });
+    expect(d.kind).toBe('confirm');
+    expect(categoryIsEgress('mesh.egress')).toBe(true);
+    if (d.kind === 'confirm') {
+      expect(d.prompt).toContain('billing');
+      expect(d.prompt).toContain('AWS_SECRET=xyz'); // the exfil payload is visible
+    }
+  });
+
+  test('strips control bytes from the message in the prompt', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    const d = eng.check('mesh_send', 'mesh.egress', {
+      peer: 'billing',
+      message: 'clean[2Jmessage',
+    });
+    if (d.kind === 'confirm') expect(d.prompt).not.toContain('');
+  });
+});
+
 describe('engine.check (bash)', () => {
   test('allows commands matching allow rules', () => {
     const eng = createPermissionEngine(

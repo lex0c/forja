@@ -136,6 +136,8 @@ describe('bootstrap', () => {
         'memory_read',
         'memory_search',
         'memory_write',
+        'mesh_peers',
+        'mesh_send',
         'read_file',
         'reminder',
         'reminder_cancel',

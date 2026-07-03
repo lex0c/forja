@@ -21,7 +21,8 @@ export type PolicyCategory =
   | 'web.fetch'
   | 'misc'
   | 'mcp'
-  | 'mcp.egress';
+  | 'mcp.egress'
+  | 'mesh.egress';
 
 // Categories that send bytes OUT of the machine to an operator-unconfined
 // destination. Egress is special-cased by the autonomous posture: a
@@ -33,7 +34,7 @@ export type PolicyCategory =
 // matched as `category === 'web.fetch'` at each guard site (which would
 // silently auto-approve the new category and reopen the exfil hole).
 export const categoryIsEgress = (category: PolicyCategory): boolean =>
-  category === 'web.fetch' || category === 'mcp.egress';
+  category === 'web.fetch' || category === 'mcp.egress' || category === 'mesh.egress';
 
 export type PolicyMode = 'strict' | 'acceptEdits' | 'bypass';
 
