@@ -1851,6 +1851,57 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('a queued peer prompt is declined (not left hanging) when the cost budget is spent', async () => {
+    type PeerCb = (p: { conversationId: string; peerAlias: string; text: string }) => void;
+    let firePrompt: PeerCb | null = null;
+    const declined: Array<{ cid: string; text: string }> = [];
+    const meshManager = meshStub({
+      onPrompt: (cb) => {
+        firePrompt = cb;
+      },
+      sendResult: (cid, text) => {
+        declined.push({ cid, text });
+        return true;
+      },
+    });
+    const writes: string[] = [];
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ meshManager }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    // An operator turn spends the whole cost budget (DEFAULT_BUDGET.maxCostUsd).
+    stdin.feed('first\r');
+    await tick();
+    ra.finish(0, { costUsd: 999 });
+    await tick();
+    // A peer prompt arrives with the budget already spent.
+    (firePrompt as unknown as PeerCb)({
+      conversationId: 'c-budget',
+      peerAlias: 'gateway',
+      text: 'help?',
+    });
+    await tick();
+    // Declined with a budget-exhausted result (slot freed, initiator gets closure) —
+    // NOT left hanging, and no peer turn ran (unlike a local wake's semi-push).
+    expect(ra.captured).toHaveLength(1); // only the operator turn
+    expect(declined).toHaveLength(1);
+    expect(declined[0]?.cid).toBe('c-budget');
+    expect(declined[0]?.text).toContain('cost budget');
+    expect(writes.join('')).toContain('cost budget reached');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('a peer turn whose model already replied (conversation closed) fails nothing and does not warn', async () => {
     type PeerCb = (p: { conversationId: string; peerAlias: string; text: string }) => void;
     let firePrompt: PeerCb | null = null;

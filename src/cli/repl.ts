@@ -2440,9 +2440,33 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // head can't starve a peer queued behind it.
     const hasPeerMessage = notifications.some((n) => n.kind === 'peer_message');
     if (!hasPeerMessage && consecutiveWakes >= MAX_CONSECUTIVE_WAKES) return;
-    // Budget gate → degrade to semi-push when the cap is already spent.
+    // Budget gate. Local wakes (bg_done / reminder) degrade to semi-push here —
+    // they wait for the operator. But a peer_message can't wait: leaving it queued
+    // holds the initiating peer's conversation open indefinitely (unlike the
+    // max-rounds / crash paths, which send a result and free the slot). So when the
+    // cap is spent, DECLINE every queued peer prompt with an explicit
+    // budget-exhausted result (frees the slot, gives the initiator closure), then
+    // semi-push whatever non-peer wakes remain.
     const cap = baseConfig.budget?.maxCostUsd;
-    if (cap !== undefined && cumulative.costUsd >= cap) return;
+    if (cap !== undefined && cumulative.costUsd >= cap) {
+      const budgetMgr = baseConfig.meshManager;
+      for (let i = notifications.length - 1; i >= 0; i--) {
+        const n = notifications[i];
+        if (n?.kind !== 'peer_message') continue;
+        budgetMgr?.sendResult(
+          n.conversationId,
+          '[mesh: this peer is at its cost budget; ask its operator to intervene]',
+        );
+        bus.emit({
+          type: 'info',
+          ts: now(),
+          tone: 'secondary',
+          message: `● ▸ declined a prompt from '${flattenControlToLine(n.peerAlias)}' — cost budget reached`,
+        });
+        notifications.splice(i, 1);
+      }
+      return;
+    }
     // Coalesce non-peer notifications into ONE wake-turn; a peer_message is
     // NEVER coalesced — each peer prompt is its own turn so its reply routes to
     // the right conversation (§6). Drain a single peer_message at the head;
