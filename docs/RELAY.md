@@ -85,7 +85,11 @@ authority.
   identity rests on these permissions plus the logical alias in the handshake.)
 - **Local sovereignty.** Every effect a peer's prompt would cause runs through
   the local permission engine under the operator's own posture. The permission
-  engine never consults the peer's text to decide authorization.
+  engine never consults the peer's text to decide authorization. When a peer's
+  turn triggers a confirm, the modal is labeled with the peer's alias (`peer:
+  '<alias>'`) — so you always know an effect was requested by a peer, not by you —
+  and the `mesh_send` / `mesh_reply` modals show the outgoing payload, so you see
+  exactly what would leave before you approve it.
 - **Provenance.** A peer prompt is a turn driver with `trust: untrusted` and
   enters as `source: 'system'` — never `source: 'user'`. Its body is wrapped as
   DATA between per-message nonce markers (the same fence `fetch_url` uses for web
@@ -118,15 +122,15 @@ trust domain.
 
 | Command | Effect |
 |---|---|
-| `/relay on` | Confirm, then start serving peers. The session stays interactive — **not dedicated**; you keep working while peer requests interleave. |
+| `/relay on` | Confirm, then start serving peers. The session stays interactive — **not dedicated**; you keep working while peer requests interleave. (`mesh_send` is disabled while serving — send from a non-relay session.) |
 | `/relay off` | Stop serving: say goodbye in-band to open conversations, close the socket, remove the descriptor. |
-| `/relay` | Report status (serving or not). `on` / `off` are the action verbs. |
+| `/relay` | Report status: serving or not, and (when serving) the inbound conversations in flight. `on` / `off` are the action verbs. |
 
 ## Tools
 
 | Tool | Category | Notes |
 |---|---|---|
-| `mesh_peers` | `misc` | Lists live serving instances — `alias`, `branch`, `status` (`idle` / `working`; `waiting-operator` is reserved — see follow-ups). Never the repo path. Off the base surface (discovered via tool search). |
+| `mesh_peers` | `misc` | Lists live serving instances — `alias`, `branch`, `status` (`idle` / `working` / `waiting-operator`, the last shown when that peer's turn is blocked on its operator's confirm). Never the repo path. Off the base surface (discovered via tool search). |
 | `mesh_send` | `mesh.egress` | Sends a textual request to a peer. Egress → operator confirms each call, and it is never auto-approved under autonomous. Asynchronous (the reply arrives in a later turn). Refuses while **this** session is itself serving — a relay does not initiate onward sends (no transitive delegation). |
 | `mesh_reply` | `mesh.reply` | Publishes your answer back to a peer that sent you a request (the `conversationId` is the handle from the incoming message; this closes the conversation). **Respects your posture** — supervised confirms what leaves (the two-audiences review), autonomous auto-approves. NOT egress. Off the base surface. |
 
@@ -144,7 +148,9 @@ max_concurrent_conversations = 4   # inbound conversations in flight
 ```
 
 Every value is clamped to a hard ceiling a typo or hostile config cannot lift:
-`max_rounds ≤ 64`, `max_message_bytes ≤ 1 MiB`, `max_concurrent_conversations ≤ 16`.
+`max_rounds ≤ 64`, `max_message_bytes ≤ 256 KiB`, `max_concurrent_conversations ≤ 16`.
+(The message ceiling sits deliberately below the 1 MiB wire framer cap so an
+enveloped, escaped max-size message can't overflow it.)
 An out-of-range or malformed value warns and falls back to the default. The
 remote posture is always at least supervised and is **not** loosenable by config.
 
@@ -156,8 +162,10 @@ Two models talking freely would form an unbounded committee. The bounds:
   turns with no operator input; past it, further peer prompts are **declined with
   an explicit result** (never a silent hang) until the operator intervenes. This
   is the real limit behind exempting peer prompts from the normal auto-wake cap.
-- **`max_message_bytes`** — an over-cap prompt is rejected (`message_too_large`);
-  an over-cap answer is clamped and marked, never silently truncated.
+- **`max_message_bytes`** — `mesh_send` rejects an over-cap message up front with
+  `mesh.message_too_large` (distinct from "no such peer", so the model shortens
+  the request rather than re-discovering); an over-cap answer is clamped and
+  marked, never silently truncated.
 - **`max_concurrent_conversations`** — an inbound prompt past the limit is
   rejected with `peer_busy`.
 - **No transitive delegation** — a serving session cannot `mesh_send` onward
@@ -168,9 +176,11 @@ Two models talking freely would form an unbounded committee. The bounds:
 - **A peer doesn't appear in `mesh_peers`.** It only appears after it runs
   `/relay on`. Confirm both instances run as the same OS user. A crashed instance's
   stale socket/descriptor is swept automatically on the next discovery.
-- **`peer_lost` in a reply.** The peer's process closed before answering (crash,
-  or `/relay off` mid-request). The conversation is failed explicitly so the loop
-  is never left waiting forever.
+- **`peer_lost` / "no reply from …".** The peer's process closed before answering
+  (crash, or `/relay off` mid-request), or a wire error hit. A transport failure
+  gets a distinct `▸ no reply from '<alias>'` headline (not the `▸ reply from` of a
+  real answer) and reaches your model as a trusted-system notice; the conversation
+  is failed explicitly so the loop is never left waiting forever.
 - **`mesh_send` says it's blocked.** The current session is serving (relay mode).
   Send from a different, non-relay instance.
 - **Where it lives.** Sockets and descriptors are under
@@ -180,8 +190,14 @@ Two models talking freely would form an unbounded committee. The bounds:
 ## Not in scope (v1) / follow-ups
 
 - **Per-conversation progress to the initiator's model** (accepted / working /
-  **waiting-operator**) is not surfaced yet — only the final result drives a
-  reply. The peer's coarse status is visible via `mesh_peers`.
+  waiting-operator) is not surfaced yet — only the final result drives a reply.
+  (The peer's coarse status, including `waiting-operator` when it is blocked on its
+  operator, is now visible to *others* via `mesh_peers`; what is still missing is
+  streaming that per-conversation state to the initiating model as it happens.)
+- **`peer_reply` shares the operator wake-cap.** Unlike an inbound `peer_message`,
+  an awaited reply can wait for the operator's next input if the session has hit
+  its consecutive-wake cap — the reply is never lost, only possibly delayed until
+  the operator acts.
 - **Remote / multi-machine** (WebSocket/TCP + mTLS), **structured attachments**
   (typed diffs / test results), a **multi-repo coordinator**, and **per-task
   worktrees** are deliberately out of v1. See [`spec/MESH.md §11`](spec/MESH.md).
