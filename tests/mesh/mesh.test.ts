@@ -21,6 +21,7 @@ import { connectMesh } from '../../src/mesh/transport.ts';
 import {
   ABSOLUTE_MESH_LIMITS,
   DEFAULT_MESH_CONFIG,
+  type MeshAuditEvent,
   type MeshConfig,
 } from '../../src/mesh/types.ts';
 
@@ -329,6 +330,86 @@ describe('mesh integration (two managers over real sockets)', () => {
 
     await gateway.shutdown();
     await billing.shutdown();
+  });
+
+  test('emits boundary audit events at the wire hub (§8)', async () => {
+    const initEvents: MeshAuditEvent[] = [];
+    const servEvents: MeshAuditEvent[] = [];
+    const server = createMeshManager({
+      dir,
+      config: cfg('auditsrv'),
+      repoRoot: '/repo/auditsrv',
+      branch: 'main',
+      pid: process.pid,
+      onAuditEvent: (e) => servEvents.push(e),
+    });
+    const client = createMeshManager({
+      dir,
+      config: cfg('auditcli'),
+      repoRoot: '/repo/auditcli',
+      branch: 'main',
+      pid: process.pid,
+      onAuditEvent: (e) => initEvents.push(e),
+    });
+    await server.startServing();
+    server.onPrompt((p) => server.sendResult(p.conversationId, 'the answer'));
+    const reply = firstReply(client);
+    const { conversationId } = await client.send('auditsrv', 'question?');
+    await reply;
+    // Server side: prompt received + reply published, both keyed by the cid.
+    expect(
+      servEvents.some(
+        (e) =>
+          e.kind === 'peer_prompt_received' &&
+          e.conversationId === conversationId &&
+          e.peerAlias === 'auditcli',
+      ),
+    ).toBe(true);
+    expect(
+      servEvents.some((e) => e.kind === 'reply_published' && e.conversationId === conversationId),
+    ).toBe(true);
+    // Initiator side: reply received from the target.
+    expect(
+      initEvents.some(
+        (e) =>
+          e.kind === 'reply_received' &&
+          e.conversationId === conversationId &&
+          e.peerAlias === 'auditsrv',
+      ),
+    ).toBe(true);
+    await client.shutdown();
+    await server.shutdown();
+  });
+
+  test('a throwing audit sink never breaks the wire operation (best-effort §8)', async () => {
+    const boom = () => {
+      throw new Error('audit DB exploded');
+    };
+    const server = createMeshManager({
+      dir,
+      config: cfg('robsrv'),
+      repoRoot: '/repo/robsrv',
+      branch: 'main',
+      pid: process.pid,
+      onAuditEvent: boom,
+    });
+    const client = createMeshManager({
+      dir,
+      config: cfg('robcli'),
+      repoRoot: '/repo/robcli',
+      branch: 'main',
+      pid: process.pid,
+      onAuditEvent: boom,
+    });
+    await server.startServing();
+    server.onPrompt((p) => server.sendResult(p.conversationId, 'still works'));
+    const reply = firstReply(client);
+    await client.send('robsrv', 'q');
+    // Prompt-received, reply-published AND reply-received sinks all throw; the
+    // round-trip must still deliver.
+    expect(await reply).toBe('still works');
+    await client.shutdown();
+    await server.shutdown();
   });
 
   test('rejects a prompt past maxConcurrentConversations with peer_busy (§8)', async () => {

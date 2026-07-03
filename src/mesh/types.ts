@@ -36,6 +36,19 @@ export type MeshMessage =
 
 export type MeshMessageType = MeshMessage['type'];
 
+// Boundary audit events the manager emits at the wire hub (§8). The manager is
+// byte/lifecycle plumbing — it emits these SEMANTIC events via a `onAuditEvent`
+// callback; the sink (wired in bootstrap with the DB) persists them to the
+// `mesh_events` table. Correlation across two Forjas is by `conversationId`; no
+// session_id (the manager doesn't own one, and the local session is recoverable
+// via the message log — the peer prompt's envelope carries the conversationId).
+export type MeshAuditEvent =
+  | { kind: 'peer_prompt_received'; conversationId: string; peerAlias: string }
+  // `output` is the published text; the sink stores only its hash + byte length
+  // (the full text already lives in the mesh_reply tool args / message log).
+  | { kind: 'reply_published'; conversationId: string; peerAlias: string; output: string }
+  | { kind: 'reply_received'; conversationId: string; peerAlias: string };
+
 export const MESH_ERROR_CODES = {
   versionMismatch: 'mesh.version_mismatch',
   roundsExceeded: 'mesh.rounds_exceeded',

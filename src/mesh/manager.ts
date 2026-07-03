@@ -30,6 +30,7 @@ import {
   CONVERSATION_ID_RE,
   MESH_ERROR_CODES,
   MESH_PROTOCOL_VERSION,
+  type MeshAuditEvent,
   type MeshConfig,
   type MeshProgressState,
   type PeerDescriptor,
@@ -46,6 +47,11 @@ export interface MeshManagerDeps {
   branch: string;
   // Defaults to process.pid; injectable for tests.
   pid?: number;
+  // Optional boundary-audit sink (§8): the manager emits MeshAuditEvents at the
+  // wire hub (prompt received / reply published / reply received); the sink,
+  // wired in bootstrap with the DB, persists them to `mesh_events`. No-op when
+  // absent (headless / tests).
+  onAuditEvent?: (event: MeshAuditEvent) => void;
 }
 
 export interface InboundPrompt {
@@ -144,6 +150,17 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     if (serving) publishDescriptor(deps.dir, descriptor());
   };
 
+  // Emit a boundary audit event best-effort (§8): audit is operational, not
+  // critical, so a sink failure (DB locked/closed, or any throw) must NEVER
+  // break the mesh operation it is observing — swallow it.
+  const emitAudit = (event: MeshAuditEvent): void => {
+    try {
+      deps.onAuditEvent?.(event);
+    } catch {
+      // best-effort — the wire operation must not fail because audit did
+    }
+  };
+
   // ---- server side ----
   const onServerConnection = (transport: MeshTransport): void => {
     // null until a valid hello arrives — a prompt before hello is rejected so it
@@ -236,6 +253,11 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
           }
           inbound.set(msg.conversationId, { transport, peerAlias });
           transport.write(encodeMeshMessage(makeProgress(msg.conversationId, 'accepted')));
+          emitAudit({
+            kind: 'peer_prompt_received',
+            conversationId: msg.conversationId,
+            peerAlias,
+          });
           promptCb?.({ conversationId: msg.conversationId, peerAlias, text: msg.text });
           break;
         }
@@ -317,6 +339,7 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
       if (!res.ok) return;
       const msg = res.msg;
       if (msg.type === 'result' && msg.conversationId === conversationId) {
+        emitAudit({ kind: 'reply_received', conversationId, peerAlias: targetAlias });
         settle(msg.text);
       } else if (msg.type === 'error') {
         settle(`[mesh error ${msg.code}] ${msg.message}`);
@@ -347,6 +370,12 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     c.transport.write(
       encodeMeshMessage(makeResult(conversationId, clampUtf8(text, deps.config.maxMessageBytes))),
     );
+    emitAudit({
+      kind: 'reply_published',
+      conversationId,
+      peerAlias: c.peerAlias,
+      output: text,
+    });
     // result is the conversation's last message (§4) — graceful close flushes
     // the buffered result before FIN, then reap the entry (no inbound leak).
     c.transport.close();

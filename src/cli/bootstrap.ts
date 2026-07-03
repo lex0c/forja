@@ -95,6 +95,7 @@ import {
   MEMORY_VERIFY_ATTEMPTS_RETENTION_MS,
   pruneVerifyAttempts,
 } from '../storage/repos/memory-verify-attempts.ts';
+import { recordMeshAuditEvent } from '../storage/repos/mesh-events.ts';
 import {
   hashPromptContent,
   recordPromptVersion,
@@ -1743,6 +1744,9 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     config: meshLoaded.config,
     repoRoot: projectConfigCwd,
     branch: probeGitContext(projectConfigCwd)?.branch ?? 'unknown',
+    // Persist the mesh boundary events (§8) to `mesh_events` — the A↔B forensic
+    // trail, correlated by conversationId across the two Forjas' DBs.
+    onAuditEvent: (event) => recordMeshAuditEvent(db, event),
   });
 
   const config: HarnessConfig = {
