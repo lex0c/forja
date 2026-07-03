@@ -67,11 +67,11 @@ export interface InboundReply {
   conversationId: string;
   peerAlias: string;
   text: string;
-  // True when `text` is a LOCALLY-generated transport failure (peer_lost / a wire
-  // error) rather than the peer's published answer — the REPL frames it as a
-  // trusted-system notice (not untrusted peer DATA) and gives it a failure
-  // headline. A neutral "ended without a reply" arrives as a normal result (peer
-  // content from our side), so it is NOT flagged here.
+  // True ONLY for a failure we generate LOCALLY — the connection closed before the
+  // peer answered (peer_lost). The REPL frames a failed reply as a trusted-system
+  // notice, so peer-SUPPLIED text must NEVER set this: a real result, a neutral
+  // "ended without a reply", AND a `type:"error"` frame's message/code are all peer
+  // content and go through the untrusted peer envelope instead.
   failed: boolean;
 }
 
@@ -426,7 +426,12 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
         emitAudit({ kind: 'reply_received', conversationId, peerAlias: targetAlias });
         settle(msg.text, false); // a real result — the peer's published content
       } else if (msg.type === 'error') {
-        settle(`[mesh error ${msg.code}] ${msg.message}`, true); // wire failure
+        // An error frame is still PEER-CONTROLLED content (a malicious peer can put
+        // arbitrary text in `message`/`code`) — NOT a locally-generated failure.
+        // Mark it unfailed so the REPL frames it as untrusted peer DATA, never as a
+        // trusted [mesh system notice]. Only the connection-close path below (text
+        // WE generate) earns the trusted framing.
+        settle(`[mesh error ${msg.code}] ${msg.message}`, false);
       }
       // Inbound 'progress' (accepted/working/waiting-operator) is not surfaced to
       // the initiator's MODEL yet — only the final 'result' drives a peer_reply

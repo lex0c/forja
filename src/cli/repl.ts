@@ -1503,8 +1503,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     peerAlias: string;
     conversationId: string;
     text: string;
-    // True when `text` is a locally-generated transport failure (peer_lost / wire
-    // error), not the peer's answer — drives a distinct headline + trusted framing.
+    // True ONLY for a locally-generated failure (the connection closed → peer_lost);
+    // never for peer-supplied text (a result or a type:"error" frame). Drives the
+    // distinct failure headline + trusted-system framing.
     failed: boolean;
   };
   // Producer payload (no id yet); `enqueueNotification` stamps the id.
@@ -1562,8 +1563,8 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // bg_done/reminder) so it can't spoof the operator's scrollback.
         return `▸ remote prompt from '${flattenControlToLine(n.peerAlias)}'`;
       case 'peer_reply':
-        // Distinct headline for a transport failure (peer_lost / wire error) so
-        // the operator doesn't skim a failed round as an answered one.
+        // Distinct headline for a locally-generated failure (peer_lost — the
+        // connection dropped) so the operator doesn't skim it as an answered round.
         return n.failed
           ? `▸ no reply from '${flattenControlToLine(n.peerAlias)}' — ${flattenControlToLine(n.text)}`
           : `▸ reply from '${flattenControlToLine(n.peerAlias)}'`;
@@ -1577,11 +1578,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // the operator-facing origin headline.
     if (n.kind === 'peer_message') return framePeerPrompt(n.peerAlias, n.conversationId, n.text);
     if (n.kind === 'peer_reply') {
-      // A locally-generated transport failure (peer_lost / wire error) is our own
-      // signal — frame it as a trusted-system notice, not untrusted peer DATA, so
-      // the model reads "the connection dropped" plainly. A real answer (incl. a
-      // neutral "ended without a reply", which is peer content from our side) gets
-      // the untrusted envelope, carrying the conversationId for correlation.
+      // Only a LOCALLY-generated failure (peer_lost — the connection dropped) is our
+      // own signal; frame it as a trusted-system notice. Everything peer-supplied —
+      // a real answer, a neutral "ended without a reply", AND a type:"error" frame's
+      // message — is peer content and gets the untrusted envelope (with the
+      // conversationId for correlation), never trusted framing.
       return n.failed
         ? `[mesh system notice] Your mesh_send to '${flattenControlToLine(n.peerAlias)}' (conversationId "${n.conversationId}") could not be completed: ${n.text}`
         : framePeerReply(n.peerAlias, n.conversationId, n.text);

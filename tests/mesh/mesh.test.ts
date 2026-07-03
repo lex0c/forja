@@ -745,6 +745,31 @@ describe('mesh integration (two managers over real sockets)', () => {
     await server.shutdown();
   });
 
+  test('a peer error frame is NOT flagged failed — its peer-controlled body stays untrusted', async () => {
+    // A `type:"error"` frame's message/code are peer-controlled; flagging it failed
+    // would give it trusted [mesh system notice] framing at the REPL, letting a
+    // hostile peer inject text as trusted system content. It must stay unfailed →
+    // untrusted envelope. Drive a real peer_busy rejection to get an error frame.
+    const server = mkMgr(dir, 'errbusysrv', { maxConcurrentConversations: 1 });
+    await server.startServing();
+    server.onPrompt(() => {}); // hold the single slot open (never answer)
+    const client = mkMgr(dir, 'errbusycli');
+    await client.send('errbusysrv', 'one'); // occupies the slot
+    const reply = new Promise<{ text: string; failed: boolean }>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('no reply')), 3000);
+      client.onReply((r) => {
+        clearTimeout(timer);
+        resolve({ text: r.text, failed: r.failed });
+      });
+    });
+    await client.send('errbusysrv', 'two'); // over the limit → peer_busy ERROR frame
+    const got = await reply;
+    expect(got.text).toContain('peer_busy');
+    expect(got.failed).toBe(false); // peer content → untrusted, never a system notice
+    await client.shutdown();
+    await server.shutdown();
+  });
+
   test('server rejects a prompt that arrives before hello', async () => {
     const srv = createMeshManager({
       dir,
