@@ -115,6 +115,8 @@ const HOLD_BYPASS: ReadonlySet<UIEvent['type']> = new Set([
   'memory:write:ask',
   'memory:action:ask',
   'memory:user-scope:ask',
+  // Relay-start confirm (MESH.md §6.1) — same synchronous-focus rationale.
+  'relay-start:ask',
   // Clarify form-modal open (STATE_MACHINE §12) — same synchronous-
   // focus rationale as the confirm flavors above.
   'clarify:ask',

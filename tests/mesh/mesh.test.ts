@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadMeshConfig } from '../../src/mesh/config.ts';
@@ -328,5 +328,22 @@ describe('mesh integration (two managers over real sockets)', () => {
     expect(await got).toContain('handshake');
     t.close();
     await srv.shutdown();
+  });
+
+  test('startServing rolls back the socket when publishing the descriptor fails', async () => {
+    const mgr = createMeshManager({
+      dir,
+      config: cfg('rb'),
+      repoRoot: '/repo/rb',
+      branch: 'main',
+      pid: process.pid,
+    });
+    // Force publishDescriptor's writeFileSync to fail: a directory sits where
+    // the descriptor .json must be written (EISDIR).
+    ensureMeshDirs(dir);
+    mkdirSync(join(dir, 'peers', 'rb.json'));
+    await expect(mgr.startServing()).rejects.toThrow();
+    expect(mgr.isServing()).toBe(false); // rolled back, no dangling listen socket
+    await mgr.shutdown();
   });
 });

@@ -392,6 +392,15 @@ export type TrustAskEvent = BaseEvent & {
   agentsMd: boolean;
 };
 
+// Relay-start flavor — `/relay` confirm before opening the mesh listen socket
+// (the first inbound channel Forja opens, so it gets an explicit confirm —
+// MESH.md §6.1). Answer maps: yes → startServing, no/cancel → stay off.
+export type RelayStartAskEvent = BaseEvent & {
+  type: 'relay-start:ask';
+  promptId: string;
+  alias: string;
+};
+
 // Shared-corpus trust re-confirmation (MEMORY.md §6.5.2 `trust_revoked`
 // detector, §7.2 rule 8). Fires after bootstrap when either:
 //
@@ -916,6 +925,15 @@ export type OperationModeChangeEvent = BaseEvent & {
   posture: ApprovalPosture;
 };
 
+// Operator toggled relay mode via `/relay`, shown as a footer badge. Emitted by
+// the slash command so the badge repaints at once. meshManager.isServing() is
+// the source of truth; this mirrors it into live state.
+export type RelayChangeEvent = BaseEvent & {
+  type: 'relay:change';
+  active: boolean;
+  alias: string | null;
+};
+
 // Operator changed the effort level via `/effort`, shown in the footer
 // right cluster. Emitted by the slash command so the chip repaints
 // immediately (the level takes effect next turn, but the operator's
@@ -929,6 +947,7 @@ export type EffortChangeEvent = BaseEvent & {
 export type UIEvent =
   | SessionStartEvent
   | OperationModeChangeEvent
+  | RelayChangeEvent
   | EffortChangeEvent
   | SessionBannerEvent
   | SessionEndEvent
@@ -957,6 +976,7 @@ export type UIEvent =
   | ModalQueueDepthEvent
   | ClarifyAskEvent
   | TrustAskEvent
+  | RelayStartAskEvent
   | SharedTrustAskEvent
   | McpTrustAskEvent
   | MemoryWriteAskEvent

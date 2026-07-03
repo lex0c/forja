@@ -157,6 +157,36 @@ describe('session lifecycle', () => {
     expect(up.state.status.effort).toBe('max');
   });
 
+  test('relay:change flips status.relayMode + relayAlias, emits no permanent', () => {
+    const on = applyEvent(createInitialState(), {
+      type: 'relay:change',
+      ts: 5,
+      active: true,
+      alias: 'billing',
+    });
+    expect(on.state.status.relayMode).toBe(true);
+    expect(on.state.status.relayAlias).toBe('billing');
+    expect(on.permanent).toEqual([]);
+    const off = applyEvent(on.state, { type: 'relay:change', ts: 6, active: false, alias: null });
+    expect(off.state.status.relayMode).toBe(false);
+    expect(off.state.status.relayAlias).toBeNull();
+  });
+
+  test('relay-start:ask opens a relay-start modal with the alias + conservative default', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'relay-start:ask',
+      ts: 5,
+      promptId: 'p1',
+      alias: 'billing',
+    });
+    expect(r.state.modal?.flavor).toBe('relay-start');
+    expect(r.state.modal?.preview.some((l) => typeof l === 'string' && l.includes('billing'))).toBe(
+      true,
+    );
+    // D65: last option ("No, cancel") is the default.
+    expect(r.state.modal?.selectedIndex).toBe((r.state.modal?.options.length ?? 0) - 1);
+  });
+
   test('session:banner seeds status.effort from the boot level', () => {
     const r = applyEvent(createInitialState(), {
       type: 'session:banner',

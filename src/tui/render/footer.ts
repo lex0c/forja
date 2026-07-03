@@ -98,6 +98,13 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
       autonomous ? 'autonomous mode on' : 'supervised mode on',
     );
     const leftParts = [`${modeLabel}${dim(caps, ' (shift+tab to change)')}`];
+    if (state.status.relayMode) {
+      // Relay-mode badge (MESH.md §6.1) — accent so it stands out from the mode
+      // cue; the operator is serving peers, supervising rather than driving.
+      const label =
+        state.status.relayAlias !== null ? `RELAY: ${state.status.relayAlias}` : 'RELAY MODE';
+      leftParts.unshift(paint(caps, 'accent', label));
+    }
     if (isRunning(state)) {
       // During a turn the operator isn't composing input, so the
       // newline affordance is noise — and it's the segment that pushes

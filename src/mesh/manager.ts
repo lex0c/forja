@@ -177,7 +177,16 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     ensureMeshDirs(deps.dir);
     server = listenMesh(socketPath(deps.dir, alias), onServerConnection);
     serving = true;
-    publishDescriptor(deps.dir, descriptor());
+    try {
+      publishDescriptor(deps.dir, descriptor());
+    } catch (err) {
+      // Roll back the socket so a failed publish (ENOSPC / EROFS / EIO) never
+      // leaves an inbound channel open after the operator was told it failed.
+      server.stop();
+      server = null;
+      serving = false;
+      throw err;
+    }
   };
 
   const stopServing = async (): Promise<void> => {

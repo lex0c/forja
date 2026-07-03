@@ -142,6 +142,12 @@ export interface StatusState {
   // `mode:change`. The permission engine is the source of truth — this
   // is the rendered mirror.
   operationMode: ApprovalPosture;
+  // Whether relay mode is on (serving mesh peers). Mirrors
+  // meshManager.isServing(), flipped by `relay:change`; drives the footer badge.
+  relayMode: boolean;
+  // Alias shown in the relay badge when serving (null when off). Mirrors the
+  // manager's alias via `relay:change`.
+  relayAlias: string | null;
   // Effort level shown in the footer's right cluster. Seeded by
   // `session:banner.effort` (config/DEFAULT_EFFORT at boot), updated by
   // `effort:change` when the operator runs `/effort`. null = not yet
@@ -264,7 +270,8 @@ export interface ConfirmState {
     | 'memory-action'
     | 'history-clear'
     | 'resume-mode'
-    | 'clarify';
+    | 'clarify'
+    | 'relay-start';
   // Title block: bold first line + dim subject. `subject` is
   // optional — null when the modal has no single target.
   title: string;
@@ -610,6 +617,8 @@ export const createInitialState = (): LiveState => ({
     sessionTotalCostUsd: 0,
     maxCostUsd: null,
     operationMode: 'supervised',
+    relayMode: false,
+    relayAlias: null,
     effort: null,
     memoryCount: 0,
     contextWindow: 0,
@@ -988,6 +997,16 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // whole signal (UI.md §4.10.6).
       return {
         state: { ...state, status: { ...state.status, operationMode: event.posture } },
+        permanent: [],
+      };
+
+    case 'relay:change':
+      // Mirror relay on/off (+ alias) into status so the footer badge repaints.
+      return {
+        state: {
+          ...state,
+          status: { ...state.status, relayMode: event.active, relayAlias: event.alias },
+        },
         permanent: [],
       };
     case 'effort:change':
@@ -2002,6 +2021,40 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             // D65 (UI.md §6.5): last option is the conservative
             // default. Operator hitting Enter without reading
             // chooses "No, exit" — the safer outcome here.
+            options,
+            selectedIndex: options.length - 1,
+            hints: ['Enter to confirm', 'Esc to cancel'],
+            queueDepth: 0,
+          },
+        },
+        permanent: [],
+      };
+    }
+
+    case 'relay-start:ask': {
+      const options: ConfirmOption[] = [
+        { key: '1', label: 'Yes, start serving', value: 'yes' },
+        { key: '2', label: 'No, cancel', value: 'no' },
+      ];
+      return {
+        state: {
+          ...state,
+          modal: {
+            promptId: event.promptId,
+            flavor: 'relay-start',
+            title: 'Start relay mode?',
+            subject: null,
+            preview: [
+              `This Forja will serve mesh peers as '${event.alias}'.`,
+              '',
+              'It opens a local Unix socket other Forja instances you run (same',
+              'user) can send textual prompts to. Each arrives as an untrusted',
+              'system turn under YOUR approval — a peer never edits or runs',
+              'anything here directly (MESH.md §0).',
+            ],
+            question: null,
+            // Last option is the conservative default (D65): Enter without
+            // reading errs toward "No, cancel".
             options,
             selectedIndex: options.length - 1,
             hints: ['Enter to confirm', 'Esc to cancel'],

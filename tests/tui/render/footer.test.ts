@@ -42,6 +42,18 @@ describe('renderFooter', () => {
     expect(out).not.toContain('profile:');
   });
 
+  test('relay-mode badge shows the alias when serving', () => {
+    const out = renderFooter(startedSession({ relayMode: true, relayAlias: 'billing' }), caps);
+    expect(out).not.toBeNull();
+    expect(out).toContain('RELAY: billing');
+  });
+
+  test('no relay badge when relay mode is off', () => {
+    const out = renderFooter(startedSession({ relayMode: false }), caps);
+    expect(out).not.toBeNull();
+    expect(out).not.toContain('RELAY');
+  });
+
   test('bash mode replaces the footer with the shell-mode indicator', () => {
     const s = startedSession();
     const out = renderFooter({ ...s, input: { value: '!ls', cursor: 3 } }, caps);

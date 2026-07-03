@@ -111,6 +111,13 @@ export interface TrustAskArgs {
 
 export type TrustAnswer = 'yes' | 'no' | 'cancel';
 
+// Relay-start flavor — `/relay` confirm before opening the mesh socket
+// (MESH.md §6.1). yes → start serving, no/cancel → stay off.
+export interface RelayStartAskArgs {
+  alias: string;
+}
+export type RelayStartAnswer = 'yes' | 'no' | 'cancel';
+
 // Shared-corpus trust re-confirmation flavor (MEMORY.md §6.5.2
 // `trust_revoked` detector). Distinct from `TrustAskArgs` even though
 // the answer shape is identical — the producer wires very different
@@ -190,6 +197,13 @@ export interface MemoryActionAskArgs {
 const TRUST_OPTIONS: readonly ConfirmOption[] = [
   { key: '1', label: 'Yes, I trust this folder', value: 'yes' },
   { key: '2', label: 'No, exit', value: 'no' },
+];
+
+// Relay-start flavor's option list. Kept in sync with the reducer's
+// `relay-start:ask` ConfirmState construction in state.ts.
+const RELAY_START_OPTIONS: readonly ConfirmOption[] = [
+  { key: '1', label: 'Yes, start serving', value: 'yes' },
+  { key: '2', label: 'No, cancel', value: 'no' },
 ];
 
 // Shared-corpus re-confirm flavor. Verbs differ from `TRUST_OPTIONS`
@@ -337,6 +351,9 @@ export interface ModalManager {
   // §9.1 calls for a 5-minute timeout that defaults to read-only —
   // we forward that via `opts.timeoutMs` so the producer decides.
   askTrust: (args: TrustAskArgs, opts?: ConfirmAskOptions) => Promise<TrustAnswer>;
+  // Relay-start flavor (MESH.md §6.1). Producer: the /relay command. yes →
+  // startServing, no/cancel → stay off.
+  askRelayStart: (args: RelayStartAskArgs, opts?: ConfirmAskOptions) => Promise<RelayStartAnswer>;
   // Shared-corpus trust re-confirmation flavor. Producer: REPL boot,
   // after bootstrap, when `shared_corpus_trust` carries a row for the
   // current scope-root AND its `last_confirmed_hash` differs from the
@@ -808,6 +825,18 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           agentsMd: args.agentsMd === true,
         }),
         TRUST_OPTIONS,
+        opts?.timeoutMs,
+        opts?.signal,
+      ),
+    askRelayStart: (args, opts) =>
+      enqueueConfirm<RelayStartAnswer>(
+        (promptId) => ({
+          type: 'relay-start:ask',
+          ts: now(),
+          promptId,
+          alias: args.alias,
+        }),
+        RELAY_START_OPTIONS,
         opts?.timeoutMs,
         opts?.signal,
       ),
