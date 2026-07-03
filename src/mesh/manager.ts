@@ -363,11 +363,16 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     try {
       publishDescriptor(deps.dir, descriptor());
     } catch (err) {
-      // Roll back the socket so a failed publish (ENOSPC / EROFS / EIO) never
-      // leaves an inbound channel open after the operator was told it failed.
+      // Roll back FULLY so a failed publish (ENOSPC / EROFS / EIO / EISDIR) leaves
+      // neither an inbound channel open NOR an orphan socket behind after the
+      // operator was told it failed. server.stop() closes the listener but leaves
+      // the .sock file listenMesh created; removeDescriptor clears it (and any
+      // partial .json) — the same cleanup stopServing does. Without it, since
+      // serving is reset to false, a later shutdown() no-ops and the orphan lingers.
       server.stop();
       server = null;
       serving = false;
+      removeDescriptor(deps.dir, alias);
       throw err;
     }
   };
@@ -394,7 +399,15 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     if (Buffer.byteLength(text, 'utf8') > deps.config.maxMessageBytes) {
       throw new Error(`mesh: message exceeds the ${deps.config.maxMessageBytes}-byte cap`);
     }
-    const target = fsListPeers(deps.dir, { selfAlias: alias }).find((p) => p.alias === targetAlias);
+    // Only exclude our OWN descriptor when WE are serving — that is the only time
+    // it exists. A non-serving client (mesh_send always runs non-serving) has no
+    // self descriptor, so excluding by alias would wrongly hide a DIFFERENT live
+    // peer that shares our derived alias (same repo basename, or another session in
+    // this repo). F1's collision check guarantees no other live peer holds our
+    // alias while we serve, so the alias-exclusion is exact there.
+    const target = fsListPeers(deps.dir, serving ? { selfAlias: alias } : {}).find(
+      (p) => p.alias === targetAlias,
+    );
     if (target === undefined) {
       throw new Error(`mesh: no live peer '${targetAlias}'`);
     }
@@ -525,7 +538,9 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
         conversationId,
         peerAlias: c.peerAlias,
       })),
-    listPeers: () => fsListPeers(deps.dir, { selfAlias: alias }).map(toPeerInfo),
+    // Exclude our own descriptor only while serving (see send()) — else a live peer
+    // sharing our derived alias would be hidden from discovery.
+    listPeers: () => fsListPeers(deps.dir, serving ? { selfAlias: alias } : {}).map(toPeerInfo),
     send,
     startServing,
     stopServing,

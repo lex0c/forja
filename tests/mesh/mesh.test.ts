@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadMeshConfig } from '../../src/mesh/config.ts';
@@ -806,6 +806,40 @@ describe('mesh integration (two managers over real sockets)', () => {
     expect(got.text).toContain('peer_lost');
     await client.shutdown();
     flaky.stop();
+  });
+
+  test('a non-serving client discovers + sends to a peer that shares its alias', async () => {
+    // Same derived alias (two repos with the same basename, or another session in
+    // this repo): the server serves 'shared'; the client is non-serving with the
+    // SAME alias. It has no self descriptor, so the self-exclusion must NOT hide it.
+    const server = mkMgr(dir, 'shared');
+    await server.startServing();
+    server.onPrompt((p) => server.sendResult(p.conversationId, 'answered'));
+    const client = mkMgr(dir, 'shared'); // same alias, NOT serving
+    expect(client.listPeers().map((p) => p.alias)).toContain('shared');
+    const reply = new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('no reply')), 3000);
+      client.onReply((r) => {
+        clearTimeout(timer);
+        resolve(r.text);
+      });
+    });
+    await client.send('shared', 'hi'); // must not throw "no live peer"
+    expect(await reply).toBe('answered');
+    await client.shutdown();
+    await server.shutdown();
+  });
+
+  test('startServing removes the socket when descriptor publishing fails (no orphan)', async () => {
+    ensureMeshDirs(dir);
+    // Force publishDescriptor to fail: put a directory where the .json goes (EISDIR).
+    mkdirSync(join(dir, 'peers', 'orphansrv.json'), { recursive: true });
+    const server = mkMgr(dir, 'orphansrv');
+    await expect(server.startServing()).rejects.toThrow();
+    // The listener's socket must NOT linger — the rollback removed it.
+    expect(existsSync(socketPath(dir, 'orphansrv'))).toBe(false);
+    expect(server.isServing()).toBe(false);
+    await server.shutdown(); // no-op, must not throw
   });
 
   test('server rejects a prompt that arrives before hello', async () => {
