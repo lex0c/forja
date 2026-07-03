@@ -297,7 +297,7 @@ type PeerHook = (p: { conversationId: string; peerAlias: string; text: string })
 type MeshStub = {
   onPrompt: (cb: PeerHook) => void;
   onReply: (cb: PeerHook) => void;
-  sendResult: (cid: string, text: string) => void;
+  sendResult: (cid: string, text: string) => boolean;
   setStatus: (s: string) => void;
   isServing: () => boolean;
   maxRounds: number;
@@ -306,7 +306,7 @@ type MeshStub = {
 const meshStub = (over: Partial<MeshStub> = {}): MeshStub => ({
   onPrompt: () => {},
   onReply: () => {},
-  sendResult: () => {},
+  sendResult: () => true,
   setStatus: () => {},
   isServing: () => false,
   maxRounds: 8,
@@ -1659,18 +1659,24 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
-  test('a finished peer turn routes its final answer back to that conversation', async () => {
+  test('a peer turn that ends without a mesh_reply fails the conversation with a neutral error + warns', async () => {
     type PeerCb = (p: { conversationId: string; peerAlias: string; text: string }) => void;
     let firePrompt: PeerCb | null = null;
     const sent: Array<{ cid: string; text: string }> = [];
+    const statuses: string[] = [];
     const meshManager = meshStub({
       onPrompt: (cb) => {
         firePrompt = cb;
       },
       sendResult: (cid, text) => {
         sent.push({ cid, text });
+        return true; // still open (model did NOT mesh_reply) → the neutral fail lands
+      },
+      setStatus: (s) => {
+        statuses.push(s);
       },
     });
+    const writes: string[] = [];
     const stdin = makeStdin();
     const ra = makeRunAgent((n) => `sess-${n}`);
     const promise = runRepl({
@@ -1680,56 +1686,9 @@ describe('repl — boot + smoke', () => {
       skipTtyCheck: true,
       skipTrustPrompt: true,
       runAgentOverride: ra.runAgent,
-    });
-    await tick();
-    // Turn 1 (operator) → idle. Its result carries NO peer conversation, so it
-    // must not route anything back.
-    stdin.feed('first\r');
-    await tick();
-    ra.finish(0, {
-      sessionContext: { lastAssistantText: () => 'local answer' } as unknown as SessionContext,
-    });
-    await tick();
-    expect(sent).toEqual([]);
-    // A peer prompt drives a system turn (turn 2).
-    (firePrompt as unknown as PeerCb)({
-      conversationId: 'c-route',
-      peerAlias: 'gateway',
-      text: 'what is the contract version?',
-    });
-    await tick();
-    expect(ra.captured).toHaveLength(2);
-    // The turn finishes with a live context whose final answer is 'v2 is live'.
-    const ctxStub = { lastAssistantText: () => 'v2 is live' } as unknown as SessionContext;
-    ra.finish(1, { sessionContext: ctxStub });
-    await tick();
-    // Only the final assistant answer is routed back — to that conversation id.
-    expect(sent).toEqual([{ cid: 'c-route', text: 'v2 is live' }]);
-    stdin.feed('\x04');
-    expect(await promise).toBe(130);
-  });
-
-  test('a peer turn with no textual answer routes the explicit fallback, not empty', async () => {
-    type PeerCb = (p: { conversationId: string; peerAlias: string; text: string }) => void;
-    let firePrompt: PeerCb | null = null;
-    const sent: Array<{ cid: string; text: string }> = [];
-    const meshManager = meshStub({
-      onPrompt: (cb) => {
-        firePrompt = cb;
+      rendererWrite: (s) => {
+        writes.push(s);
       },
-      sendResult: (cid, text) => {
-        sent.push({ cid, text });
-      },
-    });
-    const stdin = makeStdin();
-    const ra = makeRunAgent((n) => `sess-${n}`);
-    const promise = runRepl({
-      args: makeArgs(),
-      bootstrapOverride: makeBootstrapStub({ meshManager }),
-      stdin,
-      skipTtyCheck: true,
-      skipTrustPrompt: true,
-      runAgentOverride: ra.runAgent,
     });
     await tick();
     stdin.feed('first\r');
@@ -1737,17 +1696,63 @@ describe('repl — boot + smoke', () => {
     ra.finish(0);
     await tick();
     (firePrompt as unknown as PeerCb)({
-      conversationId: 'c-empty',
+      conversationId: 'c-open',
       peerAlias: 'gateway',
-      text: 'x',
+      text: 'what is the contract version?',
     });
     await tick();
-    const emptyCtx = { lastAssistantText: () => '' } as unknown as SessionContext;
-    ra.finish(1, { sessionContext: emptyCtx });
-    await tick();
+    expect(ra.captured).toHaveLength(2);
+    ra.finish(1, { sessionContext: {} as unknown as SessionContext });
+    await flushFrame();
+    // No auto-tap: the turn's text is never published. The unanswered conversation
+    // is failed with a NEUTRAL error (frees the slot), not the turn's content, and
+    // the operator is warned.
     expect(sent).toHaveLength(1);
-    expect(sent[0]?.cid).toBe('c-empty');
-    expect(sent[0]?.text).toContain('no final answer');
+    expect(sent[0]?.cid).toBe('c-open');
+    expect(sent[0]?.text).toContain('without publishing a reply');
+    expect(writes.join('')).toContain('mesh_reply');
+    expect(statuses).toContain('idle');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a peer turn whose model already replied (conversation closed) fails nothing and does not warn', async () => {
+    type PeerCb = (p: { conversationId: string; peerAlias: string; text: string }) => void;
+    let firePrompt: PeerCb | null = null;
+    const meshManager = meshStub({
+      onPrompt: (cb) => {
+        firePrompt = cb;
+      },
+      sendResult: () => false, // mesh_reply already closed it during the turn → no-op
+    });
+    const writes: string[] = [];
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ meshManager }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('first\r');
+    await tick();
+    ra.finish(0);
+    await tick();
+    (firePrompt as unknown as PeerCb)({
+      conversationId: 'c-done',
+      peerAlias: 'gateway',
+      text: 'q',
+    });
+    await tick();
+    ra.finish(1, { sessionContext: {} as unknown as SessionContext });
+    await flushFrame();
+    expect(writes.join('')).not.toContain('mesh_reply');
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
@@ -1762,6 +1767,7 @@ describe('repl — boot + smoke', () => {
       },
       sendResult: (cid, text) => {
         sent.push({ cid, text });
+        return true;
       },
     });
     const stdin = makeStdin();
@@ -1853,6 +1859,7 @@ describe('repl — boot + smoke', () => {
       },
       sendResult: (cid, text) => {
         sent.push({ cid, text });
+        return true;
       },
     });
     const stdin = makeStdin();

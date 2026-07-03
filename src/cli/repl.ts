@@ -1558,7 +1558,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const formatNotification = (n: Notification): string => {
     // A peer prompt is fed to the model enveloped as untrusted DATA (§5.2) — NOT
     // the operator-facing origin headline.
-    if (n.kind === 'peer_message') return framePeerPrompt(n.peerAlias, n.text);
+    if (n.kind === 'peer_message') return framePeerPrompt(n.peerAlias, n.conversationId, n.text);
     if (n.kind === 'peer_reply') return framePeerReply(n.peerAlias, n.text);
     return n.kind === 'bg_done' && n.summary !== undefined
       ? `${formatNotificationHeadline(n)}\n${n.summary}`
@@ -1650,23 +1650,29 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // falls back to resumeFromSessionId (re-derive from the log).
         liveContext = event.result.sessionContext ?? null;
       }
-      // Mesh return-routing (§6.3): if a peer prompt drove this turn, send its
-      // final answer back over that conversation and close it. `lastAssistantText`
-      // is the last assistant block only — this instance's tool outputs (user-role
-      // tool_result blocks) never enter it, so the peer receives the ANSWER, not
-      // this repo's paths / raw output / secrets (§0.5 two audiences). Consumed
-      // exactly once; the `.finally` error path below reaps a conversation whose
-      // turn threw before reaching here.
+      // Mesh (§6.4): the model publishes its answer with mesh_reply DURING the
+      // turn — there is NO auto-tap on the final text. If the peer turn ended
+      // WITHOUT a mesh_reply, a fresh-context turn can never answer later, so fail
+      // the conversation with a NEUTRAL error (frees the inbound slot, gives the
+      // initiator closure) rather than leak it open. NOT a content auto-reply —
+      // the neutral notice leaks nothing. `sendResult` returns false (no-op) when
+      // mesh_reply already closed it, so a properly answered turn is silent.
       if (pendingPeerConversation !== null) {
         const cid = pendingPeerConversation;
         pendingPeerConversation = null;
-        const answer = event.result.sessionContext?.lastAssistantText() ?? '';
-        baseConfig.meshManager?.sendResult(
+        const wasUnanswered = baseConfig.meshManager?.sendResult(
           cid,
-          answer.length > 0 ? answer : '[the peer ended the turn with no final answer]',
+          '[the peer ended its turn without publishing a reply]',
         );
-        // Free the serving session for the next peer — republish `idle` so
-        // discovery (mesh_peers) reflects the real state, not a stale `working`.
+        if (wasUnanswered === true) {
+          bus.emit({
+            type: 'info',
+            ts: now(),
+            tone: 'secondary',
+            message: `● ▸ turn ended without a mesh_reply — failed conversation '${flattenControlToLine(cid)}'`,
+          });
+        }
+        // Free the serving session for the next peer — republish `idle`.
         baseConfig.meshManager?.setStatus('idle');
       }
       // Hard-abort un-send (migration 079): if the operator hard-cancelled this
@@ -2266,10 +2272,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // DID fire it already scheduled the drain; skip to avoid a
         // redundant pass.
         if (!sawSessionFinished) {
-          // The turn threw before `session_finished`, so the mesh return-routing
-          // capture never ran. Fail the peer conversation explicitly rather than
-          // leave the initiator hung (§0.6: a failure is always an explicit
-          // error, never a silent hang).
+          // The turn threw before `session_finished`, so it never published a
+          // reply. Unlike a clean turn-end (which stays open — the model just
+          // chose not to answer, §6.4), a CRASHED fresh-context turn can never
+          // answer later, so fail the conversation explicitly (§0.6) rather than
+          // leak an open slot and hang the initiator. `sendResult` is a no-op if
+          // mesh_reply already closed it before the crash.
           if (pendingPeerConversation !== null) {
             const cid = pendingPeerConversation;
             pendingPeerConversation = null;

@@ -27,6 +27,7 @@ import {
 import { type MeshServer, type MeshTransport, connectMesh, listenMesh } from './transport.ts';
 import {
   ALIAS_RE,
+  CONVERSATION_ID_RE,
   MESH_ERROR_CODES,
   MESH_PROTOCOL_VERSION,
   type MeshConfig,
@@ -186,6 +187,19 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
             transport.write(
               encodeMeshMessage(
                 makeError(MESH_ERROR_CODES.handshakeFailed, 'hello required before prompt'),
+              ),
+            );
+            transport.close();
+            return;
+          }
+          // The conversationId is surfaced to the model as the reply handle (§6.2),
+          // embedded in the untrusted preamble OUTSIDE the nonce fence — reject a
+          // non-conforming (control/injection) id at the door. Don't echo the bad
+          // id back (it's the thing we're refusing to trust).
+          if (!CONVERSATION_ID_RE.test(msg.conversationId)) {
+            transport.write(
+              encodeMeshMessage(
+                makeError(MESH_ERROR_CODES.invalidConversation, 'invalid conversationId'),
               ),
             );
             transport.close();

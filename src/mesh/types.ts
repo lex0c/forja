@@ -44,6 +44,9 @@ export const MESH_ERROR_CODES = {
   noSuchPeer: 'mesh.no_such_peer',
   notServing: 'mesh.not_serving',
   handshakeFailed: 'mesh.handshake_failed',
+  // Prompt carried a conversationId outside the safe grammar (CONVERSATION_ID_RE)
+  // — rejected before it can reach the model's envelope preamble (§5.2).
+  invalidConversation: 'mesh.invalid_conversation',
   // Connection closed before the peer answered (crash / relay-off without bye).
   peerLost: 'mesh.peer_lost',
 } as const;
@@ -58,6 +61,14 @@ export type PeerStatus = 'idle' | 'working' | 'waiting-operator';
 // the registry (validates what we CONSUME from foreign descriptors).
 export const ALIAS_RE = /^[a-z][a-z0-9_-]*$/;
 export const ALIAS_MAX = 40;
+
+// Conversation-id grammar. The initiator mints it (crypto.randomUUID), but it is
+// attacker-controlled on the wire and gets surfaced to the model as the reply
+// handle inside the untrusted-message preamble (OUTSIDE the nonce fence, §5.2/
+// §6.2). Same philosophy as ALIAS_RE: safe chars + bounded length, so a hostile
+// peer can't smuggle control bytes / newlines / fake markers through it. Not
+// sanitized (that would break round-trip correlation) — rejected on ingress.
+export const CONVERSATION_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 export const PEER_STATUSES: ReadonlySet<PeerStatus> = new Set([
   'idle',
   'working',
