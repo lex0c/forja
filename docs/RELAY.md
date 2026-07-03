@@ -148,9 +148,11 @@ max_concurrent_conversations = 4   # inbound conversations in flight
 ```
 
 Every value is clamped to a hard ceiling a typo or hostile config cannot lift:
-`max_rounds ≤ 64`, `max_message_bytes ≤ 256 KiB`, `max_concurrent_conversations ≤ 16`.
-(The message ceiling sits deliberately below the 1 MiB wire framer cap so an
-enveloped, escaped max-size message can't overflow it.)
+`max_rounds ≤ 64`, `max_message_bytes ≤ 128 KiB`, `max_concurrent_conversations ≤ 16`.
+(The message ceiling sits well below the 1 MiB wire framer cap: on the wire the text
+is a JSON-string-escaped field, and a control byte expands 6× — so the raw cap must
+stay under cap/6, or an escape-heavy max-size message would overflow the framer and
+be silently dropped.)
 An out-of-range or malformed value warns and falls back to the default. The
 remote posture is always at least supervised and is **not** loosenable by config.
 

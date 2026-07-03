@@ -17,7 +17,7 @@ export const encodeJsonLine = (value: unknown): string => `${JSON.stringify(valu
 // crafted payload) would grow the buffer until the heap dies — the OOM
 // seatbelt. Overridable via `lineCap` for tests that exercise the resync path
 // without allocating a megabyte.
-const DEFAULT_LINE_CAP = 1 << 20; // 1 MiB (UTF-16 code units)
+export const DEFAULT_LINE_CAP = 1 << 20; // 1 MiB (UTF-16 code units)
 
 export interface LineFramer {
   // Push a raw byte chunk; whole lines are delivered via the onLine callback.

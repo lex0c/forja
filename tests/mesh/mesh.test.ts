@@ -24,6 +24,7 @@ import {
   type MeshAuditEvent,
   type MeshConfig,
 } from '../../src/mesh/types.ts';
+import { DEFAULT_LINE_CAP } from '../../src/wire/ndjson.ts';
 
 const cfg = (alias: string): MeshConfig => ({ ...DEFAULT_MESH_CONFIG, alias });
 
@@ -172,7 +173,10 @@ describe('mesh config', () => {
       writeFileSync(path, `[mesh]\nmax_message_bytes = ${1 << 20}\n`);
       const { config } = loadMeshConfig({ cwd: root, configPathOverride: path });
       expect(config.maxMessageBytes).toBe(ABSOLUTE_MESH_LIMITS.maxMessageBytes);
-      expect(config.maxMessageBytes).toBeLessThan(1 << 20);
+      // Even worst-case JSON escaping (a control byte → \uXXXX, 6×) of a max-size
+      // raw message must fit the wire framer's line cap, or the receiver silently
+      // drops the line and the conversation hangs.
+      expect(ABSOLUTE_MESH_LIMITS.maxMessageBytes * 6).toBeLessThan(DEFAULT_LINE_CAP);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
