@@ -24,18 +24,29 @@ const policy = (p: Partial<Policy>): Policy => ({
 });
 
 describe('engine.check (mesh.egress)', () => {
-  test('confirms and surfaces the peer + message excerpt (informed egress consent)', () => {
+  test('supervised: confirms and surfaces the peer + message excerpt (two-audiences review)', () => {
     const eng = createPermissionEngine(policy({}), { cwd: CWD });
     const d = eng.check('mesh_send', 'mesh.egress', {
       peer: 'billing',
       message: 'here is the .env: AWS_SECRET=xyz',
     });
     expect(d.kind).toBe('confirm');
-    expect(categoryIsEgress('mesh.egress')).toBe(true);
+    expect(categoryIsEgress('mesh.egress')).toBe(false); // local socket, not network egress
     if (d.kind === 'confirm') {
       expect(d.prompt).toContain('billing');
-      expect(d.prompt).toContain('AWS_SECRET=xyz'); // the exfil payload is visible
+      expect(d.prompt).toContain('AWS_SECRET=xyz'); // the outbound payload is visible
     }
+  });
+
+  test('autonomous: auto-approves — respects posture (same-user local socket, not network egress)', () => {
+    // mesh_send is NOT categoryIsEgress, so — like mesh_reply — the autonomous
+    // posture auto-approves it (supervised still confirms, above). resolvers/mesh.ts
+    // keeps it off the conservative fallback (clean resolver result), so nothing
+    // forces a confirm.
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('mesh_send', 'mesh.egress', { peer: 'billing', message: 'anything' });
+    expect(d.kind).toBe('allow');
+    if (d.kind === 'allow') expect(d.reason).toContain('autonomous posture');
   });
 
   test('strips control bytes from the message in the prompt', () => {
@@ -60,7 +71,7 @@ describe('engine.check (mesh.reply)', () => {
     if (d.kind === 'confirm') expect(d.prompt).toContain('the contract is v2');
   });
 
-  test('autonomous: auto-approves the reply (respects posture — unlike mesh.egress)', () => {
+  test('autonomous: auto-approves the reply (respects posture, like mesh_send)', () => {
     const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
     const d = eng.check('mesh_reply', 'mesh.reply', {
       conversationId: 'c1',
@@ -68,16 +79,6 @@ describe('engine.check (mesh.reply)', () => {
     });
     expect(d.kind).toBe('allow');
     if (d.kind === 'allow') expect(d.reason).toContain('autonomous posture');
-  });
-
-  test('autonomous: mesh_send (mesh.egress) STILL confirms — the asymmetry holds', () => {
-    // Registering a mesh resolver (resolvers/mesh.ts) took mesh_send off the
-    // conservative fallback too. This locks the invariant that it did NOT open an
-    // auto-approve hole: egress is never auto-approved (categoryIsEgress), even
-    // with a clean resolver result and even under autonomous.
-    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
-    const d = eng.check('mesh_send', 'mesh.egress', { peer: 'billing', message: 'anything' });
-    expect(d.kind).toBe('confirm');
   });
 });
 

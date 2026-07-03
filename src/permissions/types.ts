@@ -22,25 +22,32 @@ export type PolicyCategory =
   | 'misc'
   | 'mcp'
   | 'mcp.egress'
+  // Sending a request to a peer (mesh_send). An outbound send, but over a
+  // same-user LOCAL Unix socket — NOT network egress — so it respects the
+  // operator's posture (supervised confirms + shows the payload; autonomous
+  // auto-approves), like mesh.reply. Deliberately NOT in categoryIsEgress; the
+  // autonomous send trades the outbound-payload review for the same delegation
+  // as any local effect. See MESH.md §5.3.
   | 'mesh.egress'
   // Publishing a reply to a peer that already opened a conversation (mesh_reply).
-  // Deliberately NOT egress: it closes an inbound obligation the operator took on
-  // with `/relay on`, so it follows the operator's posture (supervised confirms
-  // what leaves; autonomous auto-approves) — unlike mesh.egress (initiating
-  // outbound contact), which stays gated even in autonomous. See MESH.md §5.3/§9.
+  // Like mesh.egress, follows the operator's posture (supervised confirms what
+  // leaves; autonomous auto-approves) — both are same-user local mesh boundaries,
+  // not network egress. See MESH.md §5.3/§9.
   | 'mesh.reply';
 
-// Categories that send bytes OUT of the machine to an operator-unconfined
-// destination. Egress is special-cased by the autonomous posture: a
-// default-confirm for an egress category is NEVER auto-approved — a
-// model-chosen fetch can carry data out in the URL (exfil; AGENTIC_CLI §9), so
-// the operator always sees an unknown-host egress, even under autonomous. This
-// is the SINGLE source of truth for "is this egress": a future egress category
-// (a POST/webhook tool, an MCP egress) must be added here, not re-pattern-
-// matched as `category === 'web.fetch'` at each guard site (which would
-// silently auto-approve the new category and reopen the exfil hole).
+// Categories that send bytes OUT to the NETWORK, to an operator-unconfined host.
+// Network egress is special-cased by the autonomous posture: a default-confirm
+// for one of these is NEVER auto-approved — a model-chosen fetch can carry data
+// out in the URL (exfil; AGENTIC_CLI §9), so the operator always sees an
+// unknown-host egress, even under autonomous. This is the SINGLE source of truth
+// for "is this NETWORK egress": a future one (a POST/webhook tool, another MCP
+// egress) must be added here, not re-pattern-matched as `category === 'web.fetch'`
+// at each guard site (which would silently auto-approve it and reopen the exfil
+// hole). NOTE: `mesh.egress` is deliberately NOT here — mesh_send crosses a
+// same-user LOCAL Unix socket, not the network, so it respects the operator's
+// posture (MESH.md §5.3) rather than this hard gate.
 export const categoryIsEgress = (category: PolicyCategory): boolean =>
-  category === 'web.fetch' || category === 'mcp.egress' || category === 'mesh.egress';
+  category === 'web.fetch' || category === 'mcp.egress';
 
 export type PolicyMode = 'strict' | 'acceptEdits' | 'bypass';
 

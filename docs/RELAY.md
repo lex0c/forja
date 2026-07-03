@@ -42,10 +42,13 @@ mesh_peers                     # discover who is serving
 mesh_send                      # send a peer a textual request
 ```
 
-`mesh_send` is **egress**: the operator confirms each send (the modal shows the
-target peer and a preview of the message). It returns immediately — the peer may
-take a while (it might be waiting on *its* operator). When the peer answers, the
-reply arrives in a later turn on its own, and your model sees it.
+`mesh_send` **respects your posture** (like any local effect): in supervised, the
+operator confirms each send — the modal shows the target peer and a preview of the
+message (the two-audiences review of what leaves); in autonomous, sends auto-approve
+(the mesh is a same-user *local* socket, not network egress, so autonomous covers it —
+trading the outbound-payload review for the same delegation as any local effect). It
+returns immediately — the peer may take a while (it might be waiting on *its*
+operator). When the peer answers, the reply arrives in a later turn on its own.
 
 ## How it works
 
@@ -102,9 +105,11 @@ authority.
   - **Autonomous** — local effects auto-approve within policy, as in any
     autonomous turn. Whoever turned autonomous on already accepted that; the mesh
     does not revoke it.
-  - **Egress stays gated in either posture.** `mesh_send` (and any `fetch_url`)
-    is never auto-approved under autonomous — the exfiltration path is always a
-    per-call operator confirm.
+  - **Network egress stays gated in either posture.** `fetch_url` (and network MCP
+    tools) are never auto-approved under autonomous — reaching an arbitrary host is
+    the exfiltration path the operator always sees. `mesh_send` is NOT network egress
+    (a same-user local socket), so it respects posture: supervised confirms + shows
+    the payload; autonomous auto-approves.
 - **Two audiences.** The local scrollback is full fidelity (the operator owns the
   repo). What crosses the wire to the peer is only what the receiver **publishes**
   via `mesh_reply` — never the raw turn. In supervised, the operator reviews that
@@ -131,7 +136,7 @@ trust domain.
 | Tool | Category | Notes |
 |---|---|---|
 | `mesh_peers` | `misc` | Lists live serving instances — `alias`, `branch`, `status` (`idle` / `working` / `waiting-operator`, the last shown when that peer's turn is blocked on its operator's confirm). Never the repo path. Off the base surface (discovered via tool search). |
-| `mesh_send` | `mesh.egress` | Sends a textual request to a peer. Egress → operator confirms each call, and it is never auto-approved under autonomous. Asynchronous (the reply arrives in a later turn). Refuses while **this** session is itself serving — a relay does not initiate onward sends (no transitive delegation). |
+| `mesh_send` | `mesh.egress` | Sends a textual request to a peer. **Respects posture** (§5.3): supervised confirms each call showing the payload; autonomous auto-approves (a same-user local socket, not network egress). Asynchronous (the reply arrives in a later turn). Refuses while **this** session is itself serving — a relay does not initiate onward sends (no transitive delegation). |
 | `mesh_reply` | `mesh.reply` | Publishes your answer back to a peer that sent you a request (the `conversationId` is the handle from the incoming message; this closes the conversation). **Respects your posture** — supervised confirms what leaves (the two-audiences review), autonomous auto-approves. NOT egress. Off the base surface. |
 
 ## Configuration

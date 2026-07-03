@@ -24,7 +24,12 @@ describe('mesh_peers tool', () => {
 });
 
 describe('mesh_send tool', () => {
-  test('is gated as egress (never auto-approved under autonomous)', () => {
+  test('carries the mesh.egress category (posture-respecting — auto-approve is tested in the engine)', () => {
+    // The category name stays `mesh.egress` (an outbound send), but it is NOT in
+    // categoryIsEgress — so it respects posture (autonomous auto-approves). That
+    // behavior is locked in tests/permissions/engine.test.ts; here we just pin the
+    // tool metadata. network:true is honest (it opens a socket) but the socket is a
+    // local Unix one, so it doesn't feed the risk score.
     expect(meshSendTool.metadata.category).toBe('mesh.egress');
     expect(meshSendTool.metadata.network).toBe(true);
   });

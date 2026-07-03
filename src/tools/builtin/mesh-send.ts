@@ -1,10 +1,11 @@
 // mesh_send — send a textual request to a local Forja peer on the mesh.
 //
-// EGRESS: crosses to another process (the peer's socket), so it's gated like
-// fetch_url — never auto-approved under autonomous posture (categoryIsEgress),
-// the operator confirms each send. Asynchronous: it delivers the prompt and
-// returns immediately; the peer's reply arrives later as its own turn (like
-// bash_background). The peer is a sovereign instance — it decides what to do
+// Sends over a same-user LOCAL Unix socket. It RESPECTS the operator's posture
+// (MESH.md §5.3): supervised confirms each send (showing the outbound payload — the
+// two-audiences review); autonomous auto-approves, like any local effect. NOT
+// categoryIsEgress — a local same-user boundary, not network egress. Asynchronous:
+// it delivers the prompt and returns immediately; the peer's reply arrives later as
+// its own turn (like bash_background). The peer is a sovereign instance — it decides what to do
 // under ITS operator's approval; this tool carries intent, never authority
 // (§0, §9). Off the base surface (deferred). See MESH.md §9.
 

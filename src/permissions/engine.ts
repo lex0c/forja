@@ -2580,12 +2580,13 @@ export const createPermissionEngine = (
         );
         break;
       case 'mesh.egress': {
-        // mesh_send delivers a prompt to a peer process (egress). No policy
-        // section — a plain per-call confirm; kept out of autonomous auto-approval
-        // by categoryIsEgress. The operator must see WHAT is leaving and to WHOM
-        // (the message is the exfil vector), so surface the peer + a bounded,
-        // control-stripped excerpt of the message — the modal has no other field
-        // for the payload.
+        // mesh_send delivers a prompt to a peer over a same-user LOCAL Unix socket.
+        // No policy section — a plain confirm that RESPECTS POSTURE (MESH.md §5.3):
+        // autonomous auto-approves, supervised confirms (it is NOT categoryIsEgress
+        // — a local same-user boundary, not network egress). In supervised the
+        // operator must see WHAT is leaving and to WHOM (the message is the outbound
+        // payload), so surface the peer + a bounded, control-stripped excerpt — the
+        // modal has no other field for it.
         const meshArgs = args as { peer?: unknown; message?: unknown };
         const meshPeer =
           typeof meshArgs.peer === 'string' ? sanitizeOneLineForDisplay(meshArgs.peer, 40) : '?';
@@ -2595,7 +2596,7 @@ export const createPermissionEngine = (
         decision = {
           kind: 'confirm',
           confirmCause: 'policy',
-          reason: 'mesh egress: peer is a separate trust domain',
+          reason: 'mesh send: peer is a separate trust domain',
           prompt: `Send to mesh peer '${meshPeer}': ${meshExcerpt}${meshEllipsis}`,
           source: { layer: 'default' },
         };
