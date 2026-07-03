@@ -445,8 +445,21 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
         true, // connection lost — a transport failure, not the peer's answer
       );
     });
-    transport.write(encodeMeshMessage(makeHello(alias)));
-    transport.write(encodeMeshMessage(makePrompt(conversationId, text)));
+    const helloOk = transport.write(encodeMeshMessage(makeHello(alias)));
+    const promptOk = transport.write(encodeMeshMessage(makePrompt(conversationId, text)));
+    if (!helloOk || !promptOk) {
+      // The peer's socket was already closed/dead when we wrote (a stale descriptor,
+      // or a /relay off race that closed it before our first byte): the prompt never
+      // left, and onClose is NOT guaranteed to fire — the close can race ahead of our
+      // handler registration, marking the transport closed without ever invoking our
+      // callback. Settle explicitly (peer_lost) so the initiator gets the promised
+      // reply instead of hanging on a prompt reported as delivered. settle() closes +
+      // removes the transport; it is idempotent, so a later onClose is a no-op.
+      settle(
+        `[mesh error ${MESH_ERROR_CODES.peerLost}] peer '${targetAlias}' closed before the request was sent`,
+        true,
+      );
+    }
     return { conversationId };
   };
 

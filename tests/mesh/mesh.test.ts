@@ -17,7 +17,7 @@ import {
   publishDescriptor,
   socketPath,
 } from '../../src/mesh/registry.ts';
-import { connectMesh } from '../../src/mesh/transport.ts';
+import { connectMesh, listenMesh } from '../../src/mesh/transport.ts';
 import {
   ABSOLUTE_MESH_LIMITS,
   DEFAULT_MESH_CONFIG,
@@ -772,6 +772,40 @@ describe('mesh integration (two managers over real sockets)', () => {
     expect(got.failed).toBe(false); // peer content → untrusted, never a system notice
     await client.shutdown();
     await server.shutdown();
+  });
+
+  test('a send to a peer that closes on accept settles as peer_lost (no silent hang)', async () => {
+    ensureMeshDirs(dir);
+    // A raw server that accepts then instantly closes — models a stale descriptor
+    // or a /relay off race that drops the connection before our prompt is read.
+    const flaky = listenMesh(socketPath(dir, 'flaky'), (t) => {
+      t.close();
+    });
+    publishDescriptor(dir, {
+      alias: 'flaky',
+      repoRoot: '/r',
+      branch: 'm',
+      pid: process.pid,
+      socket: socketPath(dir, 'flaky'),
+      status: 'idle',
+      startedAt: 1,
+    });
+    const client = mkMgr(dir, 'flakycli');
+    const reply = new Promise<{ text: string; failed: boolean }>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('no reply — the send hung')), 3000);
+      client.onReply((r) => {
+        clearTimeout(timer);
+        resolve({ text: r.text, failed: r.failed });
+      });
+    });
+    await client.send('flaky', 'hi');
+    const got = await reply;
+    // The initiator gets an explicit peer_lost (via the failed-write path OR
+    // onClose), never a prompt reported as delivered that then hangs.
+    expect(got.failed).toBe(true);
+    expect(got.text).toContain('peer_lost');
+    await client.shutdown();
+    flaky.stop();
   });
 
   test('server rejects a prompt that arrives before hello', async () => {
