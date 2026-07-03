@@ -712,6 +712,22 @@ describe('mesh integration (two managers over real sockets)', () => {
     await server.shutdown();
   });
 
+  test('startServing refuses a live alias collision instead of unlinking the peer', async () => {
+    const first = mkMgr(dir, 'dupalias');
+    await first.startServing();
+    // A second Forja tries the SAME alias (e.g. a second /relay on in one repo).
+    const second = mkMgr(dir, 'dupalias');
+    await expect(second.startServing()).rejects.toThrow(/already served by a live peer/);
+    // The first peer is untouched — still serving + discoverable (its socket was
+    // NOT unlinked out from under it).
+    expect(first.isServing()).toBe(true);
+    const client = mkMgr(dir, 'dupclient');
+    expect(client.listPeers().map((p) => p.alias)).toContain('dupalias');
+    await client.shutdown();
+    await second.shutdown();
+    await first.shutdown();
+  });
+
   test('server rejects a prompt that arrives before hello', async () => {
     const srv = createMeshManager({
       dir,

@@ -297,6 +297,7 @@ type PeerHook = (p: { conversationId: string; peerAlias: string; text: string })
 type MeshStub = {
   onPrompt: (cb: PeerHook) => void;
   onReply: (cb: PeerHook) => void;
+  isConversationOpen: (cid: string) => boolean;
   sendResult: (cid: string, text: string) => boolean;
   setStatus: (s: string) => void;
   isServing: () => boolean;
@@ -306,6 +307,7 @@ type MeshStub = {
 const meshStub = (over: Partial<MeshStub> = {}): MeshStub => ({
   onPrompt: () => {},
   onReply: () => {},
+  isConversationOpen: () => true, // default: conversation open → the peer turn runs
   sendResult: () => true,
   setStatus: () => {},
   isServing: () => false,
@@ -1756,6 +1758,48 @@ describe('repl — boot + smoke', () => {
     expect(ra.captured[1]?.configs[0]?.revealedTools?.has('mesh_reply')).toBe(true);
     ra.finish(1, { sessionContext: {} as unknown as SessionContext });
     await flushFrame();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a peer prompt whose conversation closed before the drain is dropped, not run', async () => {
+    type PeerCb = (p: { conversationId: string; peerAlias: string; text: string }) => void;
+    let firePrompt: PeerCb | null = null;
+    const meshManager = meshStub({
+      onPrompt: (cb) => {
+        firePrompt = cb;
+      },
+      isConversationOpen: () => false, // the peer disconnected after enqueue
+    });
+    const writes: string[] = [];
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ meshManager }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('first\r');
+    await tick();
+    ra.finish(0);
+    await tick();
+    (firePrompt as unknown as PeerCb)({
+      conversationId: 'c-closed',
+      peerAlias: 'gateway',
+      text: 'help?',
+    });
+    await tick();
+    // No peer turn ran — only the operator's 'first' turn was captured — and the
+    // operator was told the prompt was dropped.
+    expect(ra.captured).toHaveLength(1);
+    expect(writes.join('')).toContain('disconnected before it ran');
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });

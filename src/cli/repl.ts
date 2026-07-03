@@ -2462,6 +2462,25 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // operator intervenes; `peerRounds` resets on the next operator submit.
     const meshMgr = baseConfig.meshManager;
     const peerHead = drained[0]?.kind === 'peer_message' ? drained[0] : null;
+    // Drop a peer prompt whose connection already closed between enqueue and now
+    // (the peer disconnected, or the operator ran /relay off): the reply path is
+    // gone, so running the turn would spend a model turn — and possibly approved
+    // side effects — on a request that can no longer be answered. Skip it without
+    // counting a round or sending a decline (there is no one to receive it).
+    if (
+      peerHead !== null &&
+      meshMgr !== undefined &&
+      !meshMgr.isConversationOpen(peerHead.conversationId)
+    ) {
+      bus.emit({
+        type: 'info',
+        ts: now(),
+        tone: 'secondary',
+        message: `● ▸ dropped a prompt from '${flattenControlToLine(peerHead.peerAlias)}' — the peer disconnected before it ran`,
+      });
+      if (notifications.length > 0) queueMicrotask(() => drainNotifications());
+      return;
+    }
     if (peerHead !== null && meshMgr !== undefined) {
       if (peerRounds >= meshMgr.maxRounds) {
         meshMgr.sendResult(

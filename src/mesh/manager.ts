@@ -100,6 +100,11 @@ export interface MeshManager {
   // REPL wiring: a peer prompted us / a peer answered our send.
   onPrompt(cb: (p: InboundPrompt) => void): void;
   onReply(cb: (r: InboundReply) => void): void;
+  // True while an inbound conversation is still open (accepted, connection up, not
+  // yet answered). The REPL checks this before running a QUEUED peer turn: a peer
+  // that disconnected between enqueue and run must be dropped, not answered into a
+  // dead socket after burning a model turn on it.
+  isConversationOpen(conversationId: string): boolean;
   // Server → answer / progress on an inbound conversation. Returns false if the
   // conversation is unknown/already closed (mesh_reply surfaces that to the model).
   sendResult(conversationId: string, text: string): boolean;
@@ -335,8 +340,22 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
 
   const startServing = async (): Promise<void> => {
     if (serving) return;
-    // Clear a stale socket/descriptor from a previous crashed run at our alias,
-    // then ensure the runtime dir exists before Bun.listen binds the socket.
+    // Refuse if a LIVE peer already holds our alias (e.g. a second /relay on in the
+    // same repo — the default alias is the repo basename). Unlinking its socket
+    // below would make that peer unreachable to new mesh_send calls while it still
+    // believes it is serving. listPeers liveness-checks AND sweeps a STALE
+    // descriptor from a crashed run, so a leftover at our alias is cleared here; a
+    // live hit is a real collision (we have not published our own descriptor yet,
+    // so any hit is a different process).
+    const collision = fsListPeers(deps.dir, {}).find((p) => p.alias === alias);
+    if (collision !== undefined) {
+      throw new Error(
+        `mesh: alias '${alias}' is already served by a live peer (pid ${collision.pid}); set a distinct alias in [mesh]`,
+      );
+    }
+    // Clear a now-confirmed-stale socket/descriptor (or an orphan socket with no
+    // descriptor, which listPeers does not see), then ensure the runtime dir exists
+    // before Bun.listen binds the socket.
     removeDescriptor(deps.dir, alias);
     ensureMeshDirs(deps.dir);
     server = listenMesh(socketPath(deps.dir, alias), onServerConnection);
@@ -499,6 +518,7 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     onReply: (cb) => {
       replyCb = cb;
     },
+    isConversationOpen: (cid) => inbound.has(cid),
     sendResult,
     sendProgress,
     setStatus,
