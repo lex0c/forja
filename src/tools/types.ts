@@ -725,6 +725,9 @@ export const ERROR_CODES = {
   // Mesh tools (mesh_peers / mesh_send).
   meshUnavailable: 'mesh.unavailable',
   meshNoSuchPeer: 'mesh.no_such_peer',
+  // mesh_send refused because THIS session is serving (relayMode) — a relay
+  // does not initiate onward sends (no transitive delegation, §1.2/§8).
+  meshDelegationBlocked: 'mesh.delegation_blocked',
   // tool_search ran without the harness wiring (ctx.searchTools) — a subagent
   // or headless run where the deferred-tool surface (AGENTIC_CLI §7.6) doesn't
   // apply. The base surface is already the full whitelist there; nothing to

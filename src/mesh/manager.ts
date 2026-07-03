@@ -60,6 +60,10 @@ export interface InboundReply {
 
 export interface MeshManager {
   readonly alias: string;
+  // The §8 per-serving-session round bound — the real anti-committee limit
+  // behind the wake-cap exemption (the REPL drain reads it to cap consecutive
+  // peer turns without operator input).
+  readonly maxRounds: number;
   // Discovery (client side, always available).
   listPeers(): PeerInfo[];
   // Send a prompt to a peer, opening a conversation. Resolves when the prompt
@@ -85,6 +89,28 @@ interface Conversation {
   transport: MeshTransport;
   peerAlias: string;
 }
+
+// Clamp text to a UTF-8 byte budget on a char boundary, marking the cut so the
+// truncation is never silent (§8 message cap; no-silent-caps). Returns the
+// input untouched when it already fits.
+const clampUtf8 = (text: string, maxBytes: number): string => {
+  if (Buffer.byteLength(text, 'utf8') <= maxBytes) return text;
+  const marker = '\n[…truncated: over the mesh message cap]';
+  const markerBytes = Buffer.byteLength(marker, 'utf8');
+  // Degenerate cap (smaller than the marker itself — a misconfigured
+  // maxMessageBytes): hard-truncate to the byte budget with no marker, so the
+  // result still can't exceed the cap. Strip a trailing replacement char left by
+  // cutting mid-codepoint.
+  if (maxBytes <= markerBytes) {
+    return Buffer.from(text, 'utf8').subarray(0, maxBytes).toString('utf8').replace(/�+$/, '');
+  }
+  let s = Buffer.from(text, 'utf8')
+    .subarray(0, maxBytes - markerBytes)
+    .toString('utf8');
+  // A partial trailing char decodes to U+FFFD — drop it so the seam is clean.
+  if (s.endsWith('�')) s = s.slice(0, -1);
+  return s + marker;
+};
 
 export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
   const pid = deps.pid ?? process.pid;
@@ -164,6 +190,35 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
             transport.close();
             return;
           }
+          // §8 anti-DoS: reject an over-cap prompt or a saturated server with an
+          // explicit error the initiator materializes — never an unbounded queue
+          // or a silent drop, and BEFORE it drives a local turn.
+          if (Buffer.byteLength(msg.text, 'utf8') > deps.config.maxMessageBytes) {
+            transport.write(
+              encodeMeshMessage(
+                makeError(
+                  MESH_ERROR_CODES.messageTooLarge,
+                  `prompt exceeds the ${deps.config.maxMessageBytes}-byte cap`,
+                  msg.conversationId,
+                ),
+              ),
+            );
+            transport.close();
+            return;
+          }
+          if (inbound.size >= deps.config.maxConcurrentConversations) {
+            transport.write(
+              encodeMeshMessage(
+                makeError(
+                  MESH_ERROR_CODES.peerBusy,
+                  'peer is at its concurrent-conversation limit',
+                  msg.conversationId,
+                ),
+              ),
+            );
+            transport.close();
+            return;
+          }
           inbound.set(msg.conversationId, { transport, peerAlias });
           transport.write(encodeMeshMessage(makeProgress(msg.conversationId, 'accepted')));
           promptCb?.({ conversationId: msg.conversationId, peerAlias, text: msg.text });
@@ -218,6 +273,11 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
 
   // ---- client side ----
   const send = async (targetAlias: string, text: string): Promise<{ conversationId: string }> => {
+    // §8 message cap: refuse an over-budget prompt at the boundary so the
+    // operator sees "too large" up front, not a mid-conversation peer rejection.
+    if (Buffer.byteLength(text, 'utf8') > deps.config.maxMessageBytes) {
+      throw new Error(`mesh: message exceeds the ${deps.config.maxMessageBytes}-byte cap`);
+    }
     const target = fsListPeers(deps.dir, { selfAlias: alias }).find((p) => p.alias === targetAlias);
     if (target === undefined) {
       throw new Error(`mesh: no live peer '${targetAlias}'`);
@@ -246,7 +306,11 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
       } else if (msg.type === 'error') {
         settle(`[mesh error ${msg.code}] ${msg.message}`);
       }
-      // 'progress' is ignored in Slice 1; surfaced to the model in Slice 6.
+      // Inbound 'progress' (accepted/working/waiting-operator) is not surfaced to
+      // the initiator's MODEL yet — only the final 'result' drives a peer_reply
+      // (§6.3). The peer's coarse status is visible to the operator via mesh_peers
+      // (setStatus on the receiver, §7). Per-conversation progress → model is a
+      // deliberate follow-up: it needs a noise policy (not every state a wake).
     });
     transport.onClose(() => {
       settle(
@@ -262,7 +326,12 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     const c = inbound.get(conversationId);
     if (c === undefined) return;
     c.transport.write(encodeMeshMessage(makeProgress(conversationId, 'done')));
-    c.transport.write(encodeMeshMessage(makeResult(conversationId, text)));
+    // Clamp the answer to the §8 cap (marked, never silent) so the receiver
+    // can't push an unbounded result across — the two-audiences filter (§7)
+    // already stripped tool output; this bounds size.
+    c.transport.write(
+      encodeMeshMessage(makeResult(conversationId, clampUtf8(text, deps.config.maxMessageBytes))),
+    );
     // result is the conversation's last message (§4) — graceful close flushes
     // the buffered result before FIN, then reap the entry (no inbound leak).
     c.transport.close();
@@ -292,6 +361,7 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
 
   return {
     alias,
+    maxRounds: deps.config.maxRounds,
     listPeers: () => fsListPeers(deps.dir, { selfAlias: alias }).map(toPeerInfo),
     send,
     startServing,

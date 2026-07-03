@@ -29,7 +29,7 @@ describe('mesh_send tool', () => {
   });
 
   test('delivers and returns the conversation id', async () => {
-    const mgr = { send: async () => ({ conversationId: 'c1' }) };
+    const mgr = { isServing: () => false, send: async () => ({ conversationId: 'c1' }) };
     const r = await meshSendTool.execute({ peer: 'billing', message: 'hi' }, ctxWith(mgr));
     expect(isToolError(r)).toBe(false);
     if (!isToolError(r)) expect(r.conversationId).toBe('c1');
@@ -37,6 +37,7 @@ describe('mesh_send tool', () => {
 
   test('errors on a non-existent peer', async () => {
     const mgr = {
+      isServing: () => false,
       send: async () => {
         throw new Error('no live peer');
       },
@@ -51,8 +52,14 @@ describe('mesh_send tool', () => {
   });
 
   test('rejects an invalid peer alias (control/injection defense)', async () => {
-    const mgr = { send: async () => ({ conversationId: 'c1' }) };
+    const mgr = { isServing: () => false, send: async () => ({ conversationId: 'c1' }) };
     const r = await meshSendTool.execute({ peer: '../evil[2J', message: 'hi' }, ctxWith(mgr));
     expect(isToolError(r) && r.error_code).toBe('tool.invalid_arg');
+  });
+
+  test('refuses to send while THIS session is serving (no transitive delegation, §8)', async () => {
+    const mgr = { isServing: () => true, send: async () => ({ conversationId: 'c1' }) };
+    const r = await meshSendTool.execute({ peer: 'billing', message: 'hi' }, ctxWith(mgr));
+    expect(isToolError(r) && r.error_code).toBe('mesh.delegation_blocked');
   });
 });

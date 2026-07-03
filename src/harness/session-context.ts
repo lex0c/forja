@@ -272,6 +272,27 @@ export class SessionContext {
     return true;
   }
 
+  // The final assistant answer of the live tail: the last assistant message's
+  // text blocks, joined and trimmed. tool_use blocks (and the tool_result
+  // blocks, which are user-role) are excluded, so mesh return-routing sends a
+  // peer the ANSWER without this instance's raw tool output, paths, or secrets
+  // — the §0.5 "two audiences" filter is inherent to reading the last assistant
+  // block, not a heuristic scan of the stream. Empty when the tail produced no
+  // textual answer (e.g. the turn errored before one).
+  lastAssistantText(): string {
+    for (let i = this.messages.length - 1; i >= 0; i--) {
+      const m = this.messages[i];
+      if (m === undefined || m.role !== 'assistant') continue;
+      if (typeof m.content === 'string') return m.content.trim();
+      return m.content
+        .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+        .map((b) => b.text)
+        .join('\n')
+        .trim();
+    }
+    return '';
+  }
+
   // Heal the live array before a turn uses it. Two repairs, both in-memory
   // only (not persisted — the DB log re-derives them on resume):
   //   1. Orphaned tool_use / internal user→user — a turn aborted mid-tool

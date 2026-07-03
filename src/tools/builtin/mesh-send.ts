@@ -50,6 +50,15 @@ export const meshSendTool: Tool<MeshSendInput, MeshSendOutput> = {
     if (mgr === undefined) {
       return toolError(ERROR_CODES.meshUnavailable, 'mesh_send: mesh subsystem unavailable');
     }
+    if (mgr.isServing()) {
+      // No transitive delegation (§1.2, §8): a relay session SERVES peers, it does
+      // not initiate onward sends (no A→B→C chaining). Send from a normal
+      // (non-relay) instance instead.
+      return toolError(
+        ERROR_CODES.meshDelegationBlocked,
+        'mesh_send: a relay session does not initiate mesh sends (no transitive delegation)',
+      );
+    }
     if (typeof input.peer !== 'string' || !ALIAS_RE.test(input.peer)) {
       // Validate against the alias grammar (not just non-empty): the peer becomes
       // the confirm modal's command line, so reject a control/injection alias at

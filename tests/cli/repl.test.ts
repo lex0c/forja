@@ -288,6 +288,32 @@ const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 // live-region redraw being observable in `rendererWrite` captures.
 const flushFrame = (): Promise<void> => new Promise((r) => setTimeout(r, 50));
 
+// A mesh manager stub for REPL wiring tests — every method/prop the REPL
+// touches (onPrompt/onReply/sendResult/setStatus/isServing/maxRounds/shutdown)
+// is a no-op by default; a test overrides just the hooks it asserts on. Keeping
+// them all here means adding a mesh call to the REPL doesn't silently break
+// unrelated tests (as setStatus/maxRounds did when Slice 7 landed).
+type PeerHook = (p: { conversationId: string; peerAlias: string; text: string }) => void;
+type MeshStub = {
+  onPrompt: (cb: PeerHook) => void;
+  onReply: (cb: PeerHook) => void;
+  sendResult: (cid: string, text: string) => void;
+  setStatus: (s: string) => void;
+  isServing: () => boolean;
+  maxRounds: number;
+  shutdown: () => Promise<void>;
+};
+const meshStub = (over: Partial<MeshStub> = {}): MeshStub => ({
+  onPrompt: () => {},
+  onReply: () => {},
+  sendResult: () => {},
+  setStatus: () => {},
+  isServing: () => false,
+  maxRounds: 8,
+  shutdown: async () => {},
+  ...over,
+});
+
 describe('sanitizeForSubagentDisplay (anti-spoof for proxied modal text)', () => {
   // Spec docs/spec/IPC.md §7. The child's permission:ask wire
   // payload reaches the operator's modal as title / option label /
@@ -1540,14 +1566,14 @@ describe('repl — boot + smoke', () => {
     type PeerCb = (p: { conversationId: string; peerAlias: string; text: string }) => void;
     let fire: PeerCb | null = null;
     let meshShutdown = false;
-    const meshManager = {
-      onPrompt: (cb: PeerCb) => {
+    const meshManager = meshStub({
+      onPrompt: (cb) => {
         fire = cb;
       },
       shutdown: async () => {
         meshShutdown = true;
       },
-    };
+    });
     const stdin = makeStdin();
     const ra = makeRunAgent((n) => `sess-${n}`);
     const promise = runRepl({
@@ -1585,6 +1611,329 @@ describe('repl — boot + smoke', () => {
     stdin.feed('\x04');
     expect(await promise).toBe(130);
     expect(meshShutdown).toBe(true); // mesh torn down at REPL exit
+  });
+
+  test('a peer reply (mesh_send answer) auto-wakes a system turn, enveloped as untrusted', async () => {
+    type ReplyCb = (r: { conversationId: string; peerAlias: string; text: string }) => void;
+    let fireReply: ReplyCb | null = null;
+    const meshManager = meshStub({
+      onReply: (cb) => {
+        fireReply = cb;
+      },
+    });
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ meshManager }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    expect(fireReply).not.toBeNull();
+    // Turn 1 (operator), finished → idle.
+    stdin.feed('first\r');
+    await tick();
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    // A peer answers a prompt this session sent earlier → wake-when-idle fires a turn.
+    (fireReply as unknown as ReplyCb)({
+      conversationId: 'c9',
+      peerAlias: 'billing',
+      text: 'the contract is now v2',
+    });
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    const cfg = ra.captured[1]?.configs[0];
+    // Fed to the model enveloped as untrusted DATA (REPLY variant), source:'system'.
+    expect(cfg?.userPrompt ?? '').toContain('UNTRUSTED MESH PEER REPLY');
+    expect(cfg?.userPrompt ?? '').toContain('billing');
+    expect(cfg?.userPrompt ?? '').toContain('the contract is now v2');
+    expect(cfg?.userPromptSource).toBe('system');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a finished peer turn routes its final answer back to that conversation', async () => {
+    type PeerCb = (p: { conversationId: string; peerAlias: string; text: string }) => void;
+    let firePrompt: PeerCb | null = null;
+    const sent: Array<{ cid: string; text: string }> = [];
+    const meshManager = meshStub({
+      onPrompt: (cb) => {
+        firePrompt = cb;
+      },
+      sendResult: (cid, text) => {
+        sent.push({ cid, text });
+      },
+    });
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ meshManager }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    // Turn 1 (operator) → idle. Its result carries NO peer conversation, so it
+    // must not route anything back.
+    stdin.feed('first\r');
+    await tick();
+    ra.finish(0, {
+      sessionContext: { lastAssistantText: () => 'local answer' } as unknown as SessionContext,
+    });
+    await tick();
+    expect(sent).toEqual([]);
+    // A peer prompt drives a system turn (turn 2).
+    (firePrompt as unknown as PeerCb)({
+      conversationId: 'c-route',
+      peerAlias: 'gateway',
+      text: 'what is the contract version?',
+    });
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    // The turn finishes with a live context whose final answer is 'v2 is live'.
+    const ctxStub = { lastAssistantText: () => 'v2 is live' } as unknown as SessionContext;
+    ra.finish(1, { sessionContext: ctxStub });
+    await tick();
+    // Only the final assistant answer is routed back — to that conversation id.
+    expect(sent).toEqual([{ cid: 'c-route', text: 'v2 is live' }]);
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a peer turn with no textual answer routes the explicit fallback, not empty', async () => {
+    type PeerCb = (p: { conversationId: string; peerAlias: string; text: string }) => void;
+    let firePrompt: PeerCb | null = null;
+    const sent: Array<{ cid: string; text: string }> = [];
+    const meshManager = meshStub({
+      onPrompt: (cb) => {
+        firePrompt = cb;
+      },
+      sendResult: (cid, text) => {
+        sent.push({ cid, text });
+      },
+    });
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ meshManager }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('first\r');
+    await tick();
+    ra.finish(0);
+    await tick();
+    (firePrompt as unknown as PeerCb)({
+      conversationId: 'c-empty',
+      peerAlias: 'gateway',
+      text: 'x',
+    });
+    await tick();
+    const emptyCtx = { lastAssistantText: () => '' } as unknown as SessionContext;
+    ra.finish(1, { sessionContext: emptyCtx });
+    await tick();
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.cid).toBe('c-empty');
+    expect(sent[0]?.text).toContain('no final answer');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a peer turn that crashes before finishing fails the conversation (no hang)', async () => {
+    type PeerCb = (p: { conversationId: string; peerAlias: string; text: string }) => void;
+    let firePrompt: PeerCb | null = null;
+    const sent: Array<{ cid: string; text: string }> = [];
+    const meshManager = meshStub({
+      onPrompt: (cb) => {
+        firePrompt = cb;
+      },
+      sendResult: (cid, text) => {
+        sent.push({ cid, text });
+      },
+    });
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ meshManager }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('first\r');
+    await tick();
+    ra.finish(0);
+    await tick();
+    (firePrompt as unknown as PeerCb)({
+      conversationId: 'c-crash',
+      peerAlias: 'gateway',
+      text: 'inspect',
+    });
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    // The peer turn rejects before emitting session_finished (provider crash).
+    ra.reject(1, new Error('provider exploded'));
+    await tick();
+    // The conversation is failed explicitly — the initiator is never left hung.
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.cid).toBe('c-crash');
+    expect(sent[0]?.text).toContain('errored');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a peer turn runs against FRESH context and leaves the operator liveContext intact', async () => {
+    type PeerCb = (p: { conversationId: string; peerAlias: string; text: string }) => void;
+    let firePrompt: PeerCb | null = null;
+    const meshManager = meshStub({
+      onPrompt: (cb) => {
+        firePrompt = cb;
+      },
+    });
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ meshManager }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    // Operator turn 1 establishes a liveContext.
+    stdin.feed('first\r');
+    await tick();
+    const opCtx = { lastAssistantText: () => 'op answer' } as unknown as SessionContext;
+    ra.finish(0, { sessionContext: opCtx });
+    await tick();
+    // Peer turn (turn 2) must NOT reuse the operator's liveContext (§6.2).
+    (firePrompt as unknown as PeerCb)({ conversationId: 'c1', peerAlias: 'gw', text: 'hi' });
+    await tick();
+    const peerCfg = ra.captured[1]?.configs[0];
+    expect(peerCfg?.sessionContext).toBeUndefined();
+    expect(peerCfg?.resumeFromSessionId).toBeUndefined();
+    // The peer turn finishes with its OWN context — it must not clobber liveContext.
+    const peerCtx = { lastAssistantText: () => 'peer answer' } as unknown as SessionContext;
+    ra.finish(1, { sessionContext: peerCtx });
+    await tick();
+    // Operator turn 3 reuses the OPERATOR's context, not the peer's.
+    stdin.feed('third\r');
+    await tick();
+    expect(ra.captured[2]?.configs[0]?.sessionContext).toBe(opCtx);
+    ra.finish(2);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('declines peer prompts past maxRounds until the operator intervenes (§8)', async () => {
+    type PeerCb = (p: { conversationId: string; peerAlias: string; text: string }) => void;
+    let firePrompt: PeerCb | null = null;
+    const sent: Array<{ cid: string; text: string }> = [];
+    const meshManager = meshStub({
+      maxRounds: 2,
+      onPrompt: (cb) => {
+        firePrompt = cb;
+      },
+      sendResult: (cid, text) => {
+        sent.push({ cid, text });
+      },
+    });
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ meshManager }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    const fire = (cid: string) =>
+      (firePrompt as unknown as PeerCb)({ conversationId: cid, peerAlias: 'gw', text: cid });
+    const answer = (t: string) => ({
+      sessionContext: { lastAssistantText: () => t } as unknown as SessionContext,
+    });
+    // Rounds 1 and 2 are served (peerRounds 0→1→2, maxRounds 2).
+    fire('r1');
+    await tick();
+    ra.finish(0, answer('a1'));
+    await tick();
+    fire('r2');
+    await tick();
+    ra.finish(1, answer('a2'));
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    // Round 3 exceeds maxRounds → declined with an explicit result, no turn runs.
+    fire('r3');
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    expect(sent.find((s) => s.cid === 'r3')?.text).toContain('round limit');
+    // Operator intervenes → resets the counter (startOperatorTurn).
+    stdin.feed('op\r');
+    await tick();
+    ra.finish(2);
+    await tick();
+    // A peer prompt is served again.
+    fire('r4');
+    await tick();
+    expect(ra.captured).toHaveLength(4);
+    ra.finish(3, answer('a4'));
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('publishes working while serving a peer turn, idle when it finishes (§7)', async () => {
+    type PeerCb = (p: { conversationId: string; peerAlias: string; text: string }) => void;
+    let firePrompt: PeerCb | null = null;
+    const statuses: string[] = [];
+    const meshManager = meshStub({
+      onPrompt: (cb) => {
+        firePrompt = cb;
+      },
+      setStatus: (s) => {
+        statuses.push(s);
+      },
+    });
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ meshManager }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    (firePrompt as unknown as PeerCb)({ conversationId: 'c1', peerAlias: 'gw', text: 'x' });
+    await tick();
+    expect(statuses).toContain('working');
+    ra.finish(0, {
+      sessionContext: { lastAssistantText: () => 'done' } as unknown as SessionContext,
+    });
+    await tick();
+    expect(statuses).toEqual(['working', 'idle']);
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
   });
 
   test('a bg process finishing while IDLE auto-wakes a turn (wake-when-idle, §3B.4)', async () => {

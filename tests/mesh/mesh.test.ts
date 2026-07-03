@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadMeshConfig } from '../../src/mesh/config.ts';
-import { framePeerPrompt } from '../../src/mesh/envelope.ts';
+import { framePeerPrompt, framePeerReply } from '../../src/mesh/envelope.ts';
 import { createMeshManager } from '../../src/mesh/manager.ts';
 import {
   encodeMeshMessage,
@@ -25,6 +25,27 @@ import {
 } from '../../src/mesh/types.ts';
 
 const cfg = (alias: string): MeshConfig => ({ ...DEFAULT_MESH_CONFIG, alias });
+
+// Compact manager factory for the limit tests — spreads config overrides so a
+// test can pin maxMessageBytes / maxConcurrentConversations.
+const mkMgr = (dir: string, alias: string, over: Partial<MeshConfig> = {}) =>
+  createMeshManager({
+    dir,
+    config: { ...cfg(alias), ...over },
+    repoRoot: `/repo/${alias}`,
+    branch: 'main',
+    pid: process.pid,
+  });
+
+// Resolve the first reply/error a client materializes on a send (settle-once).
+const firstReply = (client: ReturnType<typeof createMeshManager>): Promise<string> =>
+  new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('no reply')), 3000);
+    client.onReply((r) => {
+      clearTimeout(timer);
+      resolve(r.text);
+    });
+  });
 
 describe('mesh protocol', () => {
   test('encode → parse round-trips a prompt', () => {
@@ -85,6 +106,20 @@ describe('mesh envelope', () => {
     // text sit BEFORE it, inside the fence — no breakout.
     expect(framed.trimEnd().endsWith(realEnd)).toBe(true);
     expect(framed.indexOf('break')).toBeLessThan(framed.lastIndexOf(realEnd));
+  });
+
+  test('frames a peer REPLY under its own marker, distinct from a prompt (§6.3)', () => {
+    const framed = framePeerReply('billing', 'the contract is now v2');
+    expect(framed).toContain('UNTRUSTED MESH PEER REPLY');
+    expect(framed).toContain("from 'billing'");
+    expect(framed).toContain('DATA');
+    expect(framed).toContain('the contract is now v2');
+    const begin = framed.match(/===FORJA_UNTRUSTED_PEER_REPLY_([a-f0-9]{10})_BEGIN===/);
+    expect(begin).not.toBeNull();
+    expect(framed).toContain(`===FORJA_UNTRUSTED_PEER_REPLY_${begin?.[1]}_END===`);
+    // A reply and a prompt use different markers so a peer can't pass a reply
+    // off as an operator-seeded prompt (or vice versa).
+    expect(framed).not.toContain('UNTRUSTED MESH PEER MESSAGE');
   });
 });
 
@@ -287,6 +322,67 @@ describe('mesh integration (two managers over real sockets)', () => {
 
     await gateway.shutdown();
     await billing.shutdown();
+  });
+
+  test('rejects a prompt past maxConcurrentConversations with peer_busy (§8)', async () => {
+    const server = mkMgr(dir, 'busysrv', { maxConcurrentConversations: 1 });
+    await server.startServing();
+    server.onPrompt(() => {}); // hold conversations open (never answer)
+    const client = mkMgr(dir, 'busycli');
+    await client.send('busysrv', 'one'); // occupies the single slot
+    const reply = firstReply(client);
+    await client.send('busysrv', 'two'); // over the limit → rejected
+    expect(await reply).toContain('peer_busy');
+    await client.shutdown();
+    await server.shutdown();
+  });
+
+  test('rejects an over-cap inbound prompt with message_too_large (§8)', async () => {
+    const server = mkMgr(dir, 'bigsrv', { maxMessageBytes: 16 });
+    await server.startServing();
+    server.onPrompt(() => {});
+    const client = mkMgr(dir, 'bigcli', { maxMessageBytes: 1 << 20 });
+    const reply = firstReply(client);
+    await client.send('bigsrv', 'x'.repeat(200)); // 200 bytes > server cap 16
+    expect(await reply).toContain('message_too_large');
+    await client.shutdown();
+    await server.shutdown();
+  });
+
+  test('send() refuses an over-cap outbound prompt at the boundary (§8)', async () => {
+    const client = mkMgr(dir, 'capcli', { maxMessageBytes: 8 });
+    // Fails on size BEFORE peer lookup — no server needed.
+    await expect(client.send('whoever', 'x'.repeat(100))).rejects.toThrow(/cap/);
+    await client.shutdown();
+  });
+
+  test('sendResult clamps an over-cap answer, marked (not silent) (§8)', async () => {
+    const server = mkMgr(dir, 'clampsrv', { maxMessageBytes: 80 });
+    await server.startServing();
+    server.onPrompt((p) => server.sendResult(p.conversationId, 'y'.repeat(4000)));
+    const client = mkMgr(dir, 'clampcli', { maxMessageBytes: 1 << 20 });
+    const reply = firstReply(client);
+    await client.send('clampsrv', 'ask');
+    const got = await reply;
+    expect(Buffer.byteLength(got, 'utf8')).toBeLessThanOrEqual(80);
+    expect(got).toContain('truncated');
+    await client.shutdown();
+    await server.shutdown();
+  });
+
+  test('the result clamp never exceeds even a degenerate (tiny) cap', async () => {
+    // maxMessageBytes smaller than the truncation marker itself: the clamp must
+    // still fit the cap (hard-truncate, no marker) rather than overshoot.
+    const server = mkMgr(dir, 'tinysrv', { maxMessageBytes: 8 });
+    await server.startServing();
+    server.onPrompt((p) => server.sendResult(p.conversationId, 'z'.repeat(500)));
+    const client = mkMgr(dir, 'tinycli', { maxMessageBytes: 1 << 20 });
+    const reply = firstReply(client);
+    await client.send('tinysrv', 'ask');
+    const got = await reply;
+    expect(Buffer.byteLength(got, 'utf8')).toBeLessThanOrEqual(8);
+    await client.shutdown();
+    await server.shutdown();
   });
 
   test('send to a non-existent peer rejects', async () => {
