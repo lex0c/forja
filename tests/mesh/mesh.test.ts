@@ -728,6 +728,23 @@ describe('mesh integration (two managers over real sockets)', () => {
     await first.shutdown();
   });
 
+  test('shutdown closes an open client transport (no leaked socket after an unanswered send)', async () => {
+    const server = mkMgr(dir, 'downsrv');
+    await server.startServing();
+    server.onPrompt(() => {}); // accept + hold (never answer) → the client transport stays open
+    const client = mkMgr(dir, 'downcli');
+    await client.send('downsrv', 'hold this open');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(server.inboundSummary()).toHaveLength(1); // the conversation is open
+    // Teardown (what the REPL + the one-shot run.ts finally do): shutdown() must
+    // close the client transport so the socket doesn't keep the event loop alive
+    // and hang the CLI after its final response.
+    await client.shutdown();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(server.inboundSummary()).toHaveLength(0); // server saw the close → gone
+    await server.shutdown();
+  });
+
   test('server rejects a prompt that arrives before hello', async () => {
     const srv = createMeshManager({
       dir,
