@@ -64,6 +64,20 @@ describe('mesh_send tool', () => {
     expect(isToolError(r) && r.error_code).toBe('tool.invalid_arg');
   });
 
+  test('rejects an over-cap message with a distinct message_too_large code (M3)', async () => {
+    const mgr = {
+      isServing: () => false,
+      maxMessageBytes: 10,
+      send: async () => ({ conversationId: 'c1' }),
+    };
+    const r = await meshSendTool.execute(
+      { peer: 'billing', message: 'x'.repeat(50) },
+      ctxWith(mgr),
+    );
+    // Distinct from no_such_peer — the model shortens the message, not re-discovers.
+    expect(isToolError(r) && r.error_code).toBe('mesh.message_too_large');
+  });
+
   test('refuses to send while THIS session is serving (no transitive delegation, §8)', async () => {
     const mgr = { isServing: () => true, send: async () => ({ conversationId: 'c1' }) };
     const r = await meshSendTool.execute({ peer: 'billing', message: 'hi' }, ctxWith(mgr));

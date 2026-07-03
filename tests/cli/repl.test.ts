@@ -1716,6 +1716,50 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('a peer turn reveals mesh_reply so the tool its preamble names is callable', async () => {
+    type PeerCb = (p: { conversationId: string; peerAlias: string; text: string }) => void;
+    let firePrompt: PeerCb | null = null;
+    const meshManager = meshStub({
+      onPrompt: (cb) => {
+        firePrompt = cb;
+      },
+    });
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ meshManager }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => {},
+    });
+    await tick();
+    stdin.feed('first\r');
+    await tick();
+    ra.finish(0);
+    await tick();
+    // The operator turn does NOT reveal mesh_reply (asserted before the peer turn
+    // mutates the shared revealedTools set).
+    expect(ra.captured[0]?.configs[0]?.revealedTools?.has('mesh_reply')).toBe(false);
+    (firePrompt as unknown as PeerCb)({
+      conversationId: 'c1',
+      peerAlias: 'gateway',
+      text: 'help?',
+    });
+    await tick();
+    // The peer turn reveals mesh_reply — otherwise the tool the preamble names is
+    // `deferred` (off the wire) and the cold receiver is told to call a tool it
+    // can't see, then neutral-fails.
+    expect(ra.captured).toHaveLength(2);
+    expect(ra.captured[1]?.configs[0]?.revealedTools?.has('mesh_reply')).toBe(true);
+    ra.finish(1, { sessionContext: {} as unknown as SessionContext });
+    await flushFrame();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('a peer turn whose model already replied (conversation closed) fails nothing and does not warn', async () => {
     type PeerCb = (p: { conversationId: string; peerAlias: string; text: string }) => void;
     let firePrompt: PeerCb | null = null;

@@ -96,6 +96,12 @@ describe('mesh envelope', () => {
     // The conversationId is surfaced as the reply handle (§6.2).
     expect(framed).toContain('conv-abc123');
     expect(framed).toContain('mesh_reply');
+    // The reply obligation is framed for THIS turn (a turn that ends without a
+    // mesh_reply neutral-fails — no "answer later" affordance), and the answer
+    // must be self-contained since it is read by a separate repo.
+    expect(framed).toContain('BEFORE this turn ends');
+    expect(framed).toContain('self-contained');
+    expect(framed).not.toContain('stays open until you do');
     // Per-message nonce markers (mirrors fetch_url) — same nonce on both ends.
     const begin = framed.match(/===FORJA_UNTRUSTED_PEER_MESSAGE_([a-f0-9]{10})_BEGIN===/);
     expect(begin).not.toBeNull();
@@ -117,11 +123,13 @@ describe('mesh envelope', () => {
   });
 
   test('frames a peer REPLY under its own marker, distinct from a prompt (§6.3)', () => {
-    const framed = framePeerReply('billing', 'the contract is now v2');
+    const framed = framePeerReply('billing', 'conv-xyz789', 'the contract is now v2');
     expect(framed).toContain('UNTRUSTED MESH PEER REPLY');
     expect(framed).toContain("from 'billing'");
     expect(framed).toContain('DATA');
     expect(framed).toContain('the contract is now v2');
+    // The conversationId is echoed as the correlation handle (M1).
+    expect(framed).toContain('conv-xyz789');
     const begin = framed.match(/===FORJA_UNTRUSTED_PEER_REPLY_([a-f0-9]{10})_BEGIN===/);
     expect(begin).not.toBeNull();
     expect(framed).toContain(`===FORJA_UNTRUSTED_PEER_REPLY_${begin?.[1]}_END===`);
@@ -652,17 +660,56 @@ describe('mesh integration (two managers over real sockets)', () => {
     bl.onPrompt(() => {
       void bl.stopServing();
     });
-    const reply = new Promise<string>((resolve, reject) => {
+    const reply = new Promise<{ text: string; failed: boolean }>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('no reply')), 3000);
       gw.onReply((r) => {
         clearTimeout(timer);
-        resolve(r.text);
+        resolve({ text: r.text, failed: r.failed });
       });
     });
     await gw.send('bl', 'hi');
-    expect(await reply).toContain('peer_lost');
+    const got = await reply;
+    expect(got.text).toContain('peer_lost');
+    // A transport failure is flagged (drives the distinct headline + trusted
+    // framing) — not the peer's own content (M2).
+    expect(got.failed).toBe(true);
     await gw.shutdown();
     await bl.shutdown();
+  });
+
+  test('a real result reply is not flagged failed (M2)', async () => {
+    const server = mkMgr(dir, 'okflagsrv');
+    await server.startServing();
+    server.onPrompt((p) => server.sendResult(p.conversationId, 'the answer'));
+    const client = mkMgr(dir, 'okflagcli');
+    const reply = new Promise<{ text: string; failed: boolean }>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('no reply')), 3000);
+      client.onReply((r) => {
+        clearTimeout(timer);
+        resolve({ text: r.text, failed: r.failed });
+      });
+    });
+    await client.send('okflagsrv', 'ask');
+    const got = await reply;
+    expect(got.text).toBe('the answer');
+    expect(got.failed).toBe(false);
+    await client.shutdown();
+    await server.shutdown();
+  });
+
+  test('inboundSummary reflects in-flight inbound conversations (M7)', async () => {
+    const server = mkMgr(dir, 'summsrv');
+    await server.startServing();
+    server.onPrompt(() => {}); // accept + hold the conversation open (never answer)
+    expect(server.inboundSummary()).toHaveLength(0);
+    const client = mkMgr(dir, 'summcli');
+    await client.send('summsrv', 'hold this open');
+    await new Promise((r) => setTimeout(r, 50)); // let the accept land in `inbound`
+    const summary = server.inboundSummary();
+    expect(summary).toHaveLength(1);
+    expect(summary[0]?.peerAlias).toBe('summcli');
+    await client.shutdown();
+    await server.shutdown();
   });
 
   test('server rejects a prompt that arrives before hello', async () => {

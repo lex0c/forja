@@ -787,9 +787,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // as an explicit error text, §0.6). Lands as a `peer_reply` notification →
   // the same wake-when-idle path as bg_done, since it's the async result of
   // work this session kicked off. Enveloped untrusted before the model.
-  baseConfig.meshManager?.onReply(({ conversationId, peerAlias, text }) => {
+  baseConfig.meshManager?.onReply(({ conversationId, peerAlias, text, failed }) => {
     if (exiting) return;
-    enqueueNotification({ kind: 'peer_reply', conversationId, peerAlias, text });
+    enqueueNotification({ kind: 'peer_reply', conversationId, peerAlias, text, failed });
   });
 
   // Permission engine refused to come up (PERMISSION_ENGINE.md §7.2):
@@ -1503,6 +1503,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     peerAlias: string;
     conversationId: string;
     text: string;
+    // True when `text` is a locally-generated transport failure (peer_lost / wire
+    // error), not the peer's answer — drives a distinct headline + trusted framing.
+    failed: boolean;
   };
   // Producer payload (no id yet); `enqueueNotification` stamps the id.
   type NotificationPayload =
@@ -1559,7 +1562,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // bg_done/reminder) so it can't spoof the operator's scrollback.
         return `▸ remote prompt from '${flattenControlToLine(n.peerAlias)}'`;
       case 'peer_reply':
-        return `▸ reply from '${flattenControlToLine(n.peerAlias)}'`;
+        // Distinct headline for a transport failure (peer_lost / wire error) so
+        // the operator doesn't skim a failed round as an answered one.
+        return n.failed
+          ? `▸ no reply from '${flattenControlToLine(n.peerAlias)}' — ${flattenControlToLine(n.text)}`
+          : `▸ reply from '${flattenControlToLine(n.peerAlias)}'`;
     }
   };
   // Full text fed to the model as the wake-turn input: headline + any
@@ -1569,7 +1576,16 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // A peer prompt is fed to the model enveloped as untrusted DATA (§5.2) — NOT
     // the operator-facing origin headline.
     if (n.kind === 'peer_message') return framePeerPrompt(n.peerAlias, n.conversationId, n.text);
-    if (n.kind === 'peer_reply') return framePeerReply(n.peerAlias, n.text);
+    if (n.kind === 'peer_reply') {
+      // A locally-generated transport failure (peer_lost / wire error) is our own
+      // signal — frame it as a trusted-system notice, not untrusted peer DATA, so
+      // the model reads "the connection dropped" plainly. A real answer (incl. a
+      // neutral "ended without a reply", which is peer content from our side) gets
+      // the untrusted envelope, carrying the conversationId for correlation.
+      return n.failed
+        ? `[mesh system notice] Your mesh_send to '${flattenControlToLine(n.peerAlias)}' (conversationId "${n.conversationId}") could not be completed: ${n.text}`
+        : framePeerReply(n.peerAlias, n.conversationId, n.text);
+    }
     return n.kind === 'bg_done' && n.summary !== undefined
       ? `${formatNotificationHeadline(n)}\n${n.summary}`
       : formatNotificationHeadline(n);
@@ -1811,6 +1827,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         displayRule = sanitizeForSubagentDisplay(displayRule);
       }
     }
+    // M6: a peer turn blocked on this modal is waiting-operator, not working —
+    // publish it so the peer (and its operator) can tell "busy computing" from
+    // "blocked on a human who stepped away". Reverted to working after the answer.
+    if (pendingPeerAlias !== null) baseConfig.meshManager?.setStatus('waiting-operator');
     const answer = await modalManager.askPermission(
       {
         toolName: displayToolName,
@@ -1847,6 +1867,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       // operator on a stale request.
       req.signal !== undefined ? { signal: req.signal } : undefined,
     );
+    if (pendingPeerAlias !== null) baseConfig.meshManager?.setStatus('working');
     // Modal returns 'yes' / 'no' / 'cancel'. The previous
     // 'session-allow' value was removed alongside option 2 — the
     // engine's addSessionAllow API stays available for non-modal
@@ -2504,7 +2525,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // A peer turn: publish `working` (discovery reflects the real state) and run
     // it against FRESH context (§6.2 isolation). Any other wake stays on the
     // operator lane (reuses liveContext).
-    if (peerHead !== null) meshMgr?.setStatus('working');
+    if (peerHead !== null) {
+      meshMgr?.setStatus('working');
+      // The peer-prompt preamble instructs the receiver to answer via mesh_reply,
+      // but that tool is `deferred` (off the wire until revealed). Reveal it for
+      // the peer turn so the tool the preamble names is actually in the model's
+      // schema — otherwise a cold receiver is told to call a tool it can't see,
+      // and a turn that ends without a mesh_reply neutral-fails the conversation.
+      revealedTools.add('mesh_reply');
+    }
     // 'system' source: the wake input persists as a system message, so
     // audit and --resume don't render it as operator input (migration 075).
     startTurn(drained.map(formatNotification).join('\n\n'), 'system', {

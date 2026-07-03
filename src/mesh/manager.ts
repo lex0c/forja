@@ -67,6 +67,12 @@ export interface InboundReply {
   conversationId: string;
   peerAlias: string;
   text: string;
+  // True when `text` is a LOCALLY-generated transport failure (peer_lost / a wire
+  // error) rather than the peer's published answer — the REPL frames it as a
+  // trusted-system notice (not untrusted peer DATA) and gives it a failure
+  // headline. A neutral "ended without a reply" arrives as a normal result (peer
+  // content from our side), so it is NOT flagged here.
+  failed: boolean;
 }
 
 export interface MeshManager {
@@ -75,6 +81,9 @@ export interface MeshManager {
   // behind the wake-cap exemption (the REPL drain reads it to cap consecutive
   // peer turns without operator input).
   readonly maxRounds: number;
+  // The §8 per-message byte cap — the mesh_send tool reads it to reject an
+  // over-cap message up front with a distinct error (not a generic no-peer).
+  readonly maxMessageBytes: number;
   // Discovery (client side, always available).
   listPeers(): PeerInfo[];
   // Send a prompt to a peer, opening a conversation. Resolves when the prompt
@@ -85,6 +94,9 @@ export interface MeshManager {
   startServing(): Promise<void>;
   stopServing(): Promise<void>;
   isServing(): boolean;
+  // Snapshot of in-flight INBOUND conversations (a peer prompted us) — for the
+  // operator's /relay status: who is talking to us right now.
+  inboundSummary(): { conversationId: string; peerAlias: string }[];
   // REPL wiring: a peer prompted us / a peer answered our send.
   onPrompt(cb: (p: InboundPrompt) => void): void;
   onReply(cb: (r: InboundReply) => void): void;
@@ -375,12 +387,12 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     // explicit error, never a silently hung conversation) and closes the
     // transport once we have the answer (no per-conversation socket leak, §6.5).
     let settled = false;
-    const settle = (replyText: string): void => {
+    const settle = (replyText: string, failed: boolean): void => {
       if (settled) return;
       settled = true;
       clientTransports.delete(transport);
       try {
-        replyCb?.({ conversationId, peerAlias: targetAlias, text: replyText });
+        replyCb?.({ conversationId, peerAlias: targetAlias, text: replyText, failed });
       } finally {
         // Always reclaim the socket — if the reply sink throws, skipping close()
         // would strand the fd + leave the transport in clientTransports forever.
@@ -393,9 +405,9 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
       const msg = res.msg;
       if (msg.type === 'result' && msg.conversationId === conversationId) {
         emitAudit({ kind: 'reply_received', conversationId, peerAlias: targetAlias });
-        settle(msg.text);
+        settle(msg.text, false); // a real result — the peer's published content
       } else if (msg.type === 'error') {
-        settle(`[mesh error ${msg.code}] ${msg.message}`);
+        settle(`[mesh error ${msg.code}] ${msg.message}`, true); // wire failure
       }
       // Inbound 'progress' (accepted/working/waiting-operator) is not surfaced to
       // the initiator's MODEL yet — only the final 'result' drives a peer_reply
@@ -406,6 +418,7 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     transport.onClose(() => {
       settle(
         `[mesh error ${MESH_ERROR_CODES.peerLost}] peer '${targetAlias}' closed before answering`,
+        true, // connection lost — a transport failure, not the peer's answer
       );
     });
     transport.write(encodeMeshMessage(makeHello(alias)));
@@ -469,6 +482,12 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
   return {
     alias,
     maxRounds: deps.config.maxRounds,
+    maxMessageBytes: deps.config.maxMessageBytes,
+    inboundSummary: () =>
+      Array.from(inbound.entries()).map(([conversationId, c]) => ({
+        conversationId,
+        peerAlias: c.peerAlias,
+      })),
     listPeers: () => fsListPeers(deps.dir, { selfAlias: alias }).map(toPeerInfo),
     send,
     startServing,

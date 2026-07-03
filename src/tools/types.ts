@@ -725,6 +725,9 @@ export const ERROR_CODES = {
   // Mesh tools (mesh_peers / mesh_send).
   meshUnavailable: 'mesh.unavailable',
   meshNoSuchPeer: 'mesh.no_such_peer',
+  // mesh_send message is over the peer byte cap — distinct from no_such_peer so
+  // the model shortens the request instead of re-running discovery.
+  meshMessageTooLarge: 'mesh.message_too_large',
   // mesh_send refused because THIS session is serving (relayMode) — a relay
   // does not initiate onward sends (no transitive delegation, §1.2/§8).
   meshDelegationBlocked: 'mesh.delegation_blocked',

@@ -8,6 +8,7 @@ const makeManager = () => {
   return {
     alias: 'billing',
     isServing: () => serving,
+    inboundSummary: () => [] as { conversationId: string; peerAlias: string }[],
     startServing: async () => {
       serving = true;
     },
@@ -45,6 +46,8 @@ describe('/relay', () => {
     expect(r.kind).toBe('ok');
     expect(mgr.isServing()).toBe(true);
     expect(emitted.some((e) => e.type === 'relay:change' && e.active === true)).toBe(true);
+    // The success note warns that sending is disabled while serving (M8).
+    expect(r.kind === 'ok' && r.notes?.some((n) => n.includes('mesh_send'))).toBe(true);
   });
 
   test('on: confirm no → does not start, emits nothing', async () => {

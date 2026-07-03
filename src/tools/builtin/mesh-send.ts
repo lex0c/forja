@@ -75,6 +75,17 @@ export const meshSendTool: Tool<MeshSendInput, MeshSendOutput> = {
     if (typeof input.message !== 'string' || input.message.length === 0) {
       return toolError(ERROR_CODES.invalidArg, "mesh_send: missing 'message'");
     }
+    const messageBytes = Buffer.byteLength(input.message, 'utf8');
+    if (messageBytes > mgr.maxMessageBytes) {
+      // Reject up front with a DISTINCT code — otherwise the send() throw collapses
+      // into the catch-all no_such_peer below, and the model re-runs discovery
+      // instead of shortening the request. (A smaller receiver cap can still reject
+      // it over the wire; that comes back as a legible peer error reply.)
+      return toolError(
+        ERROR_CODES.meshMessageTooLarge,
+        `mesh_send: message is ${messageBytes} bytes, over the ${mgr.maxMessageBytes}-byte peer cap — shorten the request`,
+      );
+    }
     try {
       const { conversationId } = await mgr.send(input.peer, input.message);
       return {

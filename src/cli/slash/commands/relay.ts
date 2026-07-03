@@ -12,12 +12,17 @@ import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 const statusNotes = (ctx: SlashContext): SlashResult => {
   const mgr = ctx.baseConfig.meshManager;
   if (mgr === undefined) return { kind: 'ok', notes: ['relay: mesh subsystem unavailable'] };
-  return {
-    kind: 'ok',
-    notes: mgr.isServing()
-      ? [`relay: on — serving as '${mgr.alias}'`]
-      : ['relay: off (run /relay on to start serving mesh peers)'],
-  };
+  if (!mgr.isServing()) {
+    return { kind: 'ok', notes: ['relay: off (run /relay on to start serving mesh peers)'] };
+  }
+  // Surface the inbound state so the serving operator can see who is talking to
+  // them right now — mesh_peers only lists OTHER servers (for initiating).
+  const inbound = mgr.inboundSummary();
+  const inboundNote =
+    inbound.length === 0
+      ? 'no conversations in flight'
+      : `${inbound.length} in flight (${inbound.map((c) => c.peerAlias).join(', ')})`;
+  return { kind: 'ok', notes: [`relay: on — serving as '${mgr.alias}'; ${inboundNote}`] };
 };
 
 export const relayCommand: SlashCommand = {
@@ -76,7 +81,10 @@ export const relayCommand: SlashCommand = {
       syncBadge();
       return {
         kind: 'ok',
-        notes: [`relay: on — serving as '${mgr.alias}'; keep working, peer requests interleave`],
+        notes: [
+          `relay: on — serving as '${mgr.alias}'; keep working, peer requests interleave`,
+          'note: sending to peers (mesh_send) is disabled while serving — send from a non-relay session',
+        ],
       };
     }
 
