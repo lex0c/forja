@@ -1977,6 +1977,18 @@ describe('bg lifecycle', () => {
     expect(state.reminderCount).toBe(1);
   });
 
+  test('initial state owes no replies', () => {
+    expect(createInitialState().awaitingReplyCount).toBe(0);
+  });
+
+  test('mesh:awaiting stores the absolute owed-reply count', () => {
+    const { state } = drive([
+      { type: 'mesh:awaiting', ts: 1, count: 2 },
+      { type: 'mesh:awaiting', ts: 2, count: 1 },
+    ]);
+    expect(state.awaitingReplyCount).toBe(1);
+  });
+
   test('bg:start with duplicate processId overwrites silently', () => {
     // Producer bug shouldn't crash — Map.set semantics keep the
     // count correct (still 1) and the renderer shows the latest

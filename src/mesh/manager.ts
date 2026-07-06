@@ -97,6 +97,12 @@ export interface MeshManager {
   isServing(): boolean;
   // REPL wiring: a peer sent us a message.
   onMessage(cb: (m: InboundMessage) => void): void;
+  // REPL wiring: a message WE sent to a peer landed (a successful send, after the
+  // receiver's verdict). Fires with the target alias — the REPL clears the "owed a
+  // reply" state with it (the reply-nudge safety net, §6.4). Fires for BOTH a
+  // peer-turn reply and the operator's own outbound send: the peer got an answer
+  // either way, so the owed-reply signal should clear.
+  onMessageSent(cb: (peerAlias: string) => void): void;
   // Published status (idle / working / waiting-operator).
   setStatus(status: PeerStatus): void;
   shutdown(): Promise<void>;
@@ -136,6 +142,7 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
   const openConnections = new Set<MeshTransport>();
 
   let messageCb: ((m: InboundMessage) => void) | null = null;
+  let messageSentCb: ((alias: string) => void) | null = null;
 
   const descriptor = (): PeerDescriptor => ({
     alias,
@@ -479,6 +486,13 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
       );
     }
     emitAudit({ kind: 'message_sent', id: msg.id, peerAlias: targetAlias, text });
+    // The send landed → tell the REPL so it can clear the owed-reply signal for this
+    // peer (best-effort, like the audit; a throwing observer must not fail the send).
+    try {
+      messageSentCb?.(targetAlias);
+    } catch {
+      // observer must not break the wire operation
+    }
     return { id: msg.id };
   };
 
@@ -504,6 +518,9 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     isServing: () => serving,
     onMessage: (cb) => {
       messageCb = cb;
+    },
+    onMessageSent: (cb) => {
+      messageSentCb = cb;
     },
     setStatus,
     shutdown,

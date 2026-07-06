@@ -293,14 +293,17 @@ const flushFrame = (): Promise<void> => new Promise((r) => setTimeout(r, 50));
 // overrides just the hooks it asserts on. Keeping them all here means adding a
 // mesh call to the REPL doesn't silently break unrelated tests.
 type PeerHook = (m: { peerAlias: string; text: string }) => void;
+type SentHook = (peerAlias: string) => void;
 type MeshStub = {
   onMessage: (cb: PeerHook) => void;
+  onMessageSent: (cb: SentHook) => void;
   setStatus: (s: string) => void;
   isServing: () => boolean;
   shutdown: () => Promise<void>;
 };
 const meshStub = (over: Partial<MeshStub> = {}): MeshStub => ({
   onMessage: () => {},
+  onMessageSent: () => {},
   setStatus: () => {},
   isServing: () => false,
   shutdown: async () => {},
@@ -1597,6 +1600,11 @@ describe('repl — boot + smoke', () => {
     expect(cfg?.userPromptSource).toBe('system');
     ra.finish(1);
     await tick();
+    // The peer turn ended without a mesh_send back → a one-shot reply nudge fires
+    // (captured[2], the reply safety net — asserted on its own elsewhere). Finish it
+    // so shutdown is clean rather than hanging on a running turn.
+    ra.finish(2);
+    await tick();
     stdin.feed('\x04');
     expect(await promise).toBe(130);
     expect(meshShutdown).toBe(true); // mesh torn down at REPL exit
@@ -1638,6 +1646,147 @@ describe('repl — boot + smoke', () => {
     expect(ra.captured[1]?.configs[0]?.revealedTools?.has('mesh_send')).toBe(true);
     ra.finish(1, { sessionContext: {} as unknown as SessionContext });
     await flushFrame();
+    // Unreplied peer turn → one-shot reply nudge (captured[2]); finish it for a clean exit.
+    ra.finish(2, { sessionContext: {} as unknown as SessionContext });
+    await flushFrame();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a peer turn that ends with no mesh_send back nudges once (reply safety net)', async () => {
+    type PeerCb = (m: { peerAlias: string; text: string }) => void;
+    let fire: PeerCb | null = null;
+    const meshManager = meshStub({
+      onMessage: (cb) => {
+        fire = cb;
+      },
+    });
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ meshManager }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => {},
+    });
+    await tick();
+    // Operator turn first — resets the consecutive-wake cap so the nudge isn't gated.
+    stdin.feed('first\r');
+    await tick();
+    ra.finish(0);
+    await tick();
+    // Peer message → wake turn. The model does NOT reply (onMessageSent never fires).
+    (fire as unknown as PeerCb)({ peerAlias: 'billing', text: 'inspect the contract' });
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    ra.finish(1);
+    await tick();
+    // The peer turn ended owing a reply → exactly one nudge wake, naming the peer and
+    // steering to mesh_send, fed as a system turn.
+    expect(ra.captured).toHaveLength(3);
+    const nudge = ra.captured[2]?.configs[0];
+    expect(nudge?.userPrompt ?? '').toContain('[reply pending]');
+    expect(nudge?.userPrompt ?? '').toContain('billing');
+    expect(nudge?.userPrompt ?? '').toContain('mesh_send');
+    // Steers a concluded exchange to silence, not another closing message (anti-ping-pong).
+    expect(nudge?.userPrompt ?? '').toContain('needs no reply');
+    expect(nudge?.userPromptSource).toBe('system');
+    // Finishing the nudge turn ALSO without a reply must NOT nudge again (one-shot).
+    ra.finish(2);
+    await tick();
+    expect(ra.captured).toHaveLength(3);
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('an ABORTED peer turn is not nudged AND settles the debt (operator took control)', async () => {
+    type PeerCb = (m: { peerAlias: string; text: string }) => void;
+    let fire: PeerCb | null = null;
+    const meshManager = meshStub({
+      onMessage: (cb) => {
+        fire = cb;
+      },
+    });
+    const writes: string[] = [];
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ meshManager }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('first\r');
+    await tick();
+    ra.finish(0);
+    await tick();
+    (fire as unknown as PeerCb)({ peerAlias: 'billing', text: 'inspect the contract' });
+    await tick();
+    await flushFrame();
+    expect(ra.captured).toHaveLength(2);
+    expect(writes.join('')).toContain('awaiting reply'); // the chip showed while owed
+    // The operator hard-aborts the peer turn (Ctrl-C twice) — a deliberate stop that
+    // takes manual control. No nudge fires (re-engaging the interrupted work would
+    // contradict the stop), AND the debt settles so the footer chip doesn't stick with
+    // no nudge turn ever coming to resolve it.
+    writes.length = 0;
+    ra.finish(1, { abortCause: 'hard' });
+    await flushFrame();
+    expect(ra.captured).toHaveLength(2); // no nudge wake
+    const footerFrames = writes.filter((w) => w.includes('mode on'));
+    expect(footerFrames.length).toBeGreaterThan(0);
+    expect(footerFrames[footerFrames.length - 1] ?? '').not.toContain('awaiting reply'); // cleared
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('a peer turn that DOES mesh_send back is not nudged', async () => {
+    type PeerCb = (m: { peerAlias: string; text: string }) => void;
+    type SentCb = (alias: string) => void;
+    let fire: PeerCb | null = null;
+    let fireSent: SentCb | null = null;
+    const meshManager = meshStub({
+      onMessage: (cb) => {
+        fire = cb;
+      },
+      onMessageSent: (cb) => {
+        fireSent = cb;
+      },
+    });
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ meshManager }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => {},
+    });
+    await tick();
+    stdin.feed('first\r');
+    await tick();
+    ra.finish(0);
+    await tick();
+    (fire as unknown as PeerCb)({ peerAlias: 'billing', text: 'inspect the contract' });
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    // The model replies during the turn: a successful mesh_send back to the peer.
+    (fireSent as unknown as SentCb)('billing');
+    ra.finish(1);
+    await tick();
+    // The loop closed → no nudge wake.
+    expect(ra.captured).toHaveLength(2);
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
@@ -1677,8 +1826,67 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('a nudge turn ending WITHOUT a reply settles the debt (so a fresh message re-arms it)', async () => {
+    // The field miss: after the anti-ping-pong wording, a model correctly ENDS a nudge
+    // turn without sending (a concluded exchange needs no reply). The debt must settle —
+    // clear from awaitingReply + nudgedAwaiting — or the footer chip sticks forever AND
+    // a genuinely new message from that peer would never nudge again. Proven here via
+    // re-arm: a second unreplied cycle produces a fresh nudge, which only happens if the
+    // first cycle fully cleared the peer.
+    type PeerCb = (m: { peerAlias: string; text: string }) => void;
+    let fire: PeerCb | null = null;
+    const meshManager = meshStub({
+      onMessage: (cb) => {
+        fire = cb;
+      },
+    });
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ meshManager }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => {},
+    });
+    await tick();
+    stdin.feed('first\r'); // resets the wake cap
+    await tick();
+    ra.finish(0);
+    await tick();
+    // Cycle 1: peer message → peer turn → no reply → nudge → nudge turn → no reply.
+    (fire as unknown as PeerCb)({ peerAlias: 'billing', text: 'inspect the contract' });
+    await tick();
+    ra.finish(1); // peer turn, no reply → nudge fires
+    await tick();
+    expect(ra.captured).toHaveLength(3); // captured[2] = the nudge turn
+    ra.finish(2); // nudge turn ends, still no reply → the debt SETTLES (the fix)
+    await tick();
+    expect(ra.captured).toHaveLength(3); // one-shot: no immediate re-nudge
+
+    // Cycle 2: a fresh message from the SAME peer. If the debt settled, this owes a new
+    // reply and its unreplied turn nudges AGAIN. If the peer were still stuck in
+    // nudgedAwaiting (the bug), no second nudge would ever fire.
+    (fire as unknown as PeerCb)({ peerAlias: 'billing', text: 'one more thing' });
+    await tick();
+    expect(ra.captured).toHaveLength(4); // captured[3] = the second peer turn
+    ra.finish(3); // no reply again
+    await tick();
+    expect(ra.captured).toHaveLength(5); // captured[4] = the RE-ARMED nudge (debt had cleared)
+    expect(ra.captured[4]?.configs[0]?.userPrompt ?? '').toContain('[reply pending]');
+    expect(ra.captured[4]?.configs[0]?.userPrompt ?? '').toContain('billing');
+    ra.finish(4);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('a queued peer message respects the wake cap — waits at the cap, runs after the operator acts', async () => {
     type PeerCb = (m: { peerAlias: string; text: string }) => void;
+    // Must match MAX_CONSECUTIVE_WAKES in repl.ts (not exported — kept in sync here).
+    const WAKE_CAP = 10;
     let fire: PeerCb | null = null;
     const meshManager = meshStub({
       onMessage: (cb) => {
@@ -1705,8 +1913,8 @@ describe('repl — boot + smoke', () => {
     const holder = ra.captured[0]?.configs[0]?.bgManagerHolder;
     ra.finish(0);
     await tick();
-    // Drive consecutiveWakes to the cap (3) with three bg_done wakes.
-    for (let i = 1; i <= 3; i++) {
+    // Drive consecutiveWakes to the cap with WAKE_CAP bg_done wakes.
+    for (let i = 1; i <= WAKE_CAP; i++) {
       holder?.onEvent({ type: 'bg_started', processId: `p${i}`, command: 'x', label: null });
       holder?.onEvent({ type: 'bg_ended', processId: `p${i}`, status: 'exited', exitCode: 0 });
       await tick();
@@ -1714,11 +1922,12 @@ describe('repl — boot + smoke', () => {
       ra.finish(i);
       await tick();
     }
-    // Cap spent. A peer message now RESPECTS the cap (no exemption) → it does NOT
-    // run; it waits like any wake until the operator acts.
+    // Cap spent (1 operator + WAKE_CAP bg turns). A peer message now RESPECTS the cap
+    // (no exemption) → it does NOT run; it waits like any wake until the operator acts.
+    const atCap = 1 + WAKE_CAP; // captured length once the operator + bg wakes are in
     (fire as unknown as PeerCb)({ peerAlias: 'gateway', text: 'help?' });
     await tick();
-    expect(ra.captured).toHaveLength(4); // still just 1 operator + 3 bg
+    expect(ra.captured).toHaveLength(atCap); // still just the operator + the bg wakes
     // The pause cues the operator ONCE that peer mail is waiting (it would render
     // nothing on its own — the whole point of the collaborative loop is that the
     // operator knows to re-engage).
@@ -1727,26 +1936,29 @@ describe('repl — boot + smoke', () => {
     expect(writes.join('')).toContain('waiting');
     // A further drain attempt at the cap does NOT re-cue (one-shot until the
     // operator acts).
-    holder?.onEvent({ type: 'bg_started', processId: 'p9', command: 'x', label: null });
-    holder?.onEvent({ type: 'bg_ended', processId: 'p9', status: 'exited', exitCode: 0 });
+    holder?.onEvent({ type: 'bg_started', processId: 'p99', command: 'x', label: null });
+    holder?.onEvent({ type: 'bg_ended', processId: 'p99', status: 'exited', exitCode: 0 });
     await tick();
     expect(cueCount()).toBe(1);
     // The operator acts → resets the cap; wake-when-idle then drains the queued
     // peer message.
     stdin.feed('op\r');
     await tick();
-    ra.finish(4);
+    ra.finish(atCap); // finish the operator 'op' turn
     await tick();
-    expect(ra.captured).toHaveLength(6);
-    const input = ra.captured[5]?.configs[0]?.userPrompt ?? '';
+    expect(ra.captured).toHaveLength(atCap + 2); // op turn + the drained peer turn
+    const input = ra.captured[atCap + 1]?.configs[0]?.userPrompt ?? '';
     expect(input).toContain('UNTRUSTED MESH PEER MESSAGE');
-    ra.finish(5, { sessionContext: {} as unknown as SessionContext });
+    ra.finish(atCap + 1, { sessionContext: {} as unknown as SessionContext });
+    await flushFrame();
+    // The peer turn ran unreplied → one-shot reply nudge; finish it clean.
+    ra.finish(atCap + 2, { sessionContext: {} as unknown as SessionContext });
     await flushFrame();
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
-  test('a peer turn that crashes leaves no mesh hang and republishes idle', async () => {
+  test('a peer turn that crashes leaves no mesh hang, republishes idle, and settles the debt', async () => {
     type PeerCb = (m: { peerAlias: string; text: string }) => void;
     let fire: PeerCb | null = null;
     const statuses: string[] = [];
@@ -1758,6 +1970,7 @@ describe('repl — boot + smoke', () => {
         statuses.push(s);
       },
     });
+    const writes: string[] = [];
     const stdin = makeStdin();
     const ra = makeRunAgent((n) => `sess-${n}`);
     const promise = runRepl({
@@ -1767,6 +1980,9 @@ describe('repl — boot + smoke', () => {
       skipTtyCheck: true,
       skipTrustPrompt: true,
       runAgentOverride: ra.runAgent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
     });
     await tick();
     stdin.feed('first\r');
@@ -1775,14 +1991,22 @@ describe('repl — boot + smoke', () => {
     await tick();
     (fire as unknown as PeerCb)({ peerAlias: 'gateway', text: 'inspect' });
     await tick();
+    await flushFrame();
     expect(ra.captured).toHaveLength(2);
     expect(statuses).toContain('working');
+    expect(writes.join('')).toContain('awaiting reply'); // owed while the turn ran
     // The peer turn rejects before emitting session_finished (provider crash).
+    writes.length = 0;
     ra.reject(1, new Error('provider exploded'));
-    await tick();
-    // No mesh hang: the message stays in the shared context (§6.4), and the serving
-    // instance republishes idle (no sendResult, no conversation to fail).
+    await flushFrame();
+    // No mesh hang: the crashed turn's peer message was spliced + never committed (it
+    // is lost, not recoverable), so the instance republishes idle (no conversation to
+    // fail) AND settles the owed-reply debt — there is nothing left to reply to, so the
+    // footer chip must clear rather than stick on a lost message.
     expect(statuses[statuses.length - 1]).toBe('idle');
+    const footerFrames = writes.filter((w) => w.includes('mode on'));
+    expect(footerFrames.length).toBeGreaterThan(0);
+    expect(footerFrames[footerFrames.length - 1] ?? '').not.toContain('awaiting reply');
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
@@ -1790,9 +2014,13 @@ describe('repl — boot + smoke', () => {
   test('a peer turn shares the operator liveContext and its result carries forward (§6.1)', async () => {
     type PeerCb = (m: { peerAlias: string; text: string }) => void;
     let fire: PeerCb | null = null;
+    let fireSent: SentHook | null = null;
     const meshManager = meshStub({
       onMessage: (cb) => {
         fire = cb;
+      },
+      onMessageSent: (cb) => {
+        fireSent = cb;
       },
     });
     const stdin = makeStdin();
@@ -1816,6 +2044,9 @@ describe('repl — boot + smoke', () => {
     (fire as unknown as PeerCb)({ peerAlias: 'gw', text: 'hi' });
     await tick();
     expect(ra.captured[1]?.configs[0]?.sessionContext).toBe(opCtx);
+    // The model replies during the peer turn (a successful mesh_send back) → the loop
+    // closes, so no reply nudge fires and the op → peer → op turn sequence stays intact.
+    (fireSent as unknown as SentHook)('gw');
     // The peer turn finishes with a new context → it ADVANCES the shared liveContext.
     const peerCtx = { lastAssistantText: () => 'peer answer' } as unknown as SessionContext;
     ra.finish(1, { sessionContext: peerCtx });
@@ -1875,6 +2106,9 @@ describe('repl — boot + smoke', () => {
     expect(input).not.toContain('msg-39'); // ...and everything past the cap
     ra.finish(1, { sessionContext: {} as unknown as SessionContext });
     await flushFrame();
+    // The coalesced peer turn ran unreplied → one-shot reply nudge (captured[2]); finish it.
+    ra.finish(2, { sessionContext: {} as unknown as SessionContext });
+    await flushFrame();
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
@@ -1910,6 +2144,10 @@ describe('repl — boot + smoke', () => {
     });
     await tick();
     expect(statuses).toEqual(['working', 'idle']);
+    // The unreplied peer turn fires a one-shot reply nudge (captured[1]) — it is NOT
+    // peer-driven, so it publishes no further status; finish it for a clean exit.
+    ra.finish(1);
+    await tick();
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });

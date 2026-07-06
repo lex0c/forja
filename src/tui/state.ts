@@ -525,6 +525,11 @@ export interface LiveState {
   // `bgProcesses` it survives the turn boundary (reminders are
   // session-scoped); a fresh PROCESS starts from 0.
   reminderCount: number;
+  // Peers owed a reply (MESH.md §6.4): a peer message drove a turn that ended with
+  // no mesh_send back. Passive footer count so the operator sees stranded peer mail
+  // without the model being re-woken (the one-shot reply nudge is the active path).
+  // Pushed by the REPL via `mesh:awaiting`; session-scoped, survives turn boundaries.
+  awaitingReplyCount: number;
   // Operator hit Esc once during a running turn (spec UI.md §4.10.6
   // "Soft-aborted (ainda processando)"). The footer swaps its
   // interrupt cue from "esc to interrupt" to "esc again to force"
@@ -643,6 +648,7 @@ export const createInitialState = (): LiveState => ({
   bgProcesses: new Map(),
   subagents: new Map(),
   reminderCount: 0,
+  awaitingReplyCount: 0,
   parallelStatus: null,
   softInterrupted: false,
   exitArmed: null,
@@ -2591,6 +2597,12 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // never derives it. No permanent scrollback line: the fire itself
       // surfaces via the bg_done-style `● [reminder]` wake echo.
       return { state: { ...state, reminderCount: event.count }, permanent: [] };
+
+    case 'mesh:awaiting':
+      // Passive owed-reply count (MESH.md §6.4). The REPL's awaitingReply set is the
+      // source of truth; the reducer just mirrors it for the footer chip. No
+      // permanent line — the ● [reply pending] nudge wake carries the narration.
+      return { state: { ...state, awaitingReplyCount: event.count }, permanent: [] };
 
     case 'subagent:start': {
       // Insert a fresh row keyed by subagentId. Duplicate starts

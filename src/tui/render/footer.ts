@@ -124,6 +124,14 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   if (status.relayMode) {
     rightParts.push(paint(caps, 'success', 'relay on'));
   }
+  // Peers owed a reply (MESH.md §6.4): a peer drove a turn that ended without a
+  // mesh_send back. Painted `warn` (not the live-cluster green) so it reads as an
+  // action owed, not a healthy signal — the model was nudged once; this is the
+  // passive residue the operator can act on (prompt a reply) or ignore. Suppressed
+  // at 0. Distinct from `relay on`: you can owe replies even after /relay off.
+  if (state.awaitingReplyCount > 0) {
+    rightParts.push(paint(caps, 'warn', `${state.awaitingReplyCount} awaiting reply`));
+  }
   // Pending reminders (ORCHESTRATION.md §3B.9). Leads the live cluster,
   // BEFORE `bash bg` — a scheduled wake is the operator's earliest cue
   // that the session will re-engage on its own. Same live-signal

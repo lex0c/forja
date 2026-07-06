@@ -115,10 +115,14 @@ describe('mesh envelope', () => {
     // The reply model: mesh_send back to the alias, this turn OR a later one — no
     // deadline, no mesh_reply, and the answer must be self-contained (§6.4). The
     // preamble PULLS toward replying (the v3 reason-to-exist) while allowing an
-    // anchored deferral — not a bare "not replying is fine".
+    // anchored deferral — not a bare "not replying is fine". It also leads with the
+    // NEGATIVE frame (a prose answer does NOT reach the peer, only mesh_send does) so
+    // a model can't believe it replied by merely writing text — the observed miss.
     expect(framed).toContain('mesh_send');
-    expect(framed).toContain('Prefer to reply');
+    expect(framed).toContain('NOT delivered to the peer'); // the negative frame
+    expect(framed).toContain('Prefer to send it'); // pulls toward replying THIS turn
     expect(framed).toContain('later');
+    expect(framed).toContain('needs no reply'); // a concluded exchange (thanks/goodbye) → silence
     expect(framed).toContain('self-contained');
     expect(framed).not.toContain('BEFORE this turn ends');
     expect(framed).not.toContain('mesh_reply');
@@ -525,10 +529,13 @@ describe('mesh integration (two managers over real sockets)', () => {
       pid: process.pid,
       onAuditEvent: (e) => cliEvents.push(e),
     });
+    const sentAliases: string[] = [];
+    client.onMessageSent((a) => sentAliases.push(a));
     await expect(client.send('bigsrv', 'x'.repeat(200))).rejects.toThrow(/message_too_large/);
     await new Promise((r) => setTimeout(r, 60));
     expect(received).toBe(0); // never drove a turn on the server
     expect(cliEvents.some((e) => e.kind === 'message_sent')).toBe(false); // no phantom audit
+    expect(sentAliases).toEqual([]); // rejected send → NO reply-loop-closed signal either
     await client.shutdown();
     await server.shutdown();
   });
@@ -566,6 +573,22 @@ describe('mesh integration (two managers over real sockets)', () => {
     expect(cliEvents.some((e) => e.kind === 'message_sent')).toBe(false); // no phantom audit
     await client.shutdown();
     server.stop();
+  });
+
+  test('onMessageSent fires with the alias on a successful send (reply-loop-closed signal)', async () => {
+    // The REPL clears its "owed a reply" state on this callback. It must fire exactly
+    // once, with the target alias, only after the send actually lands (post-verdict).
+    const server = mkMgr(dir, 'sentsrv');
+    await server.startServing();
+    const got = firstMessage(server); // absorb the inbound so the exchange completes
+    const sent: string[] = [];
+    const client = mkMgr(dir, 'sentcli');
+    client.onMessageSent((a) => sent.push(a));
+    await client.send('sentsrv', 'hi');
+    await got;
+    expect(sent).toEqual(['sentsrv']);
+    await client.shutdown();
+    await server.shutdown();
   });
 
   test('send() refuses an over-cap outbound message at the boundary (§9)', async () => {

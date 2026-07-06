@@ -700,6 +700,12 @@ export type BgEndEvent = BaseEvent & {
 // it directly, no per-id tracking needed for the footer chip.
 export type RemindersUpdateEvent = BaseEvent & { type: 'reminders:update'; count: number };
 
+// Count of peers owed a reply changed (MESH.md §6.4): a peer message arrived, or a
+// mesh_send back landed. Drives the footer's passive `N awaiting reply` chip so the
+// operator sees stranded peer mail without the model being woken (the one-shot reply
+// nudge is the active path). Emitted by the REPL; the count is the source of truth.
+export type MeshAwaitingUpdateEvent = BaseEvent & { type: 'mesh:awaiting'; count: number };
+
 // Budget / checkpoint signals consumed by the status line.
 export type StepBudgetEvent = BaseEvent & {
   type: 'step:budget';
@@ -999,6 +1005,7 @@ export type UIEvent =
   | BgUpdateEvent
   | BgEndEvent
   | RemindersUpdateEvent
+  | MeshAwaitingUpdateEvent
   | StepBudgetEvent
   | StatsRefreshEvent
   | ProviderWaitingStartEvent
