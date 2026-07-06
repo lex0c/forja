@@ -795,7 +795,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           type: 'info',
           ts: now(),
           tone: 'secondary',
-          message: `▸ peer inbox full (${MAX_PENDING_PEER_MESSAGES} queued) — dropping further messages until it drains`,
+          message: `▸ peer inbox full (${MAX_PENDING_PEER_MESSAGES} queued) — dropping newer messages until it drains (submit anything to resume if the exchange has paused)`,
         });
       }
       return;
@@ -1555,8 +1555,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         return `[reminder] ${flattenControlToLine(n.note)}`;
       case 'peer_message':
         // Peer alias is attacker-controlled — flatten control/ANSI (like
-        // bg_done/reminder) so it can't spoof the operator's scrollback.
-        return `▸ from '${flattenControlToLine(n.peerAlias)}'`;
+        // bg_done/reminder) so it can't spoof the operator's scrollback. Name the
+        // channel ("peer") — unlike [background]/[reminder] the bare alias gives no
+        // cue this came in over the mesh from ANOTHER repo.
+        return `▸ peer '${flattenControlToLine(n.peerAlias)}'`;
     }
   };
   // Full text fed to the model as the wake-turn input: headline + any

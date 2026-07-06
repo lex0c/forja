@@ -8,6 +8,7 @@ const makeManager = () => {
   return {
     alias: 'billing',
     isServing: () => serving,
+    listPeers: () => [] as { alias: string; branch: string; status: string }[],
     startServing: async () => {
       serving = true;
     },

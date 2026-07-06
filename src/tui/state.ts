@@ -1887,7 +1887,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             // explicit framing reads better above the action block.)
             subject:
               event.peer !== undefined
-                ? `A peer ('${event.peer.alias}') request led here — approve the action below only if you would run it yourself.`
+                ? `Requested by mesh peer '${event.peer.alias}' — approve the action below only if you would run it yourself.`
                 : 'The agent is requesting permission for the action below.',
             // Secondary tone lifts the framing line out of the dim
             // baseline (the action + cwd rows below stay dim).
@@ -2068,12 +2068,13 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
               `This Forja will serve mesh peers as '${event.alias}'.`,
               '',
               'It opens a local Unix socket other Forja instances you run (same',
-              'user) can send textual prompts to. Each arrives as an untrusted',
+              'user) can send textual messages to. Each arrives as an untrusted',
               'system turn under YOUR approval — a peer never edits or runs',
               'anything here directly (MESH.md §0).',
               '',
               'The session is NOT dedicated: you keep working normally; peer',
-              'requests interleave as their own isolated turns.',
+              'messages interleave as turns in THIS session — you see each in the',
+              'scrollback, approve what it does, and can help shape the reply.',
             ],
             question: null,
             // Last option is the conservative default (D65): Enter without

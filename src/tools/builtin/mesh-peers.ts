@@ -16,7 +16,7 @@ export interface MeshPeersOutput {
 export const meshPeersTool: Tool<MeshPeersInput, MeshPeersOutput> = {
   name: 'mesh_peers',
   description:
-    'List local Forja instances currently serving on the mesh — peers you can send a textual request to with mesh_send. Returns each alias, branch, and status. Only instances that ran /relay appear.',
+    'List local Forja instances you can message with mesh_send — those currently serving on the mesh. Returns each alias, branch, and status. Status is ADVISORY, not a send-gate: a message always queues and is delivered regardless. idle = free; working = mid-turn (your message waits in its inbox, send anyway); waiting-operator = blocked on its operator’s approval (reachable, but may reply slower). Only instances that ran /relay appear.',
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   metadata: {
     category: 'misc',

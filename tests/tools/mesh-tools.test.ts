@@ -33,11 +33,20 @@ describe('mesh_send tool', () => {
     expect(meshSendTool.metadata.network).toBe(true);
   });
 
-  test('delivers and returns the message id', async () => {
+  test('delivers, returns the message id, and surfaces the payload excerpt on the card', async () => {
     const mgr = { isServing: () => false, send: async () => ({ id: 'm1' }) };
-    const r = await meshSendTool.execute({ peer: 'billing', message: 'hi' }, ctxWith(mgr));
+    const r = await meshSendTool.execute(
+      { peer: 'billing', message: 'bump the auth contract to v2' },
+      ctxWith(mgr),
+    );
     expect(isToolError(r)).toBe(false);
-    if (!isToolError(r)) expect(r.id).toBe('m1');
+    if (!isToolError(r)) {
+      expect(r.id).toBe('m1');
+      // result_detail shows WHAT left — the operator's only payload window under
+      // autonomous (no confirm modal).
+      expect(r.result_detail).toContain('billing');
+      expect(r.result_detail).toContain('bump the auth contract to v2');
+    }
   });
 
   test('sends even while THIS session is serving (symmetric exchange — a reply is just a message)', async () => {
@@ -69,6 +78,10 @@ describe('mesh_send tool', () => {
     };
     const r = await meshSendTool.execute({ peer: 'billing', message: 'hi' }, ctxWith(mgr));
     expect(isToolError(r) && r.error_code).toBe('mesh.peer_lost');
+    // peer_lost is transient → the model should retry, so it's marked retryable
+    // (not just distinguished by code) with an actionable hint.
+    expect(isToolError(r) && r.retryable).toBe(true);
+    expect(isToolError(r) && typeof r.hint === 'string').toBe(true);
   });
 
   test('errors when the mesh subsystem is unavailable', async () => {

@@ -15,7 +15,15 @@ const statusNotes = (ctx: SlashContext): SlashResult => {
   if (!mgr.isServing()) {
     return { kind: 'ok', notes: ['relay: off (run /relay on to start serving mesh peers)'] };
   }
-  return { kind: 'ok', notes: [`relay: on — serving as '${mgr.alias}'`] };
+  // Surface reachable peers on demand — mesh_peers is a model-only tool, so this is
+  // the operator's only window into who's out there (and their coarse status) when
+  // deciding whether to jump in and help the exchange (§6.3).
+  const peers = mgr.listPeers();
+  const peerNote =
+    peers.length === 0
+      ? 'no other peers serving'
+      : `peers: ${peers.map((p) => `${p.alias} (${p.status})`).join(', ')}`;
+  return { kind: 'ok', notes: [`relay: on — serving as '${mgr.alias}'`, peerNote] };
 };
 
 export const relayCommand: SlashCommand = {

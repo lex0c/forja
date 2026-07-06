@@ -12,6 +12,7 @@
 // never authority (§0, §1.2). Off the base surface (deferred). See MESH.md §6.4.
 
 import { ALIAS_MAX, ALIAS_RE, MESH_ERROR_CODES } from '../../mesh/types.ts';
+import { sanitizeOneLineForDisplay } from '../../sanitize/ansi.ts';
 import { ERROR_CODES, type Tool, type ToolContext, type ToolResult, toolError } from '../types.ts';
 
 export interface MeshSendInput {
@@ -21,6 +22,11 @@ export interface MeshSendInput {
 export interface MeshSendOutput {
   id: string;
   delivered: string;
+  // A bounded, control-stripped excerpt of what left, surfaced on the tool card so
+  // the operator SEES the outbound payload in BOTH postures — under autonomous
+  // (no confirm) this is the only place the "nothing leaves in silence" safeguard
+  // (§6.1/§7) is met; supervised also gets it in the confirm modal.
+  result_detail?: string;
 }
 
 export const meshSendTool: Tool<MeshSendInput, MeshSendOutput> = {
@@ -84,18 +90,27 @@ export const meshSendTool: Tool<MeshSendInput, MeshSendOutput> = {
       const { id } = await mgr.send(input.peer, input.message);
       return {
         id,
-        delivered: `sent to '${input.peer}' — it may answer in a later message (or report it couldn't).`,
+        delivered: `sent to '${input.peer}' — its reply, if any, arrives on its own as a later turn (no need to wait or poll).`,
+        // Surface WHAT left on the tool card (the two-audiences review, §7) — the
+        // only outbound-payload visibility the operator gets under autonomous.
+        result_detail: `→ ${input.peer}: ${sanitizeOneLineForDisplay(input.message, 160)}`,
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       // Distinguish a peer that was reachable in discovery but dropped (peer_lost —
       // connect refused / socket closed mid-send; the manager embeds the code in the
-      // message) from one that isn't serving at all (no_such_peer), so the model
-      // retries vs. re-discovers appropriately (§6.5).
-      const code = message.includes(MESH_ERROR_CODES.peerLost)
-        ? ERROR_CODES.meshPeerLost
-        : ERROR_CODES.meshNoSuchPeer;
-      return toolError(code, `mesh_send: ${message}`);
+      // message) from one that isn't serving at all (no_such_peer). Set the machine-
+      // readable retryable/hint too, not just the code — a model keying on `retryable`
+      // must retry a transient peer_lost and re-discover a no_such_peer (§6.5).
+      if (message.includes(MESH_ERROR_CODES.peerLost)) {
+        return toolError(ERROR_CODES.meshPeerLost, `mesh_send: ${message}`, {
+          retryable: true,
+          hint: "the peer was serving but the connection dropped — retry once; if it fails again, run mesh_peers to check it's still live",
+        });
+      }
+      return toolError(ERROR_CODES.meshNoSuchPeer, `mesh_send: ${message}`, {
+        hint: 'run mesh_peers — the alias may be stale, or the peer stopped serving',
+      });
     }
   },
 };
