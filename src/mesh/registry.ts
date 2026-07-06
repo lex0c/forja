@@ -113,6 +113,19 @@ export const publishDescriptor = (dir: string, desc: PeerDescriptor): void => {
   writeFileSync(descriptorPath(dir, desc.alias), JSON.stringify(desc), { mode: 0o600 });
 };
 
+// Remove ONLY the socket file for `alias`, not the descriptor. The alias-claim
+// path (manager.startServing) uses this to clear a leftover .sock a probe has
+// confirmed DEAD, without touching a .json — an orphan socket has no descriptor,
+// and removing a live descriptor is the rollback's job, not the claim's. Guarded
+// best-effort (force swallows ENOENT; catch the rest, e.g. EPERM on a resolved path).
+export const removeSocket = (dir: string, alias: string): void => {
+  try {
+    rmSync(socketPath(dir, alias), { force: true });
+  } catch {
+    // best-effort
+  }
+};
+
 export const removeDescriptor = (dir: string, alias: string): void => {
   // force:true swallows ENOENT; guard the rest (EISDIR/EPERM on a resolved path)
   // so a single poisoned entry can't throw out of the sweep loop.
@@ -121,11 +134,7 @@ export const removeDescriptor = (dir: string, alias: string): void => {
   } catch {
     // best-effort
   }
-  try {
-    rmSync(socketPath(dir, alias), { force: true });
-  } catch {
-    // best-effort
-  }
+  removeSocket(dir, alias);
 };
 
 // A pid is alive if signal 0 doesn't throw ESRCH. EPERM ⇒ alive but not ours

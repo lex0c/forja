@@ -25,9 +25,16 @@ import {
   listPeers as fsListPeers,
   publishDescriptor,
   removeDescriptor,
+  removeSocket,
   socketPath,
 } from './registry.ts';
-import { type MeshServer, type MeshTransport, connectMesh, listenMesh } from './transport.ts';
+import {
+  type MeshServer,
+  type MeshTransport,
+  connectMesh,
+  listenMesh,
+  probeSocket,
+} from './transport.ts';
 import {
   ALIAS_MAX,
   ALIAS_RE,
@@ -287,27 +294,65 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     });
   };
 
+  // Claim the alias by BINDING its socket — the bind is the atomic exclusive claim
+  // (two concurrent binds to one unix path can't both succeed; the loser throws
+  // EADDRINUSE). Returns the live server, or throws a collision if a LIVE peer holds
+  // the path. It never unlinks pre-emptively: a path is cleared ONLY after a fresh
+  // probe proves it a DEAD leftover, so it can't orphan a peer that bound the same
+  // alias concurrently — the TOCTOU the collision check alone misses.
+  const bindAlias = async (sockPath: string): Promise<MeshServer> => {
+    const tryListen = (): MeshServer | null => {
+      try {
+        return listenMesh(sockPath, onServerConnection);
+      } catch (err) {
+        // A leftover file at the path (a dead socket OR a planted regular file) and a
+        // LIVE concurrent listener BOTH surface as EADDRINUSE — a probe distinguishes
+        // them below. Anything else (EACCES, a missing dir) is a real failure: rethrow.
+        if ((err as NodeJS.ErrnoException).code === 'EADDRINUSE') return null;
+        throw err;
+      }
+    };
+    const first = tryListen();
+    if (first !== null) return first;
+    // The path is occupied. A live listener → an honest collision (a peer bound our
+    // alias between the check above and here, or shares our derived alias). A dead
+    // leftover (crashed relay's orphan .sock, which listPeers never sweeps because it
+    // has no .json) → clear it and retry the bind ONCE.
+    if (await probeSocket(sockPath)) {
+      throw new Error(
+        `mesh: alias '${alias}' was just claimed by a live peer; set a distinct alias in [mesh]`,
+      );
+    }
+    removeSocket(deps.dir, alias);
+    const second = tryListen();
+    if (second === null) {
+      // Occupied AGAIN after clearing a dead leftover: a peer bound it in the gap.
+      // Don't loop or clobber it — report the collision honestly (the loser refuses).
+      throw new Error(
+        `mesh: alias '${alias}' was just claimed by a live peer; set a distinct alias in [mesh]`,
+      );
+    }
+    return second;
+  };
+
   const startServing = async (): Promise<void> => {
     if (serving) return;
-    // Refuse if a LIVE peer already holds our alias (e.g. a second /relay on in the
-    // same repo — the default alias is the repo basename). Unlinking its socket
-    // below would make that peer unreachable to new mesh_send calls while it still
-    // believes it is serving. listPeers liveness-checks AND sweeps a STALE
-    // descriptor from a crashed run, so a leftover at our alias is cleared here; a
-    // live hit is a real collision (we have not published our own descriptor yet,
-    // so any hit is a different process).
+    const sockPath = socketPath(deps.dir, alias);
+    // Refuse EARLY if a LIVE peer already advertises our alias (e.g. a second /relay
+    // on in the same repo — the default alias is the repo basename). listPeers
+    // liveness-checks AND sweeps a STALE descriptor from a crashed run, so a leftover
+    // .json at our alias is cleared here. This catches the SEQUENTIAL collision; the
+    // CONCURRENT one — a peer that has bound but not yet published — is caught by the
+    // atomic bind in bindAlias, which refuses rather than unlinking the live socket.
     const collision = (await fsListPeers(deps.dir, {})).find((p) => p.alias === alias);
     if (collision !== undefined) {
       throw new Error(
         `mesh: alias '${alias}' is already served by a live peer (pid ${collision.pid}); set a distinct alias in [mesh]`,
       );
     }
-    // Clear a now-confirmed-stale socket/descriptor (or an orphan socket with no
-    // descriptor, which listPeers does not see), then ensure the runtime dir exists
-    // before Bun.listen binds the socket.
-    removeDescriptor(deps.dir, alias);
+    // Ensure the runtime dir exists before Bun.listen binds, then claim atomically.
     ensureMeshDirs(deps.dir);
-    server = listenMesh(socketPath(deps.dir, alias), onServerConnection);
+    server = await bindAlias(sockPath);
     serving = true;
     try {
       publishDescriptor(deps.dir, descriptor());

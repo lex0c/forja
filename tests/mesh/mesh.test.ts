@@ -28,7 +28,7 @@ import {
   publishDescriptor,
   socketPath,
 } from '../../src/mesh/registry.ts';
-import { type MeshServer, connectMesh, listenMesh } from '../../src/mesh/transport.ts';
+import { type MeshServer, connectMesh, listenMesh, probeSocket } from '../../src/mesh/transport.ts';
 import {
   ABSOLUTE_MESH_LIMITS,
   DEFAULT_MESH_CONFIG,
@@ -655,6 +655,52 @@ describe('mesh integration (two managers over real sockets)', () => {
     expect(existsSync(socketPath(dir, 'orphansrv'))).toBe(false);
     expect(server.isServing()).toBe(false);
     await server.shutdown(); // no-op, must not throw
+  });
+
+  test('startServing does not unlink a peer that bound the alias concurrently (before it published)', async () => {
+    // The TOCTOU the sequential collision check misses: peer A has BOUND its socket
+    // but not yet published its descriptor, so B's listPeers finds no collision. B
+    // must still refuse — the bind is the atomic claim — and must NOT unlink A's live
+    // socket (the old pre-bind removeDescriptor would orphan A: it keeps serving on an
+    // unlinked inode). Simulate A with a raw listener and no descriptor.
+    ensureMeshDirs(dir);
+    const peerA = listenMesh(socketPath(dir, 'raced'), () => {});
+    const b = mkMgr(dir, 'raced');
+    await expect(b.startServing()).rejects.toThrow(/live peer/);
+    expect(b.isServing()).toBe(false);
+    // A's socket is untouched — still a live listener at the canonical path.
+    expect(await probeSocket(socketPath(dir, 'raced'))).toBe(true);
+    peerA.stop();
+  });
+
+  test('startServing clears a dead orphan socket (no descriptor) and binds', async () => {
+    // A leftover .sock with no descriptor and no listener (a relay that crashed after
+    // bind, before publish). listPeers only iterates .json files, so it never sweeps
+    // this orphan — startServing must clear it (the probe says dead) and bind, not
+    // refuse. Guards the legitimate stale-cleanup the atomic-claim rewrite must keep.
+    ensureMeshDirs(dir);
+    writeFileSync(socketPath(dir, 'orphansock'), ''); // regular file, nothing listening
+    const server = mkMgr(dir, 'orphansock');
+    await server.startServing(); // must NOT throw
+    expect(server.isServing()).toBe(true);
+    expect(await probeSocket(socketPath(dir, 'orphansock'))).toBe(true); // now OUR listener
+    await server.shutdown();
+  });
+
+  test('two managers claiming one alias concurrently: exactly one serves, the winner is reachable', async () => {
+    // The real race — two /relay on with the same derived alias at once. The bind is
+    // the atomic claim: exactly one wins, the other refuses (never a double bind, never
+    // a clobber). The invariant holds regardless of WHICH one wins.
+    const a = mkMgr(dir, 'concurrent');
+    const b = mkMgr(dir, 'concurrent');
+    const results = await Promise.allSettled([a.startServing(), b.startServing()]);
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    expect(results.filter((r) => r.status === 'rejected')).toHaveLength(1);
+    // The winner holds a live, discoverable listener at the alias.
+    expect(await probeSocket(socketPath(dir, 'concurrent'))).toBe(true);
+    const winner = a.isServing() ? a : b;
+    expect(winner.isServing()).toBe(true);
+    await winner.shutdown();
   });
 
   test('caps concurrent inbound connections (admission control) — the over-cap one gets an at_capacity frame, not a bare close', async () => {
