@@ -98,13 +98,6 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
       autonomous ? 'autonomous mode on' : 'supervised mode on',
     );
     const leftParts = [`${modeLabel}${dim(caps, ' (shift+tab to change)')}`];
-    if (state.status.relayMode) {
-      // Relay-mode badge (MESH.md §6.1) — accent so it stands out from the mode
-      // cue; the operator is serving peers, supervising rather than driving.
-      const label =
-        state.status.relayAlias !== null ? `RELAY: ${state.status.relayAlias}` : 'RELAY MODE';
-      leftParts.unshift(paint(caps, 'accent', label));
-    }
     if (isRunning(state)) {
       // During a turn the operator isn't composing input, so the
       // newline affordance is noise — and it's the segment that pushes
@@ -122,6 +115,15 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
 
   const status = state.status;
   const rightParts: string[] = [];
+  // Relay-on signal (MESH.md §6.1): an inbound socket is open and peers can drive
+  // turns in this session. Leads the live cluster and is painted `success` (green)
+  // like the other live signals (reminders / bash bg / subagents), so the operator
+  // always sees `relay on` while serving. Suppressed when off. The serving alias
+  // is available via `/relay` and the startup banner — the footer just carries the
+  // always-visible on/off state.
+  if (status.relayMode) {
+    rightParts.push(paint(caps, 'success', 'relay on'));
+  }
   // Pending reminders (ORCHESTRATION.md §3B.9). Leads the live cluster,
   // BEFORE `bash bg` — a scheduled wake is the operator's earliest cue
   // that the session will re-engage on its own. Same live-signal

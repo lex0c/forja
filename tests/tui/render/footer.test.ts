@@ -42,16 +42,22 @@ describe('renderFooter', () => {
     expect(out).not.toContain('profile:');
   });
 
-  test('relay-mode badge shows the alias when serving', () => {
+  test('surfaces a `relay on` chip while serving (live-cluster signal)', () => {
     const out = renderFooter(startedSession({ relayMode: true, relayAlias: 'billing' }), caps);
     expect(out).not.toBeNull();
-    expect(out).toContain('RELAY: billing');
+    expect(out).toContain('relay on');
   });
 
-  test('no relay badge when relay mode is off', () => {
+  test('no relay chip when relay mode is off', () => {
     const out = renderFooter(startedSession({ relayMode: false }), caps);
     expect(out).not.toBeNull();
-    expect(out).not.toContain('RELAY');
+    expect(out).not.toContain('relay on');
+  });
+
+  test('relay-on is painted success (green) like the other live chips', () => {
+    const colored: Capabilities = { ...caps, color: 'basic' };
+    const out = renderFooter(startedSession({ relayMode: true, relayAlias: 'billing' }), colored);
+    expect(out).toContain(`${CSI}32mrelay on${CSI}0m`);
   });
 
   test('bash mode replaces the footer with the shell-mode indicator', () => {

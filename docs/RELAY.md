@@ -31,8 +31,9 @@ approves anything.
 ```
 
 This asks for confirmation (opening an inbound socket is a deliberate consent
-gate), then starts serving peers and shows a `RELAY: <alias>` badge in the
-footer. **The session is not dedicated** — you keep using it normally; peer
+gate), then starts serving peers and shows a `relay on` signal in the footer
+(alongside the reminders / bash bg / subagents chips). **The session is not
+dedicated** — you keep using it normally; peer
 messages interleave as their own turns *in your own session*, which you supervise
 through the scrollback and approve as usual. Stop with `/relay off`.
 
@@ -47,8 +48,8 @@ mesh_send                      # send a peer a textual message
 operator confirms each send — the modal shows the target peer and a preview of the
 message (the two-audiences review of what leaves); in autonomous, sends auto-approve
 (the mesh is a same-user *local* socket, not network egress, so autonomous covers it —
-trading the outbound-payload review for the same delegation as any local effect). It
-returns immediately — fire-and-forget. The peer answers with its own `mesh_send`
+trading the modal review for the same delegation as any local effect, though the send's
+tool card still shows an excerpt of what left). It returns immediately — fire-and-forget. The peer answers with its own `mesh_send`
 back to you in a later message (or reports it couldn't); the exchange is free, not a
 strict request/reply. `mesh_send` works **even while you are serving** — a reply is
 just a message in the other direction.
@@ -120,9 +121,10 @@ authority.
 - **Two audiences.** The local scrollback is full fidelity (the operator owns the
   repo). What crosses the wire to the peer is only what the model **sends** via
   `mesh_send` — never the raw turn. In supervised, the operator reviews that text in
-  the confirm (what leaves); in autonomous it is trusted to the posture but stays
-  visible in the shared scrollback. So the peer never receives this repo's paths,
-  raw output, or secrets by accident.
+  the confirm modal before it leaves; in autonomous there is no modal, but the send's
+  tool card shows an excerpt of the outbound payload, so what left stays visible in
+  the scrollback either way. So the peer never receives this repo's paths, raw
+  output, or secrets by accident.
 - **No isolation — the operator's presence is the safeguard.** A peer turn runs in
   the operator's own session (not a sealed context), which is what lets the operator
   collaborate on the reply and lets the model answer in a later turn. The trade-off
@@ -140,13 +142,13 @@ trust domain.
 |---|---|
 | `/relay on` | Confirm, then start serving peers. The session stays interactive — **not dedicated**; you keep working while peer messages interleave. `mesh_send` stays available (the exchange is symmetric). |
 | `/relay off` | Stop serving: close the socket, remove the descriptor. |
-| `/relay` | Report status: serving or not, and the serving alias. `on` / `off` are the action verbs. |
+| `/relay` | Report status: serving or not, the serving alias, and the reachable peers (alias + coarse status). `mesh_peers` is a model tool, so this is your window into who's out there. `on` / `off` are the action verbs. |
 
 ## Tools
 
 | Tool | Category | Notes |
 |---|---|---|
-| `mesh_peers` | `misc` | Lists live serving instances — `alias`, `branch`, `status` (`idle` / `working` / `waiting-operator`, the last shown when that peer's turn is blocked on its operator's confirm). Never the repo path. Off the base surface (discovered via tool search). |
+| `mesh_peers` | `misc` | Lists live serving instances — `alias`, `branch`, `status` (`idle` / `working` / `waiting-operator`). Status is **advisory, not a gate** — a message queues and is delivered regardless of it. Never the repo path. Off the base surface (discovered via tool search). |
 | `mesh_send` | `mesh.egress` | Sends a textual message to a peer — a request, a reply, or a follow-up. **Respects posture** (§5.3): supervised confirms each call showing the payload; autonomous auto-approves (a same-user local socket, not network egress). Fire-and-forget (the reply arrives later as its own `peer_message`). Available while serving — the exchange is symmetric; authority is the local operator's per send, never transitive. |
 
 ## Configuration
@@ -183,6 +185,12 @@ mesh-specific limit, the exchange is bounded by the session's own caps:
   `mesh.message_too_large` (distinct from "no such peer", so the model shortens
   the message rather than re-discovering). A foreign peer's over-cap message is
   rejected on ingress before it drives a turn.
+- **Admission control.** Two hard caps keep a chatty or looping peer from
+  exhausting the serving instance: at most 64 concurrent inbound connections (a
+  peer reconnect-looping past that is dropped), and at most 32 queued peer
+  messages waiting to be served — past that, newer ones are dropped with a
+  `peer inbox full` notice until the queue drains (submit anything to resume if
+  the exchange has paused at the wake-cap).
 - **No transitive authority.** Any reachable peer can exchange messages, but every
   `mesh_send` is the local operator's authority, gated by their posture — a peer's
   message never auto-authorizes an onward send. There is no mechanical block on
@@ -193,10 +201,11 @@ mesh-specific limit, the exchange is bounded by the session's own caps:
 - **A peer doesn't appear in `mesh_peers`.** It only appears after it runs
   `/relay on`. Confirm both instances run as the same OS user. A crashed instance's
   stale socket/descriptor is swept automatically on the next discovery.
-- **`peer_lost` / "no reply from …".** A `mesh_send` failed because the peer's
-  socket was gone — it crashed, ran `/relay off`, or its descriptor was stale. The
-  send returns the failure immediately (never a silent hang); the model can try
-  again once the peer is back.
+- **`mesh.peer_lost`.** A `mesh_send` failed because the peer's socket was gone —
+  it crashed, ran `/relay off`, or its descriptor was stale. The send returns the
+  failure immediately (never a silent hang), marked retryable — the model can
+  retry, then re-run `mesh_peers` if it still fails. (Distinct from
+  `mesh.no_such_peer`, which means the alias was never serving — re-discover.)
 - **A peer never answers.** There is no deadline — the receiver's model replies
   when it decides, possibly after its operator gives it more context. It may also
   consolidate several of your messages into one reply. If you need it sooner, the
