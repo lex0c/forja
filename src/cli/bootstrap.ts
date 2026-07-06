@@ -1739,15 +1739,31 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     cwd: projectConfigCwd,
     ...(input.meshConfigPath !== undefined ? { configPathOverride: input.meshConfigPath } : {}),
   });
-  const meshManager = createMeshManager({
-    dir: input.meshSocketDir ?? meshRuntimeDir(),
-    config: meshLoaded.config,
-    repoRoot: projectConfigCwd,
-    branch: probeGitContext(projectConfigCwd)?.branch ?? 'unknown',
-    // Persist the mesh boundary events (§8) to `mesh_events` — the A↔B forensic
-    // trail, correlated by peer alias + message id across the two Forjas' DBs.
-    onAuditEvent: (event) => recordMeshAuditEvent(db, event),
-  });
+  // Resolve the mesh runtime dir. A /tmp-fallback base a foreign local user
+  // pre-positioned (§0.7) makes meshRuntimeDir throw — disable the mesh for this
+  // session rather than abort the whole boot: a non-relay session never needs it,
+  // and /relay would refuse anyway. `meshManager: undefined` is a graceful
+  // "unavailable" state the tools + /relay already handle.
+  let meshDir: string | undefined;
+  try {
+    meshDir = input.meshSocketDir ?? meshRuntimeDir();
+  } catch (err) {
+    process.stderr.write(
+      `forja: mesh disabled — ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  }
+  const meshManager =
+    meshDir === undefined
+      ? undefined
+      : createMeshManager({
+          dir: meshDir,
+          config: meshLoaded.config,
+          repoRoot: projectConfigCwd,
+          branch: probeGitContext(projectConfigCwd)?.branch ?? 'unknown',
+          // Persist the mesh boundary events (§8) to `mesh_events` — the A↔B
+          // forensic trail, correlated by peer alias + message id across the DBs.
+          onAuditEvent: (event) => recordMeshAuditEvent(db, event),
+        });
 
   const config: HarnessConfig = {
     provider,
@@ -1764,7 +1780,9 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     bgLogDir,
     broker,
     mcpManager,
-    meshManager,
+    // Conditional spread: `meshManager?` is exact-optional, so it must be OMITTED
+    // (not set to undefined) when the mesh is disabled (a compromised runtime base).
+    ...(meshManager !== undefined ? { meshManager } : {}),
     userPrompt: input.prompt,
     // Checkpoints (M3 §12): enabled for every CLI run by default
     // so users get `--undo` for free.

@@ -45,15 +45,33 @@ const hasControlChars = (s: string): boolean => {
 };
 
 // Resolve the mesh runtime root. Prefer $XDG_RUNTIME_DIR (0700, per-user by
-// construction on Linux); fall back to a per-uid tmpdir where it is unset (the
-// fallback is hardened by assertOwnedPrivateDir below).
+// construction on Linux); fall back to a per-uid tmpdir where it is unset.
 export const meshRuntimeDir = (env: NodeJS.ProcessEnv = process.env): string => {
   const runtime = env.XDG_RUNTIME_DIR;
-  const base =
-    runtime !== undefined && runtime.length > 0
-      ? runtime
-      : join(tmpdir(), `forja-${process.getuid?.() ?? 0}`);
-  return join(base, 'forja', 'mesh');
+  if (runtime !== undefined && runtime.length > 0) {
+    // $XDG_RUNTIME_DIR is /run/user/<uid> — created 0700 per-user by the OS, so
+    // the ancestors above our `forja` subtree are already private and ours.
+    return join(runtime, 'forja', 'mesh');
+  }
+  // No XDG_RUNTIME_DIR → fall back under a per-uid tmpdir. /tmp is world-writable,
+  // so /tmp/forja-<uid> and its `forja` intermediate are the FIRST directories the
+  // FS-permission auth boundary (§0.7) rests on. A DIFFERENT local user can
+  // pre-create /tmp/forja-<uid> world-writable before we boot; the recursive mkdir
+  // in ensureMeshDirs silently reuses it and only asserts the LEAF, so the
+  // attacker-owned ancestor stays swappable (plant fake descriptors / sockets).
+  // Create + assert BOTH ancestors as 0700-current-user HERE, before anything under
+  // them is trusted — assertOwnedPrivateDir throws if a foreign owner pre-positioned
+  // the base (fail-closed: the caller disables the mesh, §0.7).
+  // Key the tmp base off the SAME env (env.TMPDIR, else os.tmpdir()) so the whole
+  // resolution is a pure function of `env` — testable without mutating process.env.
+  const tmpBase = env.TMPDIR !== undefined && env.TMPDIR.length > 0 ? env.TMPDIR : tmpdir();
+  const base = join(tmpBase, `forja-${process.getuid?.() ?? 0}`);
+  mkdirSync(base, { recursive: true, mode: 0o700 });
+  assertOwnedPrivateDir(base);
+  const forjaDir = join(base, 'forja');
+  mkdirSync(forjaDir, { recursive: true, mode: 0o700 });
+  assertOwnedPrivateDir(forjaDir);
+  return join(forjaDir, 'mesh');
 };
 
 const peersDir = (dir: string): string => join(dir, 'peers');

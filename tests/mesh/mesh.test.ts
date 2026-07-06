@@ -1,5 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadMeshConfig } from '../../src/mesh/config.ts';
@@ -14,6 +23,7 @@ import {
 import {
   ensureMeshDirs,
   listPeers,
+  meshRuntimeDir,
   publishDescriptor,
   socketPath,
 } from '../../src/mesh/registry.ts';
@@ -163,6 +173,46 @@ describe('mesh config', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('meshRuntimeDir fallback hardening (§0.7)', () => {
+  let tmproot: string;
+  const uid = process.getuid?.() ?? 0;
+  beforeEach(() => {
+    tmproot = mkdtempSync(join(tmpdir(), 'mesh-rt-'));
+  });
+  afterEach(() => {
+    rmSync(tmproot, { recursive: true, force: true });
+  });
+
+  test('with XDG_RUNTIME_DIR set: returns the XDG path and never touches the tmp fallback', () => {
+    const out = meshRuntimeDir({
+      XDG_RUNTIME_DIR: '/run/user/1000',
+      TMPDIR: tmproot,
+    } as NodeJS.ProcessEnv);
+    expect(out).toBe(join('/run/user/1000', 'forja', 'mesh'));
+    expect(existsSync(join(tmproot, `forja-${uid}`))).toBe(false); // fallback not created
+  });
+
+  test('with XDG unset: creates + hardens the fallback base and forja intermediate as 0700', () => {
+    const base = join(tmproot, `forja-${uid}`);
+    const out = meshRuntimeDir({ TMPDIR: tmproot } as NodeJS.ProcessEnv);
+    expect(out).toBe(join(base, 'forja', 'mesh'));
+    // BOTH ancestors the auth boundary rests on are asserted 0700-ours — not just
+    // the leaf, so a pre-positioned world-writable ancestor can't stay swappable.
+    expect(lstatSync(base).mode & 0o777).toBe(0o700);
+    expect(lstatSync(join(base, 'forja')).mode & 0o777).toBe(0o700);
+  });
+
+  test('tightens a pre-existing loose (world-writable) but current-user fallback base to 0700', () => {
+    const base = join(tmproot, `forja-${uid}`);
+    mkdirSync(base, { recursive: true });
+    chmodSync(base, 0o777); // a loose base reachable by other local users
+    meshRuntimeDir({ TMPDIR: tmproot } as NodeJS.ProcessEnv);
+    expect(lstatSync(base).mode & 0o077).toBe(0); // group/other access cleared
+    // (A base owned by ANOTHER uid is refused with a throw — not unit-testable
+    // here without root to chown it; the uid check in assertOwnedPrivateDir covers it.)
   });
 });
 
