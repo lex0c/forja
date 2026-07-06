@@ -161,7 +161,16 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     if (openConnections.size >= maxInbound) {
       // Admission control (§9): reject a new connection once we're at the ceiling,
       // so a reconnect-looping / flooding peer can't pin fds up to the handshake
-      // window and exhaust the process. Close immediately — don't add, don't parse.
+      // window and exhaust the process. Send an explicit rejection frame BEFORE
+      // closing — a bare close reads as acceptance on the sender (send() treats a
+      // clean close with no error frame as delivered), so without it an admission
+      // drop would report a phantom delivery and audit a message we never enqueued.
+      // Don't add, don't parse — just error + close.
+      transport.write(
+        encodeMeshMessage(
+          makeError(MESH_ERROR_CODES.atCapacity, `at the ${maxInbound}-connection ceiling`),
+        ),
+      );
       transport.close();
       return;
     }

@@ -729,6 +729,10 @@ export const ERROR_CODES = {
   // the socket closed mid-send) — distinct from no_such_peer so the model can retry
   // rather than re-run discovery for a peer that isn't there (§6.5).
   meshPeerLost: 'mesh.peer_lost',
+  // The peer is serving but momentarily at its inbound-connection ceiling
+  // (admission control) — transient; the model waits briefly and retries the same
+  // send, it does NOT re-run discovery (the peer is alive, unlike peer_lost).
+  meshAtCapacity: 'mesh.at_capacity',
   // mesh_send message is over the peer byte cap — distinct from no_such_peer so
   // the model shortens the request instead of re-running discovery.
   meshMessageTooLarge: 'mesh.message_too_large',

@@ -42,6 +42,13 @@ export const MESH_ERROR_CODES = {
   // Connection closed / refused before the message could be delivered (crash,
   // relay-off, or a stale descriptor) — surfaced to the sender's model (§6.5).
   peerLost: 'mesh.peer_lost',
+  // The peer is serving but momentarily at its inbound-connection ceiling
+  // (admission control, §9): it dropped the connection before the message was
+  // enqueued. Sent as an explicit frame so the sender doesn't read the bare close
+  // as acceptance (a phantom delivery). Transient + retryable, and DISTINCT from
+  // peerLost — the peer is alive, so the sender waits and retries rather than
+  // re-running discovery for a peer it thinks is gone.
+  atCapacity: 'mesh.at_capacity',
 } as const;
 
 // ---- Registry (discovery) ----

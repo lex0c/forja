@@ -84,6 +84,25 @@ describe('mesh_send tool', () => {
     expect(isToolError(r) && typeof r.hint === 'string').toBe(true);
   });
 
+  test('maps an at_capacity send failure to a DISTINCT retryable code (wait vs re-discover)', async () => {
+    const mgr = {
+      isServing: () => false,
+      send: async () => {
+        // The manager embeds at_capacity when the peer's admission control dropped
+        // the connection at its ceiling — the peer is alive, just momentarily full.
+        throw new Error(
+          "mesh: peer 'x' rejected the message — mesh.at_capacity: at the 64-connection ceiling",
+        );
+      },
+    };
+    const r = await meshSendTool.execute({ peer: 'billing', message: 'hi' }, ctxWith(mgr));
+    // Distinct code (not peer_lost / no_such_peer) so the model waits and retries the
+    // SAME send rather than re-running discovery for a peer it thinks is gone.
+    expect(isToolError(r) && r.error_code).toBe('mesh.at_capacity');
+    expect(isToolError(r) && r.retryable).toBe(true);
+    expect(isToolError(r) && typeof r.hint === 'string').toBe(true);
+  });
+
   test('errors when the mesh subsystem is unavailable', async () => {
     const r = await meshSendTool.execute({ peer: 'x', message: 'y' }, ctxWith(undefined));
     expect(isToolError(r) && r.error_code).toBe('mesh.unavailable');

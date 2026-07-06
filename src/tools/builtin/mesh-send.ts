@@ -103,6 +103,16 @@ export const meshSendTool: Tool<MeshSendInput, MeshSendOutput> = {
       if (message.includes(MESH_ERROR_CODES.messageTooLarge)) {
         return toolError(ERROR_CODES.meshMessageTooLarge, `mesh_send: ${message}`);
       }
+      // The peer is alive and serving but momentarily at its inbound-connection
+      // ceiling (admission control dropped us before enqueue). Transient — tell the
+      // model to wait briefly and retry the SAME send; it is NOT a lost/absent peer,
+      // so it must not re-run discovery. `retryable` keys the machine-readable path.
+      if (message.includes(MESH_ERROR_CODES.atCapacity)) {
+        return toolError(ERROR_CODES.meshAtCapacity, `mesh_send: ${message}`, {
+          retryable: true,
+          hint: 'the peer is momentarily at its connection limit — wait a moment and retry; it is alive, no need to re-run mesh_peers',
+        });
+      }
       // Distinguish a peer that was reachable in discovery but dropped (peer_lost —
       // connect refused / socket closed mid-send; the manager embeds the code in the
       // message) from one that isn't serving at all (no_such_peer). Set the machine-

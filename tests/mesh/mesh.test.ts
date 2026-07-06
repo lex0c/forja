@@ -31,6 +31,7 @@ import { type MeshServer, connectMesh, listenMesh } from '../../src/mesh/transpo
 import {
   ABSOLUTE_MESH_LIMITS,
   DEFAULT_MESH_CONFIG,
+  MESH_ERROR_CODES,
   type MeshAuditEvent,
   type MeshConfig,
 } from '../../src/mesh/types.ts';
@@ -620,7 +621,7 @@ describe('mesh integration (two managers over real sockets)', () => {
     await server.shutdown(); // no-op, must not throw
   });
 
-  test('caps concurrent inbound connections (admission control) — the over-cap one is dropped', async () => {
+  test('caps concurrent inbound connections (admission control) — the over-cap one gets an at_capacity frame, not a bare close', async () => {
     const srv = createMeshManager({
       dir,
       config: cfg('capsrv'),
@@ -635,14 +636,69 @@ describe('mesh integration (two managers over real sockets)', () => {
     const t1 = await connectMesh(socketPath(dir, 'capsrv'));
     const t2 = await connectMesh(socketPath(dir, 'capsrv'));
     await new Promise((r) => setTimeout(r, 40)); // let both accepts land in openConnections
-    // The third is over the ceiling → the server closes it on accept.
+    // The third is over the ceiling. The server must send an EXPLICIT at_capacity
+    // error frame before closing — a bare close reads as acceptance on the sender
+    // (send() treats a clean close with no error as delivered → a phantom delivery).
+    // Capturing the frame proves the drop is legible on the wire.
     const t3 = await connectMesh(socketPath(dir, 'capsrv'));
-    await new Promise((r) => setTimeout(r, 50)); // let the server's close reach the client
-    expect(t3.write(encodeMeshMessage(makeHello('x')))).toBe(false); // dropped → write fails
+    const rejected = new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('no rejection frame')), 3000);
+      t3.onLine((line) => {
+        const res = parseMeshLine(line);
+        if (res.ok && res.msg.type === 'error') {
+          clearTimeout(timer);
+          resolve(res.msg.code);
+        }
+      });
+    });
+    expect(await rejected).toBe(MESH_ERROR_CODES.atCapacity);
     t1.close();
     t2.close();
     t3.close();
     await srv.shutdown();
+  });
+
+  test('send() to a peer at its connection ceiling fails retryably and audits no message_sent', async () => {
+    // The admission-control sibling of the peer-rejection test: the receiver is full,
+    // so it drops the connection on accept (with an at_capacity frame, and no hello
+    // ack first). send() must read that verdict and FAIL — not read the bare close as
+    // delivery and audit a phantom send. The exact thrown code is at_capacity, or
+    // peer_lost if the server's close wins the race against our hello/message write;
+    // both are legitimate retryable "the send didn't land" outcomes — a silent
+    // success is not.
+    const server = createMeshManager({
+      dir,
+      config: cfg('fullsrv'),
+      repoRoot: '/repo/fullsrv',
+      branch: 'main',
+      pid: process.pid,
+      maxInboundConnections: 1,
+      handshakeDeadlineMs: 5000, // hold the filler open through the test
+    });
+    await server.startServing();
+    let received = 0;
+    server.onMessage(() => {
+      received++;
+    });
+    // Fill the single slot with a stalled connection (connect, no hello).
+    const filler = await connectMesh(socketPath(dir, 'fullsrv'));
+    await new Promise((r) => setTimeout(r, 40)); // let the accept land in openConnections
+    const cliEvents: MeshAuditEvent[] = [];
+    const client = createMeshManager({
+      dir,
+      config: cfg('fullcli'),
+      repoRoot: '/repo/fullcli',
+      branch: 'main',
+      pid: process.pid,
+      onAuditEvent: (e) => cliEvents.push(e),
+    });
+    await expect(client.send('fullsrv', 'hi')).rejects.toThrow(/at_capacity|peer_lost/);
+    await new Promise((r) => setTimeout(r, 60));
+    expect(received).toBe(0); // never drove a turn on the server
+    expect(cliEvents.some((e) => e.kind === 'message_sent')).toBe(false); // no phantom audit
+    filler.close();
+    await client.shutdown();
+    await server.shutdown();
   });
 
   test('processes at most one message per connection (§4) — a pipelined second is ignored', async () => {
