@@ -728,11 +728,6 @@ export const ERROR_CODES = {
   // mesh_send message is over the peer byte cap — distinct from no_such_peer so
   // the model shortens the request instead of re-running discovery.
   meshMessageTooLarge: 'mesh.message_too_large',
-  // mesh_send refused because THIS session is serving (relayMode) — a relay
-  // does not initiate onward sends (no transitive delegation, §1.2/§8).
-  meshDelegationBlocked: 'mesh.delegation_blocked',
-  // mesh_reply targeted a conversation that is unknown or already closed.
-  meshNoSuchConversation: 'mesh.no_such_conversation',
   // tool_search ran without the harness wiring (ctx.searchTools) — a subagent
   // or headless run where the deferred-tool surface (AGENTIC_CLI §7.6) doesn't
   // apply. The base surface is already the full whitelist there; nothing to

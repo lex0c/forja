@@ -16,7 +16,6 @@ import { memoryReadTool } from './memory-read.ts';
 import { memorySearchTool } from './memory-search.ts';
 import { memoryWriteTool } from './memory-write.ts';
 import { meshPeersTool } from './mesh-peers.ts';
-import { meshReplyTool } from './mesh-reply.ts';
 import { meshSendTool } from './mesh-send.ts';
 import { readFileTool } from './read-file.ts';
 import { reminderCancelTool } from './reminder-cancel.ts';
@@ -76,8 +75,6 @@ export { memoryWriteTool } from './memory-write.ts';
 export type { MemoryWriteInput, MemoryWriteOutput } from './memory-write.ts';
 export { meshPeersTool } from './mesh-peers.ts';
 export type { MeshPeersInput, MeshPeersOutput } from './mesh-peers.ts';
-export { meshReplyTool } from './mesh-reply.ts';
-export type { MeshReplyInput, MeshReplyOutput } from './mesh-reply.ts';
 export { meshSendTool } from './mesh-send.ts';
 export type { MeshSendInput, MeshSendOutput } from './mesh-send.ts';
 export { monitorTool } from './monitor.ts';
@@ -158,10 +155,9 @@ export const BUILTIN_TOOLS = [
   // discovery; always visible (it's how the model reaches the deferred set).
   toolSearchTool,
   // Mesh tools (MESH.md §9): mesh_peers discovers serving peers (read-only),
-  // mesh_send delivers a textual request to one (egress, confirm per call).
+  // mesh_send delivers a textual message to one (respects posture, §5.3).
   // Both deferred — reached via tool_search, off the base surface.
   meshPeersTool,
-  meshReplyTool,
   meshSendTool,
   // wait_for / monitor are intentionally NOT registered: the model
   // should not see or call them. The tool modules, their re-exports

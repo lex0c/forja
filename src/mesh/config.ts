@@ -25,12 +25,7 @@ export interface LoadMeshConfigInput {
   configPathOverride?: string | null;
 }
 
-const MESH_KEYS = new Set([
-  'alias',
-  'max_rounds',
-  'max_message_bytes',
-  'max_concurrent_conversations',
-]);
+const MESH_KEYS = new Set(['alias', 'max_message_bytes']);
 
 const clampInt = (
   v: unknown,
@@ -79,25 +74,11 @@ export const loadMeshConfig = (input: LoadMeshConfigInput): LoadedMeshConfig => 
       config.alias = alias;
     }
   }
-  config.maxRounds = clampInt(
-    section.max_rounds,
-    DEFAULT_MESH_CONFIG.maxRounds,
-    ABSOLUTE_MESH_LIMITS.maxRounds,
-    'max_rounds',
-    warnings,
-  );
   config.maxMessageBytes = clampInt(
     section.max_message_bytes,
     DEFAULT_MESH_CONFIG.maxMessageBytes,
     ABSOLUTE_MESH_LIMITS.maxMessageBytes,
     'max_message_bytes',
-    warnings,
-  );
-  config.maxConcurrentConversations = clampInt(
-    section.max_concurrent_conversations,
-    DEFAULT_MESH_CONFIG.maxConcurrentConversations,
-    ABSOLUTE_MESH_LIMITS.maxConcurrentConversations,
-    'max_concurrent_conversations',
     warnings,
   );
 

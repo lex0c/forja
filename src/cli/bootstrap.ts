@@ -1745,7 +1745,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     repoRoot: projectConfigCwd,
     branch: probeGitContext(projectConfigCwd)?.branch ?? 'unknown',
     // Persist the mesh boundary events (§8) to `mesh_events` — the A↔B forensic
-    // trail, correlated by conversationId across the two Forjas' DBs.
+    // trail, correlated by peer alias + message id across the two Forjas' DBs.
     onAuditEvent: (event) => recordMeshAuditEvent(db, event),
   });
 

@@ -22,18 +22,14 @@ export type PolicyCategory =
   | 'misc'
   | 'mcp'
   | 'mcp.egress'
-  // Sending a request to a peer (mesh_send). An outbound send, but over a
+  // Sending a message to a peer (mesh_send). An outbound send, but over a
   // same-user LOCAL Unix socket — NOT network egress — so it respects the
   // operator's posture (supervised confirms + shows the payload; autonomous
-  // auto-approves), like mesh.reply. Deliberately NOT in categoryIsEgress; the
-  // autonomous send trades the outbound-payload review for the same delegation
-  // as any local effect. See MESH.md §5.3.
-  | 'mesh.egress'
-  // Publishing a reply to a peer that already opened a conversation (mesh_reply).
-  // Like mesh.egress, follows the operator's posture (supervised confirms what
-  // leaves; autonomous auto-approves) — both are same-user local mesh boundaries,
-  // not network egress. See MESH.md §5.3/§9.
-  | 'mesh.reply';
+  // auto-approves). Deliberately NOT in categoryIsEgress; the autonomous send
+  // trades the outbound-payload review for the same delegation as any local
+  // effect. The mesh is symmetric (send is available while serving) — authority
+  // is the local operator's per send, never transitive. See MESH.md §5.3.
+  | 'mesh.egress';
 
 // Categories that send bytes OUT to the NETWORK, to an operator-unconfined host.
 // Network egress is special-cased by the autonomous posture: a default-confirm

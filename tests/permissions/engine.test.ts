@@ -39,10 +39,9 @@ describe('engine.check (mesh.egress)', () => {
   });
 
   test('autonomous: auto-approves — respects posture (same-user local socket, not network egress)', () => {
-    // mesh_send is NOT categoryIsEgress, so — like mesh_reply — the autonomous
-    // posture auto-approves it (supervised still confirms, above). resolvers/mesh.ts
-    // keeps it off the conservative fallback (clean resolver result), so nothing
-    // forces a confirm.
+    // mesh_send is NOT categoryIsEgress, so the autonomous posture auto-approves it
+    // (supervised still confirms, above). resolvers/mesh.ts keeps it off the
+    // conservative fallback (clean resolver result), so nothing forces a confirm.
     const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
     const d = eng.check('mesh_send', 'mesh.egress', { peer: 'billing', message: 'anything' });
     expect(d.kind).toBe('allow');
@@ -56,29 +55,6 @@ describe('engine.check (mesh.egress)', () => {
       message: 'clean[2Jmessage',
     });
     if (d.kind === 'confirm') expect(d.prompt).not.toContain('');
-  });
-});
-
-describe('engine.check (mesh.reply)', () => {
-  test('supervised: confirms and surfaces the output (two-audiences review), but is NOT egress', () => {
-    const eng = createPermissionEngine(policy({}), { cwd: CWD });
-    const d = eng.check('mesh_reply', 'mesh.reply', {
-      conversationId: 'c1',
-      output: 'the contract is v2: amount, currency, idem_key',
-    });
-    expect(d.kind).toBe('confirm');
-    expect(categoryIsEgress('mesh.reply')).toBe(false);
-    if (d.kind === 'confirm') expect(d.prompt).toContain('the contract is v2');
-  });
-
-  test('autonomous: auto-approves the reply (respects posture, like mesh_send)', () => {
-    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
-    const d = eng.check('mesh_reply', 'mesh.reply', {
-      conversationId: 'c1',
-      output: 'the answer',
-    });
-    expect(d.kind).toBe('allow');
-    if (d.kind === 'allow') expect(d.reason).toContain('autonomous posture');
   });
 });
 

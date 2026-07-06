@@ -1,37 +1,24 @@
 // Mesh wire + subsystem types. The message envelope mirrors the IPC channel
 // ({ type, id, ts, ...payload }) but the type set is the mesh's own — a peer
-// speaks intent (hello/prompt/progress/result/error/bye), never IPC commands.
+// speaks intent (hello/message/error/bye), never IPC commands. A `message` is
+// one textual peer message (request, reply, or follow-up — the type does not
+// distinguish); there is no conversation lifecycle (§4, §6.4).
 // See docs/spec/MESH.md §4.
 
 export const MESH_PROTOCOL_VERSION = 1;
 
 interface MeshCommonFields {
-  // UUID v4 from the emitter; correlates a request/response pair.
+  // UUID v4 from the emitter; the message's own id, used only for audit/dedup
+  // (§4 — messages are not paired, so it is not a correlation handle).
   id: string;
   // Wall-clock from the emitter (epoch ms); forensic only.
   ts: number;
 }
 
-// High-level conversation state surfaced to the initiator. Deliberately coarse
-// — never a raw tool output (privacy, §7).
-export type MeshProgressState = 'accepted' | 'working' | 'waiting-operator' | 'done';
-
 export type MeshMessage =
   | (MeshCommonFields & { type: 'hello'; alias: string; protocolVersion: number })
-  | (MeshCommonFields & { type: 'prompt'; conversationId: string; text: string })
-  | (MeshCommonFields & {
-      type: 'progress';
-      conversationId: string;
-      state: MeshProgressState;
-      note?: string;
-    })
-  | (MeshCommonFields & { type: 'result'; conversationId: string; text: string })
-  | (MeshCommonFields & {
-      type: 'error';
-      conversationId?: string;
-      code: string;
-      message: string;
-    })
+  | (MeshCommonFields & { type: 'message'; text: string })
+  | (MeshCommonFields & { type: 'error'; code: string; message: string })
   | (MeshCommonFields & { type: 'bye' });
 
 export type MeshMessageType = MeshMessage['type'];
@@ -39,28 +26,21 @@ export type MeshMessageType = MeshMessage['type'];
 // Boundary audit events the manager emits at the wire hub (§8). The manager is
 // byte/lifecycle plumbing — it emits these SEMANTIC events via a `onAuditEvent`
 // callback; the sink (wired in bootstrap with the DB) persists them to the
-// `mesh_events` table. Correlation across two Forjas is by `conversationId`; no
-// session_id (the manager doesn't own one, and the local session is recoverable
-// via the message log — the peer prompt's envelope carries the conversationId).
+// `mesh_events` table. Correlation across two Forjas is by `peerAlias` + the
+// message `id`; no session_id (the manager doesn't own one, and the local
+// session is recoverable via the message log).
 export type MeshAuditEvent =
-  | { kind: 'peer_prompt_received'; conversationId: string; peerAlias: string }
-  // `output` is the published text; the sink stores only its hash + byte length
-  // (the full text already lives in the mesh_reply tool args / message log).
-  | { kind: 'reply_published'; conversationId: string; peerAlias: string; output: string }
-  | { kind: 'reply_received'; conversationId: string; peerAlias: string };
+  // A message went out on the wire (a mesh_send). The sink stores only hash(text)
+  // + byte length — the full text lives in the mesh_send tool args / message log.
+  | { kind: 'message_sent'; id: string; peerAlias: string; text: string }
+  | { kind: 'message_received'; id: string; peerAlias: string };
 
 export const MESH_ERROR_CODES = {
   versionMismatch: 'mesh.version_mismatch',
-  roundsExceeded: 'mesh.rounds_exceeded',
-  peerBusy: 'mesh.peer_busy',
   messageTooLarge: 'mesh.message_too_large',
-  noSuchPeer: 'mesh.no_such_peer',
-  notServing: 'mesh.not_serving',
   handshakeFailed: 'mesh.handshake_failed',
-  // Prompt carried a conversationId outside the safe grammar (CONVERSATION_ID_RE)
-  // — rejected before it can reach the model's envelope preamble (§5.2).
-  invalidConversation: 'mesh.invalid_conversation',
-  // Connection closed before the peer answered (crash / relay-off without bye).
+  // Connection closed / refused before the message could be delivered (crash,
+  // relay-off, or a stale descriptor) — surfaced to the sender's model (§6.5).
   peerLost: 'mesh.peer_lost',
 } as const;
 
@@ -75,13 +55,6 @@ export type PeerStatus = 'idle' | 'working' | 'waiting-operator';
 export const ALIAS_RE = /^[a-z][a-z0-9_-]*$/;
 export const ALIAS_MAX = 40;
 
-// Conversation-id grammar. The initiator mints it (crypto.randomUUID), but it is
-// attacker-controlled on the wire and gets surfaced to the model as the reply
-// handle inside the untrusted-message preamble (OUTSIDE the nonce fence, §5.2/
-// §6.2). Same philosophy as ALIAS_RE: safe chars + bounded length, so a hostile
-// peer can't smuggle control bytes / newlines / fake markers through it. Not
-// sanitized (that would break round-trip correlation) — rejected on ingress.
-export const CONVERSATION_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 export const PEER_STATUSES: ReadonlySet<PeerStatus> = new Set([
   'idle',
   'working',
@@ -119,31 +92,24 @@ export const toPeerInfo = (d: PeerDescriptor): PeerInfo => ({
 export interface MeshConfig {
   // null → derive from the repo-root basename at manager construction.
   alias: string | null;
-  maxRounds: number;
   maxMessageBytes: number;
-  maxConcurrentConversations: number;
 }
 
 export const DEFAULT_MESH_CONFIG: MeshConfig = {
   alias: null,
-  maxRounds: 8,
   maxMessageBytes: 32 * 1024,
-  maxConcurrentConversations: 4,
 };
 
 // Absolute ceilings the loader clamps to (a hostile/typo'd config can't lift
 // the mesh past these).
 export const ABSOLUTE_MESH_LIMITS = {
-  maxRounds: 64,
   // 128 KiB. maxMessageBytes bounds the RAW text; on the wire the text is a
-  // JSON-string-escaped field of an NDJSON message (makePrompt / makeResult), and
-  // a control byte escapes to `\uXXXX` — a 6× WORST-case expansion (256 KiB of
-  // NULs → ~1.5 MiB). The receiving framer (ndjson DEFAULT_LINE_CAP, 1 MiB) DROPS
-  // any line past its cap → a silently lost message → spurious peer_lost / a hung
-  // conversation, even though both sides accepted the raw size. So the ceiling
-  // must stay below cap/6: 128 KiB × 6 = 768 KiB fits even an all-control message,
-  // with room for the JSON wrapper. (The prior 256 KiB left only ~4× and could
-  // overflow on escape-heavy content.)
+  // JSON-string-escaped field of an NDJSON message (makeMessage), and a control
+  // byte escapes to `\uXXXX` — a 6× WORST-case expansion (256 KiB of NULs → ~1.5
+  // MiB). The receiving framer (ndjson DEFAULT_LINE_CAP, 1 MiB) DROPS any line
+  // past its cap → a silently lost message, even though both sides accepted the
+  // raw size. So the ceiling must stay below cap/6: 128 KiB × 6 = 768 KiB fits
+  // even an all-control message, with room for the JSON wrapper. (The prior
+  // 256 KiB left only ~4× and could overflow on escape-heavy content.)
   maxMessageBytes: 128 * 1024,
-  maxConcurrentConversations: 16,
 } as const;

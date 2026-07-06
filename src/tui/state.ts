@@ -1829,17 +1829,17 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         // the one emphasized token; the URL stays dim like other actions.
         previewLines.push({ verb: 'fetch', text: event.command });
       } else if (
-        (event.toolName === 'mesh_send' || event.toolName === 'mesh_reply') &&
+        event.toolName === 'mesh_send' &&
         event.reason !== undefined &&
         event.reason.length > 0
       ) {
-        // For a mesh send/reply the vocab `command` is only the peer/target;
-        // the PAYLOAD that crosses the trust boundary lives in `event.reason`
-        // — the engine (mesh.egress/mesh.reply) builds a bounded, one-line,
-        // control-stripped "to WHOM + WHAT leaves" excerpt there precisely
-        // because the modal has no dedicated payload field. Render THAT as the
-        // action so the operator reviews what is leaving, not just to whom (the
-        // two-audiences review, MESH.md §7). Without it the send is blind.
+        // For a mesh send the vocab `command` is only the peer/target; the PAYLOAD
+        // that crosses the trust boundary lives in `event.reason` — the engine
+        // (mesh.egress) builds a bounded, one-line, control-stripped "to WHOM +
+        // WHAT leaves" excerpt there precisely because the modal has no dedicated
+        // payload field. Render THAT as the action so the operator reviews what is
+        // leaving, not just to whom (the two-audiences review, MESH.md §7). Without
+        // it the send is blind.
         previewLines.push(`    ${event.reason}`);
       } else {
         previewLines.push(`    ${event.command}`);

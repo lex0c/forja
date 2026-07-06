@@ -2602,26 +2602,6 @@ export const createPermissionEngine = (
         };
         break;
       }
-      case 'mesh.reply': {
-        // mesh_reply publishes an answer back to a peer that ALREADY opened a
-        // conversation (an inbound obligation `/relay on` took on). NOT egress
-        // (not in categoryIsEgress), so the autonomous posture auto-approves this
-        // policy-confirm — but supervised still shows the operator WHAT is being
-        // published (the two-audiences review, MESH.md §7), since the output is
-        // what crosses the trust boundary to the peer.
-        const replyArgs = args as { output?: unknown };
-        const replyOut = typeof replyArgs.output === 'string' ? replyArgs.output : '';
-        const replyExcerpt = sanitizeOneLineForDisplay(replyOut, 160);
-        const replyEllipsis = replyOut.length > 160 ? '…' : '';
-        decision = {
-          kind: 'confirm',
-          confirmCause: 'policy',
-          reason: 'mesh reply: output crosses to a peer (separate trust domain)',
-          prompt: `Publish to mesh peer: ${replyExcerpt}${replyEllipsis}`,
-          source: { layer: 'default' },
-        };
-        break;
-      }
     }
     // Degraded upgrade applied AFTER the normal pipeline so the
     // rule that would have fired keeps its attribution in `source`

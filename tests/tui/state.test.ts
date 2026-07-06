@@ -2345,21 +2345,6 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
     }
   });
 
-  test('a mesh_reply action renders the published output excerpt (event.reason)', () => {
-    const r = applyEvent(createInitialState(), {
-      type: 'permission:ask',
-      ts: 1,
-      promptId: 'p1',
-      toolName: 'mesh_reply',
-      command: 'mesh peer', // vocab subject is static
-      reason: 'Publish to mesh peer: the contract now returns 200 on /v2',
-      cwd: '/p',
-    } as UIEvent);
-    expect(r.state.modal?.preview[1]).toBe(
-      '    Publish to mesh peer: the contract now returns 200 on /v2',
-    );
-  });
-
   test('a peer-driven confirm labels the modal with peer attribution', () => {
     const r = applyEvent(createInitialState(), {
       type: 'permission:ask',

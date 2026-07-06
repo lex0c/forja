@@ -3,9 +3,9 @@
 // `/relay on` opens a confirm modal (opening the listen socket is the first
 // inbound channel Forja creates, so it gets an explicit consent gate —
 // MESH.md §6.1); on yes the session starts serving peers WITHOUT becoming
-// dedicated — the operator keeps working, and peer prompts interleave as their
-// own isolated system turns under the operator's approval. `/relay off` stops it.
-// Bare `/relay` reports status. A peer prompt is intent, never authority.
+// dedicated — the operator keeps working, and peer messages interleave as system
+// turns in the operator's OWN session, under their approval (§6.1). `/relay off`
+// stops it. Bare `/relay` reports status. A peer message is intent, never authority.
 
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
@@ -15,14 +15,7 @@ const statusNotes = (ctx: SlashContext): SlashResult => {
   if (!mgr.isServing()) {
     return { kind: 'ok', notes: ['relay: off (run /relay on to start serving mesh peers)'] };
   }
-  // Surface the inbound state so the serving operator can see who is talking to
-  // them right now — mesh_peers only lists OTHER servers (for initiating).
-  const inbound = mgr.inboundSummary();
-  const inboundNote =
-    inbound.length === 0
-      ? 'no conversations in flight'
-      : `${inbound.length} in flight (${inbound.map((c) => c.peerAlias).join(', ')})`;
-  return { kind: 'ok', notes: [`relay: on — serving as '${mgr.alias}'; ${inboundNote}`] };
+  return { kind: 'ok', notes: [`relay: on — serving as '${mgr.alias}'`] };
 };
 
 export const relayCommand: SlashCommand = {
@@ -82,8 +75,8 @@ export const relayCommand: SlashCommand = {
       return {
         kind: 'ok',
         notes: [
-          `relay: on — serving as '${mgr.alias}'; keep working, peer requests interleave`,
-          'note: sending to peers (mesh_send) is disabled while serving — send from a non-relay session',
+          `relay: on — serving as '${mgr.alias}'; keep working, peer messages interleave`,
+          'you can still mesh_send to peers while serving — the exchange is symmetric',
         ],
       };
     }

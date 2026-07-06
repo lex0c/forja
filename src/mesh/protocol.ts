@@ -5,28 +5,9 @@
 
 import { safeJsonParse } from '../broker/safe-json.ts';
 import { encodeJsonLine } from '../wire/ndjson.ts';
-import {
-  MESH_PROTOCOL_VERSION,
-  type MeshMessage,
-  type MeshMessageType,
-  type MeshProgressState,
-} from './types.ts';
+import { MESH_PROTOCOL_VERSION, type MeshMessage, type MeshMessageType } from './types.ts';
 
-const KNOWN_TYPES: ReadonlySet<MeshMessageType> = new Set([
-  'hello',
-  'prompt',
-  'progress',
-  'result',
-  'error',
-  'bye',
-]);
-
-const PROGRESS_STATES: ReadonlySet<MeshProgressState> = new Set([
-  'accepted',
-  'working',
-  'waiting-operator',
-  'done',
-]);
+const KNOWN_TYPES: ReadonlySet<MeshMessageType> = new Set(['hello', 'message', 'error', 'bye']);
 
 export const encodeMeshMessage = (msg: MeshMessage): string => encodeJsonLine(msg);
 
@@ -66,37 +47,12 @@ export const parseMeshLine = (line: string): MeshParseResult => {
         return { ok: false, reason: 'hello.missing_protocolVersion' };
       }
       break;
-    case 'prompt':
-      if (!isNonEmptyString(obj.conversationId)) {
-        return { ok: false, reason: 'prompt.missing_conversationId' };
-      }
-      if (typeof obj.text !== 'string') return { ok: false, reason: 'prompt.missing_text' };
-      break;
-    case 'progress':
-      if (!isNonEmptyString(obj.conversationId)) {
-        return { ok: false, reason: 'progress.missing_conversationId' };
-      }
-      if (!PROGRESS_STATES.has(obj.state as MeshProgressState)) {
-        return { ok: false, reason: `progress.unknown_state:${String(obj.state)}` };
-      }
-      // Optional field: type-check when present so it can't slip a non-string
-      // through the union contract.
-      if (obj.note !== undefined && typeof obj.note !== 'string') {
-        return { ok: false, reason: 'progress.note_not_string' };
-      }
-      break;
-    case 'result':
-      if (!isNonEmptyString(obj.conversationId)) {
-        return { ok: false, reason: 'result.missing_conversationId' };
-      }
-      if (typeof obj.text !== 'string') return { ok: false, reason: 'result.missing_text' };
+    case 'message':
+      if (typeof obj.text !== 'string') return { ok: false, reason: 'message.missing_text' };
       break;
     case 'error':
       if (!isNonEmptyString(obj.code)) return { ok: false, reason: 'error.missing_code' };
       if (typeof obj.message !== 'string') return { ok: false, reason: 'error.missing_message' };
-      if (obj.conversationId !== undefined && typeof obj.conversationId !== 'string') {
-        return { ok: false, reason: 'error.conversationId_not_string' };
-      }
       break;
     case 'bye':
       break;
@@ -112,34 +68,17 @@ export const makeHello = (alias: string): MeshMessage => ({
   protocolVersion: MESH_PROTOCOL_VERSION,
   ...stamp(),
 });
-export const makePrompt = (conversationId: string, text: string): MeshMessage => ({
-  type: 'prompt',
-  conversationId,
+// One textual peer message (request, reply, or follow-up — the type does not
+// distinguish, §4). `stamp()` mints the id used only for audit/dedup.
+export const makeMessage = (text: string): MeshMessage => ({
+  type: 'message',
   text,
   ...stamp(),
 });
-export const makeProgress = (
-  conversationId: string,
-  state: MeshProgressState,
-  note?: string,
-): MeshMessage => ({
-  type: 'progress',
-  conversationId,
-  state,
-  ...(note !== undefined ? { note } : {}),
-  ...stamp(),
-});
-export const makeResult = (conversationId: string, text: string): MeshMessage => ({
-  type: 'result',
-  conversationId,
-  text,
-  ...stamp(),
-});
-export const makeError = (code: string, message: string, conversationId?: string): MeshMessage => ({
+export const makeError = (code: string, message: string): MeshMessage => ({
   type: 'error',
   code,
   message,
-  ...(conversationId !== undefined ? { conversationId } : {}),
   ...stamp(),
 });
 export const makeBye = (): MeshMessage => ({ type: 'bye', ...stamp() });
