@@ -9,7 +9,7 @@
 
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
-const statusNotes = (ctx: SlashContext): SlashResult => {
+const statusNotes = async (ctx: SlashContext): Promise<SlashResult> => {
   const mgr = ctx.baseConfig.meshManager;
   if (mgr === undefined) return { kind: 'ok', notes: ['relay: mesh subsystem unavailable'] };
   if (!mgr.isServing()) {
@@ -17,8 +17,9 @@ const statusNotes = (ctx: SlashContext): SlashResult => {
   }
   // Surface reachable peers on demand — mesh_peers is a model-only tool, so this is
   // the operator's only window into who's out there (and their coarse status) when
-  // deciding whether to jump in and help the exchange (§6.3).
-  const peers = mgr.listPeers();
+  // deciding whether to jump in and help the exchange (§6.3). listPeers connect-
+  // probes each, so this also reflects true liveness (stale phantoms don't show).
+  const peers = await mgr.listPeers();
   const peerNote =
     peers.length === 0
       ? 'no other peers serving'

@@ -15,6 +15,7 @@ import {
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { safeJsonParse } from '../broker/safe-json.ts';
+import { probeSocket } from './transport.ts';
 import {
   ALIAS_MAX,
   ALIAS_RE,
@@ -177,14 +178,15 @@ const parseDescriptor = (raw: string): PeerDescriptor | null => {
   return o as unknown as PeerDescriptor;
 };
 
-// List live peers. Descriptors with a dead pid or a missing socket are stale —
-// skipped, and (unless sweep is disabled) their .json + .sock are removed so the
-// registry self-heals. `selfAlias` excludes the caller's own descriptor (a Forja
-// identifies itself by its logical alias, not pid).
-export const listPeers = (
+// List live peers. Descriptors with a dead pid or a socket no listener accepts
+// are stale — skipped, and (unless sweep is disabled) their .json + .sock are
+// removed so the registry self-heals. `selfAlias` excludes the caller's own
+// descriptor (a Forja identifies itself by its logical alias, not pid). Async
+// because liveness needs a connect PROBE, not a file-existence check (see below).
+export const listPeers = async (
   dir: string,
   opts: { sweep?: boolean; selfAlias?: string } = {},
-): PeerDescriptor[] => {
+): Promise<PeerDescriptor[]> => {
   const dirPath = peersDir(dir);
   if (!existsSync(dirPath)) return [];
   let entries: string[];
@@ -225,10 +227,14 @@ export const listPeers = (
     if (opts.selfAlias !== undefined && desc.alias === opts.selfAlias) continue;
     // Recompute the socket from OUR dir + the validated alias — never trust the
     // `socket` field a foreign descriptor wrote (it could aim mesh_send at an
-    // arbitrary Unix socket). Require it to exist (§2 liveness: pid alive AND
-    // socket present; a full connect-probe is Slice 7).
+    // arbitrary Unix socket). Liveness is a connect PROBE, not file existence
+    // (§2): a crashed relay leaves its .sock file behind, and pid reuse makes the
+    // dead descriptor's pid look alive again — so existsSync would advertise a
+    // phantom that every mesh_send immediately loses AND trip startServing's
+    // alias-collision check. probeSocket connects; only a live listener accepts.
+    // Sweep on refusal so the registry self-heals.
     const canonicalSocket = socketPath(dir, desc.alias);
-    if (!existsSync(canonicalSocket)) {
+    if (!(await probeSocket(canonicalSocket))) {
       if (opts.sweep !== false) removeDescriptor(dir, desc.alias);
       continue;
     }

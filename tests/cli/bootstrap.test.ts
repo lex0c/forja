@@ -183,7 +183,7 @@ describe('bootstrap', () => {
     // /relay, and there are no peers in the isolated runtime dir (MESH.md §6.1).
     expect(config.meshManager).toBeDefined();
     expect(config.meshManager?.isServing()).toBe(false);
-    expect(config.meshManager?.listPeers()).toEqual([]);
+    expect(await config.meshManager?.listPeers()).toEqual([]);
     expect((config.meshManager?.alias ?? '').length).toBeGreaterThan(0);
     db.close();
   });

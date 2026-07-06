@@ -73,8 +73,9 @@ export interface MeshManager {
   // The §9 per-message byte cap — the mesh_send tool reads it to reject an
   // over-cap message up front with a distinct error (not a generic no-peer).
   readonly maxMessageBytes: number;
-  // Discovery (client side, always available).
-  listPeers(): PeerInfo[];
+  // Discovery (client side, always available). Async — liveness is a connect probe
+  // (a present socket file isn't a live listener; §2).
+  listPeers(): Promise<PeerInfo[]>;
   // Send a message to a peer: connect → hello → message → close, fire-and-forget.
   // Resolves with the message id once the message is written to the transport.
   // Throws (no live peer / peer_lost) if the peer is unreachable or the write
@@ -280,7 +281,7 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     // descriptor from a crashed run, so a leftover at our alias is cleared here; a
     // live hit is a real collision (we have not published our own descriptor yet,
     // so any hit is a different process).
-    const collision = fsListPeers(deps.dir, {}).find((p) => p.alias === alias);
+    const collision = (await fsListPeers(deps.dir, {})).find((p) => p.alias === alias);
     if (collision !== undefined) {
       throw new Error(
         `mesh: alias '${alias}' is already served by a live peer (pid ${collision.pid}); set a distinct alias in [mesh]`,
@@ -337,7 +338,7 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     // alias would wrongly hide a DIFFERENT live peer that shares our derived alias
     // (same repo basename, or another session in this repo). F1's collision check
     // guarantees no other live peer holds our alias while we serve.
-    const target = fsListPeers(deps.dir, serving ? { selfAlias: alias } : {}).find(
+    const target = (await fsListPeers(deps.dir, serving ? { selfAlias: alias } : {})).find(
       (p) => p.alias === targetAlias,
     );
     if (target === undefined) {
@@ -385,7 +386,8 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     maxMessageBytes: deps.config.maxMessageBytes,
     // Exclude our own descriptor only while serving (see send()) — else a live peer
     // sharing our derived alias would be hidden from discovery.
-    listPeers: () => fsListPeers(deps.dir, serving ? { selfAlias: alias } : {}).map(toPeerInfo),
+    listPeers: async () =>
+      (await fsListPeers(deps.dir, serving ? { selfAlias: alias } : {})).map(toPeerInfo),
     send,
     startServing,
     stopServing,

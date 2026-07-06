@@ -30,7 +30,7 @@ export const meshPeersTool: Tool<MeshPeersInput, MeshPeersOutput> = {
     if (mgr === undefined) {
       return toolError(ERROR_CODES.meshUnavailable, 'mesh_peers: mesh subsystem unavailable');
     }
-    const peers = mgr.listPeers().map((p) => ({
+    const peers = (await mgr.listPeers()).map((p) => ({
       alias: p.alias,
       branch: p.branch,
       status: p.status,

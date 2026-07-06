@@ -212,6 +212,39 @@ export const listenMesh = (
   };
 };
 
+// Liveness probe: does a listener ACCEPT a connection on this unix socket? A
+// present socket FILE is not liveness — a crashed relay leaves the file behind,
+// and pid reuse makes a stale descriptor's pid look alive (registry §2). Only a
+// real connect distinguishes a live listener (which accepts, even into a busy
+// backlog) from an orphaned socket file, a planted regular file (ENOTSOCK), or a
+// missing one (ENOENT). Local unix connects settle immediately; the timeout is a
+// backstop against a pathological hang (a full backlog), treated as dead.
+export const probeSocket = (socketPath: string, timeoutMs = 500): Promise<boolean> =>
+  new Promise((resolve) => {
+    let settled = false;
+    const done = (alive: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(alive);
+    };
+    const timer = setTimeout(() => done(false), timeoutMs);
+    timer.unref?.();
+    Bun.connect<undefined>({
+      unix: socketPath,
+      socket: {
+        open(sock) {
+          // Accepted → a listener is live. We only needed the accept; close now.
+          sock.end();
+          done(true);
+        },
+        data() {},
+        close() {},
+        error() {},
+      },
+    }).catch(() => done(false)); // ECONNREFUSED / ENOTSOCK / ENOENT → no live listener
+  });
+
 // Dial a peer's Unix socket. Attaches in `open` (before any data arrives) so the
 // server's hello is never dropped between connect-resolve and attach.
 export const connectMesh = async (socketPath: string): Promise<MeshTransport> => {
