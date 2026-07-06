@@ -392,8 +392,20 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
       timer.unref?.();
       transport.onLine((line) => {
         const res = parseMeshLine(line);
-        if (res.ok && res.msg.type === 'error') {
+        if (!res.ok) return;
+        if (res.msg.type === 'error') {
           err = { code: res.msg.code, message: res.msg.message };
+          done();
+        } else if (res.msg.type === 'bye') {
+          // The peer said bye (relay-off, §6.5) after accepting our connection but
+          // BEFORE enqueuing our message — it is going away and dropped the message.
+          // Read it as peer_lost (relay-off is a listed peer_lost cause) so the send
+          // FAILS; otherwise the close that FOLLOWS the bye resolves via onClose as
+          // acceptance — a phantom delivery + audit of a message the peer never took.
+          err = {
+            code: MESH_ERROR_CODES.peerLost,
+            message: 'the peer stopped serving (bye) before the message was enqueued',
+          };
           done();
         }
         // A `hello` ack is just the handshake echo — ignore it.

@@ -16,6 +16,7 @@ import { framePeerMessage } from '../../src/mesh/envelope.ts';
 import { createMeshManager } from '../../src/mesh/manager.ts';
 import {
   encodeMeshMessage,
+  makeBye,
   makeHello,
   makeMessage,
   parseMeshLine,
@@ -530,6 +531,41 @@ describe('mesh integration (two managers over real sockets)', () => {
     expect(cliEvents.some((e) => e.kind === 'message_sent')).toBe(false); // no phantom audit
     await client.shutdown();
     await server.shutdown();
+  });
+
+  test('send() reads a peer bye (relay-off mid-send) as peer_lost, not acceptance', async () => {
+    // A serving peer that runs /relay off while our send connection is open writes a
+    // bye frame then closes (stopServing, §6.5). The sender must read that bye as a
+    // DROPPED delivery (peer_lost) — not let the close that follows resolve via onClose
+    // as acceptance (a phantom delivery + audit of a message the peer never took). Drive
+    // send() against a raw server that byes on accept, exactly as stopServing does.
+    ensureMeshDirs(dir); // the raw listenMesh below bypasses the manager's dir setup
+    const server = listenMesh(socketPath(dir, 'byesrv'), (t) => {
+      t.write(encodeMeshMessage(makeBye())); // in-band relay-off signal, then close
+      t.close();
+    });
+    publishDescriptor(dir, {
+      alias: 'byesrv',
+      repoRoot: '/repo/byesrv',
+      branch: 'main',
+      pid: process.pid,
+      socket: socketPath(dir, 'byesrv'),
+      status: 'idle',
+      startedAt: 1,
+    });
+    const cliEvents: MeshAuditEvent[] = [];
+    const client = createMeshManager({
+      dir,
+      config: cfg('byecli'),
+      repoRoot: '/repo/byecli',
+      branch: 'main',
+      pid: process.pid,
+      onAuditEvent: (e) => cliEvents.push(e),
+    });
+    await expect(client.send('byesrv', 'hi')).rejects.toThrow(/peer_lost/);
+    expect(cliEvents.some((e) => e.kind === 'message_sent')).toBe(false); // no phantom audit
+    await client.shutdown();
+    server.stop();
   });
 
   test('send() refuses an over-cap outbound message at the boundary (§9)', async () => {
