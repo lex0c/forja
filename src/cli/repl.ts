@@ -781,6 +781,25 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // (same runtime-only rationale as the holder/timer).
   baseConfig.meshManager?.onMessage(({ peerAlias, text }) => {
     if (exiting) return;
+    // Bound the inbox (§9): past MAX_PENDING_PEER_MESSAGES queued, drop the newest
+    // with a one-shot notice rather than grow heap / build an oversized coalesced
+    // turn. Re-armed when the queue drains (drainNotifications).
+    const pendingPeers = notifications.reduce(
+      (acc, n) => acc + (n.kind === 'peer_message' ? 1 : 0),
+      0,
+    );
+    if (pendingPeers >= MAX_PENDING_PEER_MESSAGES) {
+      if (!peerInboxFullAnnounced) {
+        peerInboxFullAnnounced = true;
+        bus.emit({
+          type: 'info',
+          ts: now(),
+          tone: 'secondary',
+          message: `▸ peer inbox full (${MAX_PENDING_PEER_MESSAGES} queued) — dropping further messages until it drains`,
+        });
+      }
+      return;
+    }
     enqueueNotification({ kind: 'peer_message', peerAlias, text });
   });
 
@@ -1513,6 +1532,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // nothing, without a cue the collaborative exchange strands silently. Reset when
   // the operator acts (startOperatorTurn re-arms the cap) so a later pause re-cues.
   let peerPausePendingAnnounced = false;
+  // Admission control on the in-memory inbox (§9): the wake-cap bounds the turn
+  // COUNT, not enqueuing — while the session is busy or paused, ingress keeps
+  // filling `notifications`, and the drain coalesces the WHOLE queue into one turn.
+  // Cap the pending peer messages so a chatty/buggy peer can't grow heap without
+  // bound or build an oversized turn; drop the newest past the ceiling (one-shot
+  // notice, re-armed when the queue drains). Generous — legitimate bursts are small.
+  const MAX_PENDING_PEER_MESSAGES = 32;
+  let peerInboxFullAnnounced = false;
   // The headline line — the `● `-able status sentence, no body. One
   // `case` per producer `kind`.
   const formatNotificationHeadline = (n: Notification): string => {
@@ -2384,6 +2411,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // along. Each still renders its own scrollback line with its origin stamp.
     const drained = notifications.splice(0);
     consecutiveWakes += 1;
+    peerInboxFullAnnounced = false; // the queue drained → re-arm the inbox-full cue
     // Surface each notification in the scrollback as a system `info` entry (distinct
     // from an operator-submit bar) so the operator sees WHY the session woke and
     // what the turn is about: the `● ` headline, then any body indented beneath it.
@@ -2397,11 +2425,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           ? n.summary
           : n.kind === 'peer_message'
             ? // Untrusted peer text on the operator's TTY — strip control/ANSI
-              // (anti-spoof, like bg_done), collapse blank-line runs (anti-flood: a
-              // peer can't paint thousands of empty rows), and cap the length. The
-              // operator still sees the peer's message at full local fidelity (§0.5)
-              // even though the model receives it enveloped.
-              collapseBlankLines(stripControlKeepLines(n.text)).slice(0, 2000)
+              // (anti-spoof, like bg_done) and collapse blank-line runs (anti-flood:
+              // a peer can't paint thousands of empty rows). The scrollback preview
+              // is length-capped, but the MODEL receives the FULL text enveloped
+              // (§5.2) — so mark the cut, or the operator (whose presence is the
+              // no-isolation safeguard, §6.1) would miss steering content past the cap.
+              ((clean) =>
+                clean.length > 2000
+                  ? `${clean.slice(0, 2000)}\n[… preview truncated — the model receives the full message]`
+                  : clean)(collapseBlankLines(stripControlKeepLines(n.text)))
             : undefined;
       const message =
         body === undefined

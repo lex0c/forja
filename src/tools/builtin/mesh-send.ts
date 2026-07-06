@@ -11,7 +11,7 @@
 // it decides what to do under ITS operator's approval; this tool carries intent,
 // never authority (§0, §1.2). Off the base surface (deferred). See MESH.md §6.4.
 
-import { ALIAS_MAX, ALIAS_RE } from '../../mesh/types.ts';
+import { ALIAS_MAX, ALIAS_RE, MESH_ERROR_CODES } from '../../mesh/types.ts';
 import { ERROR_CODES, type Tool, type ToolContext, type ToolResult, toolError } from '../types.ts';
 
 export interface MeshSendInput {
@@ -87,10 +87,15 @@ export const meshSendTool: Tool<MeshSendInput, MeshSendOutput> = {
         delivered: `sent to '${input.peer}' — it may answer in a later message (or report it couldn't).`,
       };
     } catch (err) {
-      return toolError(
-        ERROR_CODES.meshNoSuchPeer,
-        `mesh_send: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      const message = err instanceof Error ? err.message : String(err);
+      // Distinguish a peer that was reachable in discovery but dropped (peer_lost —
+      // connect refused / socket closed mid-send; the manager embeds the code in the
+      // message) from one that isn't serving at all (no_such_peer), so the model
+      // retries vs. re-discovers appropriately (§6.5).
+      const code = message.includes(MESH_ERROR_CODES.peerLost)
+        ? ERROR_CODES.meshPeerLost
+        : ERROR_CODES.meshNoSuchPeer;
+      return toolError(code, `mesh_send: ${message}`);
     }
   },
 };

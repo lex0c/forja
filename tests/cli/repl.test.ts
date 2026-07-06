@@ -1831,6 +1831,54 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('bounds the peer inbox — past the cap, further messages are dropped with a one-shot notice', async () => {
+    type PeerCb = (m: { peerAlias: string; text: string }) => void;
+    let fire: PeerCb | null = null;
+    const meshManager = meshStub({
+      onMessage: (cb) => {
+        fire = cb;
+      },
+    });
+    const writes: string[] = [];
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ meshManager }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    // Keep the session BUSY so peer messages queue (the drain is isBusy-gated)
+    // instead of draining — this is the busy/paused window where ingress piles up.
+    stdin.feed('work\r');
+    await tick();
+    const f = fire as unknown as PeerCb;
+    for (let i = 0; i < 40; i++) f({ peerAlias: 'gw', text: `msg-${i}` });
+    await tick();
+    // Cap is 32 → the excess is dropped, with the notice emitted exactly once.
+    const inboxFullCount = writes.join('').split('peer inbox full').length - 1;
+    expect(inboxFullCount).toBe(1);
+    // Finish the operator turn → the bounded queue drains into ONE coalesced turn.
+    ra.finish(0);
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    const input = ra.captured[1]?.configs[0]?.userPrompt ?? '';
+    expect(input).toContain('msg-0'); // an early message enqueued
+    expect(input).toContain('msg-31'); // the 32nd (index 31) enqueued
+    expect(input).not.toContain('msg-32'); // the 33rd was dropped at ingress
+    expect(input).not.toContain('msg-39'); // ...and everything past the cap
+    ra.finish(1, { sessionContext: {} as unknown as SessionContext });
+    await flushFrame();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('publishes working while serving a peer turn, idle when it finishes (§7)', async () => {
     type PeerCb = (m: { peerAlias: string; text: string }) => void;
     let fire: PeerCb | null = null;

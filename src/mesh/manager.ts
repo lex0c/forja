@@ -52,6 +52,9 @@ export interface MeshManagerDeps {
   // Pre-message reap window (see HANDSHAKE_DEADLINE_MS); injectable for tests so
   // they don't wait the full 30 s.
   handshakeDeadlineMs?: number;
+  // Concurrent-connection ceiling (see MAX_INBOUND_CONNECTIONS); injectable so a
+  // test can exercise admission control without opening 64 real sockets.
+  maxInboundConnections?: number;
   // Optional boundary-audit sink (§8): the manager emits MeshAuditEvents at the
   // wire hub (message received / message sent); the sink, wired in bootstrap with
   // the DB, persists them to `mesh_events`. No-op when absent (headless / tests).
@@ -98,6 +101,14 @@ export interface MeshManager {
 // stalled/half-open connection, never a legitimate one.
 const HANDSHAKE_DEADLINE_MS = 30_000;
 
+// Ceiling on concurrent inbound connections (admission control). The handshake
+// reaper bounds each connection's LIFETIME (30 s), not the COUNT — so a peer stuck
+// in a reconnect loop could open thousands within one reaper window and exhaust
+// the process fd limit (starving Forja's own tools). Each mesh message is a short
+// connection, so legitimate concurrency is a handful; this ceiling sits well under
+// a typical 1024 soft fd limit, leaving ample room for the rest of Forja.
+const MAX_INBOUND_CONNECTIONS = 64;
+
 export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
   const pid = deps.pid ?? process.pid;
   const alias = resolveAlias(deps.config, deps.repoRoot);
@@ -138,7 +149,15 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
   };
 
   // ---- server side ----
+  const maxInbound = deps.maxInboundConnections ?? MAX_INBOUND_CONNECTIONS;
   const onServerConnection = (transport: MeshTransport): void => {
+    if (openConnections.size >= maxInbound) {
+      // Admission control (§9): reject a new connection once we're at the ceiling,
+      // so a reconnect-looping / flooding peer can't pin fds up to the handshake
+      // window and exhaust the process. Close immediately — don't add, don't parse.
+      transport.close();
+      return;
+    }
     openConnections.add(transport);
     // null until a valid hello arrives — a message before hello is rejected so it
     // can't bypass version negotiation (§4).

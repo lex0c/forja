@@ -58,6 +58,19 @@ describe('mesh_send tool', () => {
     expect(isToolError(r) && r.error_code).toBe('mesh.no_such_peer');
   });
 
+  test('maps a peer_lost send failure to a DISTINCT code (retry vs re-discover, §6.5)', async () => {
+    const mgr = {
+      isServing: () => false,
+      send: async () => {
+        // The manager embeds the peer_lost code in the message on a connect-refused
+        // / write-failed send (a peer that WAS in discovery but dropped).
+        throw new Error("mesh: peer 'x' is unreachable — mesh.peer_lost");
+      },
+    };
+    const r = await meshSendTool.execute({ peer: 'billing', message: 'hi' }, ctxWith(mgr));
+    expect(isToolError(r) && r.error_code).toBe('mesh.peer_lost');
+  });
+
   test('errors when the mesh subsystem is unavailable', async () => {
     const r = await meshSendTool.execute({ peer: 'x', message: 'y' }, ctxWith(undefined));
     expect(isToolError(r) && r.error_code).toBe('mesh.unavailable');

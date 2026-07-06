@@ -72,10 +72,22 @@ const attachSocket = (socket: Socket<undefined>): MeshTransport => {
   };
 
   // Push `bytes` onto the socket; buffer whatever it didn't accept. Returns
-  // false if the socket write threw (socket dead) — the bytes did not leave.
+  // false if the bytes did not leave (socket dead / shutting down), true if
+  // written or buffered for drain.
   const pump = (bytes: Uint8Array): boolean => {
     try {
       const wrote = socket.write(bytes);
+      if (wrote < 0) {
+        // Bun's socket.write returns -1 (it does NOT throw) when the socket is
+        // closed or shutting down — the bytes did NOT leave. Without this guard the
+        // `wrote < bytes.length` branch below would read -1 as a partial write
+        // (`pending = bytes.subarray(-1)`, the last byte) and return true, so a send
+        // to a peer that closed mid-handshake (the /relay off race) would report a
+        // phantom success — and mesh_send would resolve + audit a delivery that
+        // never happened, defeating the peer_lost guard. Surface it as a dead socket.
+        for (const cb of errorCbs) cb(new Error('socket closed'));
+        return false;
+      }
       if (wrote < bytes.length) {
         pending = bytes.subarray(wrote);
       } else {

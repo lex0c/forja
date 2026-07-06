@@ -80,6 +80,17 @@ describe('mesh protocol', () => {
     expect(parseMeshLine('{"type":"message","id":"1","ts":1,"text":{}}').ok).toBe(false);
     expect(parseMeshLine('{"type":"hello","id":"1","ts":1,"protocolVersion":1}').ok).toBe(false);
   });
+
+  test('rejects a message whose id exceeds the length cap (audit-bloat defense)', () => {
+    // The id lands raw (un-hashed) in mesh_events.message_id; without a cap a peer
+    // could ship a ~1 MiB id under the wire line cap and bloat the forensic log.
+    const longId = 'a'.repeat(200);
+    expect(parseMeshLine(`{"type":"message","id":"${longId}","ts":1,"text":"x"}`).ok).toBe(false);
+    // A normal UUID-length id is fine.
+    expect(parseMeshLine(`{"type":"message","id":"${'a'.repeat(36)}","ts":1,"text":"x"}`).ok).toBe(
+      true,
+    );
+  });
 });
 
 describe('mesh envelope', () => {
@@ -531,6 +542,31 @@ describe('mesh integration (two managers over real sockets)', () => {
     expect(existsSync(socketPath(dir, 'orphansrv'))).toBe(false);
     expect(server.isServing()).toBe(false);
     await server.shutdown(); // no-op, must not throw
+  });
+
+  test('caps concurrent inbound connections (admission control) — the over-cap one is dropped', async () => {
+    const srv = createMeshManager({
+      dir,
+      config: cfg('capsrv'),
+      repoRoot: '/repo/capsrv',
+      branch: 'main',
+      pid: process.pid,
+      maxInboundConnections: 2,
+      handshakeDeadlineMs: 5000, // don't reap the stalled fillers during the test
+    });
+    await srv.startServing();
+    // Two connections that connect then stall (no hello) fill the ceiling.
+    const t1 = await connectMesh(socketPath(dir, 'capsrv'));
+    const t2 = await connectMesh(socketPath(dir, 'capsrv'));
+    await new Promise((r) => setTimeout(r, 40)); // let both accepts land in openConnections
+    // The third is over the ceiling → the server closes it on accept.
+    const t3 = await connectMesh(socketPath(dir, 'capsrv'));
+    await new Promise((r) => setTimeout(r, 50)); // let the server's close reach the client
+    expect(t3.write(encodeMeshMessage(makeHello('x')))).toBe(false); // dropped → write fails
+    t1.close();
+    t2.close();
+    t3.close();
+    await srv.shutdown();
   });
 
   test('processes at most one message per connection (§4) — a pipelined second is ignored', async () => {

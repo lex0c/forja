@@ -35,7 +35,12 @@ export const parseMeshLine = (line: string): MeshParseResult => {
   const t = obj.type;
   if (typeof t !== 'string') return { ok: false, reason: 'missing_type' };
   if (!KNOWN_TYPES.has(t as MeshMessageType)) return { ok: false, reason: `unknown_type:${t}` };
-  if (!isNonEmptyString(obj.id)) return { ok: false, reason: 'missing_id' };
+  // `id` is emitter-minted (a UUID). Cap its length: it is the one attacker-
+  // controlled field that lands raw (un-hashed) in the audit store (mesh_events
+  // .message_id), so without a bound a peer could ship a ~1 MiB id (under the wire
+  // line cap) of arbitrary bytes and bloat the forensic log. 128 covers a UUID with
+  // room to spare; anything longer is malformed.
+  if (!isNonEmptyString(obj.id) || obj.id.length > 128) return { ok: false, reason: 'bad_id' };
   if (typeof obj.ts !== 'number' || !Number.isFinite(obj.ts)) {
     return { ok: false, reason: 'missing_ts' };
   }
