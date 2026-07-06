@@ -110,6 +110,12 @@ const HANDSHAKE_DEADLINE_MS = 30_000;
 // a typical 1024 soft fd limit, leaving ample room for the rest of Forja.
 const MAX_INBOUND_CONNECTIONS = 64;
 
+// How long send() reads for the receiver's synchronous verdict (an `error` frame,
+// or a clean close = accepted) before treating silence as delivered. A conforming
+// receiver errors/closes within a local round-trip (sub-ms); this only bounds a
+// non-conforming/hung peer so a send never waits indefinitely.
+const SEND_ACK_DEADLINE_MS = 1000;
+
 export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
   const pid = deps.pid ?? process.pid;
   const alias = resolveAlias(deps.config, deps.repoRoot);
@@ -354,6 +360,37 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
       throw new Error(`mesh: peer '${targetAlias}' is unreachable — ${MESH_ERROR_CODES.peerLost}`);
     }
     const msg = makeMessage(text);
+    // Read the receiver's synchronous verdict BEFORE reporting delivery. A valid
+    // message → the receiver just closes (no ack); a REJECTED one → an `error`
+    // frame before close. The common miss: the receiver caps messages SMALLER than
+    // we do (our up-front check used OUR maxMessageBytes), so a size we accept trips
+    // ITS ingress message_too_large. Fire-and-forget means not awaiting the peer's
+    // REPLY (§6.4) — not ignoring a synchronous protocol rejection, which would
+    // report a phantom delivery AND audit a message the peer dropped.
+    const rejection = new Promise<{ code: string; message: string } | null>((resolve) => {
+      let settled = false;
+      let err: { code: string; message: string } | null = null;
+      const done = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(err);
+      };
+      // A conforming receiver errors/closes within a round-trip; the deadline only
+      // fires for a non-conforming/hung peer → treat silence as accepted (the
+      // fire-and-forget fallback), never a hang.
+      const timer = setTimeout(done, SEND_ACK_DEADLINE_MS);
+      timer.unref?.();
+      transport.onLine((line) => {
+        const res = parseMeshLine(line);
+        if (res.ok && res.msg.type === 'error') {
+          err = { code: res.msg.code, message: res.msg.message };
+          done();
+        }
+        // A `hello` ack is just the handshake echo — ignore it.
+      });
+      transport.onClose(done); // closed with no error frame → the peer accepted it
+    });
     const helloOk = transport.write(encodeMeshMessage(makeHello(alias)));
     const msgOk = transport.write(encodeMeshMessage(msg));
     if (!helloOk || !msgOk) {
@@ -364,11 +401,18 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
         `mesh: peer '${targetAlias}' closed before the message was sent — ${MESH_ERROR_CODES.peerLost}`,
       );
     }
-    emitAudit({ kind: 'message_sent', id: msg.id, peerAlias: targetAlias, text });
-    // One message = one short connection (§4). Graceful close flushes the two
-    // buffered lines (hello + message) before FIN — safe to close right after
-    // write (transport.close contract). Fire-and-forget: we do not await a reply.
+    const rejected = await rejection;
+    // One message = one short connection (§4): close after the verdict (idempotent
+    // if the peer already closed).
     transport.close();
+    if (rejected !== null) {
+      // The peer rejected it on the wire (message_too_large, version mismatch, …) —
+      // surface it instead of a false "delivered", and DON'T audit a dropped send.
+      throw new Error(
+        `mesh: peer '${targetAlias}' rejected the message — ${rejected.code}: ${rejected.message}`,
+      );
+    }
+    emitAudit({ kind: 'message_sent', id: msg.id, peerAlias: targetAlias, text });
     return { id: msg.id };
   };
 

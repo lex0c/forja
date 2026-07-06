@@ -97,6 +97,12 @@ export const meshSendTool: Tool<MeshSendInput, MeshSendOutput> = {
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      // The peer REJECTED it on the wire because its cap is smaller than ours (our
+      // up-front check used OUR cap) — same distinct code + "shorten it" guidance as
+      // the up-front path, so the model shortens rather than re-discovering.
+      if (message.includes(MESH_ERROR_CODES.messageTooLarge)) {
+        return toolError(ERROR_CODES.meshMessageTooLarge, `mesh_send: ${message}`);
+      }
       // Distinguish a peer that was reachable in discovery but dropped (peer_lost —
       // connect refused / socket closed mid-send; the manager embeds the code in the
       // message) from one that isn't serving at all (no_such_peer). Set the machine-

@@ -503,17 +503,30 @@ describe('mesh integration (two managers over real sockets)', () => {
     await server.shutdown();
   });
 
-  test('rejects an over-cap inbound message on ingress (server onMessage never fires)', async () => {
+  test('a peer rejection (its cap < ours) surfaces to the sender and audits no message_sent', async () => {
+    // The exact silent-loss case: our up-front check uses OUR cap (128 KiB), so a
+    // 200-byte message passes it, but the SERVER caps at 16 → its ingress rejects
+    // with an error frame. send() must read that verdict and FAIL — not report a
+    // phantom delivery + audit a message the peer dropped.
     const server = mkMgr(dir, 'bigsrv', { maxMessageBytes: 16 });
     await server.startServing();
     let received = 0;
     server.onMessage(() => {
       received++;
     });
-    const client = mkMgr(dir, 'bigcli', { maxMessageBytes: 1 << 20 });
-    await client.send('bigsrv', 'x'.repeat(200)); // 200 bytes > server cap 16
+    const cliEvents: MeshAuditEvent[] = [];
+    const client = createMeshManager({
+      dir,
+      config: { ...cfg('bigcli'), maxMessageBytes: 1 << 20 },
+      repoRoot: '/repo/bigcli',
+      branch: 'main',
+      pid: process.pid,
+      onAuditEvent: (e) => cliEvents.push(e),
+    });
+    await expect(client.send('bigsrv', 'x'.repeat(200))).rejects.toThrow(/message_too_large/);
     await new Promise((r) => setTimeout(r, 60));
-    expect(received).toBe(0); // rejected on ingress, never drove a turn
+    expect(received).toBe(0); // never drove a turn on the server
+    expect(cliEvents.some((e) => e.kind === 'message_sent')).toBe(false); // no phantom audit
     await client.shutdown();
     await server.shutdown();
   });
