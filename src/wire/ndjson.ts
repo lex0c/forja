@@ -73,14 +73,26 @@ export const createLineFramer = (
       // partial line, kept for the next push.
       let nl = buf.indexOf('\n');
       while (nl !== -1) {
-        const line = buf.slice(0, nl);
+        // Enforce the cap on COMPLETE lines too — not just the trailing partial
+        // below. `nl` IS the line length (line = buf.slice(0, nl)), so an over-cap
+        // line is detected WITHOUT materializing the (potentially multi-MB) slice,
+        // and dropped before onLine. Without this, a record that arrives WITH its
+        // trailing `\n` in one chunk would be sliced + emitted before the partial
+        // check runs, so the cap only bounded unterminated floods — a peer could
+        // hand a giant line straight to the parser (the OOM/DoS guard, defeated).
+        // No resync needed: we already have the boundary, so the next line frames
+        // normally; only the unterminated case (below) has to hunt for it.
+        if (nl > lineCap) {
+          options.onOverflow?.(nl);
+        } else if (nl > 0) {
+          onLine(buf.slice(0, nl));
+        }
         buf = buf.slice(nl + 1);
-        if (line.length > 0) onLine(line);
         nl = buf.indexOf('\n');
       }
-      // Cap check: a trailing partial line past the cap is dropped + resynced;
-      // the dropped count goes through the diagnostic channel, the wire stays
-      // open.
+      // Trailing partial line past the cap: dropped + resynced (an unterminated
+      // flood — we don't have the boundary yet, so discard until the next `\n`).
+      // The dropped count goes through the diagnostic channel; the wire stays open.
       if (buf.length > lineCap) {
         const dropped = buf.length;
         buf = '';
