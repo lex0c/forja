@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { renderFooter } from '../../../src/tui/render/footer.ts';
+import {
+  hasFooterPathRow,
+  renderFooter,
+  renderFooterPath,
+} from '../../../src/tui/render/footer.ts';
 import { visualWidth } from '../../../src/tui/render/width.ts';
 import { type ActiveTool, type LiveState, createInitialState } from '../../../src/tui/state.ts';
 import { CSI, type Capabilities } from '../../../src/tui/term.ts';
@@ -821,6 +825,77 @@ describe('renderFooter', () => {
       // The model remains in the right column — the gate only
       // takes over the left.
       expect(out).toContain('sonnet-4.6');
+    });
+  });
+
+  describe('cwd path row (second footer line)', () => {
+    test('renders the working directory once cwd is seeded', () => {
+      const out = renderFooterPath(startedSession({ cwd: '/home/lex/work/forja', home: '' }), caps);
+      expect(out).not.toBeNull();
+      expect(out).toContain('/home/lex/work/forja');
+      // Frame-margin indented like the rest of the padded live region.
+      expect(out?.startsWith('  ')).toBe(true);
+    });
+
+    test('collapses $HOME to ~ (same treatment as the banner cwd)', () => {
+      const out = renderFooterPath(
+        startedSession({ cwd: '/home/lex/work/forja', home: '/home/lex' }),
+        caps,
+      );
+      expect(out).toContain('~/work/forja');
+      expect(out).not.toContain('/home/lex/work/forja');
+    });
+
+    test('elides the noisy middle of a deep mount path', () => {
+      // A removable-drive mount buries the signal (where + repo) under a
+      // long uuid; shortenCwd keeps the head + last two components.
+      const deep = '/run/media/728c6e4f-56b6-4bf8-903c-838aeaaf2690/Workspaces/forja';
+      const out = renderFooterPath(startedSession({ cwd: deep, home: '' }), caps);
+      expect(out).toContain('/run/media');
+      expect(out).toContain('Workspaces/forja');
+      expect(out).toContain('…');
+    });
+
+    test('painted secondary (grey) when color enabled — matches the banner cwd', () => {
+      const colored: Capabilities = { ...caps, color: 'basic' };
+      const out = renderFooterPath(startedSession({ cwd: '/x/forja', home: '' }), colored);
+      expect(out).toContain(`${CSI}90m`);
+    });
+
+    test('suppressed before the banner seeds cwd (null → no row)', () => {
+      expect(renderFooterPath(createInitialState(), caps)).toBeNull();
+      expect(hasFooterPathRow(createInitialState())).toBe(false);
+    });
+
+    test('suppressed while a modal owns the bottom slot', () => {
+      const s = startedSession({ cwd: '/x/forja', home: '' });
+      s.modal = {
+        promptId: 'p1',
+        flavor: 'permission',
+        title: 'm',
+        subject: null,
+        preview: [],
+        question: null,
+        options: [{ key: '1', label: 'OK', value: 'yes' }],
+        selectedIndex: 0,
+        hints: [],
+        queueDepth: 0,
+      };
+      expect(renderFooterPath(s, caps)).toBeNull();
+      expect(hasFooterPathRow(s)).toBe(false);
+    });
+
+    test('suppressed in bash mode (footer collapses to the shell indicator)', () => {
+      const s = startedSession({ cwd: '/x/forja', home: '' });
+      const bash = { ...s, input: { value: '!ls', cursor: 3 } };
+      expect(renderFooterPath(bash, caps)).toBeNull();
+      expect(hasFooterPathRow(bash)).toBe(false);
+    });
+
+    test('hasFooterPathRow tracks renderFooterPath presence (cursor-math contract)', () => {
+      const present = startedSession({ cwd: '/x/forja', home: '' });
+      expect(hasFooterPathRow(present)).toBe(true);
+      expect(renderFooterPath(present, caps)).not.toBeNull();
     });
   });
 });

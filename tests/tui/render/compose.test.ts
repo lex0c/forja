@@ -555,6 +555,33 @@ describe('composeLive layout', () => {
     expect(out).toHaveLength(expectedLength);
   });
 
+  test('cwd path row is emitted as an extra trailing line directly below the footer', () => {
+    // Once the banner seeds status.cwd, composeLive appends the repo-path
+    // row directly below the info line — one MORE than the base block.
+    const s = createInitialState();
+    s.input.value = 'abc';
+    s.status.cwd = '/home/lex/work/forja';
+    const out = composeLive(s, caps, 0);
+    // Base is [blank, rule, '> abc', rule, footer]; the path row adds one.
+    expect(out).toHaveLength(1 + 1 + 1 + FOOTER_BLOCK_LINES + 1);
+    // Last line is the padded, path-bearing row.
+    expect(out[out.length - 1]).toContain('/home/lex/work/forja');
+    expect(out[out.length - 1]?.startsWith('  ')).toBe(true);
+  });
+
+  test('composeCursor keeps the caret on the input row when the path row is present', () => {
+    // The extra trailing path row must be absorbed by trailingBelowInput,
+    // or the cursor would drift up by one row into the input.
+    const s = createInitialState();
+    s.input.value = 'abc';
+    s.input.cursor = 3;
+    s.status.cwd = '/home/lex/work/forja';
+    // lines = [blank, rule, '> abc', rule, footer, path]. lineCount = 6.
+    // trailingBelowInput = FOOTER_BLOCK_LINES(2) + pathRow(1) = 3.
+    // inputStartRow = 6 - 3 - 1 = 2. Caret col = 2 prefix + 3 = 5.
+    expect(composeCursor(s, caps, 6)).toEqual({ row: 2, col: 5 });
+  });
+
   test('frame margin (UI.md §6.3): the input block (rule + input + rule) is edge-to-edge; everything else padded', () => {
     // UI.md §6.3 "bloco do input" exception — the 3 rows that form
     // the typing zone (rule above + input + rule below) all live at
