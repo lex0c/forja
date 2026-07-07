@@ -6,21 +6,9 @@ What sets Forja apart is the structure surrounding the model. Every action with 
 
 > **Measure twice, cut once.**
 
-## Install
+## Get started
 
-Forja runs on [Bun](https://bun.sh) (single binary via `bun build --compile`).
-The current build target is Linux x64; macOS and Windows binaries are tracked
-on the roadmap.
-
-```bash
-git clone <repo-url> forja && cd forja
-bun install
-# The binary name carries the version (e.g. dist/forja-0.0.0-linux-x64).
-# A dev build (FORJA_PROFILE=dev bun run build) adds the profile:
-# dist/forja-0.0.0-dev-linux-x64 — the binary itself is profile-agnostic.
-bun run build              # produces dist/forja-<version>-linux-x64
-ln -s "$PWD/dist/forja-0.0.0-linux-x64" ~/.local/bin/forja
-```
+...
 
 Verify the install:
 
@@ -332,13 +320,6 @@ spec diverge, the spec wins.)
 |---|---|
 | [`BENCHMARK.md`](docs/BENCHMARK.md) | Self-SWE-bench (capability axis): can a model driving Forja fix a real bug, verified by the project's own tests. |
 | [`RANKING.md`](docs/RANKING.md) | How models perform *inside the Forja harness* — measured on real loop behavior, not a general benchmark. |
-
-### Project tracking
-
-| Doc | What it covers |
-|---|---|
-| [`BACKLOG.md`](docs/BACKLOG.md) | Progress diary: implementation entries in reverse-chronological order. |
-| [`TODO.md`](docs/TODO.md) | Deferred work: items left for later milestones, with rationale and pull-in signals. |
 
 ---
 
