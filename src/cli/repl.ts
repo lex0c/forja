@@ -803,15 +803,21 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // This peer is now owed a reply (drives the footer count + the reply nudge). A
     // successful mesh_send back clears it (onMessageSent below). Add BEFORE enqueue so
     // the count reflects mail waiting at a wake-cap pause, not just mail in a turn.
+    receivedGen.set(peerAlias, (receivedGen.get(peerAlias) ?? 0) + 1);
     awaitingReply.add(peerAlias);
     emitAwaiting();
     enqueueNotification({ kind: 'peer_message', peerAlias, text });
   });
-  // A message WE sent to a peer landed → the loop closed for it: drop it from the
-  // owed set (and re-arm its nudge, so a later message can nudge again). Counts the
-  // operator's OWN outbound sends too — the peer got an answer regardless of who
-  // typed it. A no-op for a peer we don't owe (delete returns false → no re-emit).
+  // A message WE sent to a peer landed → the loop closed for it: drop it from the owed
+  // set (and re-arm its nudge, so a later message can nudge again). Counts the
+  // operator's OWN outbound sends too — the peer got an answer regardless of who typed
+  // it. But clear ONLY if no NEWER message from this peer arrived since the turn began:
+  // otherwise the reply was for the turn's message(s), and a rapid second message queued
+  // for a later turn keeps its own debt (§6.4). repliedThisTurn records the send either
+  // way, so a debt kept-because-newer does not fire a premature nudge below.
   baseConfig.meshManager?.onMessageSent((peerAlias) => {
+    repliedThisTurn.add(peerAlias);
+    if (hasNewerSinceTurnStart(peerAlias)) return;
     if (awaitingReply.delete(peerAlias)) {
       nudgedAwaiting.delete(peerAlias);
       emitAwaiting();
@@ -1571,6 +1577,18 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const nudgedAwaiting = new Set<string>();
   const emitAwaiting = (): void =>
     bus.emit({ type: 'mesh:awaiting', ts: now(), count: awaitingReply.size });
+  // Per-peer count of inbound messages (monotonic) + a snapshot of it at the current
+  // turn's start. A debt is cleared/settled ONLY when the peer got no NEWER message
+  // since the turn began — otherwise a reply to the turn's message would also wipe a
+  // rapid second message from the same peer queued for a LATER turn, stranding it (its
+  // own turn nudges/settles it instead). A send during a turn is recorded in
+  // repliedThisTurn so a debt KEPT because a newer message arrived does not fire a
+  // premature nudge for a message the current turn already answered.
+  const receivedGen = new Map<string, number>();
+  let turnStartGen = new Map<string, number>();
+  const repliedThisTurn = new Set<string>();
+  const hasNewerSinceTurnStart = (alias: string): boolean =>
+    (receivedGen.get(alias) ?? 0) !== (turnStartGen.get(alias) ?? 0);
   // Settle the owed-reply debt for these aliases: drop them from awaitingReply +
   // nudgedAwaiting and repaint the footer count. Called at every RESOLUTION of a debt
   // — the nudge turn ends (the model had its reminder and replied or declined), the
@@ -1581,6 +1599,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const settleAwaiting = (aliases: readonly string[]): void => {
     let changed = false;
     for (const a of aliases) {
+      // A peer that got a NEWER message during this turn keeps its debt — that message
+      // was not part of what this turn resolved; its own turn will settle it (§6.4).
+      if (hasNewerSinceTurnStart(a)) continue;
       if (awaitingReply.delete(a)) changed = true;
       nudgedAwaiting.delete(a);
     }
@@ -1760,8 +1781,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // tracking the owed reply and SETTLES it (else branch) rather than leaving the
         // footer chip stuck with no nudge turn ever coming to resolve it.
         if (event.result.abortCause === undefined) {
+          // !repliedThisTurn: if the model DID send to this peer this turn, the turn's
+          // message was answered — don't nudge, even if the debt is still set because a
+          // NEWER message arrived mid-turn (that one nudges at its own turn, not here).
           const stranded = pendingPeerAliasList.filter(
-            (a) => awaitingReply.has(a) && !nudgedAwaiting.has(a),
+            (a) => awaitingReply.has(a) && !nudgedAwaiting.has(a) && !repliedThisTurn.has(a),
           );
           if (stranded.length > 0) {
             for (const a of stranded) nudgedAwaiting.add(a);
@@ -2286,6 +2310,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   };
   const startTurn = (text: string, source: MessageSource = 'operator'): void => {
     if (isBusy() || exiting) return;
+    // Snapshot the per-peer inbound count at the turn's start and reset the per-turn
+    // send tracker. Debt clears/settles this turn compare against this snapshot, so a
+    // peer message that arrives DURING the turn keeps its own debt instead of being
+    // wiped by this turn's reply (§6.4 rapid-send race).
+    turnStartGen = new Map(receivedGen);
+    repliedThisTurn.clear();
     running = true;
     syncBusy();
     // Mint a fresh token for this turn and claim ownership of the

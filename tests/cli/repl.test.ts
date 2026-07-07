@@ -1826,6 +1826,65 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('a rapid second message from the same peer is not stranded by the first turn reply', async () => {
+    // Peer X sends msg1; while Turn 1 (for msg1) runs, X sends msg2 (queued for Turn 2).
+    // The model replies to msg1 mid-turn. That reply must NOT clear msg2's debt —
+    // awaitingReply is per-peer, so a naive delete-on-send would wipe both, and msg2's
+    // own unreplied turn would then never nudge. The turn-start gen gate keeps msg2's
+    // debt so its turn nudges.
+    type PeerCb = (m: { peerAlias: string; text: string }) => void;
+    type SentCb = (alias: string) => void;
+    let fire: PeerCb | null = null;
+    let fireSent: SentCb | null = null;
+    const meshManager = meshStub({
+      onMessage: (cb) => {
+        fire = cb;
+      },
+      onMessageSent: (cb) => {
+        fireSent = cb;
+      },
+    });
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ meshManager }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => {},
+    });
+    await tick();
+    stdin.feed('first\r'); // resets the wake cap
+    await tick();
+    ra.finish(0);
+    await tick();
+    // msg1 → Turn 1.
+    (fire as unknown as PeerCb)({ peerAlias: 'billing', text: 'first question' });
+    await tick();
+    expect(ra.captured).toHaveLength(2); // captured[1] = Turn 1 (msg1)
+    // msg2 arrives WHILE Turn 1 runs → queued for a later turn.
+    (fire as unknown as PeerCb)({ peerAlias: 'billing', text: 'second question' });
+    // The model replies to msg1 during Turn 1 (a send back to billing).
+    (fireSent as unknown as SentCb)('billing');
+    ra.finish(1);
+    await tick();
+    // Turn 1 replied → no nudge for it; msg2 drains as Turn 2.
+    expect(ra.captured).toHaveLength(3); // captured[2] = Turn 2 (msg2)
+    ra.finish(2); // Turn 2 ends with NO reply to msg2
+    await tick();
+    // msg2 survived Turn 1's reply → its unreplied turn nudges (would be absent — length
+    // 3 — under the naive delete-on-send that this fix replaces).
+    expect(ra.captured).toHaveLength(4); // captured[3] = the nudge for msg2
+    expect(ra.captured[3]?.configs[0]?.userPrompt ?? '').toContain('[reply pending]');
+    expect(ra.captured[3]?.configs[0]?.userPrompt ?? '').toContain('billing');
+    ra.finish(3);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('a nudge turn ending WITHOUT a reply settles the debt (so a fresh message re-arms it)', async () => {
     // The field miss: after the anti-ping-pong wording, a model correctly ENDS a nudge
     // turn without sending (a concluded exchange needs no reply). The debt must settle —
