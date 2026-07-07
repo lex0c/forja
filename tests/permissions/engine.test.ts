@@ -38,6 +38,20 @@ describe('engine.check (mesh.egress)', () => {
     }
   });
 
+  test('surfaces how much of a long message is hidden past the excerpt (scale of what leaves)', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    // 200 innocuous chars, then a secret in the tail the 160-char excerpt hides.
+    const message = `${'x'.repeat(200)}SECRET=leaked`;
+    const d = eng.check('mesh_send', 'mesh.egress', { peer: 'billing', message });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') {
+      // The tail past the excerpt is NOT shown (a modal row can't hold 200+ chars)…
+      expect(d.prompt).not.toContain('SECRET=leaked');
+      // …but the operator sees HOW MUCH is hidden, not a silent '…' truncation.
+      expect(d.prompt).toContain(`+${message.length - 160} more chars`);
+    }
+  });
+
   test('autonomous: auto-approves — respects posture (same-user local socket, not network egress)', () => {
     // mesh_send is NOT categoryIsEgress, so the autonomous posture auto-approves it
     // (supervised still confirms, above). resolvers/mesh.ts keeps it off the

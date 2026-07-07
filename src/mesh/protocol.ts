@@ -56,8 +56,17 @@ export const parseMeshLine = (line: string): MeshParseResult => {
       if (typeof obj.text !== 'string') return { ok: false, reason: 'message.missing_text' };
       break;
     case 'error':
-      if (!isNonEmptyString(obj.code)) return { ok: false, reason: 'error.missing_code' };
-      if (typeof obj.message !== 'string') return { ok: false, reason: 'error.missing_message' };
+      // `code` + `message` land raw in the SENDER's model context + audit — send()
+      // surfaces them verbatim in the thrown Error (manager.ts). Bound both, like `id`
+      // above: a hostile peer could otherwise ship a ~1 MiB error frame (under the wire
+      // line cap) of arbitrary bytes to bloat the forensic log / context. Conforming
+      // codes are short enum strings and messages a sentence; longer is malformed.
+      if (!isNonEmptyString(obj.code) || obj.code.length > 64) {
+        return { ok: false, reason: 'error.bad_code' };
+      }
+      if (typeof obj.message !== 'string' || obj.message.length > 256) {
+        return { ok: false, reason: 'error.bad_message' };
+      }
       break;
     case 'bye':
       break;

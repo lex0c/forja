@@ -9,6 +9,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -110,8 +111,15 @@ export const ensureMeshDirs = (dir: string): void => {
 
 export const publishDescriptor = (dir: string, desc: PeerDescriptor): void => {
   ensureMeshDirs(dir);
-  // 0600: only the owner reads a descriptor (it carries the repo path).
-  writeFileSync(descriptorPath(dir, desc.alias), JSON.stringify(desc), { mode: 0o600 });
+  // 0600: only the owner reads a descriptor (it carries the repo path). Write to a
+  // temp then atomically rename into place, so a concurrent listPeers never reads a
+  // half-written (truncated) descriptor and transiently drops a live peer as
+  // parse-failed. The temp ends in `.tmp` (not `.json`), so the discovery/sweep loop
+  // — which keys on `.json` — never picks it up mid-write. Same dir → rename is atomic.
+  const path = descriptorPath(dir, desc.alias);
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, JSON.stringify(desc), { mode: 0o600 });
+  renameSync(tmp, path);
 };
 
 // Remove ONLY the socket file for `alias`, not the descriptor. The alias-claim
@@ -127,7 +135,20 @@ export const removeSocket = (dir: string, alias: string): void => {
   }
 };
 
-export const removeDescriptor = (dir: string, alias: string): void => {
+// Remove ONLY the descriptor .json for `alias`, never the socket. The discovery
+// SWEEP (listPeers) uses this: a stale/unreachable descriptor is dropped, but the
+// .sock at the path is left untouched. Removing the socket in the sweep was a
+// check-then-act race — the staleness decision (a dead pid, or a probe result that
+// can be up to ~500 ms old) and the unlink are not atomic, so a peer that rebound
+// the SAME alias in the window (a /relay off→on, or another same-repo session that
+// derives the same alias) would lose its live socket and be left serving on an
+// unlinked inode: permanently unreachable, since republish() only rewrites the
+// .json, never rebinds the socket. A genuine dead-orphan .sock is harmless here
+// (discovery keys on .json, so an orphan socket never surfaces) and is cleared,
+// probe-guarded, by the next bindAlias claim. removeDescriptor (both files) stays
+// for a server tearing down its OWN alias, where it holds the lock and no rebind
+// can race.
+export const removeDescriptorFile = (dir: string, alias: string): void => {
   // force:true swallows ENOENT; guard the rest (EISDIR/EPERM on a resolved path)
   // so a single poisoned entry can't throw out of the sweep loop.
   try {
@@ -135,6 +156,10 @@ export const removeDescriptor = (dir: string, alias: string): void => {
   } catch {
     // best-effort
   }
+};
+
+export const removeDescriptor = (dir: string, alias: string): void => {
+  removeDescriptorFile(dir, alias);
   removeSocket(dir, alias);
 };
 
@@ -240,8 +265,9 @@ const parseDescriptor = (raw: string): PeerDescriptor | null => {
 };
 
 // List live peers. Descriptors with a dead pid or a socket no listener accepts
-// are stale — skipped, and (unless sweep is disabled) their .json + .sock are
-// removed so the registry self-heals. `selfAlias` excludes the caller's own
+// are stale — skipped, and (unless sweep is disabled) their .json is removed so
+// the registry self-heals (only the .json — never the .sock; see
+// removeDescriptorFile). `selfAlias` excludes the caller's own
 // descriptor (a Forja identifies itself by its logical alias, not pid). Async
 // because liveness needs a connect PROBE, not a file-existence check (see below).
 export const listPeers = async (
@@ -279,10 +305,10 @@ export const listPeers = async (
     // alias is malformed/planted — acting on it would sweep a DIFFERENT, possibly
     // live, peer's <alias>.json/.sock (removeDescriptor keys on desc.alias). Skip:
     // never surface, never sweep. With this guard, desc.alias === basename(name),
-    // so removeDescriptor targets exactly the file we read.
+    // so removeDescriptorFile targets exactly the file we read.
     if (basename(name, '.json') !== desc.alias) continue;
     if (!isAlive(desc.pid)) {
-      if (opts.sweep !== false) removeDescriptor(dir, desc.alias);
+      if (opts.sweep !== false) removeDescriptorFile(dir, desc.alias);
       continue;
     }
     if (opts.selfAlias !== undefined && desc.alias === opts.selfAlias) continue;
@@ -293,10 +319,13 @@ export const listPeers = async (
     // dead descriptor's pid look alive again — so existsSync would advertise a
     // phantom that every mesh_send immediately loses AND trip startServing's
     // alias-collision check. probeSocket connects; only a live listener accepts.
-    // Sweep on refusal so the registry self-heals.
+    // Sweep the descriptor on refusal so the registry self-heals — but NOT the
+    // socket: a probe refusal can be transient (a peer mid /relay off→on rebinds
+    // the same alias), and a stale probe result must never authorize unlinking a
+    // socket a live peer has since rebound (removeDescriptorFile).
     const canonicalSocket = socketPath(dir, desc.alias);
     if (!(await probeSocket(canonicalSocket))) {
-      if (opts.sweep !== false) removeDescriptor(dir, desc.alias);
+      if (opts.sweep !== false) removeDescriptorFile(dir, desc.alias);
       continue;
     }
     out.push({ ...desc, socket: canonicalSocket });

@@ -60,6 +60,18 @@ describe('mesh_send tool', () => {
     }
   });
 
+  test('surfaces how much of a long message is hidden past the excerpt on the card', async () => {
+    // Under autonomous the card is the ONLY payload window; a bare truncation would
+    // hide a kilobyte tail (a path/secret). Show the scale of what left.
+    const mgr = { isServing: () => false, send: async () => ({ id: 'm2' }) };
+    const message = `${'x'.repeat(200)} tail`;
+    const r = await meshSendTool.execute({ peer: 'billing', message }, ctxWith(mgr));
+    expect(isToolError(r)).toBe(false);
+    if (!isToolError(r)) {
+      expect(r.result_detail).toContain(`+${message.length - 160} more chars`);
+    }
+  });
+
   test('sends even while THIS session is serving (symmetric exchange — a reply is just a message)', async () => {
     const mgr = { isServing: () => true, send: async () => ({ id: 'm1' }) };
     const r = await meshSendTool.execute({ peer: 'billing', message: 'hi' }, ctxWith(mgr));

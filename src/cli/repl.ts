@@ -805,6 +805,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // the count reflects mail waiting at a wake-cap pause, not just mail in a turn.
     receivedGen.set(peerAlias, (receivedGen.get(peerAlias) ?? 0) + 1);
     awaitingReply.add(peerAlias);
+    // A NEW message opens a fresh awaiting episode: clear any prior one-shot nudge
+    // flag for this alias so this message can be actively nudged too. Without it, a
+    // second message from an already-nudged peer would only ever get the passive
+    // chip — the stranded filter at session_finished blocks on !nudgedAwaiting (§6.4).
+    nudgedAwaiting.delete(peerAlias);
     emitAwaiting();
     enqueueNotification({ kind: 'peer_message', peerAlias, text });
   });
@@ -1764,6 +1769,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       // `idle` (the serving instance is no longer working). A forgotten reply is
       // NOT a failure — the message stays in the shared context for a later turn
       // (§6.4).
+      // Snapshot the peers whose FRESH message drove this turn BEFORE the block
+      // below clears pendingPeerAliasList — the nudge-settle further down needs it to
+      // avoid wiping a debt the peer block already owns (reassignment, not mutation,
+      // so the reference stays intact).
+      const peerAliasesThisTurn = pendingPeerAliasList;
       if (pendingPeerAlias !== null) {
         // Reply safety net (§6.4): this turn was driven by peer message(s). Any
         // originating peer we STILL owe a reply (no mesh_send back landed during the
@@ -1805,7 +1815,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       // or the footer chip sticks forever on a conversation the model closed on
       // purpose. (A nudge turn is not a peer_message, so the block above was skipped.)
       if (pendingNudgeAliases.length > 0) {
-        settleAwaiting(pendingNudgeAliases);
+        // Don't let the nudge-turn settle wipe an alias that ALSO received a fresh
+        // peer_message this turn (a held nudge + a new message from the same peer
+        // coalesced into one turn, §6.2): the peer block above already owns that
+        // alias's debt — it kept it, or re-nudged it. Settling it here would drop the
+        // new message's owed reply with no reminder. Only settle PURE nudge aliases,
+        // those with no fresh message this turn.
+        settleAwaiting(pendingNudgeAliases.filter((a) => !peerAliasesThisTurn.includes(a)));
         pendingNudgeAliases = [];
       }
       // Hard-abort un-send (migration 079): if the operator hard-cancelled this

@@ -88,12 +88,16 @@ export const meshSendTool: Tool<MeshSendInput, MeshSendOutput> = {
     }
     try {
       const { id } = await mgr.send(input.peer, input.message);
+      // Surface HOW MUCH is past the 160-char excerpt so the tool card shows the
+      // scale of what left, not a bare truncation that hides a kilobyte tail.
+      const hidden =
+        input.message.length > 160 ? ` (+${input.message.length - 160} more chars)` : '';
       return {
         id,
         delivered: `sent to '${input.peer}' — its reply, if any, arrives on its own as a later turn (no need to wait or poll).`,
         // Surface WHAT left on the tool card (the two-audiences review, §7) — the
         // only outbound-payload visibility the operator gets under autonomous.
-        result_detail: `→ ${input.peer}: ${sanitizeOneLineForDisplay(input.message, 160)}`,
+        result_detail: `→ ${input.peer}: ${sanitizeOneLineForDisplay(input.message, 160)}${hidden}`,
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

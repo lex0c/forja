@@ -1702,6 +1702,65 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('a new message from an already-nudged peer earns its own nudge (fresh episode)', async () => {
+    type PeerCb = (m: { peerAlias: string; text: string }) => void;
+    let fire: PeerCb | null = null;
+    const meshManager = meshStub({
+      onMessage: (cb) => {
+        fire = cb;
+      },
+    });
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ meshManager }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => {},
+    });
+    await tick();
+    // Operator turn first — resets the consecutive-wake cap.
+    stdin.feed('first\r');
+    await tick();
+    ra.finish(0);
+    await tick();
+    // msg1 → peer turn; the model does NOT reply.
+    (fire as unknown as PeerCb)({ peerAlias: 'billing', text: 'inspect the contract' });
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    ra.finish(1);
+    await tick();
+    // Owed → one nudge (captured[2]); 'billing' is now flagged nudged.
+    expect(ra.captured).toHaveLength(3);
+    expect(ra.captured[2]?.configs[0]?.userPrompt ?? '').toContain('[reply pending]');
+    // A NEW message from the SAME peer arrives DURING the nudge turn — a fresh
+    // question, not what the nudge is about. It opens a new awaiting episode.
+    (fire as unknown as PeerCb)({ peerAlias: 'billing', text: 'and the migration?' });
+    await tick();
+    // The nudge turn ends unanswered: its debt-settle must NOT wipe the new message
+    // (it kept awaiting via the newer-than-turn-start guard), and the new message
+    // then drives its OWN turn.
+    ra.finish(2);
+    await tick();
+    expect(ra.captured).toHaveLength(4);
+    // The new message is likewise left unanswered → it earns its OWN nudge. Before
+    // the fix, nudgedAwaiting still held 'billing' so the stranded filter blocked it,
+    // stranding the fresh question with only a passive chip and no reminder.
+    ra.finish(3);
+    await tick();
+    expect(ra.captured).toHaveLength(5);
+    expect(ra.captured[4]?.configs[0]?.userPrompt ?? '').toContain('[reply pending]');
+    expect(ra.captured[4]?.configs[0]?.userPrompt ?? '').toContain('billing');
+    // Finish the second nudge turn for a clean exit.
+    ra.finish(4);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('an ABORTED peer turn is not nudged AND settles the debt (operator took control)', async () => {
     type PeerCb = (m: { peerAlias: string; text: string }) => void;
     let fire: PeerCb | null = null;

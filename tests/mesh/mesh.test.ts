@@ -5,6 +5,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -104,6 +105,23 @@ describe('mesh protocol', () => {
     expect(parseMeshLine(`{"type":"message","id":"${'a'.repeat(36)}","ts":1,"text":"x"}`).ok).toBe(
       true,
     );
+  });
+
+  test('rejects an error frame with over-long code or message (context/audit-bloat defense)', () => {
+    // code + message land raw in the sender's model context + audit (send() surfaces
+    // them verbatim), so a hostile peer could bloat both — bounded like `id`.
+    expect(
+      parseMeshLine(`{"type":"error","id":"1","ts":1,"code":"x","message":"${'a'.repeat(300)}"}`)
+        .ok,
+    ).toBe(false);
+    expect(
+      parseMeshLine(`{"type":"error","id":"1","ts":1,"code":"${'c'.repeat(100)}","message":"m"}`)
+        .ok,
+    ).toBe(false);
+    // A conforming short error frame still parses.
+    expect(
+      parseMeshLine('{"type":"error","id":"1","ts":1,"code":"mesh.peer_lost","message":"gone"}').ok,
+    ).toBe(true);
   });
 });
 
@@ -282,6 +300,46 @@ describe('mesh registry', () => {
     expect(await listPeers(dir)).toHaveLength(0);
     // Swept on the first pass — a second read still finds nothing.
     expect(await listPeers(dir)).toHaveLength(0);
+  });
+
+  test('the sweep removes only the descriptor, never a socket a live peer rebound', async () => {
+    // A stale dead-pid descriptor for 'app' (a crashed prior run) coexists with a
+    // LIVE app.sock a fresh relay just rebound under the same alias (the /relay
+    // off→on or same-repo race). The sweep must drop the stale .json but NEVER
+    // unlink the live socket — else the fresh peer is left serving on an unlinked
+    // inode: reachable by no one, and republish() never rebinds the socket.
+    publishDescriptor(dir, {
+      alias: 'app',
+      repoRoot: '/r/app',
+      branch: 'main',
+      pid: 2147483647, // dead
+      socket: socketPath(dir, 'app'),
+      status: 'idle',
+      startedAt: 1,
+    });
+    servers.push(listenMesh(socketPath(dir, 'app'), () => {})); // fresh live listener
+    await listPeers(dir); // triggers the dead-pid sweep
+    // The stale descriptor is gone, but the live socket survives: the file is still
+    // there AND a connect still accepts (probeSocket true).
+    expect(existsSync(socketPath(dir, 'app'))).toBe(true);
+    expect(await probeSocket(socketPath(dir, 'app'))).toBe(true);
+  });
+
+  test('publishDescriptor writes atomically — no truncated read, no temp leftover', () => {
+    publishDescriptor(dir, {
+      alias: 'atomic',
+      repoRoot: '/r/atomic',
+      branch: 'main',
+      pid: process.pid,
+      socket: socketPath(dir, 'atomic'),
+      status: 'idle',
+      startedAt: 1,
+    });
+    // The final descriptor is present and whole; the .tmp scratch was renamed away, so
+    // a concurrent reader keying on .json never sees a half-written prefix.
+    const entries = readdirSync(join(dir, 'peers'));
+    expect(entries).toContain('atomic.json');
+    expect(entries.some((e) => e.endsWith('.tmp'))).toBe(false);
   });
 
   test('does not sweep by descriptor alias — a mismatched filename is skipped, not acted on', async () => {

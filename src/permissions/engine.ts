@@ -2592,12 +2592,17 @@ export const createPermissionEngine = (
           typeof meshArgs.peer === 'string' ? sanitizeOneLineForDisplay(meshArgs.peer, 40) : '?';
         const meshMsg = typeof meshArgs.message === 'string' ? meshArgs.message : '';
         const meshExcerpt = sanitizeOneLineForDisplay(meshMsg, 160);
-        const meshEllipsis = meshMsg.length > 160 ? '…' : '';
+        // A message can be up to maxMessageBytes (32 KiB default). The excerpt caps
+        // the visible text at 160 chars; surface HOW MUCH is beyond it so the operator
+        // sees the SCALE of what leaves — a bare '…' would hide a kilobyte tail that
+        // could carry a path or secret past the review (§7, the two-audiences review).
+        // sanitizeOneLineForDisplay already appends its own '…' on truncation.
+        const meshHidden = meshMsg.length > 160 ? ` (+${meshMsg.length - 160} more chars)` : '';
         decision = {
           kind: 'confirm',
           confirmCause: 'policy',
           reason: 'mesh send: peer is a separate trust domain',
-          prompt: `Send to mesh peer '${meshPeer}': ${meshExcerpt}${meshEllipsis}`,
+          prompt: `Send to mesh peer '${meshPeer}': ${meshExcerpt}${meshHidden}`,
           source: { layer: 'default' },
         };
         break;
