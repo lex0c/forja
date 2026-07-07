@@ -164,6 +164,22 @@ export interface ToolMetadata {
   summarize?: (result: unknown, args: Record<string, unknown>) => SummarizedOutput;
 }
 
+// Does this tool's metadata declare a side effect a narrowed subagent envelope can NEVER
+// cover? The envelope gate (engine §10.3, branch b) consults it for tools whose resolver
+// emits ZERO capabilities: with nothing in the envelope to cover, an opaque side effect
+// must be refused. Covers fs writes, process exec, bg / reminder lifecycle, AND network
+// egress / cwd escape — mesh_send / fetch_url send data OUTSIDE the sandbox, so `writes`
+// is false but the egress IS the side effect. ONE source so the two oracle wiring points
+// (cli/bootstrap.ts, cli/subagent-child.ts) can't drift apart — they did: network /
+// escapesCwd was missed, letting mesh_send pass under `effectiveCapabilities: []`.
+export const isEnvelopeSideEffect = (m: ToolMetadata): boolean =>
+  m.writes === true ||
+  m.exec === true ||
+  m.requiresBgManager === true ||
+  m.requiresReminderScheduler === true ||
+  m.network === true ||
+  m.escapesCwd === true;
+
 // Result of a `ToolMetadata.summarize` call. Carries the reduced
 // result object (same shape as the raw result), a flag indicating
 // whether any reduction actually happened, and the diagnostic

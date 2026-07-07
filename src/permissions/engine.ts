@@ -2041,17 +2041,17 @@ export const createPermissionEngine = (
     //       and refuse if any of them is uncovered.
     //
     //   (b) Resolver emitted ZERO caps but the tool declares a side
-    //       effect (`metadata.writes` or `metadata.exec`). Spec
-    //       §10.1 mandates pure-LLM subagent has no side-effect
-    //       tools; §10.3 says escape is impossible. `bash_kill` /
-    //       `bash_output` (category 'misc', empty caps from the
-    //       resolver because they carry no `args.command` to
-    //       attribute from) would otherwise pass under
-    //       `effectiveCapabilities: []`. The `isToolSideEffect`
-    //       oracle is bootstrap-wired from the tool registry's
-    //       `metadata.writes || metadata.exec`; when omitted (test
-    //       harnesses without a registry), branch (b) is skipped
-    //       so legacy callers see the prior behavior.
+    //       effect the envelope can't cover. Spec §10.1 mandates a
+    //       pure-LLM subagent has no side-effect tools; §10.3 says
+    //       escape is impossible. `bash_kill` / `bash_output` (empty
+    //       caps — no `args.command` to attribute) and `mesh_send`
+    //       (network egress, `writes:false`) would otherwise pass
+    //       under `effectiveCapabilities: []`. The `isToolSideEffect`
+    //       oracle is bootstrap-wired from `isEnvelopeSideEffect`
+    //       (tool metadata: writes / exec / bg-reminder lifecycle /
+    //       network egress / cwd escape); when omitted (test harnesses
+    //       without a registry), branch (b) is skipped so legacy
+    //       callers see the prior behavior.
     //
     // Misc-category tools without `writes`/`exec` (purely
     // informational ToolContext accessors) still trivially pass —
@@ -2090,7 +2090,7 @@ export const createPermissionEngine = (
         // definition here).
         const decision: Decision = {
           kind: 'deny',
-          reason: `subagent envelope blocks side-effect tool '${toolName}': resolver emitted no capability but the tool declares writes/exec (spec §10.1, §10.3)`,
+          reason: `subagent envelope blocks side-effect tool '${toolName}': resolver emitted no capability but the tool declares a side effect (fs write / exec / bg-reminder lifecycle / network egress) — spec §10.1, §10.3`,
           source: { layer: 'default', section: 'subagent-effective' },
         };
         const e = emitAudit(toolName, args, decision, [], 0, {}, null);

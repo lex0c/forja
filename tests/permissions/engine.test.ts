@@ -4477,7 +4477,7 @@ describe('engine — effective capabilities envelope (§10.1, slice 95)', () => 
     expect(decision.kind).toBe('deny');
     expect(decision.source?.section).toBe('subagent-effective');
     expect(decision.reason).toContain("'bash_kill'");
-    expect(decision.reason).toContain('writes/exec');
+    expect(decision.reason).toContain('fs write / exec'); // the enumerated side-effect axes
   });
 
   test('isToolSideEffect: narrowed envelope also blocks side-effect tool with caps=[]', () => {

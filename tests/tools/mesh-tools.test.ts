@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { meshPeersTool } from '../../src/tools/builtin/mesh-peers.ts';
 import { meshSendTool } from '../../src/tools/builtin/mesh-send.ts';
-import { type ToolContext, isToolError } from '../../src/tools/types.ts';
+import { type ToolContext, isEnvelopeSideEffect, isToolError } from '../../src/tools/types.ts';
 
 const ctxWith = (meshManager: unknown): ToolContext =>
   ({ meshManager, signal: new AbortController().signal }) as unknown as ToolContext;
@@ -31,6 +31,17 @@ describe('mesh_send tool', () => {
     // local Unix one, so it doesn't feed the risk score.
     expect(meshSendTool.metadata.category).toBe('mesh.egress');
     expect(meshSendTool.metadata.network).toBe(true);
+  });
+
+  test('counts as an envelope side effect — network egress cannot slip a narrowed subagent', () => {
+    // mesh_send's resolver emits NO capabilities, so the §10.3 envelope gate falls back
+    // to isEnvelopeSideEffect for a zero-cap resolver. writes is false, so before the fix
+    // it passed under effectiveCapabilities:[] and a narrowed subagent could send
+    // arbitrary text (secrets) to a peer. network / escapesCwd now make it a side effect.
+    expect(isEnvelopeSideEffect(meshSendTool.metadata)).toBe(true);
+    // Contrast: mesh_peers is read-only (misc, no writes/network/escapesCwd) → still
+    // allowed under an empty envelope; discovery leaks nothing outbound.
+    expect(isEnvelopeSideEffect(meshPeersTool.metadata)).toBe(false);
   });
 
   test('delivers, returns the message id, and surfaces the payload excerpt on the card', async () => {

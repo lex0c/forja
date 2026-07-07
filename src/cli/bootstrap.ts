@@ -105,6 +105,7 @@ import { setRecapCacheTtlOverride } from '../storage/repos/recap-cache.ts';
 import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { isSmallWindow, memoryMaxEntries } from '../tools/context-budget.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
+import { isEnvelopeSideEffect } from '../tools/types.ts';
 import { isTrusted, trustListPath } from '../trust/index.ts';
 import { composeWithConstraints } from './constraints-prompt.ts';
 import { composeWithEnvironment } from './environment-prompt.ts';
@@ -944,26 +945,17 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       path: sandboxAvail.path,
       trustWarnings: sandboxAvail.trustWarnings,
     },
-    // Side-effect oracle for the §10.1 envelope gate. Closes the
-    // bash_kill / bash_output / bash_background bypass where a
-    // narrowed subagent invokes a tool whose resolver returns no
-    // caps but whose metadata declares writes / exec / bgManager
-    // dependence. `requiresBgManager` rides along because reading
-    // or signalling bg-process lifecycle IS a side effect from
-    // the envelope's perspective even when no fs write happens
-    // (e.g., bash_output is `writes:false` but reads stdout from
-    // a previously-spawned process). The callback re-reads the
-    // registry on each check (not snapshotted) so MCP tools
+    // Side-effect oracle for the §10.1 envelope gate — the single predicate
+    // `isEnvelopeSideEffect` (see its doc: writes/exec/bg/reminder AND network
+    // egress/cwd escape) so this and the subagent-child oracle can't drift. Closes the
+    // bash_kill / bash_output bypass (resolver returns no caps but the tool touches
+    // bg-process lifecycle) AND the mesh_send bypass (network egress under empty caps).
+    // The callback re-reads the registry on each check (not snapshotted) so MCP tools
     // registered post-bootstrap are observed without re-plumbing.
     isToolSideEffect: (toolName) => {
       const tool = toolRegistry.get(toolName);
       if (tool === null) return false;
-      return (
-        tool.metadata.writes === true ||
-        tool.metadata.exec === true ||
-        tool.metadata.requiresBgManager === true ||
-        tool.metadata.requiresReminderScheduler === true
-      );
+      return isEnvelopeSideEffect(tool.metadata);
     },
   });
   const permissionEngine = permResult.engine;

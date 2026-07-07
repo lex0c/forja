@@ -79,6 +79,7 @@ import {
 import { createRecordingTelemetrySink } from '../telemetry/index.ts';
 import { isSmallWindow, memoryMaxEntries } from '../tools/context-budget.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
+import { isEnvelopeSideEffect } from '../tools/types.ts';
 import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 import { composeWithOutputSchemaBlock } from './output-schema-block.ts';
 import { composeWithParallelHint } from './parallel-prompt.ts';
@@ -816,21 +817,14 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       telemetry: childTelemetry,
       sessionId: opts.sessionId,
       trustedHosts: childTrustedHosts,
+      // Single predicate `isEnvelopeSideEffect` (shared with bootstrap so the two can't
+      // drift): writes / exec / bg / reminder lifecycle AND network egress / cwd escape.
+      // The latter closes the mesh_send hole — its resolver emits no caps and writes is
+      // false, but a narrowed subagent must not send arbitrary text (secrets) to a peer.
       isToolSideEffect: (toolName) => {
         const tool = fullRegistry.get(toolName);
         if (tool === null) return false;
-        // `requiresBgManager` rides along with writes/exec — touching
-        // bg-process lifecycle (read stdout, send signal) IS a side
-        // effect from the envelope's perspective even when the tool's
-        // own metadata says writes:false (bash_output reads stdout of
-        // a previously-spawned process; a narrowed subagent should
-        // not freely consume that stream).
-        return (
-          tool.metadata.writes === true ||
-          tool.metadata.exec === true ||
-          tool.metadata.requiresBgManager === true ||
-          tool.metadata.requiresReminderScheduler === true
-        );
+        return isEnvelopeSideEffect(tool.metadata);
       },
     });
 
