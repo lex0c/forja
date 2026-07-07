@@ -301,30 +301,42 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     });
   };
 
-  // Claim the alias by BINDING its socket — the bind is the atomic exclusive claim
-  // (two concurrent binds to one unix path can't both succeed; the loser throws
-  // EADDRINUSE). Returns the live server, or throws a collision if a LIVE peer holds
-  // the path. It never unlinks pre-emptively: a path is cleared ONLY after a fresh
-  // probe proves it a DEAD leftover, so it can't orphan a peer that bound the same
-  // alias concurrently — the TOCTOU the collision check alone misses.
+  // Claim the alias by binding its socket, PROBING for a live listener FIRST. The
+  // probe-first refuses before any bind/unlink can clobber the path, so it protects a
+  // peer that bound our alias but hasn't published its descriptor yet (the concurrent
+  // /relay on path the descriptor collision check misses) REGARDLESS of whether the
+  // platform's Bun.listen throws EADDRINUSE on an occupied path or silently replaces
+  // the socket — the bind never runs against a live peer. On a throws-on-occupied
+  // platform the bind is ALSO the atomic claim (the loser gets EADDRINUSE → re-probe →
+  // collision); a path is cleared only after a fresh probe proves it a DEAD leftover,
+  // never orphaning a live peer. Residual: two claimants that BOTH probe-dead before
+  // either binds still race on a platform whose bind is non-exclusive — closing that
+  // needs a separate lock (e.g. an O_EXCL lockfile), out of scope here.
   const bindAlias = async (sockPath: string): Promise<MeshServer> => {
+    // Probe-first (§2): a live listener already answers on the path → refuse WITHOUT
+    // touching it. This is the sole guard that does not depend on the bind throwing.
+    if (await probeSocket(sockPath)) {
+      throw new Error(
+        `mesh: alias '${alias}' is already served by a live peer; set a distinct alias in [mesh]`,
+      );
+    }
     const tryListen = (): MeshServer | null => {
       try {
         return listenMesh(sockPath, onServerConnection);
       } catch (err) {
         // A leftover file at the path (a dead socket OR a planted regular file) and a
-        // LIVE concurrent listener BOTH surface as EADDRINUSE — a probe distinguishes
-        // them below. Anything else (EACCES, a missing dir) is a real failure: rethrow.
+        // LIVE listener that raced in since the probe BOTH surface as EADDRINUSE — a
+        // re-probe distinguishes them. Anything else (EACCES, a missing dir): rethrow.
         if ((err as NodeJS.ErrnoException).code === 'EADDRINUSE') return null;
         throw err;
       }
     };
     const first = tryListen();
     if (first !== null) return first;
-    // The path is occupied. A live listener → an honest collision (a peer bound our
-    // alias between the check above and here, or shares our derived alias). A dead
-    // leftover (crashed relay's orphan .sock, which listPeers never sweeps because it
-    // has no .json) → clear it and retry the bind ONCE.
+    // Occupied, but the probe above found no live listener → a dead leftover (crashed
+    // relay's orphan .sock, which listPeers never sweeps as it has no .json), OR a peer
+    // that bound in the tiny gap since the probe. Re-probe: live → collision, dead →
+    // clear it and retry the bind ONCE.
     if (await probeSocket(sockPath)) {
       throw new Error(
         `mesh: alias '${alias}' was just claimed by a live peer; set a distinct alias in [mesh]`,
