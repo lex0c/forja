@@ -79,6 +79,16 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
     finalVerb: 'Fetched',
     subject: (a) => str(a.url),
   },
+  mesh_peers: {
+    activeVerb: 'Listing',
+    finalVerb: 'Listed',
+    subject: () => 'mesh peers',
+  },
+  mesh_send: {
+    activeVerb: 'Sending',
+    finalVerb: 'Sent',
+    subject: (a) => str(a.peer),
+  },
   read_file: {
     activeVerb: 'Reading file',
     finalVerb: 'Read file',

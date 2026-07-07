@@ -23,6 +23,55 @@ const policy = (p: Partial<Policy>): Policy => ({
   ...p,
 });
 
+describe('engine.check (mesh.egress)', () => {
+  test('supervised: confirms and surfaces the peer + message excerpt (two-audiences review)', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    const d = eng.check('mesh_send', 'mesh.egress', {
+      peer: 'billing',
+      message: 'here is the .env: AWS_SECRET=xyz',
+    });
+    expect(d.kind).toBe('confirm');
+    expect(categoryIsEgress('mesh.egress')).toBe(false); // local socket, not network egress
+    if (d.kind === 'confirm') {
+      expect(d.prompt).toContain('billing');
+      expect(d.prompt).toContain('AWS_SECRET=xyz'); // the outbound payload is visible
+    }
+  });
+
+  test('surfaces how much of a long message is hidden past the excerpt (scale of what leaves)', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    // 200 innocuous chars, then a secret in the tail the 160-char excerpt hides.
+    const message = `${'x'.repeat(200)}SECRET=leaked`;
+    const d = eng.check('mesh_send', 'mesh.egress', { peer: 'billing', message });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') {
+      // The tail past the excerpt is NOT shown (a modal row can't hold 200+ chars)…
+      expect(d.prompt).not.toContain('SECRET=leaked');
+      // …but the operator sees HOW MUCH is hidden, not a silent '…' truncation.
+      expect(d.prompt).toContain(`+${message.length - 160} more chars`);
+    }
+  });
+
+  test('autonomous: auto-approves — respects posture (same-user local socket, not network egress)', () => {
+    // mesh_send is NOT categoryIsEgress, so the autonomous posture auto-approves it
+    // (supervised still confirms, above). resolvers/mesh.ts keeps it off the
+    // conservative fallback (clean resolver result), so nothing forces a confirm.
+    const eng = createPermissionEngine(policy({}), { cwd: CWD, approvalPosture: 'autonomous' });
+    const d = eng.check('mesh_send', 'mesh.egress', { peer: 'billing', message: 'anything' });
+    expect(d.kind).toBe('allow');
+    if (d.kind === 'allow') expect(d.reason).toContain('autonomous posture');
+  });
+
+  test('strips control bytes from the message in the prompt', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    const d = eng.check('mesh_send', 'mesh.egress', {
+      peer: 'billing',
+      message: 'clean[2Jmessage',
+    });
+    if (d.kind === 'confirm') expect(d.prompt).not.toContain('');
+  });
+});
+
 describe('engine.check (bash)', () => {
   test('allows commands matching allow rules', () => {
     const eng = createPermissionEngine(
@@ -4442,7 +4491,7 @@ describe('engine — effective capabilities envelope (§10.1, slice 95)', () => 
     expect(decision.kind).toBe('deny');
     expect(decision.source?.section).toBe('subagent-effective');
     expect(decision.reason).toContain("'bash_kill'");
-    expect(decision.reason).toContain('writes/exec');
+    expect(decision.reason).toContain('fs write / exec'); // the enumerated side-effect axes
   });
 
   test('isToolSideEffect: narrowed envelope also blocks side-effect tool with caps=[]', () => {

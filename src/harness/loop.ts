@@ -3764,6 +3764,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ? { confirmMemoryUserScope: config.confirmMemoryUserScope }
             : {}),
           ...(config.clarify !== undefined ? { clarify: config.clarify } : {}),
+          ...(config.meshManager !== undefined ? { meshManager: config.meshManager } : {}),
           // Built once per run above (REPL-injected or a fresh wrapper over
           // the db), so pin_context works in any mode (like the todolist),
           // not just the interactive REPL.

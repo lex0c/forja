@@ -35,10 +35,16 @@ import { RESUME_FULL_WARN_THRESHOLD } from '../harness/resume.ts';
 import { effectiveBudget, isRecapEnabled, resolveMaxOutputTokens } from '../harness/types.ts';
 import { dispatchChain } from '../hooks/dispatcher.ts';
 import type { HookChainResult, HookEventPayload } from '../hooks/types.ts';
+import { framePeerMessage } from '../mesh/envelope.ts';
 import type { PolicySource } from '../permissions/index.ts';
 import { buildAutoTerse } from '../recap/auto-display.ts';
 import { createReminderScheduler } from '../reminders/index.ts';
-import { flattenControlToLine, stripAnsi, stripControlKeepLines } from '../sanitize/index.ts';
+import {
+  collapseBlankLines,
+  flattenControlToLine,
+  stripAnsi,
+  stripControlKeepLines,
+} from '../sanitize/index.ts';
 import {
   HISTORY_CAP,
   appendHistory,
@@ -655,6 +661,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     sandboxConfigWarnings,
     verifyConfigWarnings,
     mcpConfigWarnings,
+    meshConfigWarnings,
     sandboxEnforcement,
     permissionState,
     permissionRefusingReason,
@@ -766,6 +773,62 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   });
   baseConfig.reminderScheduler = reminderScheduler;
 
+  // Mesh peer ingress (MESH.md §6.2): a peer's message — only possible while
+  // serving, i.e. after /relay — lands as a `peer_message` notification, driving
+  // the same wake-when-idle path as bg_done/reminder. A message may be a request,
+  // a reply to something WE sent, or a follow-up — the wire doesn't distinguish
+  // (§4); the model correlates by context. Forward-references `enqueueNotification`
+  // (same runtime-only rationale as the holder/timer).
+  baseConfig.meshManager?.onMessage(({ peerAlias, text }) => {
+    if (exiting) return;
+    // Bound the inbox (§9): past MAX_PENDING_PEER_MESSAGES queued, drop the newest
+    // with a one-shot notice rather than grow heap / build an oversized coalesced
+    // turn. Re-armed when the queue drains (drainNotifications).
+    const pendingPeers = notifications.reduce(
+      (acc, n) => acc + (n.kind === 'peer_message' ? 1 : 0),
+      0,
+    );
+    if (pendingPeers >= MAX_PENDING_PEER_MESSAGES) {
+      if (!peerInboxFullAnnounced) {
+        peerInboxFullAnnounced = true;
+        bus.emit({
+          type: 'info',
+          ts: now(),
+          tone: 'secondary',
+          message: `▸ peer inbox full (${MAX_PENDING_PEER_MESSAGES} queued) — dropping newer messages until it drains (submit anything to resume if the exchange has paused)`,
+        });
+      }
+      return;
+    }
+    // This peer is now owed a reply (drives the footer count + the reply nudge). A
+    // successful mesh_send back clears it (onMessageSent below). Add BEFORE enqueue so
+    // the count reflects mail waiting at a wake-cap pause, not just mail in a turn.
+    receivedGen.set(peerAlias, (receivedGen.get(peerAlias) ?? 0) + 1);
+    awaitingReply.add(peerAlias);
+    // A NEW message opens a fresh awaiting episode: clear any prior one-shot nudge
+    // flag for this alias so this message can be actively nudged too. Without it, a
+    // second message from an already-nudged peer would only ever get the passive
+    // chip — the stranded filter at session_finished blocks on !nudgedAwaiting (§6.4).
+    nudgedAwaiting.delete(peerAlias);
+    emitAwaiting();
+    enqueueNotification({ kind: 'peer_message', peerAlias, text });
+  });
+  // A message WE sent to a peer landed → the loop closed for it: drop it from the owed
+  // set (and re-arm its nudge, so a later message can nudge again). Counts the
+  // operator's OWN outbound sends too — the peer got an answer regardless of who typed
+  // it. But clear ONLY if no NEWER message from this peer arrived since the turn began:
+  // otherwise the reply was for the turn's message(s), and a rapid second message queued
+  // for a later turn keeps its own debt (§6.4). repliedThisTurn records the send either
+  // way, so a debt kept-because-newer does not fire a premature nudge below.
+  baseConfig.meshManager?.onMessageSent((peerAlias) => {
+    repliedThisTurn.add(peerAlias);
+    if (hasNewerSinceTurnStart(peerAlias)) return;
+    if (awaitingReply.delete(peerAlias)) {
+      nudgedAwaiting.delete(peerAlias);
+      emitAwaiting();
+    }
+  });
+
   // Permission engine refused to come up (PERMISSION_ENGINE.md §7.2):
   // broken audit chain, invalid policy, install_id I/O failure, or a
   // sandbox required-but-unavailable. `refusing` is terminal — every
@@ -871,6 +934,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // HTTP body), so an unsanitized ANSI/control payload could repaint the banner.
   for (const w of mcpConfigWarnings) {
     errSink(`forja: mcp: ${flattenControlToLine(w)}\n`);
+  }
+  for (const w of meshConfigWarnings) {
+    errSink(`forja: mesh: ${flattenControlToLine(w)}\n`);
   }
   // Shared-corpus trust probe outcome (S5/T5.2 + T5.3). Render a
   // single summary line so operators see what the modal decision
@@ -1455,20 +1521,121 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     note: string;
     scheduledAt: number;
   };
+  type PeerMessageNotification = {
+    kind: 'peer_message';
+    // Peer alias (scrollback origin header + the reply handle in the untrusted
+    // preamble). `text` is the raw peer message — a request, a reply, or a
+    // follow-up (the wire doesn't distinguish, §4) — enveloped as untrusted DATA
+    // before it reaches the model.
+    peerAlias: string;
+    text: string;
+  };
+  // Reply safety net (MESH.md §6.4): a peer-driven turn ended with no mesh_send back
+  // to a peer we owe. Enqueued at session_finished; drives ONE wake-turn whose input
+  // tells the model to answer via mesh_send. Harness-authored (the aliases are
+  // grammar-validated), NOT untrusted peer text — so it is not enveloped.
+  type PeerReplyNudgeNotification = {
+    kind: 'peer_reply_nudge';
+    aliases: string[];
+  };
   // Producer payload (no id yet); `enqueueNotification` stamps the id.
-  type NotificationPayload = BgDoneNotification | ReminderNotification;
+  type NotificationPayload =
+    | BgDoneNotification
+    | ReminderNotification
+    | PeerMessageNotification
+    | PeerReplyNudgeNotification;
   type Notification =
     | (BgDoneNotification & { id: string })
-    | (ReminderNotification & { id: string });
+    | (ReminderNotification & { id: string })
+    | (PeerMessageNotification & { id: string })
+    | (PeerReplyNudgeNotification & { id: string });
   const notifications: Notification[] = [];
   let notifSeq = 0;
+  // Peer attribution (MESH.md §6.2): the alias(es) of the peer(s) whose message(s)
+  // drive the CURRENT turn, or null on operator/non-peer turns. Set at the drain
+  // when the batch contains a peer_message; kept so a confirm firing mid-turn can
+  // attribute the ask to the peer (never let a peer's effect look like the
+  // operator's own work) and so the mesh status reflects working/waiting-operator.
+  // A single slot suffices because turns are strictly serialized (isBusy-gated);
+  // if several peers' messages coalesce into one turn, it holds the joined list.
+  let pendingPeerAlias: string | null = null;
+  // The same peer alias(es) as an array (pendingPeerAlias is the joined display
+  // form). The reply-nudge check at session_finished iterates it. Empty on operator /
+  // non-peer / nudge turns, so a nudge turn can never itself re-trigger a nudge.
+  let pendingPeerAliasList: string[] = [];
+  // Aliases the CURRENT turn's reply-nudge is for (empty unless a peer_reply_nudge
+  // drove this turn). At the nudge turn's end the debt RESOLVES — the model had its
+  // one reminder and either replied (cleared on send) or declined (ended without
+  // sending, e.g. a concluded exchange) — so these clear from awaitingReply. Without
+  // it the footer chip sticks forever on a conversation the model deliberately closed
+  // (the reply preamble now tells it a concluded exchange needs no reply, so an
+  // end-without-send is the COMMON resolution, not a miss).
+  let pendingNudgeAliases: string[] = [];
+  // Peers owed a reply: a peer message arrived and no mesh_send back has been observed
+  // yet. Drives the passive footer count (mesh:awaiting) AND the one-shot reply nudge.
+  // Cleared when a successful send lands (onMessageSent) OR when the nudge turn for it
+  // resolves (pendingNudgeAliases) — either way the debt is settled.
+  const awaitingReply = new Set<string>();
+  // Aliases already nudged once for a stranded reply — bounds the nudge to ONE wake
+  // per awaiting episode (a stubborn or deliberately-silent model is not re-woken
+  // forever). Cleared whenever the debt settles (see settleAwaiting).
+  const nudgedAwaiting = new Set<string>();
+  const emitAwaiting = (): void =>
+    bus.emit({ type: 'mesh:awaiting', ts: now(), count: awaitingReply.size });
+  // Per-peer count of inbound messages (monotonic) + a snapshot of it at the current
+  // turn's start. A debt is cleared/settled ONLY when the peer got no NEWER message
+  // since the turn began — otherwise a reply to the turn's message would also wipe a
+  // rapid second message from the same peer queued for a LATER turn, stranding it (its
+  // own turn nudges/settles it instead). A send during a turn is recorded in
+  // repliedThisTurn so a debt KEPT because a newer message arrived does not fire a
+  // premature nudge for a message the current turn already answered.
+  const receivedGen = new Map<string, number>();
+  let turnStartGen = new Map<string, number>();
+  const repliedThisTurn = new Set<string>();
+  const hasNewerSinceTurnStart = (alias: string): boolean =>
+    (receivedGen.get(alias) ?? 0) !== (turnStartGen.get(alias) ?? 0);
+  // Settle the owed-reply debt for these aliases: drop them from awaitingReply +
+  // nudgedAwaiting and repaint the footer count. Called at every RESOLUTION of a debt
+  // — the nudge turn ends (the model had its reminder and replied or declined), the
+  // operator ABORTS the peer turn (they took manual control), or the turn CRASHES (the
+  // peer message was spliced from the queue and never committed — it is unrecoverable,
+  // so there is nothing left to reply to). Only a clean, un-nudged peer turn KEEPS the
+  // debt, to nudge. No repaint if none were actually owed.
+  const settleAwaiting = (aliases: readonly string[]): void => {
+    let changed = false;
+    for (const a of aliases) {
+      // A peer that got a NEWER message during this turn keeps its debt — that message
+      // was not part of what this turn resolved; its own turn will settle it (§6.4).
+      if (hasNewerSinceTurnStart(a)) continue;
+      if (awaitingReply.delete(a)) changed = true;
+      nudgedAwaiting.delete(a);
+    }
+    if (changed) emitAwaiting();
+  };
   let drainNotifications: () => void = () => {};
   // Anti-loop backstop (§3B.4): max auto-wake turns fired with NO
   // operator input between them. Reset on every operator submit
   // (startOperatorTurn). Without it, a wake-turn that itself spawns more
-  // bg work could ping-pong the session awake forever.
+  // bg work could ping-pong the session awake forever. Raised above the
+  // spec's default of 3 so a longer collaborative mesh exchange (peer
+  // messages + reply nudges) can flow before pausing — still hard-bounded,
+  // and the operator's input resets it. NOTE: divergence from ORCHESTRATION
+  // §3B.4 ("default 3") — sync the spec if this value stabilizes.
   let consecutiveWakes = 0;
-  const MAX_CONSECUTIVE_WAKES = 3;
+  const MAX_CONSECUTIVE_WAKES = 10;
+  // One-shot flag: whether we've already cued the operator that peer mail is
+  // waiting at the wake-cap pause (§6.2). Since a paused peer_message renders
+  // nothing, without a cue the collaborative exchange strands silently. Reset when
+  // the operator acts (startOperatorTurn re-arms the cap) so a later pause re-cues.
+  let peerPausePendingAnnounced = false;
+  // Admission control on the in-memory inbox (§9): the wake-cap bounds the turn
+  // COUNT, not enqueuing — while the session is busy or paused, ingress keeps
+  // filling `notifications`, and the drain coalesces the WHOLE queue into one turn.
+  // Cap the pending peer messages so a chatty/buggy peer can't grow heap without
+  // bound or build an oversized turn; drop the newest past the ceiling (one-shot
+  // notice, re-armed when the queue drains). Generous — legitimate bursts are small.
+  const MAX_PENDING_PEER_MESSAGES = 32;
+  let peerInboxFullAnnounced = false;
   // The headline line — the `● `-able status sentence, no body. One
   // `case` per producer `kind`.
   const formatNotificationHeadline = (n: Notification): string => {
@@ -1482,15 +1649,41 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       }
       case 'reminder':
         return `[reminder] ${flattenControlToLine(n.note)}`;
+      case 'peer_message':
+        // Peer alias is attacker-controlled — flatten control/ANSI (like
+        // bg_done/reminder) so it can't spoof the operator's scrollback. Name the
+        // channel ("peer") — unlike [background]/[reminder] the bare alias gives no
+        // cue this came in over the mesh from ANOTHER repo.
+        return `▸ peer '${flattenControlToLine(n.peerAlias)}'`;
+      case 'peer_reply_nudge': {
+        // Dual audience: the operator sees this in scrollback (● [reply pending] …)
+        // and the model receives it as the wake-turn input (formatNotification returns
+        // the headline verbatim — harness-authored, not enveloped). Names what a prose
+        // answer does NOT do (the observed miss) and points at mesh_send — but ALSO
+        // that a concluded exchange needs NO reply. Without that, two polite instances
+        // ping-pong farewells (each closing message becomes the other's inbound → its
+        // own nudge → another closing message) until the wake cap pauses it.
+        const who = n.aliases.map((a) => `'${flattenControlToLine(a)}'`).join(', ');
+        const one = n.aliases.length === 1;
+        const noun = one ? 'peer' : 'peers';
+        const verb = one ? 'is' : 'are';
+        const them = one ? 'it' : 'them';
+        return `[reply pending] ${noun} ${who} ${verb} unanswered over the mesh — your plain text reply, if any, did NOT reach ${them}. If you owe a real answer or a decision, call mesh_send now. If the exchange has simply run its course (a thanks or a goodbye needs no reply), just end the turn — do NOT send another closing message back. Either way you will not be reminded again.`;
+      }
     }
   };
   // Full text fed to the model as the wake-turn input: headline + any
   // attached body. Only bg_done carries a body (the output head-tail);
   // reminder's headline is complete on its own.
-  const formatNotification = (n: Notification): string =>
-    n.kind === 'bg_done' && n.summary !== undefined
+  const formatNotification = (n: Notification): string => {
+    // A peer message is fed to the model enveloped as untrusted DATA (§5.2) — NOT
+    // the operator-facing origin headline. To respond, the model calls mesh_send
+    // back to the alias (this turn or a later one — §6.4).
+    if (n.kind === 'peer_message') return framePeerMessage(n.peerAlias, n.text);
+    return n.kind === 'bg_done' && n.summary !== undefined
       ? `${formatNotificationHeadline(n)}\n${n.summary}`
       : formatNotificationHeadline(n);
+  };
   // Head + tail caps for the inline summary. The tail is bigger: for a
   // build/test, the RESULT (pass/fail counts, errors) lives at the END.
   const enqueueNotification = (n: NotificationPayload): void => {
@@ -1563,11 +1756,74 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       running = false;
       syncBusy();
       sawSessionFinished = true;
+      // Unified session (§6.1): a peer turn runs in the operator's SHARED context,
+      // so its session anchors ARE the session's — hold them for the next turn
+      // (peer or operator) exactly like any turn. No fresh-context isolation and
+      // no auto-tap: the model replies by calling mesh_send when it decides — this
+      // turn or a later one, because the message persists in the shared context.
       lastSessionId = event.result.sessionId;
-      // Hold the live context for the next turn's reuse. A turn that
-      // errored before resolving one leaves this null → the next turn
+      // A turn that errored before resolving one leaves this null → the next turn
       // falls back to resumeFromSessionId (re-derive from the log).
       liveContext = event.result.sessionContext ?? null;
+      // A peer-driven turn finished: clear the peer attribution and republish
+      // `idle` (the serving instance is no longer working). A forgotten reply is
+      // NOT a failure — the message stays in the shared context for a later turn
+      // (§6.4).
+      // Snapshot the peers whose FRESH message drove this turn BEFORE the block
+      // below clears pendingPeerAliasList — the nudge-settle further down needs it to
+      // avoid wiping a debt the peer block already owns (reassignment, not mutation,
+      // so the reference stays intact).
+      const peerAliasesThisTurn = pendingPeerAliasList;
+      if (pendingPeerAlias !== null) {
+        // Reply safety net (§6.4): this turn was driven by peer message(s). Any
+        // originating peer we STILL owe a reply (no mesh_send back landed during the
+        // turn — the model may have answered in prose, which never reaches the peer,
+        // or simply moved on) and haven't nudged yet gets ONE reminder wake so it is
+        // not silently stranded. One-shot per alias (nudgedAwaiting); the passive
+        // footer count persists until a real reply. The nudge turn itself is a
+        // peer_reply_nudge (not a peer_message), so pendingPeerAliasList is empty for
+        // it — it can never re-trigger a nudge.
+        //
+        // NOT on an aborted turn (soft/hard): an abort is the operator's deliberate
+        // "stop", so auto-waking to re-engage the very peer work they interrupted
+        // contradicts it — the same reason the crash path (the finalizer below) doesn't
+        // nudge. On abort the operator has taken manual control, so the harness stops
+        // tracking the owed reply and SETTLES it (else branch) rather than leaving the
+        // footer chip stuck with no nudge turn ever coming to resolve it.
+        if (event.result.abortCause === undefined) {
+          // !repliedThisTurn: if the model DID send to this peer this turn, the turn's
+          // message was answered — don't nudge, even if the debt is still set because a
+          // NEWER message arrived mid-turn (that one nudges at its own turn, not here).
+          const stranded = pendingPeerAliasList.filter(
+            (a) => awaitingReply.has(a) && !nudgedAwaiting.has(a) && !repliedThisTurn.has(a),
+          );
+          if (stranded.length > 0) {
+            for (const a of stranded) nudgedAwaiting.add(a);
+            enqueueNotification({ kind: 'peer_reply_nudge', aliases: stranded });
+          }
+        } else {
+          settleAwaiting(pendingPeerAliasList);
+        }
+        pendingPeerAlias = null;
+        pendingPeerAliasList = [];
+        baseConfig.meshManager?.setStatus('idle');
+      }
+      // Nudge-turn resolution: a reply-nudge turn just ended. The model has now had
+      // its one reminder — whether it replied (already cleared via onMessageSent) or
+      // consciously declined (ended without sending — a concluded exchange needs no
+      // reply, per the preamble) — so the debt is settled. Clear the nudged aliases,
+      // or the footer chip sticks forever on a conversation the model closed on
+      // purpose. (A nudge turn is not a peer_message, so the block above was skipped.)
+      if (pendingNudgeAliases.length > 0) {
+        // Don't let the nudge-turn settle wipe an alias that ALSO received a fresh
+        // peer_message this turn (a held nudge + a new message from the same peer
+        // coalesced into one turn, §6.2): the peer block above already owns that
+        // alias's debt — it kept it, or re-nudged it. Settling it here would drop the
+        // new message's owed reply with no reminder. Only settle PURE nudge aliases,
+        // those with no fresh message this turn.
+        settleAwaiting(pendingNudgeAliases.filter((a) => !peerAliasesThisTurn.includes(a)));
+        pendingNudgeAliases = [];
+      }
       // Hard-abort un-send (migration 079): if the operator hard-cancelled this
       // turn right after sending — nothing settled, so the live tail is still
       // their message — drop it from the live context (durable: the row is
@@ -1693,6 +1949,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         displayRule = sanitizeForSubagentDisplay(displayRule);
       }
     }
+    // M6: a peer turn blocked on this modal is waiting-operator, not working —
+    // publish it so the peer (and its operator) can tell "busy computing" from
+    // "blocked on a human who stepped away". Reverted to working after the answer.
+    if (pendingPeerAlias !== null) baseConfig.meshManager?.setStatus('waiting-operator');
     const answer = await modalManager.askPermission(
       {
         toolName: displayToolName,
@@ -1714,6 +1974,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // the parent's own confirms — the reducer only branches
         // on its presence.
         ...(req.subagent !== undefined ? { subagent: req.subagent } : {}),
+        // Peer attribution: when THIS turn is peer-driven (mesh), label the modal
+        // so the operator sees the effect was requested by a PEER, not by them —
+        // approving a peer's edit as if it were your own is the worst failure the
+        // subsystem exists to prevent. The alias is ALIAS_RE-validated at ingress;
+        // flatten as defense-in-depth (mirrors the origin-header treatment).
+        ...(pendingPeerAlias !== null
+          ? { peer: { alias: flattenControlToLine(pendingPeerAlias) } }
+          : {}),
       },
       // Forward producer cancellation signal. Subagent proxy
       // wires it to the child's IPC lifetime so a child dying
@@ -1721,6 +1989,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       // operator on a stale request.
       req.signal !== undefined ? { signal: req.signal } : undefined,
     );
+    if (pendingPeerAlias !== null) baseConfig.meshManager?.setStatus('working');
     // Modal returns 'yes' / 'no' / 'cancel'. The previous
     // 'session-allow' value was removed alongside option 2 — the
     // engine's addSessionAllow API stays available for non-modal
@@ -2057,6 +2326,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   };
   const startTurn = (text: string, source: MessageSource = 'operator'): void => {
     if (isBusy() || exiting) return;
+    // Snapshot the per-peer inbound count at the turn's start and reset the per-turn
+    // send tracker. Debt clears/settles this turn compare against this snapshot, so a
+    // peer message that arrives DURING the turn keeps its own debt instead of being
+    // wiped by this turn's reply (§6.4 rapid-send race).
+    turnStartGen = new Map(receivedGen);
+    repliedThisTurn.clear();
     running = true;
     syncBusy();
     // Mint a fresh token for this turn and claim ownership of the
@@ -2071,7 +2346,8 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     const adapter = createHarnessAdapter(buildAdapterCtx());
     // Consume the one-shot full/summary-resume recap flag: only the first turn
     // after a prehydrated resume runs the [resume_context] rehydrate, and only
-    // when actually on the reuse path (liveContext set).
+    // when actually on the reuse path (liveContext set). Any turn — operator or a
+    // peer message in the shared session (§6.1) — can be that first turn.
     const includeResumeRecap = liveContext !== null && resumeRecapPending;
     resumeRecapPending = false;
     // Track this turn's operator text for the hard-abort un-send affordance
@@ -2098,9 +2374,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       workingStateStore,
       revealedTools,
       // Reuse the live context (compact-once-reuse). Fall back to
-      // resumeFromSessionId only when there's no live context — a turn
-      // that errored before resolving one — so the next turn re-derives
-      // from the DB log instead of starting a fresh session.
+      // resumeFromSessionId only when there's no live context — a turn that errored
+      // before resolving one — so the next turn re-derives from the DB log instead
+      // of starting a fresh session. Peer turns share this context too (§6.1): a
+      // peer message is just another turn in the operator's session.
       ...(liveContext !== null
         ? {
             sessionContext: liveContext,
@@ -2150,7 +2427,32 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // the next turn instead of sitting pending. When session_finished
         // DID fire it already scheduled the drain; skip to avoid a
         // redundant pass.
-        if (!sawSessionFinished) queueMicrotask(() => drainInbox());
+        if (!sawSessionFinished) {
+          // The turn threw before `session_finished`, so the session anchors were
+          // NOT committed (liveContext/lastSessionId still point at the last good
+          // turn). A peer message consumed by this crashed turn is therefore not
+          // recoverable from the live context — the same loss any wake notification
+          // takes when its turn crashes (the drain already spliced it). There is no
+          // conversation to fail (§6.4); the receiver's operator sees the crash in
+          // their own scrollback. Clear the peer attribution + republish idle, then
+          // drain anything that queued during the failed turn.
+          // The crashed turn's peer message was spliced from the queue and never
+          // committed to the live context — it is unrecoverable (see above), so there
+          // is nothing left to reply to: SETTLE the owed-reply debt for this turn's
+          // peer(s) and/or nudge target(s), or the footer chip sticks forever on a lost
+          // message. A crashed turn does NOT nudge (a wake on top of a crash is noise).
+          settleAwaiting(pendingPeerAliasList);
+          settleAwaiting(pendingNudgeAliases);
+          if (pendingPeerAlias !== null) {
+            pendingPeerAlias = null;
+            baseConfig.meshManager?.setStatus('idle');
+          }
+          // Per-turn state resets regardless of peer/nudge/operator kind (a crashed
+          // nudge turn has pendingPeerAlias === null, so it misses the block above).
+          pendingPeerAliasList = [];
+          pendingNudgeAliases = [];
+          queueMicrotask(() => drainInbox());
+        }
       });
   };
 
@@ -2214,7 +2516,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // the auto-wake chain (§3B.4 — the cap only counts wakes with no
   // operator turn between them).
   const startOperatorTurn = (text: string): void => {
+    // Operator intervened → reset the wake cap: it measures "auto-wake turns since
+    // the operator last acted", and the mesh exchange rides that same cap now
+    // (§6.2/§9), so operator input re-arms the whole thing — including re-arming the
+    // one-shot "peer mail waiting" cue for the next pause.
     consecutiveWakes = 0;
+    peerPausePendingAnnounced = false;
     startTurn(text);
   };
 
@@ -2250,29 +2557,65 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     if (notifications.length === 0) return;
     // Operator-typing gate: don't steal the turn while they compose.
     if (renderer.state().input.value.length > 0) return;
-    // Consecutive-wake cap: anti-loop backstop.
-    if (consecutiveWakes >= MAX_CONSECUTIVE_WAKES) return;
-    // Budget gate → degrade to semi-push when the cap is already spent.
+    // Consecutive-wake cap: anti-loop backstop. peer_message RESPECTS the cap now
+    // (§6.2/§9) — no exemption — so the mesh exchange pauses after N auto-wakes
+    // with no operator input, exactly like any wake. Operator input resets it, so
+    // the exchange flows while the operator engages and pauses when they step away.
+    if (consecutiveWakes >= MAX_CONSECUTIVE_WAKES) {
+      // Peer mail waiting at the pause renders nothing on its own (it never reached
+      // the scrollback loop below), so cue the operator ONCE — the exchange's rhythm
+      // is theirs, and silence would strand a waiting peer. Only for peer_message;
+      // bg_done/reminder semi-pushing at the cap is the ordinary, already-visible case.
+      if (!peerPausePendingAnnounced) {
+        const waiting = notifications.filter((n) => n.kind === 'peer_message').length;
+        if (waiting > 0) {
+          peerPausePendingAnnounced = true;
+          bus.emit({
+            type: 'info',
+            ts: now(),
+            tone: 'secondary',
+            message: `▸ ${waiting} peer message${waiting === 1 ? '' : 's'} waiting — the exchange paused; act (submit anything) to resume`,
+          });
+        }
+      }
+      return;
+    }
+    // Budget gate. Every wake (bg_done / reminder / peer_message) degrades to
+    // semi-push here — it waits for the operator's next submit. A peer_message is
+    // fire-and-forget from the sender (no held-open conversation on our side to
+    // free), so it simply stays queued like any other wake.
     const cap = baseConfig.budget?.maxCostUsd;
     if (cap !== undefined && cumulative.costUsd >= cap) return;
-    // Coalesce: every pending notification goes into ONE wake-turn, so a
-    // burst of completions doesn't fire a turn each.
+    // Coalesce the pending notifications into ONE wake-turn (§6.2): a batch of peer
+    // messages — from one peer or several — becomes one turn, so the model sees
+    // them together and replies/consolidates as it decides; bg_done/reminder ride
+    // along. Each still renders its own scrollback line with its origin stamp.
     const drained = notifications.splice(0);
     consecutiveWakes += 1;
-    // Surface each notification in the scrollback as a system `info`
-    // entry (distinct from an operator-submit bar — the point of a
-    // separate channel) so the operator sees WHY the session woke and
-    // what the turn is about: the `● ` headline, then the output
-    // head-tail indented beneath it. Applies to the semi-push path too
-    // (this drain also runs at the boundary).
+    peerInboxFullAnnounced = false; // the queue drained → re-arm the inbox-full cue
+    // Surface each notification in the scrollback as a system `info` entry (distinct
+    // from an operator-submit bar) so the operator sees WHY the session woke and
+    // what the turn is about: the `● ` headline, then any body indented beneath it.
     for (const n of drained) {
       const headline = `● ${formatNotificationHeadline(n)}`;
-      // One info event per notification (info emits a single leading
-      // blank — separate events would blank-separate every line). A
-      // bg_done body (output head-tail) rides in the same message, each
-      // row indented 4sp so it sits under the headline text (frame 2sp +
-      // the `● ` prefix). A reminder has no body — headline only.
-      const body = n.kind === 'bg_done' ? n.summary : undefined;
+      // A bg_done body (output head-tail) or a peer message's text rides in the same
+      // message, each row indented 4sp so it sits under the headline. A reminder has
+      // no body — headline only.
+      const body =
+        n.kind === 'bg_done'
+          ? n.summary
+          : n.kind === 'peer_message'
+            ? // Untrusted peer text on the operator's TTY — strip control/ANSI
+              // (anti-spoof, like bg_done) and collapse blank-line runs (anti-flood:
+              // a peer can't paint thousands of empty rows). The scrollback preview
+              // is length-capped, but the MODEL receives the FULL text enveloped
+              // (§5.2) — so mark the cut, or the operator (whose presence is the
+              // no-isolation safeguard, §6.1) would miss steering content past the cap.
+              ((clean) =>
+                clean.length > 2000
+                  ? `${clean.slice(0, 2000)}\n[… preview truncated — the model receives the full message]`
+                  : clean)(collapseBlankLines(stripControlKeepLines(n.text)))
+            : undefined;
       const message =
         body === undefined
           ? headline
@@ -2282,8 +2625,38 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
               .join('\n')}`;
       bus.emit({ type: 'info', ts: now(), tone: 'secondary', message });
     }
-    // 'system' source: the wake input persists as a system message, so
-    // audit and --resume don't render it as operator input (migration 075).
+    // Peer attribution (§6.2): if the batch contains any peer message, mark this
+    // turn peer-driven so a confirm labels the effect `peer: '…'` (never let a
+    // peer's effect look like the operator's own) and publish `working` while it
+    // runs. If several distinct peers coalesced, hold the joined list.
+    const peerAliases = [
+      ...new Set(
+        drained.flatMap((n) =>
+          n.kind === 'peer_message' ? [flattenControlToLine(n.peerAlias)] : [],
+        ),
+      ),
+    ];
+    pendingPeerAlias = peerAliases.length > 0 ? peerAliases.join(', ') : null;
+    // Array form of the same aliases — the reply-nudge check at session_finished
+    // iterates it (pendingPeerAlias is the joined display form).
+    pendingPeerAliasList = peerAliases;
+    // Aliases of any reply-nudge coalesced into this turn — at its end they resolve
+    // (see pendingNudgeAliases). Usually a nudge turn is pure (no peer_message).
+    pendingNudgeAliases = drained.flatMap((n) => (n.kind === 'peer_reply_nudge' ? n.aliases : []));
+    if (pendingPeerAlias !== null) {
+      baseConfig.meshManager?.setStatus('working');
+    }
+    // Reveal mesh_send when the model is expected to answer a peer: a peer_message
+    // turn (the preamble names mesh_send, which is `deferred` off the wire until
+    // revealed) OR a reply-nudge turn (same ask). Without it a cold receiver is told
+    // to call a tool it can't see. Persisted for the session: harmless, and the
+    // exchange is symmetric, so the operator's own turns may send too.
+    if (pendingPeerAlias !== null || drained.some((n) => n.kind === 'peer_reply_nudge')) {
+      revealedTools.add('mesh_send');
+    }
+    // 'system' source: the wake input persists as a system message, so audit and
+    // --resume don't render it as operator input (migration 075). The turn runs in
+    // the operator's SHARED context (§6.1) — no fresh-context isolation.
     startTurn(drained.map(formatNotification).join('\n\n'), 'system');
   };
 
@@ -2357,6 +2730,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // Swallow — cleanup() is already per-client fail-soft; this guards a
         // surprise throw from blocking exit.
       }
+    }
+    // Mesh teardown (MESH.md §6.5): send bye to inbound peers, close the listen
+    // socket, remove the descriptor. The CLI owns this teardown
+    // (harness/types.ts) — without it the .sock + descriptor leak on exit.
+    if (baseConfig.meshManager !== undefined) {
+      await baseConfig.meshManager.shutdown();
     }
     // Session-scoped reminders (ORCHESTRATION.md §3B.9): clear every
     // pending timer so a fired callback can't run after teardown. Pure
@@ -3332,6 +3711,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         cursor: result.next.cursor,
       });
       updateSlashSuggestions(result.next.value);
+      // Re-offer queued wakes the moment the buffer clears. drainNotifications'
+      // operator-typing gate holds them (incl. peer_message) while the buffer is
+      // non-empty, and nothing else re-kicks it until the next turn boundary or a
+      // new notification — so a peer prompt queued mid-typing would hang until
+      // then if the operator just backspaces to empty and sits idle. The drain
+      // self-guards (busy / nothing-pending), so an unconditional re-kick is safe.
+      if (result.next.value.length === 0) queueMicrotask(() => drainNotifications());
     }
 
     // Enter routing (INBOX docs/spec/INBOX.md §4.1 / §4.2):

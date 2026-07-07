@@ -53,6 +53,9 @@ import {
   resolveScopeRoots,
 } from '../memory/index.ts';
 import type { ProbeSharedTrustResult } from '../memory/index.ts';
+import { loadMeshConfig } from '../mesh/config.ts';
+import { createMeshManager } from '../mesh/manager.ts';
+import { meshRuntimeDir } from '../mesh/registry.ts';
 import { createSqliteOutcomeSink } from '../outcomes/index.ts';
 import {
   type ApprovalPosture,
@@ -92,6 +95,7 @@ import {
   MEMORY_VERIFY_ATTEMPTS_RETENTION_MS,
   pruneVerifyAttempts,
 } from '../storage/repos/memory-verify-attempts.ts';
+import { recordMeshAuditEvent } from '../storage/repos/mesh-events.ts';
 import {
   hashPromptContent,
   recordPromptVersion,
@@ -101,6 +105,7 @@ import { setRecapCacheTtlOverride } from '../storage/repos/recap-cache.ts';
 import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { isSmallWindow, memoryMaxEntries } from '../tools/context-budget.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
+import { isEnvelopeSideEffect } from '../tools/types.ts';
 import { isTrusted, trustListPath } from '../trust/index.ts';
 import { composeWithConstraints } from './constraints-prompt.ts';
 import { composeWithEnvironment } from './environment-prompt.ts';
@@ -189,6 +194,12 @@ export interface BootstrapInput {
   // userAgentsDir: `null` disables the user layer (keeps a developer's real
   // ~/.config/forja/mcp.toml out of a test's bootstrap), absent = default.
   userMcpPath?: string | null;
+  // Test seams for the mesh subsystem (MESH.md). `meshConfigPath` overrides the
+  // [mesh] config.toml lookup (null ⇒ defaults); `meshSocketDir` overrides the
+  // runtime dir where sockets + descriptors live, isolating tests from the real
+  // $XDG_RUNTIME_DIR.
+  meshConfigPath?: string | null;
+  meshSocketDir?: string;
   // --auto-approve-mcp <list>: MCP servers granted trust without a prompt
   // (CI/headless). Threaded into the MCP manager's `autoApprove`.
   autoApproveMcp?: ReadonlySet<string>;
@@ -442,6 +453,9 @@ export interface BootstrapResult {
   // handshake failures, unreadable cached manifests — surfaced on the stderr
   // banner so an operator whose MCP server was skipped sees why.
   mcpConfigWarnings: readonly string[];
+  // Warnings from the [mesh] config loader (unknown key / over-ceiling value /
+  // invalid alias), surfaced on the same stderr banner.
+  meshConfigWarnings: readonly string[];
   // Final state of the permission engine after bootstrap walked
   // init → loading-policy → validating-chain → ready/refusing.
   // When this is `refusing`, the engine is a deny-everything stub
@@ -931,26 +945,17 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       path: sandboxAvail.path,
       trustWarnings: sandboxAvail.trustWarnings,
     },
-    // Side-effect oracle for the §10.1 envelope gate. Closes the
-    // bash_kill / bash_output / bash_background bypass where a
-    // narrowed subagent invokes a tool whose resolver returns no
-    // caps but whose metadata declares writes / exec / bgManager
-    // dependence. `requiresBgManager` rides along because reading
-    // or signalling bg-process lifecycle IS a side effect from
-    // the envelope's perspective even when no fs write happens
-    // (e.g., bash_output is `writes:false` but reads stdout from
-    // a previously-spawned process). The callback re-reads the
-    // registry on each check (not snapshotted) so MCP tools
+    // Side-effect oracle for the §10.1 envelope gate — the single predicate
+    // `isEnvelopeSideEffect` (see its doc: writes/exec/bg/reminder AND network
+    // egress/cwd escape) so this and the subagent-child oracle can't drift. Closes the
+    // bash_kill / bash_output bypass (resolver returns no caps but the tool touches
+    // bg-process lifecycle) AND the mesh_send bypass (network egress under empty caps).
+    // The callback re-reads the registry on each check (not snapshotted) so MCP tools
     // registered post-bootstrap are observed without re-plumbing.
     isToolSideEffect: (toolName) => {
       const tool = toolRegistry.get(toolName);
       if (tool === null) return false;
-      return (
-        tool.metadata.writes === true ||
-        tool.metadata.exec === true ||
-        tool.metadata.requiresBgManager === true ||
-        tool.metadata.requiresReminderScheduler === true
-      );
+      return isEnvelopeSideEffect(tool.metadata);
     },
   });
   const permissionEngine = permResult.engine;
@@ -1718,6 +1723,40 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     projectConfigCwd,
   );
 
+  // Mesh subsystem (MESH.md §10). No init()/DB: constructed at boot so /relay
+  // and the mesh tools reach the handle; the server socket only binds on /relay,
+  // the client dials on-demand. Branch is best-effort (cosmetic in the
+  // descriptor). Fail-soft: config warnings ride the stderr banner, never abort.
+  const meshLoaded = loadMeshConfig({
+    cwd: projectConfigCwd,
+    ...(input.meshConfigPath !== undefined ? { configPathOverride: input.meshConfigPath } : {}),
+  });
+  // Resolve the mesh runtime dir. A /tmp-fallback base a foreign local user
+  // pre-positioned (§0.7) makes meshRuntimeDir throw — disable the mesh for this
+  // session rather than abort the whole boot: a non-relay session never needs it,
+  // and /relay would refuse anyway. `meshManager: undefined` is a graceful
+  // "unavailable" state the tools + /relay already handle.
+  let meshDir: string | undefined;
+  try {
+    meshDir = input.meshSocketDir ?? meshRuntimeDir();
+  } catch (err) {
+    process.stderr.write(
+      `forja: mesh disabled — ${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  }
+  const meshManager =
+    meshDir === undefined
+      ? undefined
+      : createMeshManager({
+          dir: meshDir,
+          config: meshLoaded.config,
+          repoRoot: projectConfigCwd,
+          branch: probeGitContext(projectConfigCwd)?.branch ?? 'unknown',
+          // Persist the mesh boundary events (§8) to `mesh_events` — the A↔B
+          // forensic trail, correlated by peer alias + message id across the DBs.
+          onAuditEvent: (event) => recordMeshAuditEvent(db, event),
+        });
+
   const config: HarnessConfig = {
     provider,
     // Model catalog (PLAYBOOKS.md §1.1), threaded so the `task` tool's spawn
@@ -1733,6 +1772,9 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     bgLogDir,
     broker,
     mcpManager,
+    // Conditional spread: `meshManager?` is exact-optional, so it must be OMITTED
+    // (not set to undefined) when the mesh is disabled (a compromised runtime base).
+    ...(meshManager !== undefined ? { meshManager } : {}),
     userPrompt: input.prompt,
     // Checkpoints (M3 §12): enabled for every CLI run by default
     // so users get `--undo` for free.
@@ -1930,6 +1972,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     sandboxConfigWarnings: sandboxLoaded.warnings,
     verifyConfigWarnings: verifyLoaded.warnings,
     mcpConfigWarnings: mcpInit.warnings,
+    meshConfigWarnings: meshLoaded.warnings,
     permissionState: permResult.state,
     ...(permResult.refusingReason !== undefined
       ? { permissionRefusingReason: permResult.refusingReason }

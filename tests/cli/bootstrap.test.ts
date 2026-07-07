@@ -136,6 +136,8 @@ describe('bootstrap', () => {
         'memory_read',
         'memory_search',
         'memory_write',
+        'mesh_peers',
+        'mesh_send',
         'read_file',
         'reminder',
         'reminder_cancel',
@@ -160,6 +162,29 @@ describe('bootstrap', () => {
         'write_file',
       ].sort(),
     );
+    db.close();
+  });
+
+  test('wires a mesh manager (constructed, not serving until /relay)', async () => {
+    const { config, db } = await bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      userMcpPath: null,
+      // Isolate the mesh runtime dir from the real $XDG_RUNTIME_DIR, and take
+      // [mesh] defaults (no config file).
+      meshSocketDir: join(workdir, 'mesh-runtime'),
+      meshConfigPath: null,
+    });
+    // Constructed and reachable, but the server socket does not bind until
+    // /relay, and there are no peers in the isolated runtime dir (MESH.md §6.1).
+    expect(config.meshManager).toBeDefined();
+    expect(config.meshManager?.isServing()).toBe(false);
+    expect(await config.meshManager?.listPeers()).toEqual([]);
+    expect((config.meshManager?.alias ?? '').length).toBeGreaterThan(0);
     db.close();
   });
 

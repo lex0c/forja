@@ -42,6 +42,24 @@ describe('renderFooter', () => {
     expect(out).not.toContain('profile:');
   });
 
+  test('surfaces a `relay on` chip while serving (live-cluster signal)', () => {
+    const out = renderFooter(startedSession({ relayMode: true, relayAlias: 'billing' }), caps);
+    expect(out).not.toBeNull();
+    expect(out).toContain('relay on');
+  });
+
+  test('no relay chip when relay mode is off', () => {
+    const out = renderFooter(startedSession({ relayMode: false }), caps);
+    expect(out).not.toBeNull();
+    expect(out).not.toContain('relay on');
+  });
+
+  test('relay-on is painted success (green) like the other live chips', () => {
+    const colored: Capabilities = { ...caps, color: 'basic' };
+    const out = renderFooter(startedSession({ relayMode: true, relayAlias: 'billing' }), colored);
+    expect(out).toContain(`${CSI}32mrelay on${CSI}0m`);
+  });
+
   test('bash mode replaces the footer with the shell-mode indicator', () => {
     const s = startedSession();
     const out = renderFooter({ ...s, input: { value: '!ls', cursor: 3 } }, caps);
@@ -443,6 +461,35 @@ describe('renderFooter', () => {
       s.reminderCount = 3;
       const out = renderFooter(s, colored) ?? '';
       expect(out).toContain(`${CSI}32m3 reminders${CSI}0m`);
+    });
+  });
+
+  describe('awaiting-reply chip (`N awaiting reply`)', () => {
+    test('surfaces an `N awaiting reply` chip from the owed count', () => {
+      const s = startedSession();
+      s.awaitingReplyCount = 2;
+      const out = renderFooter(s, caps) ?? '';
+      expect(out).toContain('2 awaiting reply');
+    });
+
+    test('zero owed drops the chip entirely', () => {
+      const out = renderFooter(startedSession(), caps) ?? '';
+      expect(out).not.toContain('awaiting reply');
+    });
+
+    test('painted warn (yellow), not the live-cluster green — an action owed', () => {
+      const colored: Capabilities = { ...caps, color: 'basic' };
+      const s = startedSession();
+      s.awaitingReplyCount = 1;
+      const out = renderFooter(s, colored) ?? '';
+      expect(out).toContain(`${CSI}33m1 awaiting reply${CSI}0m`);
+    });
+
+    test('shows even with relay off — you can still owe replies after /relay off', () => {
+      const s = startedSession({ relayMode: false });
+      s.awaitingReplyCount = 1;
+      const out = renderFooter(s, caps) ?? '';
+      expect(out).toContain('1 awaiting reply');
     });
   });
 

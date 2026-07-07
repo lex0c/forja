@@ -98,6 +98,10 @@ export interface PermissionAskArgs {
   // so the operator distinguishes a parent confirm from a child
   // confirm. Undefined for the parent's own confirms.
   subagent?: { sessionId: string; name: string };
+  // Peer attribution (mesh). Set by the REPL when the confirm belongs to a
+  // peer-driven turn; the reducer labels the modal so a peer's effect isn't
+  // mistaken for the operator's own. Undefined for operator/self turns.
+  peer?: { alias: string };
 }
 
 // Trust flavor — first-run "is this directory safe to operate in?"
@@ -110,6 +114,13 @@ export interface TrustAskArgs {
 }
 
 export type TrustAnswer = 'yes' | 'no' | 'cancel';
+
+// Relay-start flavor — `/relay` confirm before opening the mesh socket
+// (MESH.md §6.1). yes → start serving, no/cancel → stay off.
+export interface RelayStartAskArgs {
+  alias: string;
+}
+export type RelayStartAnswer = 'yes' | 'no' | 'cancel';
 
 // Shared-corpus trust re-confirmation flavor (MEMORY.md §6.5.2
 // `trust_revoked` detector). Distinct from `TrustAskArgs` even though
@@ -190,6 +201,13 @@ export interface MemoryActionAskArgs {
 const TRUST_OPTIONS: readonly ConfirmOption[] = [
   { key: '1', label: 'Yes, I trust this folder', value: 'yes' },
   { key: '2', label: 'No, exit', value: 'no' },
+];
+
+// Relay-start flavor's option list. Kept in sync with the reducer's
+// `relay-start:ask` ConfirmState construction in state.ts.
+const RELAY_START_OPTIONS: readonly ConfirmOption[] = [
+  { key: '1', label: 'Yes, start serving', value: 'yes' },
+  { key: '2', label: 'No, cancel', value: 'no' },
 ];
 
 // Shared-corpus re-confirm flavor. Verbs differ from `TRUST_OPTIONS`
@@ -337,6 +355,9 @@ export interface ModalManager {
   // §9.1 calls for a 5-minute timeout that defaults to read-only —
   // we forward that via `opts.timeoutMs` so the producer decides.
   askTrust: (args: TrustAskArgs, opts?: ConfirmAskOptions) => Promise<TrustAnswer>;
+  // Relay-start flavor (MESH.md §6.1). Producer: the /relay command. yes →
+  // startServing, no/cancel → stay off.
+  askRelayStart: (args: RelayStartAskArgs, opts?: ConfirmAskOptions) => Promise<RelayStartAnswer>;
   // Shared-corpus trust re-confirmation flavor. Producer: REPL boot,
   // after bootstrap, when `shared_corpus_trust` carries a row for the
   // current scope-root AND its `last_confirmed_hash` differs from the
@@ -787,6 +808,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           ...(args.layer !== undefined ? { layer: args.layer } : {}),
           ...(args.reason !== undefined ? { reason: args.reason } : {}),
           ...(args.subagent !== undefined ? { subagent: args.subagent } : {}),
+          ...(args.peer !== undefined ? { peer: args.peer } : {}),
         }),
         buildPermissionOptions(),
         opts?.timeoutMs,
@@ -810,6 +832,24 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         TRUST_OPTIONS,
         opts?.timeoutMs,
         opts?.signal,
+      ),
+    askRelayStart: (args, opts) =>
+      enqueueConfirm<RelayStartAnswer>(
+        (promptId) => ({
+          type: 'relay-start:ask',
+          ts: now(),
+          promptId,
+          alias: args.alias,
+        }),
+        RELAY_START_OPTIONS,
+        opts?.timeoutMs,
+        opts?.signal,
+        // `/relay on` is an EXPLICIT operator action (they typed the command), so Enter
+        // defaults to "Yes, start serving" (index 0) — like the permission flavor. The
+        // conservative last-option default (D5/D65) is for UNSOLICITED prompts (trust an
+        // unknown folder); here it made a natural Enter right after the command cancel
+        // the very thing the operator just asked for ("relay: not started").
+        0,
       ),
     askSharedTrust: (args, opts) =>
       enqueueConfirm<SharedTrustAnswer>(

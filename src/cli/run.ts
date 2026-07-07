@@ -786,6 +786,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       sandboxConfigWarnings,
       verifyConfigWarnings,
       mcpConfigWarnings,
+      meshConfigWarnings,
       permissionState,
       permissionRefusingReason,
       permissionChain,
@@ -918,6 +919,9 @@ export const run = async (options: RunOptions): Promise<number> => {
       for (const w of mcpConfigWarnings) {
         errSink(`forja: mcp: ${flattenControlToLine(w)}\n`);
       }
+      for (const w of meshConfigWarnings) {
+        errSink(`forja: mesh: ${flattenControlToLine(w)}\n`);
+      }
     }
 
     // Resume-mode (headless): full/summary hydrate the WHOLE log (and summary
@@ -1025,6 +1029,18 @@ export const run = async (options: RunOptions): Promise<number> => {
           await cfg.mcpManager.cleanup();
         } catch {
           // Swallow — teardown must not skip closeDb on a stubborn server.
+        }
+      }
+      // Mesh (MESH.md §6.5): a one-shot `mesh_send` opens a client Unix socket that
+      // stays in clientTransports until the peer answers — an active handle that
+      // keeps the event loop alive and hangs the CLI after its final response (and
+      // leaks the .sock/descriptor if this run was also serving). The REPL shuts the
+      // manager down on exit; run.ts must too. shutdown() bye+closes it all.
+      if (cfg.meshManager !== undefined) {
+        try {
+          await cfg.meshManager.shutdown();
+        } catch {
+          // Swallow — teardown must not skip closeDb.
         }
       }
       closeDb(db);

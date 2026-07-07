@@ -123,6 +123,9 @@ export const TRUST_GATE_FLAVORS: ReadonlySet<ConfirmState['flavor']> = new Set([
   'trust',
   'shared-trust',
   'mcp-trust',
+  // The /relay confirm gates the first inbound channel Forja opens (MESH.md
+  // §6.1) — paint it warn ("stop and read"), not routine accent.
+  'relay-start',
 ]);
 
 export const renderModal = (modal: ConfirmState, caps: Capabilities): string[] => {

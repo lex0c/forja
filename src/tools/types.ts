@@ -164,6 +164,22 @@ export interface ToolMetadata {
   summarize?: (result: unknown, args: Record<string, unknown>) => SummarizedOutput;
 }
 
+// Does this tool's metadata declare a side effect a narrowed subagent envelope can NEVER
+// cover? The envelope gate (engine §10.3, branch b) consults it for tools whose resolver
+// emits ZERO capabilities: with nothing in the envelope to cover, an opaque side effect
+// must be refused. Covers fs writes, process exec, bg / reminder lifecycle, AND network
+// egress / cwd escape — mesh_send / fetch_url send data OUTSIDE the sandbox, so `writes`
+// is false but the egress IS the side effect. ONE source so the two oracle wiring points
+// (cli/bootstrap.ts, cli/subagent-child.ts) can't drift apart — they did: network /
+// escapesCwd was missed, letting mesh_send pass under `effectiveCapabilities: []`.
+export const isEnvelopeSideEffect = (m: ToolMetadata): boolean =>
+  m.writes === true ||
+  m.exec === true ||
+  m.requiresBgManager === true ||
+  m.requiresReminderScheduler === true ||
+  m.network === true ||
+  m.escapesCwd === true;
+
 // Result of a `ToolMetadata.summarize` call. Carries the reduced
 // result object (same shape as the raw result), a flag indicating
 // whether any reduction actually happened, and the diagnostic
@@ -447,6 +463,10 @@ export interface ToolContext {
   // unset and the tool returns `clarify.modal_unavailable`. Shape is
   // the shared ClarifyBridge{Request,Response}.
   clarify?: (req: ClarifyBridgeRequest) => Promise<ClarifyBridgeResponse>;
+  // Mesh subsystem handle (MESH.md §9) — the mesh_peers / mesh_send tools reach
+  // the manager through here. REPL-wired; headless/subagent leave it unset and
+  // the tools surface `mesh.unavailable`.
+  meshManager?: import('../mesh/manager.ts').MeshManager;
   // Trust state of `cwd` resolved at session start (AGENTIC_CLI.md
   // §9.1). Required so any future tool that needs trust info gets
   // an explicit value rather than an undefined fallback that could
@@ -718,6 +738,20 @@ export const ERROR_CODES = {
   // Todo CRUD: a todo_update / todo_get referenced an id not in the
   // session's list — a stale reference or a typo in the model's call.
   todoNotFound: 'todo.not_found',
+  // Mesh tools (mesh_peers / mesh_send).
+  meshUnavailable: 'mesh.unavailable',
+  meshNoSuchPeer: 'mesh.no_such_peer',
+  // The peer was reachable in discovery but the send failed (connect refused, or
+  // the socket closed mid-send) — distinct from no_such_peer so the model can retry
+  // rather than re-run discovery for a peer that isn't there (§6.5).
+  meshPeerLost: 'mesh.peer_lost',
+  // The peer is serving but momentarily at its inbound-connection ceiling
+  // (admission control) — transient; the model waits briefly and retries the same
+  // send, it does NOT re-run discovery (the peer is alive, unlike peer_lost).
+  meshAtCapacity: 'mesh.at_capacity',
+  // mesh_send message is over the peer byte cap — distinct from no_such_peer so
+  // the model shortens the request instead of re-running discovery.
+  meshMessageTooLarge: 'mesh.message_too_large',
   // tool_search ran without the harness wiring (ctx.searchTools) — a subagent
   // or headless run where the deferred-tool surface (AGENTIC_CLI §7.6) doesn't
   // apply. The base surface is already the full whitelist there; nothing to

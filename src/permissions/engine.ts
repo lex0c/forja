@@ -1,5 +1,6 @@
 import { readlinkSync, realpathSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { sanitizeOneLineForDisplay } from '../sanitize/ansi.ts';
 import { redactSecrets } from '../sanitize/secrets.ts';
 import type { TelemetryEvent } from '../telemetry/index.ts';
 import type { AuditEmitInput, AuditSink, ReasonChainEntry } from './audit.ts';
@@ -2040,17 +2041,17 @@ export const createPermissionEngine = (
     //       and refuse if any of them is uncovered.
     //
     //   (b) Resolver emitted ZERO caps but the tool declares a side
-    //       effect (`metadata.writes` or `metadata.exec`). Spec
-    //       §10.1 mandates pure-LLM subagent has no side-effect
-    //       tools; §10.3 says escape is impossible. `bash_kill` /
-    //       `bash_output` (category 'misc', empty caps from the
-    //       resolver because they carry no `args.command` to
-    //       attribute from) would otherwise pass under
-    //       `effectiveCapabilities: []`. The `isToolSideEffect`
-    //       oracle is bootstrap-wired from the tool registry's
-    //       `metadata.writes || metadata.exec`; when omitted (test
-    //       harnesses without a registry), branch (b) is skipped
-    //       so legacy callers see the prior behavior.
+    //       effect the envelope can't cover. Spec §10.1 mandates a
+    //       pure-LLM subagent has no side-effect tools; §10.3 says
+    //       escape is impossible. `bash_kill` / `bash_output` (empty
+    //       caps — no `args.command` to attribute) and `mesh_send`
+    //       (network egress, `writes:false`) would otherwise pass
+    //       under `effectiveCapabilities: []`. The `isToolSideEffect`
+    //       oracle is bootstrap-wired from `isEnvelopeSideEffect`
+    //       (tool metadata: writes / exec / bg-reminder lifecycle /
+    //       network egress / cwd escape); when omitted (test harnesses
+    //       without a registry), branch (b) is skipped so legacy
+    //       callers see the prior behavior.
     //
     // Misc-category tools without `writes`/`exec` (purely
     // informational ToolContext accessors) still trivially pass —
@@ -2089,7 +2090,7 @@ export const createPermissionEngine = (
         // definition here).
         const decision: Decision = {
           kind: 'deny',
-          reason: `subagent envelope blocks side-effect tool '${toolName}': resolver emitted no capability but the tool declares writes/exec (spec §10.1, §10.3)`,
+          reason: `subagent envelope blocks side-effect tool '${toolName}': resolver emitted no capability but the tool declares a side effect (fs write / exec / bg-reminder lifecycle / network egress) — spec §10.1, §10.3`,
           source: { layer: 'default', section: 'subagent-effective' },
         };
         const e = emitAudit(toolName, args, decision, [], 0, {}, null);
@@ -2578,6 +2579,34 @@ export const createPermissionEngine = (
           sessionAllow.get('mcp'),
         );
         break;
+      case 'mesh.egress': {
+        // mesh_send delivers a prompt to a peer over a same-user LOCAL Unix socket.
+        // No policy section — a plain confirm that RESPECTS POSTURE (MESH.md §5.3):
+        // autonomous auto-approves, supervised confirms (it is NOT categoryIsEgress
+        // — a local same-user boundary, not network egress). In supervised the
+        // operator must see WHAT is leaving and to WHOM (the message is the outbound
+        // payload), so surface the peer + a bounded, control-stripped excerpt — the
+        // modal has no other field for it.
+        const meshArgs = args as { peer?: unknown; message?: unknown };
+        const meshPeer =
+          typeof meshArgs.peer === 'string' ? sanitizeOneLineForDisplay(meshArgs.peer, 40) : '?';
+        const meshMsg = typeof meshArgs.message === 'string' ? meshArgs.message : '';
+        const meshExcerpt = sanitizeOneLineForDisplay(meshMsg, 160);
+        // A message can be up to maxMessageBytes (32 KiB default). The excerpt caps
+        // the visible text at 160 chars; surface HOW MUCH is beyond it so the operator
+        // sees the SCALE of what leaves — a bare '…' would hide a kilobyte tail that
+        // could carry a path or secret past the review (§7, the two-audiences review).
+        // sanitizeOneLineForDisplay already appends its own '…' on truncation.
+        const meshHidden = meshMsg.length > 160 ? ` (+${meshMsg.length - 160} more chars)` : '';
+        decision = {
+          kind: 'confirm',
+          confirmCause: 'policy',
+          reason: 'mesh send: peer is a separate trust domain',
+          prompt: `Send to mesh peer '${meshPeer}': ${meshExcerpt}${meshHidden}`,
+          source: { layer: 'default' },
+        };
+        break;
+      }
     }
     // Degraded upgrade applied AFTER the normal pipeline so the
     // rule that would have fired keeps its attribution in `source`

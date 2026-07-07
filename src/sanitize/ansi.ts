@@ -177,6 +177,23 @@ export const stripControlKeepLines = (s: string): string => {
   return out;
 };
 
+// Collapse runs of blank (whitespace-only) lines down to a single empty line.
+// `stripControlKeepLines` preserves \n for a multi-line body, but that lets
+// untrusted text flood the TTY with blank lines — a peer sending thousands of
+// '\n' renders as thousands of blank (indented) rows even under a char cap.
+// Content lines are kept at full fidelity; only the empty runs shrink.
+export const collapseBlankLines = (s: string): string => {
+  const out: string[] = [];
+  let prevBlank = false;
+  for (const line of s.split('\n')) {
+    const blank = line.trim().length === 0;
+    if (blank && prevBlank) continue;
+    out.push(line);
+    prevBlank = blank;
+  }
+  return out.join('\n');
+};
+
 // Recursively strip ANSI from every string leaf in a value. Preserves
 // shape (plain objects, arrays, numbers, booleans, null) so a tool
 // returning `{ stdout: "..", stderr: ".." }` keeps that schema for

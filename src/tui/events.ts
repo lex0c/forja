@@ -326,6 +326,12 @@ export type PermissionAskEvent = BaseEvent & {
   // operator distinguishes parent vs child requests. Undefined
   // for the parent's own confirms.
   subagent?: { sessionId: string; name: string };
+  // Peer attribution (mesh, MESH.md §6). Set by the REPL when the confirm fires
+  // DURING a peer-driven turn: the ask exists because a PEER's request led here,
+  // not the operator's own work. The reducer labels the modal so the operator
+  // never approves a peer's effect mistaking it for their own. Undefined for
+  // operator/self turns.
+  peer?: { alias: string };
 };
 // Modal resolution event. Renamed from `permission:answer` because
 // the same event flows for every modal flavor (trust answers `yes`/
@@ -390,6 +396,15 @@ export type TrustAskEvent = BaseEvent & {
   promptId: string;
   path: string;
   agentsMd: boolean;
+};
+
+// Relay-start flavor — `/relay` confirm before opening the mesh listen socket
+// (the first inbound channel Forja opens, so it gets an explicit confirm —
+// MESH.md §6.1). Answer maps: yes → startServing, no/cancel → stay off.
+export type RelayStartAskEvent = BaseEvent & {
+  type: 'relay-start:ask';
+  promptId: string;
+  alias: string;
 };
 
 // Shared-corpus trust re-confirmation (MEMORY.md §6.5.2 `trust_revoked`
@@ -685,6 +700,12 @@ export type BgEndEvent = BaseEvent & {
 // it directly, no per-id tracking needed for the footer chip.
 export type RemindersUpdateEvent = BaseEvent & { type: 'reminders:update'; count: number };
 
+// Count of peers owed a reply changed (MESH.md §6.4): a peer message arrived, or a
+// mesh_send back landed. Drives the footer's passive `N awaiting reply` chip so the
+// operator sees stranded peer mail without the model being woken (the one-shot reply
+// nudge is the active path). Emitted by the REPL; the count is the source of truth.
+export type MeshAwaitingUpdateEvent = BaseEvent & { type: 'mesh:awaiting'; count: number };
+
 // Budget / checkpoint signals consumed by the status line.
 export type StepBudgetEvent = BaseEvent & {
   type: 'step:budget';
@@ -916,6 +937,15 @@ export type OperationModeChangeEvent = BaseEvent & {
   posture: ApprovalPosture;
 };
 
+// Operator toggled relay mode via `/relay`, shown as a footer badge. Emitted by
+// the slash command so the badge repaints at once. meshManager.isServing() is
+// the source of truth; this mirrors it into live state.
+export type RelayChangeEvent = BaseEvent & {
+  type: 'relay:change';
+  active: boolean;
+  alias: string | null;
+};
+
 // Operator changed the effort level via `/effort`, shown in the footer
 // right cluster. Emitted by the slash command so the chip repaints
 // immediately (the level takes effect next turn, but the operator's
@@ -929,6 +959,7 @@ export type EffortChangeEvent = BaseEvent & {
 export type UIEvent =
   | SessionStartEvent
   | OperationModeChangeEvent
+  | RelayChangeEvent
   | EffortChangeEvent
   | SessionBannerEvent
   | SessionEndEvent
@@ -957,6 +988,7 @@ export type UIEvent =
   | ModalQueueDepthEvent
   | ClarifyAskEvent
   | TrustAskEvent
+  | RelayStartAskEvent
   | SharedTrustAskEvent
   | McpTrustAskEvent
   | MemoryWriteAskEvent
@@ -973,6 +1005,7 @@ export type UIEvent =
   | BgUpdateEvent
   | BgEndEvent
   | RemindersUpdateEvent
+  | MeshAwaitingUpdateEvent
   | StepBudgetEvent
   | StatsRefreshEvent
   | ProviderWaitingStartEvent

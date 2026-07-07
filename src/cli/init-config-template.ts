@@ -72,5 +72,8 @@ proactive_inject = ${m.proactiveInject}
 
 [recap]
 enabled = true
+
+[mesh]
+max_message_bytes = 32768
 `;
 };

@@ -342,6 +342,33 @@ describe('askPermission (2-option modal per UI.md §4.10.13)', () => {
   });
 });
 
+describe('askRelayStart (relay-start:ask producer, MESH.md §6.1)', () => {
+  test('default selectedIndex = Yes (index 0); Enter resolves "yes" — /relay on is an explicit action', async () => {
+    // `/relay on` is a SOLICITED operator action, so the confirm defaults to "Yes,
+    // start serving" (like the permission flavor). A natural Enter right after the
+    // command must START relay, not cancel it ("relay: not started"). The conservative
+    // last-option default is for UNSOLICITED prompts (trust) — pinned elsewhere.
+    const s = make();
+    const promise = s.manager.askRelayStart({ alias: 'billing' });
+    s.fs.dispatch(key('enter'));
+    await expect(promise).resolves.toBe('yes');
+  });
+
+  test('hotkey "2" resolves "no" (explicit decline still works)', async () => {
+    const s = make();
+    const promise = s.manager.askRelayStart({ alias: 'billing' });
+    s.fs.dispatch(charKey('2'));
+    await expect(promise).resolves.toBe('no');
+  });
+
+  test('Esc resolves "cancel"', async () => {
+    const s = make();
+    const promise = s.manager.askRelayStart({ alias: 'billing' });
+    s.fs.dispatch(key('escape'));
+    await expect(promise).resolves.toBe('cancel');
+  });
+});
+
 describe('open-time modal:select (manager is the single source for the cursor)', () => {
   // The manager owns the resolution index (active.selectedIndex — what
   // Enter resolves). Emitting modal:select on open forces the reducer's

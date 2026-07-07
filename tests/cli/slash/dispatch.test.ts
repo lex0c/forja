@@ -151,7 +151,7 @@ describe('dispatch', () => {
 });
 
 describe('createBuiltinRegistry', () => {
-  test('contains all 19 builtins (no /pin; no playbook-derived commands)', () => {
+  test('contains all 20 builtins (no /pin; no playbook-derived commands)', () => {
     const r = createBuiltinRegistry();
     const names = r.list().map((c) => c.name);
     expect(names).toEqual([
@@ -171,6 +171,7 @@ describe('createBuiltinRegistry', () => {
       'history',
       'memory',
       'mcp',
+      'relay',
       'hooks',
       'agent',
       'skill',
@@ -184,8 +185,8 @@ describe('createBuiltinRegistry', () => {
     if (help === undefined) return;
     const result = await help.exec([], makeCtx().ctx);
     if (result.kind !== 'ok') return;
-    // 19 commands → header + 19 rows + blank + emergency-exit footer = 22.
-    expect(result.notes?.length).toBe(22);
+    // 20 commands → header + 20 rows + blank + emergency-exit footer = 23.
+    expect(result.notes?.length).toBe(23);
   });
 
   test('arg-hints match the args the command actually accepts', () => {

@@ -142,6 +142,12 @@ export interface StatusState {
   // `mode:change`. The permission engine is the source of truth — this
   // is the rendered mirror.
   operationMode: ApprovalPosture;
+  // Whether relay mode is on (serving mesh peers). Mirrors
+  // meshManager.isServing(), flipped by `relay:change`; drives the footer badge.
+  relayMode: boolean;
+  // Alias shown in the relay badge when serving (null when off). Mirrors the
+  // manager's alias via `relay:change`.
+  relayAlias: string | null;
   // Effort level shown in the footer's right cluster. Seeded by
   // `session:banner.effort` (config/DEFAULT_EFFORT at boot), updated by
   // `effort:change` when the operator runs `/effort`. null = not yet
@@ -264,7 +270,8 @@ export interface ConfirmState {
     | 'memory-action'
     | 'history-clear'
     | 'resume-mode'
-    | 'clarify';
+    | 'clarify'
+    | 'relay-start';
   // Title block: bold first line + dim subject. `subject` is
   // optional — null when the modal has no single target.
   title: string;
@@ -518,6 +525,11 @@ export interface LiveState {
   // `bgProcesses` it survives the turn boundary (reminders are
   // session-scoped); a fresh PROCESS starts from 0.
   reminderCount: number;
+  // Peers owed a reply (MESH.md §6.4): a peer message drove a turn that ended with
+  // no mesh_send back. Passive footer count so the operator sees stranded peer mail
+  // without the model being re-woken (the one-shot reply nudge is the active path).
+  // Pushed by the REPL via `mesh:awaiting`; session-scoped, survives turn boundaries.
+  awaitingReplyCount: number;
   // Operator hit Esc once during a running turn (spec UI.md §4.10.6
   // "Soft-aborted (ainda processando)"). The footer swaps its
   // interrupt cue from "esc to interrupt" to "esc again to force"
@@ -610,6 +622,8 @@ export const createInitialState = (): LiveState => ({
     sessionTotalCostUsd: 0,
     maxCostUsd: null,
     operationMode: 'supervised',
+    relayMode: false,
+    relayAlias: null,
     effort: null,
     memoryCount: 0,
     contextWindow: 0,
@@ -634,6 +648,7 @@ export const createInitialState = (): LiveState => ({
   bgProcesses: new Map(),
   subagents: new Map(),
   reminderCount: 0,
+  awaitingReplyCount: 0,
   parallelStatus: null,
   softInterrupted: false,
   exitArmed: null,
@@ -988,6 +1003,16 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // whole signal (UI.md §4.10.6).
       return {
         state: { ...state, status: { ...state.status, operationMode: event.posture } },
+        permanent: [],
+      };
+
+    case 'relay:change':
+      // Mirror relay on/off (+ alias) into status so the footer badge repaints.
+      return {
+        state: {
+          ...state,
+          status: { ...state.status, relayMode: event.active, relayAlias: event.alias },
+        },
         permanent: [],
       };
     case 'effort:change':
@@ -1791,9 +1816,11 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // `name` (from the agents/*.md frontmatter) reaches the suffix
       // — never a string the child generated.
       const titleStr =
-        event.subagent !== undefined
-          ? `Permission required (subagent: ${event.subagent.name})`
-          : 'Permission required';
+        event.peer !== undefined
+          ? `Permission required (peer: ${event.peer.alias})`
+          : event.subagent !== undefined
+            ? `Permission required (subagent: ${event.subagent.name})`
+            : 'Permission required';
 
       const previewLines: PreviewLine[] = [];
       // Action block: a blank line, then the command verbatim (no
@@ -1807,6 +1834,19 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         // it is ("fetch https://…"), not an opaque address. The verb is
         // the one emphasized token; the URL stays dim like other actions.
         previewLines.push({ verb: 'fetch', text: event.command });
+      } else if (
+        event.toolName === 'mesh_send' &&
+        event.reason !== undefined &&
+        event.reason.length > 0
+      ) {
+        // For a mesh send the vocab `command` is only the peer/target; the PAYLOAD
+        // that crosses the trust boundary lives in `event.reason` — the engine
+        // (mesh.egress) builds a bounded, one-line, control-stripped "to WHOM +
+        // WHAT leaves" excerpt there precisely because the modal has no dedicated
+        // payload field. Render THAT as the action so the operator reviews what is
+        // leaving, not just to whom (the two-audiences review, MESH.md §7). Without
+        // it the send is blind.
+        previewLines.push(`    ${event.reason}`);
       } else {
         previewLines.push(`    ${event.command}`);
       }
@@ -1851,15 +1891,20 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             // single plain-language framing line for the ask.
             // (Reinstated after the redesign had dropped it — the
             // explicit framing reads better above the action block.)
-            subject: 'The agent is requesting permission for the action below.',
+            subject:
+              event.peer !== undefined
+                ? `Requested by mesh peer '${event.peer.alias}' — approve the action below only if you would run it yourself.`
+                : 'The agent is requesting permission for the action below.',
             // Secondary tone lifts the framing line out of the dim
             // baseline (the action + cwd rows below stay dim).
             subjectTone: 'secondary',
             preview: previewLines,
             // Question sits directly above the option list as the
-            // explicit decision prompt; the numbered Yes/No
-            // options answer it. The engine's `event.reason` (if any)
-            // still rides the source-attribution preview line.
+            // explicit decision prompt; the numbered Yes/No options
+            // answer it. `event.reason` (the engine's payload framing)
+            // is rendered as the action line for mesh tools above; for
+            // other tools the action (`event.command`) already carries
+            // the intent, so reason would only duplicate it.
             question: 'Approve this action?',
             options,
             // Per-flavor cursor default. Sourced from the same
@@ -2004,6 +2049,49 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             // chooses "No, exit" — the safer outcome here.
             options,
             selectedIndex: options.length - 1,
+            hints: ['Enter to confirm', 'Esc to cancel'],
+            queueDepth: 0,
+          },
+        },
+        permanent: [],
+      };
+    }
+
+    case 'relay-start:ask': {
+      const options: ConfirmOption[] = [
+        { key: '1', label: 'Yes, start serving', value: 'yes' },
+        { key: '2', label: 'No, cancel', value: 'no' },
+      ];
+      return {
+        state: {
+          ...state,
+          modal: {
+            promptId: event.promptId,
+            flavor: 'relay-start',
+            title: 'Start relay mode?',
+            subject: null,
+            preview: [
+              `This Forja will serve mesh peers as '${event.alias}'.`,
+              '',
+              'It opens a local Unix socket other Forja instances you run (same',
+              'user) can send textual messages to. Each arrives as an untrusted',
+              'system turn under YOUR approval — a peer never edits or runs',
+              'anything here directly (MESH.md §0).',
+              '',
+              'The session is NOT dedicated: you keep working normally; peer',
+              'messages interleave as turns in THIS session — you see each in the',
+              'scrollback, approve what it does, and can help shape the reply.',
+            ],
+            question: null,
+            // Enter defaults to "Yes, start serving" (index 0): `/relay on` is an
+            // EXPLICIT operator action, so the default confirms it — the conservative
+            // last-option default (D65) is for UNSOLICITED prompts. The manager owns
+            // the resolution index and re-emits it via modal:select on open, so this
+            // seed is authoritative-in-render only when it AGREES; kept in sync with
+            // askRelayStart's defaultIndex (modal-manager.ts) to avoid a cursor/Enter
+            // drift.
+            options,
+            selectedIndex: 0,
             hints: ['Enter to confirm', 'Esc to cancel'],
             queueDepth: 0,
           },
@@ -2514,6 +2602,12 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // never derives it. No permanent scrollback line: the fire itself
       // surfaces via the bg_done-style `● [reminder]` wake echo.
       return { state: { ...state, reminderCount: event.count }, permanent: [] };
+
+    case 'mesh:awaiting':
+      // Passive owed-reply count (MESH.md §6.4). The REPL's awaitingReply set is the
+      // source of truth; the reducer just mirrors it for the footer chip. No
+      // permanent line — the ● [reply pending] nudge wake carries the narration.
+      return { state: { ...state, awaitingReplyCount: event.count }, permanent: [] };
 
     case 'subagent:start': {
       // Insert a fresh row keyed by subagentId. Duplicate starts

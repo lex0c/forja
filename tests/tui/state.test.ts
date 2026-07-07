@@ -157,6 +157,39 @@ describe('session lifecycle', () => {
     expect(up.state.status.effort).toBe('max');
   });
 
+  test('relay:change flips status.relayMode + relayAlias, emits no permanent', () => {
+    const on = applyEvent(createInitialState(), {
+      type: 'relay:change',
+      ts: 5,
+      active: true,
+      alias: 'billing',
+    });
+    expect(on.state.status.relayMode).toBe(true);
+    expect(on.state.status.relayAlias).toBe('billing');
+    expect(on.permanent).toEqual([]);
+    const off = applyEvent(on.state, { type: 'relay:change', ts: 6, active: false, alias: null });
+    expect(off.state.status.relayMode).toBe(false);
+    expect(off.state.status.relayAlias).toBeNull();
+  });
+
+  test('relay-start:ask opens a relay-start modal with the alias + Yes default (explicit action)', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'relay-start:ask',
+      ts: 5,
+      promptId: 'p1',
+      alias: 'billing',
+    });
+    expect(r.state.modal?.flavor).toBe('relay-start');
+    expect(r.state.modal?.preview.some((l) => typeof l === 'string' && l.includes('billing'))).toBe(
+      true,
+    );
+    // `/relay on` is an EXPLICIT operator action, so Enter defaults to "Yes, start
+    // serving" (index 0), NOT the conservative last-option default (that is for
+    // unsolicited prompts). Kept in sync with askRelayStart's defaultIndex.
+    expect(r.state.modal?.selectedIndex).toBe(0);
+    expect(r.state.modal?.options[0]?.value).toBe('yes');
+  });
+
   test('session:banner seeds status.effort from the boot level', () => {
     const r = applyEvent(createInitialState(), {
       type: 'session:banner',
@@ -1947,6 +1980,18 @@ describe('bg lifecycle', () => {
     expect(state.reminderCount).toBe(1);
   });
 
+  test('initial state owes no replies', () => {
+    expect(createInitialState().awaitingReplyCount).toBe(0);
+  });
+
+  test('mesh:awaiting stores the absolute owed-reply count', () => {
+    const { state } = drive([
+      { type: 'mesh:awaiting', ts: 1, count: 2 },
+      { type: 'mesh:awaiting', ts: 2, count: 1 },
+    ]);
+    expect(state.awaitingReplyCount).toBe(1);
+  });
+
   test('bg:start with duplicate processId overwrites silently', () => {
     // Producer bug shouldn't crash — Map.set semantics keep the
     // count correct (still 1) and the renderer shows the latest
@@ -2293,6 +2338,59 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
         text: 'https://claude.com/product/claude-code',
       });
     }
+  });
+
+  test('a mesh_send action renders the payload excerpt (event.reason), not just the peer', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p1',
+      toolName: 'mesh_send',
+      command: 'gateway', // vocab subject is the peer alias ONLY
+      reason: "Send to mesh peer 'gateway': please bump the auth contract to v2",
+      cwd: '/p',
+    } as UIEvent);
+    expect(r.state.modal).not.toBeNull();
+    if (r.state.modal !== null) {
+      // The action must carry WHAT is leaving (the message), not just to whom —
+      // else the operator approves an egress they can't see.
+      expect(r.state.modal.preview[1]).toBe(
+        "    Send to mesh peer 'gateway': please bump the auth contract to v2",
+      );
+    }
+  });
+
+  test('a peer-driven confirm labels the modal with peer attribution', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p1',
+      toolName: 'edit_file',
+      command: 'src/routes.ts',
+      cwd: '/p',
+      peer: { alias: 'checkout' },
+    } as UIEvent);
+    expect(r.state.modal).not.toBeNull();
+    if (r.state.modal !== null) {
+      // The operator must see the effect was requested by a PEER, not by them.
+      expect(r.state.modal.title).toBe('Permission required (peer: checkout)');
+      expect(r.state.modal.subject).toContain('checkout');
+      expect(r.state.modal.subject).toContain('peer');
+    }
+  });
+
+  test('peer attribution takes precedence over subagent in the modal title', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p1',
+      toolName: 'bash',
+      command: 'ls',
+      cwd: '/p',
+      peer: { alias: 'checkout' },
+      subagent: { sessionId: 's1', name: 'explore' },
+    } as UIEvent);
+    expect(r.state.modal?.title).toBe('Permission required (peer: checkout)');
   });
 
   test('title is the fixed "Permission required" label regardless of tool', () => {
