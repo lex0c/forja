@@ -575,6 +575,40 @@ describe('mesh integration (two managers over real sockets)', () => {
     server.stop();
   });
 
+  test('send() reads a pre-handshake close (accept, no hello ack) as peer_lost, not delivery', async () => {
+    // A stale/hostile listener — or a crash during the handshake — accepts the socket and
+    // closes WITHOUT sending its hello ack, so it never read our message. send() must NOT
+    // read that bare close as "delivered": with no ack the handshake never completed, so
+    // the message never enqueued → peer_lost, and NO message_sent audit. Drive send()
+    // against a raw server that drops the connection on accept, sending nothing.
+    ensureMeshDirs(dir);
+    const server = listenMesh(socketPath(dir, 'mutesrv'), (t) => {
+      t.close(); // accept then drop — no hello ack, never reads the message
+    });
+    publishDescriptor(dir, {
+      alias: 'mutesrv',
+      repoRoot: '/repo/mutesrv',
+      branch: 'main',
+      pid: process.pid,
+      socket: socketPath(dir, 'mutesrv'),
+      status: 'idle',
+      startedAt: 1,
+    });
+    const cliEvents: MeshAuditEvent[] = [];
+    const client = createMeshManager({
+      dir,
+      config: cfg('mutecli'),
+      repoRoot: '/repo/mutecli',
+      branch: 'main',
+      pid: process.pid,
+      onAuditEvent: (e) => cliEvents.push(e),
+    });
+    await expect(client.send('mutesrv', 'hi')).rejects.toThrow(/peer_lost/);
+    expect(cliEvents.some((e) => e.kind === 'message_sent')).toBe(false); // no phantom audit
+    await client.shutdown();
+    server.stop();
+  });
+
   test('onMessageSent fires with the alias on a successful send (reply-loop-closed signal)', async () => {
     // The REPL clears its "owed a reply" state on this callback. It must fire exactly
     // once, with the target alias, only after the send actually lands (post-verdict).

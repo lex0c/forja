@@ -431,15 +431,30 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     const rejection = new Promise<{ code: string; message: string } | null>((resolve) => {
       let settled = false;
       let err: { code: string; message: string } | null = null;
+      // The receiver's hello ack — proof it is a LIVE, conforming peer that read our
+      // hello (and, absent an error frame, will read the message). Delivery is inferred
+      // from a COMPLETED handshake + a clean close; a close/timeout BEFORE the ack means
+      // a stale/hostile listener that accepted the socket then dropped, or a crash
+      // mid-handshake — it never enqueued our message.
+      let handshaken = false;
       const done = (): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        // A clean close / silence counts as delivery ONLY once the handshake completed.
+        // Before the ack (accept-then-drop, or a hung listener) the message never
+        // landed → peer_lost, not a phantom "delivered" + audit of a dropped send.
+        if (err === null && !handshaken) {
+          err = {
+            code: MESH_ERROR_CODES.peerLost,
+            message: 'the peer closed before completing the handshake',
+          };
+        }
         resolve(err);
       };
-      // A conforming receiver errors/closes within a round-trip; the deadline only
-      // fires for a non-conforming/hung peer → treat silence as accepted (the
-      // fire-and-forget fallback), never a hang.
+      // A conforming receiver acks the hello within a round-trip; the deadline only
+      // fires for a non-conforming/hung peer — no ack by then is peer_lost (above); an
+      // ack followed by a slow close is accepted (fire-and-forget fallback), never a hang.
       const timer = setTimeout(done, SEND_ACK_DEADLINE_MS);
       timer.unref?.();
       transport.onLine((line) => {
@@ -459,10 +474,13 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
             message: 'the peer stopped serving (bye) before the message was enqueued',
           };
           done();
+        } else if (res.msg.type === 'hello') {
+          // The receiver's hello ack: the handshake completed. A clean close after this
+          // (no error frame) is now a real delivery, not a pre-handshake drop.
+          handshaken = true;
         }
-        // A `hello` ack is just the handshake echo — ignore it.
       });
-      transport.onClose(done); // closed with no error frame → the peer accepted it
+      transport.onClose(done); // clean close AFTER the handshake → the peer accepted it
     });
     const helloOk = transport.write(encodeMeshMessage(makeHello(alias)));
     const msgOk = transport.write(encodeMeshMessage(msg));
