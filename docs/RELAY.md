@@ -84,6 +84,14 @@ Terminal A (ran /relay on)               Terminal B (ran /relay on)
   so a turn that ends without replying is fine (the model can answer later, or
   consolidate several messages into one reply). If the peer is gone when you send,
   `mesh_send` fails immediately with `peer_lost` — never a silent hang.
+- **Reply safety net** — a plain text answer only reaches *your* scrollback; only a
+  `mesh_send` reaches the peer. So when a peer-driven turn ends without a send back to
+  that peer, Forja fires a **one-shot `[reply pending]` reminder** turn (the model then
+  answers, or decides no reply is warranted — a thanks / goodbye needs none), and a
+  passive **`N awaiting reply`** chip shows in the footer until the debt clears. It is a
+  nudge, never an auto-send: the model still composes and sends the reply itself, so the
+  two-audiences boundary holds. A rapid second message from the same peer keeps its own
+  debt — replying to the first does not silence the reminder for the second.
 
 ## Security model
 
@@ -140,7 +148,7 @@ trust domain.
 
 | Command | Effect |
 |---|---|
-| `/relay on` | Confirm, then start serving peers. The session stays interactive — **not dedicated**; you keep working while peer messages interleave. `mesh_send` stays available (the exchange is symmetric). |
+| `/relay on` | Confirm (you typed the command, so the modal defaults to Yes — Enter starts serving; `2` / Esc cancels), then start serving peers. The session stays interactive — **not dedicated**; you keep working while peer messages interleave. `mesh_send` stays available (the exchange is symmetric). |
 | `/relay off` | Stop serving: close the socket, remove the descriptor. |
 | `/relay` | Report status: serving or not, the serving alias, and the reachable peers (alias + coarse status). `mesh_peers` is a model tool, so this is your window into who's out there. `on` / `off` are the action verbs. |
 
@@ -201,11 +209,21 @@ mesh-specific limit, the exchange is bounded by the session's own caps:
 - **A peer doesn't appear in `mesh_peers`.** It only appears after it runs
   `/relay on`. Confirm both instances run as the same OS user. A crashed instance's
   stale socket/descriptor is swept automatically on the next discovery.
-- **`mesh.peer_lost`.** A `mesh_send` failed because the peer's socket was gone —
-  it crashed, ran `/relay off`, or its descriptor was stale. The send returns the
-  failure immediately (never a silent hang), marked retryable — the model can
-  retry, then re-run `mesh_peers` if it still fails. (Distinct from
+- **`mesh.peer_lost`.** A `mesh_send` failed because the peer's socket was gone or
+  dropped before the message landed — it crashed, ran `/relay off` (an in-band `bye`),
+  its descriptor was stale, or it closed before completing the handshake. The send
+  returns the failure immediately (never a phantom "delivered"), marked retryable — the
+  model can retry, then re-run `mesh_peers` if it still fails. (Distinct from
   `mesh.no_such_peer`, which means the alias was never serving — re-discover.)
+- **`mesh.at_capacity`.** The peer is serving but momentarily at its inbound-connection
+  ceiling (admission control dropped the connection before enqueue) — transient and
+  retryable. The model waits a moment and retries the *same* send; it does not
+  re-discover, because the peer is alive (unlike `peer_lost`).
+- **`/relay on` says the alias is already served by a live peer.** Another live
+  instance holds that alias — the default alias is the repo-root basename, so two
+  sessions in the same repo (or two repos with the same basename) collide. Claiming an
+  alias is atomic: exactly one instance serves it at a time, even under two concurrent
+  `/relay on`. Set a distinct `alias` in `[mesh]` for the second.
 - **A peer never answers.** There is no deadline — the receiver's model replies
   when it decides, possibly after its operator gives it more context. It may also
   consolidate several of your messages into one reply. If you need it sooner, the
