@@ -30,6 +30,7 @@ forja welcome
 Forja needs an API key for at least one provider. Pick one:
 
 ```bash
+export OLLAMA_API_KEY=...               # Ollama Cloud
 export ANTHROPIC_API_KEY=sk-ant-...     # Anthropic (default model)
 export OPENAI_API_KEY=sk-...            # OpenAI
 export GOOGLE_API_KEY=...               # Google
