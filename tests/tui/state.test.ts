@@ -172,7 +172,7 @@ describe('session lifecycle', () => {
     expect(off.state.status.relayAlias).toBeNull();
   });
 
-  test('relay-start:ask opens a relay-start modal with the alias + conservative default', () => {
+  test('relay-start:ask opens a relay-start modal with the alias + Yes default (explicit action)', () => {
     const r = applyEvent(createInitialState(), {
       type: 'relay-start:ask',
       ts: 5,
@@ -183,8 +183,11 @@ describe('session lifecycle', () => {
     expect(r.state.modal?.preview.some((l) => typeof l === 'string' && l.includes('billing'))).toBe(
       true,
     );
-    // D65: last option ("No, cancel") is the default.
-    expect(r.state.modal?.selectedIndex).toBe((r.state.modal?.options.length ?? 0) - 1);
+    // `/relay on` is an EXPLICIT operator action, so Enter defaults to "Yes, start
+    // serving" (index 0), NOT the conservative last-option default (that is for
+    // unsolicited prompts). Kept in sync with askRelayStart's defaultIndex.
+    expect(r.state.modal?.selectedIndex).toBe(0);
+    expect(r.state.modal?.options[0]?.value).toBe('yes');
   });
 
   test('session:banner seeds status.effort from the boot level', () => {

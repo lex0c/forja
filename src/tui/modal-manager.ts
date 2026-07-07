@@ -844,6 +844,12 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         RELAY_START_OPTIONS,
         opts?.timeoutMs,
         opts?.signal,
+        // `/relay on` is an EXPLICIT operator action (they typed the command), so Enter
+        // defaults to "Yes, start serving" (index 0) — like the permission flavor. The
+        // conservative last-option default (D5/D65) is for UNSOLICITED prompts (trust an
+        // unknown folder); here it made a natural Enter right after the command cancel
+        // the very thing the operator just asked for ("relay: not started").
+        0,
       ),
     askSharedTrust: (args, opts) =>
       enqueueConfirm<SharedTrustAnswer>(

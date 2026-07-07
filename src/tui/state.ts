@@ -2083,10 +2083,15 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
               'scrollback, approve what it does, and can help shape the reply.',
             ],
             question: null,
-            // Last option is the conservative default (D65): Enter without
-            // reading errs toward "No, cancel".
+            // Enter defaults to "Yes, start serving" (index 0): `/relay on` is an
+            // EXPLICIT operator action, so the default confirms it — the conservative
+            // last-option default (D65) is for UNSOLICITED prompts. The manager owns
+            // the resolution index and re-emits it via modal:select on open, so this
+            // seed is authoritative-in-render only when it AGREES; kept in sync with
+            // askRelayStart's defaultIndex (modal-manager.ts) to avoid a cursor/Enter
+            // drift.
             options,
-            selectedIndex: options.length - 1,
+            selectedIndex: 0,
             hints: ['Enter to confirm', 'Esc to cancel'],
             queueDepth: 0,
           },
