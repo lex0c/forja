@@ -2,6 +2,7 @@
 
 import type { LiveState } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
+import { shortenCwd } from './cwd.ts';
 import { FRAME_MARGIN, FRAME_MARGIN_WIDTH } from './frame.ts';
 import { isBashMode } from './mode.ts';
 import { visualWidth } from './width.ts';
@@ -233,4 +234,31 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   // the terminal edge.
   const padding = ' '.repeat(Math.max(0, caps.cols - 2 * FRAME_MARGIN_WIDTH - leftW - rightW));
   return `${FRAME_MARGIN}${left}${padding}${right}${FRAME_MARGIN}`;
+};
+
+// Whether the footer's second row (the repo/cwd path) renders. Suppressed
+// alongside the whole footer when a modal owns the bottom slot, and in bash
+// mode where the info line collapses to the shell-mode indicator (the path
+// would be noise while composing a `!cmd`). Also suppressed pre-banner, when
+// `cwd` hasn't been seeded yet. Caps-free so both compose.ts (the writer) and
+// composeCursor (the row math) can agree on the block height without a render.
+export const hasFooterPathRow = (state: LiveState): boolean =>
+  state.modal === null &&
+  !isBashMode(state) &&
+  state.status.cwd !== null &&
+  state.status.cwd !== '';
+
+// The footer's second row: the working-directory path, shown directly below
+// the info line so the operator always knows which repo this session is rooted
+// in once the startup banner has scrolled away. Painted `secondary` (same tone
+// as the banner's cwd line) and passed through the SAME `shortenCwd` collapse
+// (`$HOME → ~`, elide the noisy middle of a deep mount) for a readable form;
+// the renderer's `truncateToWidth` still hard-clips if the terminal is
+// narrower. Returns null when `hasFooterPathRow` is false so the row collapses
+// entirely (keeps the cursor math truthful). The RAW cwd stays untouched on
+// the banner PermanentItem for audit — only this display line shrinks.
+export const renderFooterPath = (state: LiveState, caps: Capabilities): string | null => {
+  if (!hasFooterPathRow(state)) return null;
+  const cwd = state.status.cwd as string;
+  return `${FRAME_MARGIN}${dim(caps, shortenCwd(cwd, state.status.home, caps))}`;
 };

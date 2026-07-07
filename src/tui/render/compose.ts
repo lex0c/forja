@@ -31,7 +31,7 @@ import { type LiveState, flushPendingToolEndBatch } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
 import { renderAssistantChip } from './assistant-chip.ts';
 import { renderAwaitingChip } from './awaiting-chip.ts';
-import { renderFooter } from './footer.ts';
+import { hasFooterPathRow, renderFooter, renderFooterPath } from './footer.ts';
 import { padFrame } from './frame.ts';
 import { renderQueued } from './inbox.ts';
 import { renderInput } from './input.ts';
@@ -78,16 +78,22 @@ const horizontalRule = (caps: Capabilities, bash = false): string =>
 //
 // Exported so a regression test can guard against drift between the
 // constant and what composeLive actually emits below the input.
+// BASE case only: the rule below the input + the single footer info line.
+// The footer's optional second row (the cwd path — present once the banner
+// has seeded `status.cwd`) is NOT counted here; `trailingBelowInput` adds it
+// dynamically so the constant stays truthful for the pre-banner / bash-mode
+// case the guard test exercises.
 export const FOOTER_BLOCK_LINES = 2;
 
-// How many live-region rows sit BELOW the last input row, accounting
-// for the optional slash popover. Single source of truth shared by the
-// composer (writes that block) and composeCursor (subtracts it to find
-// the input row). If a future element joins the trailing stack, extend
-// here and in composeLive in lockstep.
+// How many live-region rows sit BELOW the last input row, accounting for the
+// optional slash popover AND the footer's optional cwd path row. Single source
+// of truth shared by the composer (writes that block) and composeCursor
+// (subtracts it to find the input row). If a future element joins the trailing
+// stack, extend here and in composeLive in lockstep.
 const trailingBelowInput = (state: LiveState): number => {
   const popover = state.slash !== null ? slashPopoverLineCount(state.slash) : 0;
-  return FOOTER_BLOCK_LINES + popover;
+  const pathRow = hasFooterPathRow(state) ? 1 : 0;
+  return FOOTER_BLOCK_LINES + pathRow + popover;
 };
 
 // Position the cursor wants to land inside the live region, so the
@@ -470,6 +476,12 @@ export const composeLive: ComposeLive = (
   const footer = renderFooter(state, caps);
   if (footer === null) throw new Error('composeLive: renderFooter returned null in non-modal path');
   lines.push(footer);
+  // Footer's second row: the repo/cwd path, directly below the info line
+  // (UI.md §4.10.6). Null before the banner seeds `status.cwd`, and in bash
+  // mode — `trailingBelowInput` mirrors that via `hasFooterPathRow` so the
+  // cursor row math stays exact whether or not the row is present.
+  const footerPath = renderFooterPath(state, caps);
+  if (footerPath !== null) lines.push(footerPath);
 
   return lines;
 };

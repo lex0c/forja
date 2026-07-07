@@ -116,6 +116,14 @@ export interface ActiveTool {
 export interface StatusState {
   sessionId: string | null;
   project: string | null;
+  // Working directory + operator home dir, seeded by session:banner. The
+  // footer's second row renders `shortenCwd(cwd, home)` so the operator can
+  // always see which repo this session is rooted in after the banner scrolls
+  // out of view (same source the banner's cwd line uses). `cwd` is null before
+  // the banner lands → the path row is suppressed. `home` (for the
+  // `$HOME → ~` collapse) defaults to '' → no collapse when unknown.
+  cwd: string | null;
+  home: string;
   model: string | null;
   // Active isolation profile (`--profile`/FORJA_PROFILE), or null on the
   // default namespace. Seeded by session:banner; drives the footer chip.
@@ -614,6 +622,8 @@ export const createInitialState = (): LiveState => ({
   status: {
     sessionId: null,
     project: null,
+    cwd: null,
+    home: '',
     model: null,
     profile: null,
     steps: 0,
@@ -1191,6 +1201,10 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             ...state.status,
             model: event.model,
             profile: event.profile ?? state.status.profile,
+            // Mirror cwd + home so the footer's path row can render after the
+            // banner (which carries the same fields) scrolls out of view.
+            cwd: event.cwd,
+            home: event.home ?? state.status.home,
             contextWindow: event.contextWindow,
             operationMode: event.operationMode ?? state.status.operationMode,
             effort: event.effort ?? state.status.effort,
