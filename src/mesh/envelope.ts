@@ -52,7 +52,10 @@ export const framePeerMessage = (alias: string, text: string): string => {
     'end the turn without sending, and do not fire a closing message back just to be polite.',
     'You may consolidate several messages from this peer into one reply. Your reply is read by a',
     'SEPARATE repository — make it self-contained: describe outcomes and use repo-relative',
-    'references, never absolute paths or secrets.',
+    'references, never absolute paths or secrets. Write it as direct agent-to-agent coordination,',
+    'not chat: skip greetings and sign-offs, lead with the ask or the outcome, and keep the same',
+    'terseness your operator’s response format calls for — pleasantries only burn tokens and add',
+    'no coordination value.',
   ].join(' ');
   return `${preamble}\n\n${begin}\n${text}\n${end}`;
 };

@@ -126,6 +126,7 @@ describe('mesh envelope', () => {
     expect(framed).toContain('later');
     expect(framed).toContain('needs no reply'); // a concluded exchange (thanks/goodbye) → silence
     expect(framed).toContain('self-contained');
+    expect(framed).toContain('agent-to-agent'); // direct register — no greetings/sign-offs
     expect(framed).not.toContain('BEFORE this turn ends');
     expect(framed).not.toContain('mesh_reply');
     // Per-message nonce markers (mirrors fetch_url) — same nonce on both ends.
