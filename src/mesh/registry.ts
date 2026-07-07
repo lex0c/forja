@@ -79,6 +79,7 @@ const peersDir = (dir: string): string => join(dir, 'peers');
 
 export const socketPath = (dir: string, alias: string): string => join(dir, `${alias}.sock`);
 const descriptorPath = (dir: string, alias: string): string => join(peersDir(dir), `${alias}.json`);
+const lockPath = (dir: string, alias: string): string => join(dir, `${alias}.lock`);
 
 // The FS permission IS the auth boundary (§0.7). mkdir's `mode` only applies to
 // dirs it CREATES — a pre-existing world-writable dir (e.g. an attacker
@@ -145,6 +146,57 @@ const isAlive = (pid: number): boolean => {
     return true;
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+};
+
+// The holder pid written into an alias lock, or null if the file is gone/unreadable/
+// malformed (all treated as "no valid holder" → the lock is stealable).
+const readLockPid = (path: string): number | null => {
+  try {
+    const pid = Number.parseInt(readFileSync(path, 'utf8').trim(), 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+};
+
+// Atomically CLAIM an alias before binding its socket (§2). The O_EXCL create is the
+// serializer: of N managers racing `/relay on` on one alias, exactly one creates
+// <alias>.lock and the rest get EEXIST — so two can't both bind + publish even where the
+// platform's socket bind doesn't reliably throw on an occupied path. Returns true if we
+// hold the lock, false if a LIVE peer already does (a real collision). A stale lock from
+// a crashed relay (holder pid no longer exists) is stolen: unlinked, then the exclusive
+// create is retried ONCE — a live racer that grabbed it in the gap re-trips EEXIST and we
+// refuse. Held for the serving lifetime; `releaseAliasLock` drops it on stop/rollback.
+// (pid reuse is the one residual: a dead relay's pid re-assigned to an unrelated live
+// process reads as "live holder" → a spurious refuse. Rare, and fail-safe.)
+export const acquireAliasLock = (dir: string, alias: string, pid: number): boolean => {
+  ensureMeshDirs(dir);
+  const path = lockPath(dir, alias);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      // `wx` = O_CREAT | O_EXCL | O_WRONLY — throws EEXIST if the path exists.
+      writeFileSync(path, String(pid), { flag: 'wx', mode: 0o600 });
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      const holder = readLockPid(path);
+      if (holder !== null && isAlive(holder)) return false; // live holder → collision
+      try {
+        rmSync(path, { force: true }); // stale → steal and retry the exclusive create
+      } catch {
+        // best-effort; a concurrent stealer may have removed it first
+      }
+    }
+  }
+  return false;
+};
+
+export const releaseAliasLock = (dir: string, alias: string): void => {
+  try {
+    rmSync(lockPath(dir, alias), { force: true });
+  } catch {
+    // best-effort
   }
 };
 

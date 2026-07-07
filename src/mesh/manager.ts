@@ -21,9 +21,11 @@ import {
   parseMeshLine,
 } from './protocol.ts';
 import {
+  acquireAliasLock,
   ensureMeshDirs,
   listPeers as fsListPeers,
   publishDescriptor,
+  releaseAliasLock,
   removeDescriptor,
   removeSocket,
   socketPath,
@@ -357,35 +359,50 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
   const startServing = async (): Promise<void> => {
     if (serving) return;
     const sockPath = socketPath(deps.dir, alias);
-    // Refuse EARLY if a LIVE peer already advertises our alias (e.g. a second /relay
-    // on in the same repo — the default alias is the repo basename). listPeers
-    // liveness-checks AND sweeps a STALE descriptor from a crashed run, so a leftover
-    // .json at our alias is cleared here. This catches the SEQUENTIAL collision; the
-    // CONCURRENT one — a peer that has bound but not yet published — is caught by the
-    // atomic bind in bindAlias, which refuses rather than unlinking the live socket.
-    const collision = (await fsListPeers(deps.dir, {})).find((p) => p.alias === alias);
-    if (collision !== undefined) {
+    // Serialize the claim with an atomic O_EXCL lock BEFORE any check or bind: of N
+    // managers racing `/relay on` on one alias, exactly one creates the lock and the rest
+    // refuse — so two can't both bind + publish even where the socket bind isn't a
+    // reliable cross-platform serializer (§2). A stale lock from a crashed relay is stolen
+    // inside acquire. Held for the serving lifetime; released here on any failure and by
+    // stopServing.
+    if (!acquireAliasLock(deps.dir, alias, pid)) {
       throw new Error(
-        `mesh: alias '${alias}' is already served by a live peer (pid ${collision.pid}); set a distinct alias in [mesh]`,
+        `mesh: alias '${alias}' is already served by a live peer; set a distinct alias in [mesh]`,
       );
     }
-    // Ensure the runtime dir exists before Bun.listen binds, then claim atomically.
-    ensureMeshDirs(deps.dir);
-    server = await bindAlias(sockPath);
-    serving = true;
     try {
+      // Refuse if a LIVE peer already ADVERTISES our alias (a published descriptor —
+      // e.g. an older relay whose lock predates this feature, or a live one whose lock we
+      // couldn't observe). listPeers liveness-checks AND sweeps a STALE descriptor from a
+      // crashed run, so a leftover .json is cleared here; the lock above already serialized
+      // a concurrent unpublished racer.
+      const collision = (await fsListPeers(deps.dir, {})).find((p) => p.alias === alias);
+      if (collision !== undefined) {
+        throw new Error(
+          `mesh: alias '${alias}' is already served by a live peer (pid ${collision.pid}); set a distinct alias in [mesh]`,
+        );
+      }
+      // Ensure the runtime dir exists before Bun.listen binds, then bind (bindAlias still
+      // clears a stale orphan .sock left by a crashed relay whose lock we stole).
+      ensureMeshDirs(deps.dir);
+      server = await bindAlias(sockPath);
+      serving = true;
       publishDescriptor(deps.dir, descriptor());
     } catch (err) {
-      // Roll back FULLY so a failed publish (ENOSPC / EROFS / EIO / EISDIR) leaves
-      // neither an inbound channel open NOR an orphan socket behind after the
-      // operator was told it failed. server.stop() closes the listener but leaves
-      // the .sock file listenMesh created; removeDescriptor clears it (and any
-      // partial .json) — the same cleanup stopServing does. Without it, since
-      // serving is reset to false, a later shutdown() no-ops and the orphan lingers.
-      server.stop();
-      server = null;
-      serving = false;
-      removeDescriptor(deps.dir, alias);
+      // Always drop the lock — we're not serving. Then tear down ONLY what WE created:
+      //   - server !== null → we bound before failing (a failed publish) → close the
+      //     listener and clear OUR socket + partial descriptor (else, since serving
+      //     resets to false, a later shutdown() no-ops and the orphan lingers).
+      //   - server === null → we REFUSED before binding (live collision, or bindAlias
+      //     found a live peer): the socket/descriptor at the path belong to that peer —
+      //     removeDescriptor would clobber a live peer's socket, so touch NOTHING.
+      releaseAliasLock(deps.dir, alias);
+      if (server !== null) {
+        server.stop();
+        server = null;
+        serving = false;
+        removeDescriptor(deps.dir, alias);
+      }
       throw err;
     }
   };
@@ -403,6 +420,7 @@ export const createMeshManager = (deps: MeshManagerDeps): MeshManager => {
     server?.stop();
     server = null;
     removeDescriptor(deps.dir, alias);
+    releaseAliasLock(deps.dir, alias); // drop the claim so the alias is free to re-serve
   };
 
   // ---- client side ----

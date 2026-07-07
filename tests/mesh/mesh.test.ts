@@ -22,10 +22,12 @@ import {
   parseMeshLine,
 } from '../../src/mesh/protocol.ts';
 import {
+  acquireAliasLock,
   ensureMeshDirs,
   listPeers,
   meshRuntimeDir,
   publishDescriptor,
+  releaseAliasLock,
   socketPath,
 } from '../../src/mesh/registry.ts';
 import { type MeshServer, connectMesh, listenMesh, probeSocket } from '../../src/mesh/transport.ts';
@@ -745,9 +747,10 @@ describe('mesh integration (two managers over real sockets)', () => {
   });
 
   test('two managers claiming one alias concurrently: exactly one serves, the winner is reachable', async () => {
-    // The real race — two /relay on with the same derived alias at once. The bind is
-    // the atomic claim: exactly one wins, the other refuses (never a double bind, never
-    // a clobber). The invariant holds regardless of WHICH one wins.
+    // The real race — two /relay on with the same derived alias at once. An atomic O_EXCL
+    // lock is the claim: exactly one creates <alias>.lock and wins, the other refuses
+    // (never a double bind, never a clobber) — independent of the platform's socket-bind
+    // semantics. The invariant holds regardless of WHICH one wins.
     const a = mkMgr(dir, 'concurrent');
     const b = mkMgr(dir, 'concurrent');
     const results = await Promise.allSettled([a.startServing(), b.startServing()]);
@@ -758,6 +761,39 @@ describe('mesh integration (two managers over real sockets)', () => {
     const winner = a.isServing() ? a : b;
     expect(winner.isServing()).toBe(true);
     await winner.shutdown();
+  });
+
+  test('startServing refuses when a live lock already holds the alias, even before any bind', async () => {
+    // The concurrent window the finding targets: a racer HELD the lock but has not bound
+    // its socket yet. A second startServing must refuse on the LOCK alone — not on the
+    // socket bind (which some platforms don't enforce). Simulate the racer's claim with a
+    // raw lock under a live pid; no socket / descriptor exists, so only the lock can catch
+    // it. (Without the lock, startServing would bind the free socket and double-serve.)
+    ensureMeshDirs(dir);
+    expect(acquireAliasLock(dir, 'locked', process.pid)).toBe(true);
+    const m = mkMgr(dir, 'locked');
+    await expect(m.startServing()).rejects.toThrow(/live peer/);
+    expect(m.isServing()).toBe(false);
+    releaseAliasLock(dir, 'locked');
+  });
+
+  test('acquireAliasLock serializes: a live holder blocks, release frees it', () => {
+    ensureMeshDirs(dir);
+    expect(acquireAliasLock(dir, 'lk', process.pid)).toBe(true);
+    expect(acquireAliasLock(dir, 'lk', process.pid)).toBe(false); // live holder → refused
+    releaseAliasLock(dir, 'lk');
+    expect(acquireAliasLock(dir, 'lk', process.pid)).toBe(true); // freed → re-acquirable
+    releaseAliasLock(dir, 'lk');
+  });
+
+  test('acquireAliasLock steals a stale lock (no live holder) instead of blocking forever', () => {
+    ensureMeshDirs(dir);
+    // A leftover lock with no valid holder pid (a crashed relay's / truncated file) must
+    // be stolen, or a crash would wedge the alias permanently.
+    writeFileSync(join(dir, 'stalelk.lock'), 'not-a-pid');
+    expect(acquireAliasLock(dir, 'stalelk', process.pid)).toBe(true); // stolen + reclaimed
+    expect(acquireAliasLock(dir, 'stalelk', process.pid)).toBe(false); // now WE hold it
+    releaseAliasLock(dir, 'stalelk');
   });
 
   test('caps concurrent inbound connections (admission control) — the over-cap one gets an at_capacity frame, not a bare close', async () => {
