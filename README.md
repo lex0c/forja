@@ -90,6 +90,7 @@ forja --json "what changed in the last commit?" > events.ndjson
 | **Memory** | Cross-session knowledge with three scopes (user / project_shared / project_local), explicit trust, lifecycle states (active / quarantined / invalidated), provenance tracking | `forja --memory list`, `forja --memory show <name>`, `/memory` slash |
 | **Skills** | Eager-loaded catalog of operator-authored procedures, body lazy | Skills auto-surface in system prompt; `/skill` slash |
 | **Subagents** | Worktree-isolated child runs (`task`), async handles (`task_async`), parallel dispatch with caps | `.forja/playbooks/*.md` |
+| **Mesh (relay)** | Local Forja instances (same user, different repos) exchange plain-text messages to coordinate a cross-repo change. A peer's message is untrusted *intent, never authority* — every effect stays gated by the local operator's own posture | `/relay on`, `mesh_peers` / `mesh_send`, `[mesh]` in `.forja/config.toml` |
 | **Checkpoints** | Auto-snapshot of the working tree before any write tool. `--undo` restores | `forja --undo <session>`, `forja --checkpoints list <session>` |
 | **Audit** | Append-only event log across messages, tool calls, approvals, hooks, failures, memory events, checkpoints. Optional hash chain (tamper-evident) | `audit_timeline` view, `.local/share/forja/audit.db` |
 | **Hooks** | Operator-provided shell hooks at lifecycle events (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, etc.) with `additionalContext` injection | `.forja/hooks/` |
@@ -301,6 +302,7 @@ spec diverge, the spec wins.)
 | [`HOOKS.md`](docs/HOOKS.md) | Hook system: lifecycle events, wiring shell commands, the stdin/stdout JSON contract, and the security model. |
 | [`MCP.md`](docs/MCP.md) | Model Context Protocol integration: declaring servers, trust, tool exposure, and connection lifecycle. |
 | [`MEMORY.md`](docs/MEMORY.md) | Cross-session memory: what's persisted, the lifecycle state machine, and the day-to-day slash commands. |
+| [`RELAY.md`](docs/RELAY.md) | Forja Mesh: how local instances discover each other and exchange messages, the trust model (intent, never authority), and the `/relay` + `mesh_*` surfaces. |
 | [`SKILLS.md`](docs/SKILLS.md) | Authoring and invoking reusable, vetted procedures that surface when a goal matches. |
 | [`VERIFY.md`](docs/VERIFY.md) | Claim-time verify gate: the opt-in check that a run actually ran the project's tests before declaring done. |
 
