@@ -2697,4 +2697,21 @@ describe('gitconfigMaskSource — sanitized identity bind (Linux)', () => {
     expect(gc).toBeGreaterThan(0);
     expect(argv[gc - 1]).toBe(MASK);
   });
+
+  test('binds the identity even when ~/.gitconfig is ABSENT (Nix / relocated-global)', () => {
+    // Nothing on disk (pathExists → false): the usual absent-file skip
+    // would drop every mask, but the identity bind is placed anyway so a
+    // Nix/relocated-global operator (no physical ~/.gitconfig) still gets
+    // an identity inside the sandbox.
+    const argv = buildBwrapArgv({
+      ...base,
+      pathExists: () => false,
+      gitconfigMaskSource: '/forja-sanitized-gitconfig',
+    });
+    const gc = argv.indexOf(`${HOME}/.gitconfig`);
+    expect(gc).toBeGreaterThan(0);
+    expect(argv[gc - 1]).toBe('/forja-sanitized-gitconfig');
+    // A sibling credential file with no source is still skipped when absent.
+    expect(argv).not.toContain(`${HOME}/.netrc`);
+  });
 });

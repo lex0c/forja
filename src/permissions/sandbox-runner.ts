@@ -809,16 +809,22 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   }
   for (const file of HIDE_PATHS_FILES) {
     const abs = joinPath(home, file);
-    if (!shouldMask(abs)) continue;
     // `.gitconfig` gets the sanitized identity file (if provided) as its
     // bind source instead of the empty mask — same masking of the real
     // file's dangerous knobs, but with `[user]` exposed so `git commit`
-    // has an identity. Every other file masks empty.
-    const src =
-      file === '.gitconfig' && options.gitconfigMaskSource !== undefined
-        ? options.gitconfigMaskSource
-        : maskSrc;
-    flags.push('--ro-bind', src, abs);
+    // has an identity.
+    const identitySrc = file === '.gitconfig' ? options.gitconfigMaskSource : undefined;
+    // The identity bind is placed even when the target is ABSENT: Nix /
+    // relocated-`GIT_CONFIG_GLOBAL` operators have no physical
+    // `~/.gitconfig`, so the usual absent-file skip would leave their
+    // sandboxed git with no identity. Its parent (`$HOME`) always exists,
+    // so bwrap creates the file mountpoint under `--ro-bind / /` (verified
+    // empirically) — no EROFS (that risk is for absent PARENT DIRS, which
+    // the every-other-file skip below still guards against). Delivering a
+    // global-level `~/.gitconfig` also can't override a repo's own local
+    // config; git precedence keeps repo-local winning.
+    if (identitySrc === undefined && !shouldMask(abs)) continue;
+    flags.push('--ro-bind', identitySrc ?? maskSrc, abs);
   }
   // Start the inner process in cwd.
   flags.push('--chdir', cwd);
