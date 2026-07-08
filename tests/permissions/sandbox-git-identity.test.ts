@@ -1,11 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   type GitIdentity,
+  ensureSanitizedGitconfigFile,
   gitIdentityPassthroughEnv,
+  renderSanitizedGitconfig,
   resolveGitIdentity,
+  resolveGlobalGitIdentity,
 } from '../../src/permissions/sandbox-git-identity.ts';
 
 // `gitIdentityPassthroughEnv` is pure — the shape logic (both / name-only /
@@ -52,6 +55,63 @@ describe('gitIdentityPassthroughEnv', () => {
       'GIT_COMMITTER_EMAIL',
       'GIT_COMMITTER_NAME',
     ]);
+  });
+});
+
+// The Linux delivery: a sanitized `[user]`-only gitconfig, quoted so
+// comment chars / quotes round-trip and NOTHING but identity is exposed.
+describe('renderSanitizedGitconfig', () => {
+  test('emits a quoted [user] block with name + email', () => {
+    expect(renderSanitizedGitconfig({ name: 'Ada Lovelace', email: 'ada@example.com' })).toBe(
+      '[user]\n\tname = "Ada Lovelace"\n\temail = "ada@example.com"\n',
+    );
+  });
+
+  test('name-only / email-only render just that line', () => {
+    expect(renderSanitizedGitconfig({ name: 'Ada' })).toBe('[user]\n\tname = "Ada"\n');
+    expect(renderSanitizedGitconfig({ email: 'a@b' })).toBe('[user]\n\temail = "a@b"\n');
+  });
+
+  test('empty identity → null (nothing to deliver)', () => {
+    expect(renderSanitizedGitconfig({})).toBeNull();
+    expect(renderSanitizedGitconfig({ name: '', email: '' })).toBeNull();
+  });
+
+  test('escapes backslash + quote and quotes comment chars so the value round-trips', () => {
+    // A name with `;`/`#` (config comment chars) must be quoted, and `"`/`\`
+    // escaped, or git would truncate/mis-parse it.
+    expect(renderSanitizedGitconfig({ name: 'A ; B # C' })).toBe('[user]\n\tname = "A ; B # C"\n');
+    expect(renderSanitizedGitconfig({ name: 'a"b\\c' })).toBe('[user]\n\tname = "a\\"b\\\\c"\n');
+  });
+
+  test('never emits a section other than [user]', () => {
+    const out = renderSanitizedGitconfig({ name: 'Ada', email: 'a@b' }) ?? '';
+    // No core.* / alias / credential / includeIf — only identity.
+    expect(out.includes('[core]')).toBe(false);
+    expect(out.includes('sshCommand')).toBe(false);
+    expect(out.trimStart().startsWith('[user]')).toBe(true);
+  });
+});
+
+describe('ensureSanitizedGitconfigFile', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'forja-gitcfg-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('writes the rendered config and returns its path', () => {
+    const id: GitIdentity = { name: 'Ada', email: 'ada@example.com' };
+    const p = ensureSanitizedGitconfigFile(id, dir);
+    expect(p).not.toBeNull();
+    const expected = renderSanitizedGitconfig(id) as string;
+    expect(readFileSync(p as string, 'utf8')).toBe(expected);
+  });
+
+  test('empty identity → null, no file written', () => {
+    expect(ensureSanitizedGitconfigFile({}, dir)).toBeNull();
   });
 });
 
@@ -168,8 +228,35 @@ describe('resolveGitIdentity (global-only, local-gated)', () => {
     expect(resolveGitIdentity(repo)).toEqual({});
   });
 
+  // resolveGlobalGitIdentity (the Linux file path) is UNGATED — it returns
+  // the operator's global identity even when the repo sets its own local
+  // identity, because the file sits at GLOBAL precedence so repo-local wins
+  // naturally inside git. This is the key difference from the gated env path.
+  test('resolveGlobalGitIdentity returns the global identity even when the repo has local config', () => {
+    if (!gitAvailable()) return;
+    writeGlobal(globalCfg, 'Global User', 'global@example.com');
+    git(repo, 'config', 'user.name', 'Repo Local');
+    git(repo, 'config', 'user.email', 'local@example.com');
+
+    // Ungated: global returned regardless of local (contrast: resolveGitIdentity → {}).
+    expect(resolveGlobalGitIdentity(repo)).toEqual({
+      name: 'Global User',
+      email: 'global@example.com',
+    });
+    expect(resolveGitIdentity(repo)).toEqual({});
+  });
+
+  test('resolveGlobalGitIdentity rejects control-char values too', () => {
+    if (!gitAvailable()) return;
+    writeGlobal(globalCfg, 'A\x1b]0;x\x07B', 'clean@example.com');
+    const id = resolveGlobalGitIdentity(repo);
+    expect(id.name).toBeUndefined();
+    expect(id.email).toBe('clean@example.com');
+  });
+
   test('is best-effort: a non-existent cwd never throws', () => {
     const id = resolveGitIdentity(join(dir, 'does', 'not', 'exist'));
     expect(typeof id).toBe('object');
+    expect(typeof resolveGlobalGitIdentity(join(dir, 'nope'))).toBe('object');
   });
 });

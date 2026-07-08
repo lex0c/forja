@@ -272,6 +272,16 @@ export interface BuildBwrapArgvOptions {
   // (`ensureSandboxMaskFile`); tests pin a fixed path so the argv is
   // deterministic without creating a real file on the runner.
   maskFileSource?: string;
+  // Optional bind SOURCE for the `~/.gitconfig` mask specifically. When
+  // set, the runner binds THIS file (a Forja-written SANITIZED gitconfig —
+  // only `[user] name/email`) over `~/.gitconfig` instead of the empty
+  // `maskFileSource`, so a sandboxed `git commit` sees the operator's
+  // identity at GLOBAL precedence (repo-local `.git/config` still wins).
+  // The real file's executable knobs stay hidden — only `[user]` is
+  // exposed. Undefined ⇒ `.gitconfig` masks empty like every other
+  // credential file. See `sandbox-git-identity.ts`. Linux only; macOS
+  // (no bind primitive) delivers identity via `passthroughEnv` instead.
+  gitconfigMaskSource?: string;
   // Forja-internal control-plane env that must survive the
   // `--clearenv` kernel boundary alongside the canonical
   // `SANDBOX_SAFE_ENV_VARS` allowlist. The runner emits one
@@ -294,15 +304,16 @@ export interface BuildBwrapArgvOptions {
   // forja owns — not a place to relax the host-env allowlist by
   // proxy.
   //
-  // Second sanctioned use (reviewed carve-out): the operator's git
-  // COMMIT IDENTITY — `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/
-  // `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`, forja-RESOLVED from the
-  // real (unmasked) config in the main process (`sandbox-git-identity.ts`)
-  // and threaded here so a sandboxed `git commit` has an identity despite
-  // the masked `~/.gitconfig` + `GIT_*`-dropping `--clearenv`. These four
-  // are purely declarative (no exec, no repo redirect), UNLIKE the
-  // `GIT_SSH_COMMAND`/`GIT_CONFIG_*`/`GIT_EDITOR`/… that `scrubEnv` + the
-  // safe-list keep out — which is why they, and only they, are admitted.
+  // Second sanctioned use (reviewed carve-out) — macOS ONLY: the operator's
+  // git COMMIT IDENTITY (`GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/
+  // `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`), forja-RESOLVED in the main
+  // process (`sandbox-git-identity.ts`) so a sandboxed `git commit` has an
+  // identity despite the masked `~/.gitconfig` + `GIT_*`-dropping
+  // `--clearenv`. These four are purely declarative (no exec, no repo
+  // redirect), UNLIKE the `GIT_SSH_COMMAND`/`GIT_CONFIG_*`/`GIT_EDITOR`/…
+  // that `scrubEnv` + the safe-list keep out — which is why they, and only
+  // they, are admitted. Linux uses `gitconfigMaskSource` (a config-file
+  // bind at global precedence) instead, so it does NOT put identity here.
   passthroughEnv?: Record<string, string>;
   // Operator-configurable list of $HOME-relative cache dirs exposed as
   // fresh writable tmpfs mounts inside cwd-rw / cwd-rw-net (build
@@ -798,7 +809,16 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
   }
   for (const file of HIDE_PATHS_FILES) {
     const abs = joinPath(home, file);
-    if (shouldMask(abs)) flags.push('--ro-bind', maskSrc, abs);
+    if (!shouldMask(abs)) continue;
+    // `.gitconfig` gets the sanitized identity file (if provided) as its
+    // bind source instead of the empty mask — same masking of the real
+    // file's dangerous knobs, but with `[user]` exposed so `git commit`
+    // has an identity. Every other file masks empty.
+    const src =
+      file === '.gitconfig' && options.gitconfigMaskSource !== undefined
+        ? options.gitconfigMaskSource
+        : maskSrc;
+    flags.push('--ro-bind', src, abs);
   }
   // Start the inner process in cwd.
   flags.push('--chdir', cwd);
@@ -916,6 +936,11 @@ export interface MaybeWrapSandboxArgvOptions {
   // BuildBwrapArgvOptions.writableCacheDirs. Linux-only for now — the
   // macOS SBPL runner does not consume it yet (tracked for parity).
   writableCacheDirs?: readonly string[];
+  // Sanitized-gitconfig bind source for the `~/.gitconfig` mask (Linux).
+  // See BuildBwrapArgvOptions.gitconfigMaskSource. macOS has no bind
+  // primitive, so it delivers identity via `passthroughEnv` instead and
+  // ignores this.
+  gitconfigMaskSource?: string;
   // Mid-session-loss posture (fail-closed). When `true`, a profile that
   // requires a wrap (non-host) but finds NO resolvable sandbox tool is a
   // LOSS (the tool was present at boot but vanished) and the helper THROWS
@@ -1059,6 +1084,8 @@ export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): stri
       if (options.passthroughEnv !== undefined) bwrapOpts.passthroughEnv = options.passthroughEnv;
       if (options.writableCacheDirs !== undefined)
         bwrapOpts.writableCacheDirs = options.writableCacheDirs;
+      if (options.gitconfigMaskSource !== undefined)
+        bwrapOpts.gitconfigMaskSource = options.gitconfigMaskSource;
       // On Linux the `tmpdir` option (a darwin-only SBPL knob until now)
       // becomes the per-session `/tmp` bind source for shared_tmp. The
       // bootstrap only sets it on Linux when shared_tmp is on (see

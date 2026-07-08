@@ -72,8 +72,10 @@ import {
 import { setWritableCacheDirsOverride } from '../permissions/sandbox-cache-dirs.ts';
 import { setCachePersistenceOverride } from '../permissions/sandbox-cache-env.ts';
 import {
+  ensureSanitizedGitconfigFile,
   gitIdentityPassthroughEnv,
   resolveGitIdentity,
+  resolveGlobalGitIdentity,
 } from '../permissions/sandbox-git-identity.ts';
 import { type ModelRegistry, loadModelRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
@@ -1719,14 +1721,26 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     if (input.brokerMode !== undefined) return input.brokerMode;
     return sandboxAvail.available ? 'spawn' : 'in-process';
   })();
-  // Resolve the operator's git commit identity ONLY for the sandboxing
-  // (`spawn`) broker: that path masks `~/.gitconfig` + `--clearenv`s all
-  // `GIT_*`, so a model-issued `git commit` has no identity. The
-  // `in-process` broker doesn't sandbox, so the real config is already
-  // visible and no injection is needed. Resolved in this (unsandboxed)
-  // process from the session cwd; empty map when nothing is configured.
+  // Deliver the operator's git commit identity into the sandbox ONLY for
+  // the sandboxing (`spawn`) broker: that path masks `~/.gitconfig` +
+  // `--clearenv`s all `GIT_*`, so a model-issued `git commit` has no
+  // identity. `in-process` doesn't sandbox → the real config is already
+  // visible. Two platform mechanisms (see `sandbox-git-identity.ts`):
+  //   - Linux: bind a sanitized `[user]`-only gitconfig over the masked
+  //     `~/.gitconfig` at GLOBAL precedence, so a repo's own local config
+  //     (incl. a nested repo the model commits in) still wins. No env.
+  //   - macOS: no bind primitive → env-inject the four identity vars,
+  //     gated on the session repo's local config (best-effort).
+  // Both resolved here, in the unsandboxed process, from the session cwd.
+  const isDarwin = process.platform === 'darwin';
   const gitIdentityPassthrough =
-    resolvedBrokerMode === 'spawn' ? gitIdentityPassthroughEnv(resolveGitIdentity(cwd)) : {};
+    resolvedBrokerMode === 'spawn' && isDarwin
+      ? gitIdentityPassthroughEnv(resolveGitIdentity(cwd))
+      : {};
+  const gitconfigMaskSource =
+    resolvedBrokerMode === 'spawn' && !isDarwin
+      ? (ensureSanitizedGitconfigFile(resolveGlobalGitIdentity(cwd)) ?? undefined)
+      : undefined;
   const broker = constructBroker(
     resolvedBrokerMode,
     cwd,
@@ -1734,6 +1748,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     sandboxAvail.available,
     projectConfigCwd,
     gitIdentityPassthrough,
+    gitconfigMaskSource,
   );
 
   // Mesh subsystem (MESH.md §10). No init()/DB: constructed at boot so /relay
@@ -2062,13 +2077,15 @@ const constructBroker = (
   // sandbox runner so the foreign `.forja/` read-floor is anchored at the repo
   // root even when a bash command's cwd is a subdirectory of the session tree.
   projectRoot: string,
-  // Operator git commit identity (`GIT_AUTHOR_*`/`GIT_COMMITTER_*`), resolved
-  // from the REAL config in the main process. Forwarded via the worker wrap's
-  // `passthroughEnv` so a sandboxed `git commit` has an identity despite the
-  // masked `~/.gitconfig` + `--clearenv`. Empty in `in-process` mode (no
-  // sandbox → real config visible) and when no identity is configured. See
+  // Operator git commit identity for the macOS ENV path
+  // (`GIT_AUTHOR_*`/`GIT_COMMITTER_*`). Empty on Linux (uses the file bind
+  // below), in `in-process` mode, and when no identity is configured. See
   // `sandbox-git-identity.ts`.
   gitIdentityPassthrough: Record<string, string>,
+  // Linux sanitized-gitconfig bind source (the `[user]`-only file bound
+  // over the masked `~/.gitconfig`). Undefined on macOS / in-process / when
+  // no identity resolves.
+  gitconfigMaskSource: string | undefined,
 ): Broker => {
   if (mode === 'spawn') {
     // Slice 103 (R6 #9): no `as SandboxProfile` cast. The TS
@@ -2103,6 +2120,10 @@ const constructBroker = (
         projectRoot,
         innerArgv,
         ...(sandboxTmpdir !== undefined ? { tmpdir: sandboxTmpdir } : {}),
+        // Linux only: bind the sanitized `[user]` gitconfig over the masked
+        // `~/.gitconfig` so a sandboxed `git commit` has an identity at
+        // global precedence (repo-local still wins). Undefined ⇒ no-op.
+        ...(gitconfigMaskSource !== undefined ? { gitconfigMaskSource } : {}),
         // Also forward FORJA_PROFILE: bwrap `--clearenv` / sandbox-exec strip
         // it otherwise, and while the worker is a thin tool-executor that
         // resolves no namespaced path TODAY, a future worker-side path lookup
