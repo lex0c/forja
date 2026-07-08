@@ -313,6 +313,23 @@ describe('scrubEnv', () => {
       });
       expect(out).toEqual({ KEEP: 'v' });
     });
+    // Complement to the drops above — and the boundary the sandbox
+    // git-identity carve-out relies on (see permissions/sandbox-git-identity.ts):
+    // the four DECLARATIVE commit-identity vars are NOT executable / repo-
+    // redirecting, so scrubEnv must KEEP them. If a future denylist entry
+    // ever broadened to `^GIT_` it would silently re-break sandboxed
+    // `git commit`; this test fails loudly if that happens.
+    test('KEEPS GIT_AUTHOR_* / GIT_COMMITTER_* (declarative identity, not exec)', () => {
+      const identity = {
+        GIT_AUTHOR_NAME: 'Ada',
+        GIT_AUTHOR_EMAIL: 'ada@example.com',
+        GIT_COMMITTER_NAME: 'Ada',
+        GIT_COMMITTER_EMAIL: 'ada@example.com',
+      };
+      const out = scrubEnv({ ...identity, GIT_SSH_COMMAND: 'sh -c id', KEEP: 'v' });
+      // Identity survives; the adjacent exec var does not.
+      expect(out).toEqual({ ...identity, KEEP: 'v' });
+    });
   });
 });
 

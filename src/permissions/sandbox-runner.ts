@@ -293,6 +293,16 @@ export interface BuildBwrapArgvOptions {
   // when violated. Caller is responsible for supplying only keys
   // forja owns — not a place to relax the host-env allowlist by
   // proxy.
+  //
+  // Second sanctioned use (reviewed carve-out): the operator's git
+  // COMMIT IDENTITY — `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/
+  // `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`, forja-RESOLVED from the
+  // real (unmasked) config in the main process (`sandbox-git-identity.ts`)
+  // and threaded here so a sandboxed `git commit` has an identity despite
+  // the masked `~/.gitconfig` + `GIT_*`-dropping `--clearenv`. These four
+  // are purely declarative (no exec, no repo redirect), UNLIKE the
+  // `GIT_SSH_COMMAND`/`GIT_CONFIG_*`/`GIT_EDITOR`/… that `scrubEnv` + the
+  // safe-list keep out — which is why they, and only they, are admitted.
   passthroughEnv?: Record<string, string>;
   // Operator-configurable list of $HOME-relative cache dirs exposed as
   // fresh writable tmpfs mounts inside cwd-rw / cwd-rw-net (build

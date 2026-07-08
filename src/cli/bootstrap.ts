@@ -71,6 +71,10 @@ import {
 } from '../permissions/index.ts';
 import { setWritableCacheDirsOverride } from '../permissions/sandbox-cache-dirs.ts';
 import { setCachePersistenceOverride } from '../permissions/sandbox-cache-env.ts';
+import {
+  gitIdentityPassthroughEnv,
+  resolveGitIdentity,
+} from '../permissions/sandbox-git-identity.ts';
 import { type ModelRegistry, loadModelRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
 import { resolveProviderFromId } from '../providers/resolve.ts';
@@ -1715,12 +1719,21 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     if (input.brokerMode !== undefined) return input.brokerMode;
     return sandboxAvail.available ? 'spawn' : 'in-process';
   })();
+  // Resolve the operator's git commit identity ONLY for the sandboxing
+  // (`spawn`) broker: that path masks `~/.gitconfig` + `--clearenv`s all
+  // `GIT_*`, so a model-issued `git commit` has no identity. The
+  // `in-process` broker doesn't sandbox, so the real config is already
+  // visible and no injection is needed. Resolved in this (unsandboxed)
+  // process from the session cwd; empty map when nothing is configured.
+  const gitIdentityPassthrough =
+    resolvedBrokerMode === 'spawn' ? gitIdentityPassthroughEnv(resolveGitIdentity(cwd)) : {};
   const broker = constructBroker(
     resolvedBrokerMode,
     cwd,
     sandboxTmpdirHandle.tmpdir,
     sandboxAvail.available,
     projectConfigCwd,
+    gitIdentityPassthrough,
   );
 
   // Mesh subsystem (MESH.md §10). No init()/DB: constructed at boot so /relay
@@ -2049,6 +2062,13 @@ const constructBroker = (
   // sandbox runner so the foreign `.forja/` read-floor is anchored at the repo
   // root even when a bash command's cwd is a subdirectory of the session tree.
   projectRoot: string,
+  // Operator git commit identity (`GIT_AUTHOR_*`/`GIT_COMMITTER_*`), resolved
+  // from the REAL config in the main process. Forwarded via the worker wrap's
+  // `passthroughEnv` so a sandboxed `git commit` has an identity despite the
+  // masked `~/.gitconfig` + `--clearenv`. Empty in `in-process` mode (no
+  // sandbox → real config visible) and when no identity is configured. See
+  // `sandbox-git-identity.ts`.
+  gitIdentityPassthrough: Record<string, string>,
 ): Broker => {
   if (mode === 'spawn') {
     // Slice 103 (R6 #9): no `as SandboxProfile` cast. The TS
@@ -2093,6 +2113,10 @@ const constructBroker = (
           ...(process.env.FORJA_PROFILE !== undefined && process.env.FORJA_PROFILE.length > 0
             ? { FORJA_PROFILE: process.env.FORJA_PROFILE }
             : {}),
+          // Operator commit identity so a sandboxed `git commit` succeeds
+          // (masked `~/.gitconfig` + `--clearenv` would otherwise strip it).
+          // Distinct keys from the control-plane vars above — no collision.
+          ...gitIdentityPassthrough,
         },
         // fail-closed on mid-session sandbox loss when the tool was present
         // at boot. A non-host profile that can't wrap now → throw → broker
