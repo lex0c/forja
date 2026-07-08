@@ -276,6 +276,34 @@ describe('resolveGitIdentity (global-only, local-gated)', () => {
     expect(id.email).toBe('clean@example.com');
   });
 
+  // includeIf: operators select work/personal identity via `[includeIf
+  // "gitdir:…"]`. `--global --get` ignores it (returns the unconditional
+  // value); the scoped read must resolve it the way `git commit` would.
+  test('honors an includeIf gitdir conditional identity (not the unconditional global)', () => {
+    if (!gitAvailable()) return;
+    const inc = join(dir, 'work.inc');
+    writeFileSync(inc, '[user]\n\temail = work@corp\n');
+    // Unconditional personal identity + a conditional include for THIS repo.
+    writeFileSync(
+      globalCfg,
+      `[user]\n\tname = Personal\n\temail = personal@x\n[includeIf "gitdir:${repo}/"]\n\tpath = ${inc}\n`,
+    );
+    // The includeIf'd email wins (git commit here would use work@corp), name
+    // falls back to the unconditional value.
+    expect(resolveGlobalGitIdentity(repo)).toEqual({ name: 'Personal', email: 'work@corp' });
+  });
+
+  test('a repo NOT under the includeIf condition gets the unconditional identity', () => {
+    if (!gitAvailable()) return;
+    const inc = join(dir, 'work.inc');
+    writeFileSync(inc, '[user]\n\temail = work@corp\n');
+    writeFileSync(
+      globalCfg,
+      `[user]\n\tname = Personal\n\temail = personal@x\n[includeIf "gitdir:${join(dir, 'elsewhere')}/"]\n\tpath = ${inc}\n`,
+    );
+    expect(resolveGlobalGitIdentity(repo)).toEqual({ name: 'Personal', email: 'personal@x' });
+  });
+
   test('is best-effort: a non-existent cwd never throws', () => {
     const id = resolveGitIdentity(join(dir, 'does', 'not', 'exist'));
     expect(typeof id).toBe('object');
