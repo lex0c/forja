@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -112,6 +112,28 @@ describe('ensureSanitizedGitconfigFile', () => {
 
   test('empty identity → null, no file written', () => {
     expect(ensureSanitizedGitconfigFile({}, dir)).toBeNull();
+  });
+
+  test('content-addressed: different identities → different immutable paths (no clobber)', () => {
+    const p1 = ensureSanitizedGitconfigFile({ name: 'Ada', email: 'ada@x' }, dir);
+    const p2 = ensureSanitizedGitconfigFile({ name: 'Bob', email: 'bob@x' }, dir);
+    expect(p1).not.toBeNull();
+    expect(p2).not.toBeNull();
+    expect(p1).not.toBe(p2);
+    // Each file keeps its OWN identity — a concurrent second session writing
+    // a different identity can't overwrite the first's file.
+    expect(readFileSync(p1 as string, 'utf8')).toContain('ada@x');
+    expect(readFileSync(p2 as string, 'utf8')).toContain('bob@x');
+  });
+
+  test('same identity → same path (idempotent)', () => {
+    const id: GitIdentity = { name: 'Ada', email: 'ada@x' };
+    expect(ensureSanitizedGitconfigFile(id, dir)).toBe(ensureSanitizedGitconfigFile(id, dir));
+  });
+
+  test('atomic write leaves no temp file behind', () => {
+    ensureSanitizedGitconfigFile({ name: 'Ada', email: 'ada@x' }, dir);
+    expect(readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
   });
 });
 

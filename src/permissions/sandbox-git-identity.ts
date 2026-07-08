@@ -44,7 +44,8 @@
 // sandboxed worker sees the masked config, so reading the identity there
 // comes up empty.
 
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join as joinPath } from 'node:path';
 import { defaultDataDir } from '../storage/paths.ts';
 import { getGitBinaryWithEnvSync } from '../subagents/git-binary.ts';
@@ -183,10 +184,20 @@ export const renderSanitizedGitconfig = (id: GitIdentity): string | null => {
 };
 
 // Write the sanitized gitconfig for `id` and return its absolute path, or
-// null when there's no identity to deliver. Lives beside the empty
-// sandbox mask file under the data dir; mode 0600 (holds the operator's
-// email). Best-effort: null on write failure → no bind → the normal empty
-// mask applies (identity absent, same as before this feature).
+// null when there's no identity to deliver. Lives under the data dir;
+// mode 0600 (holds the operator's email). Best-effort: null on write
+// failure → no bind → the normal empty mask applies (identity absent,
+// same as before this feature).
+//
+// CONTENT-ADDRESSED filename (`sandbox-gitconfig-<sha>`), NOT a shared
+// mutable one: the broker captures this path at boot and re-reads it (as a
+// bind SOURCE) on every later spawn, so a fixed `sandbox-gitconfig` would
+// let a SECOND concurrent session's bootstrap overwrite it and hand the
+// FIRST session the wrong author on its next commit. Hashing the content
+// gives each distinct identity its own immutable file (same identity →
+// same file, idempotent; bounded accumulation — one tiny file per distinct
+// identity). Written to a pid-suffixed temp + atomic rename so a concurrent
+// same-identity write can't expose a torn read to a mid-flight bind.
 export const ensureSanitizedGitconfigFile = (
   id: GitIdentity,
   dir: string = defaultDataDir(),
@@ -195,8 +206,11 @@ export const ensureSanitizedGitconfigFile = (
   if (content === null) return null;
   try {
     mkdirSync(dir, { recursive: true });
-    const p = joinPath(dir, 'sandbox-gitconfig');
-    writeFileSync(p, content, { mode: 0o600 });
+    const digest = createHash('sha256').update(content).digest('hex').slice(0, 16);
+    const p = joinPath(dir, `sandbox-gitconfig-${digest}`);
+    const tmp = `${p}.${process.pid}.tmp`;
+    writeFileSync(tmp, content, { mode: 0o600 });
+    renameSync(tmp, p);
     return p;
   } catch {
     return null;
