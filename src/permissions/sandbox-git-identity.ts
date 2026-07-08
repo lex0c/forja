@@ -90,7 +90,17 @@ const probeScoped = (
   try {
     const { git, env } = getGitBinaryWithEnvSync();
     const readEnv: Record<string, string> = { ...env };
-    for (const k of ['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'XDG_CONFIG_HOME']) {
+    // `GIT_CONFIG_NOSYSTEM` is forwarded alongside the location knobs:
+    // `safeGitEnv()` builds a fresh env (doesn't inherit process.env), so
+    // without this the probe would READ /etc/gitconfig even when the
+    // operator disabled system config — capturing a system-level identity
+    // that their real `git commit` ignores, and mis-attributing commits.
+    for (const k of [
+      'GIT_CONFIG_GLOBAL',
+      'GIT_CONFIG_SYSTEM',
+      'GIT_CONFIG_NOSYSTEM',
+      'XDG_CONFIG_HOME',
+    ]) {
       const v = process.env[k];
       if (v !== undefined && v.length > 0) readEnv[k] = v;
     }

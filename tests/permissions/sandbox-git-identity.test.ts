@@ -183,15 +183,26 @@ describe('resolveGitIdentity (global-only, local-gated)', () => {
     });
     // Isolate global/system config so the machine's real identity can't
     // leak into the assertions.
-    for (const k of ['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'XDG_CONFIG_HOME']) {
+    for (const k of [
+      'GIT_CONFIG_GLOBAL',
+      'GIT_CONFIG_SYSTEM',
+      'GIT_CONFIG_NOSYSTEM',
+      'XDG_CONFIG_HOME',
+    ]) {
       saved[k] = process.env[k];
     }
     process.env.GIT_CONFIG_GLOBAL = globalCfg;
     process.env.GIT_CONFIG_SYSTEM = '/dev/null';
     process.env.XDG_CONFIG_HOME = join(dir, 'xdg-empty');
+    delete process.env.GIT_CONFIG_NOSYSTEM; // clean default (system read unless a test opts out)
   });
   afterEach(() => {
-    for (const k of ['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'XDG_CONFIG_HOME']) {
+    for (const k of [
+      'GIT_CONFIG_GLOBAL',
+      'GIT_CONFIG_SYSTEM',
+      'GIT_CONFIG_NOSYSTEM',
+      'XDG_CONFIG_HOME',
+    ]) {
       if (saved[k] === undefined) delete process.env[k];
       else process.env[k] = saved[k];
     }
@@ -302,6 +313,30 @@ describe('resolveGitIdentity (global-only, local-gated)', () => {
       `[user]\n\tname = Personal\n\temail = personal@x\n[includeIf "gitdir:${join(dir, 'elsewhere')}/"]\n\tpath = ${inc}\n`,
     );
     expect(resolveGlobalGitIdentity(repo)).toEqual({ name: 'Personal', email: 'personal@x' });
+  });
+
+  // GIT_CONFIG_NOSYSTEM: an operator who disabled system config must not have
+  // a /etc/gitconfig-level identity captured. The probe forwards the var.
+  test('captures a system-level identity by default (system scope is read)', () => {
+    if (!gitAvailable()) return;
+    const sysCfg = join(dir, 'system.gitconfig');
+    writeFileSync(sysCfg, '[user]\n\temail = sys@fromsystem\n');
+    process.env.GIT_CONFIG_SYSTEM = sysCfg; // override the /dev/null default
+    writeGlobal(globalCfg, null, null); // no global identity → only system has email
+
+    expect(resolveGlobalGitIdentity(repo).email).toBe('sys@fromsystem');
+  });
+
+  test('honors GIT_CONFIG_NOSYSTEM — no system-level identity is captured', () => {
+    if (!gitAvailable()) return;
+    const sysCfg = join(dir, 'system.gitconfig');
+    writeFileSync(sysCfg, '[user]\n\temail = sys@fromsystem\n');
+    process.env.GIT_CONFIG_SYSTEM = sysCfg;
+    process.env.GIT_CONFIG_NOSYSTEM = '1'; // operator disabled system config
+    writeGlobal(globalCfg, null, null);
+
+    // git would ignore /etc/gitconfig; so must we.
+    expect(resolveGlobalGitIdentity(repo).email).toBeUndefined();
   });
 
   test('is best-effort: a non-existent cwd never throws', () => {
