@@ -34,6 +34,21 @@
 //            best-effort mitigation; a nested repo can't be protected this
 //            way (documented residual, macOS only).
 //
+//            KNOWN LIMITATION (deferred): when the operator HAS a real
+//            `~/.gitconfig`, the env identity is largely MOOT. git reads the
+//            global config unconditionally, and the SBPL `(deny file-read*)`
+//            makes that open() fail with EPERM — which git does NOT tolerate
+//            (unlike EACCES; see `access_or_die` + `ACCESS_EACCES_OK`), so it
+//            aborts with `fatal: reading the configuration files` BEFORE the
+//            identity env is consulted. The fix would be to point git away
+//            from the denied file (`GIT_CONFIG_GLOBAL=/dev/null` or a readable
+//            sanitized file), but `scrubEnv` drops all `GIT_CONFIG_*` before
+//            the inner bash, so that redirect can't be delivered without a
+//            handler-level re-admission — a security-boundary change that is
+//            UNTESTABLE from a Linux host. Tracked with the parallel
+//            config-EPERM note in `sandbox-runner-macos.ts`. Linux (the
+//            config-file bind) is unaffected.
+//
 // Why the four env vars are safe to forward (macOS path): they're purely
 // DECLARATIVE — no exec / no repo-redirect — unlike `GIT_SSH_COMMAND`,
 // `GIT_CONFIG_*`, `GIT_EDITOR`, `GIT_PAGER`, `GIT_PROXY_COMMAND`,

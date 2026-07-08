@@ -392,6 +392,13 @@ export const buildSbplProfile = (
   // copy-to-empty-then-chroot scheme. Untestable from a Linux host;
   // tracked in BACKLOG. The write-deny (the RCE-plant vector) holds
   // regardless.
+  //
+  // Consequence for the git COMMIT-IDENTITY fallback (`sandbox-git-identity.ts`):
+  // when the operator has a real `~/.gitconfig`, git EPERMs reading it here
+  // BEFORE the injected `GIT_AUTHOR_*`/`GIT_COMMITTER_*` identity is used, so
+  // the macOS env delivery is largely moot in that (common) case. The natural
+  // remedy — `GIT_CONFIG_GLOBAL` pointing git away from the denied file — is
+  // itself dropped by `scrubEnv`, so it's deferred with this same limitation.
   for (const file of HIDE_PATHS_FILES) {
     const absFile = joinPath(home, file);
     const escaped = escapeSbplLiteral(absFile);
