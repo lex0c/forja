@@ -2664,3 +2664,54 @@ describe('buildBwrapArgv — profile read floor (foreign .forja/ masking)', () =
     }
   });
 });
+
+describe('gitconfigMaskSource — sanitized identity bind (Linux)', () => {
+  // pathExists: () => true makes every HIDE_PATHS_FILES entry "present" so
+  // shouldMask emits its bind; realpath is an identity stub.
+  const base = {
+    profile: 'cwd-rw' as const,
+    cwd: CWD,
+    home: HOME,
+    innerArgv: INNER,
+    env: {},
+    realpath: (p: string) => p,
+    maskFileSource: MASK,
+    pathExists: () => true,
+  };
+
+  test('binds the sanitized source over ~/.gitconfig; siblings still mask empty', () => {
+    const argv = buildBwrapArgv({ ...base, gitconfigMaskSource: '/forja-sanitized-gitconfig' });
+    const gc = argv.indexOf(`${HOME}/.gitconfig`);
+    expect(gc).toBeGreaterThan(0);
+    expect(argv[gc - 1]).toBe('/forja-sanitized-gitconfig'); // SOURCE
+    expect(argv[gc - 2]).toBe('--ro-bind');
+    // A sibling credential file keeps the empty mask — only .gitconfig is special.
+    const netrc = argv.indexOf(`${HOME}/.netrc`);
+    expect(netrc).toBeGreaterThan(0);
+    expect(argv[netrc - 1]).toBe(MASK);
+  });
+
+  test('without the option, ~/.gitconfig masks empty like every other file', () => {
+    const argv = buildBwrapArgv({ ...base });
+    const gc = argv.indexOf(`${HOME}/.gitconfig`);
+    expect(gc).toBeGreaterThan(0);
+    expect(argv[gc - 1]).toBe(MASK);
+  });
+
+  test('binds the identity even when ~/.gitconfig is ABSENT (Nix / relocated-global)', () => {
+    // Nothing on disk (pathExists → false): the usual absent-file skip
+    // would drop every mask, but the identity bind is placed anyway so a
+    // Nix/relocated-global operator (no physical ~/.gitconfig) still gets
+    // an identity inside the sandbox.
+    const argv = buildBwrapArgv({
+      ...base,
+      pathExists: () => false,
+      gitconfigMaskSource: '/forja-sanitized-gitconfig',
+    });
+    const gc = argv.indexOf(`${HOME}/.gitconfig`);
+    expect(gc).toBeGreaterThan(0);
+    expect(argv[gc - 1]).toBe('/forja-sanitized-gitconfig');
+    // A sibling credential file with no source is still skipped when absent.
+    expect(argv).not.toContain(`${HOME}/.netrc`);
+  });
+});
