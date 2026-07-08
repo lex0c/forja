@@ -50,6 +50,6 @@ describe('DEFAULT_BUDGET (slice C — cost-primary posture)', () => {
     // loop hash window still defend against pathological runs.
     expect(DEFAULT_BUDGET.maxWallClockMs).toBe(24 * 60 * 60 * 1000);
     expect(DEFAULT_BUDGET.maxToolErrors).toBe(5);
-    expect(DEFAULT_BUDGET.maxRepeatedToolHash).toBe(3);
+    expect(DEFAULT_BUDGET.maxRepeatedToolHash).toBe(5);
   });
 });

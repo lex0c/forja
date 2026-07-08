@@ -779,6 +779,48 @@ describe('runAgent', () => {
     expect(result.detail).toContain('echo');
   });
 
+  test('degenerate loop: default budget tolerates 4 identical calls, refuses the 5th', async () => {
+    const sameStep = (): ScriptedStep => ({
+      tool_uses: [{ id: crypto.randomUUID(), name: 'echo', input: { msg: 'same' } }],
+      stop_reason: 'tool_use',
+    });
+    const { handle, config } = buildConfig(Array.from({ length: 10 }, () => sameStep()));
+    const result = await runAgent(config);
+    expect(result.reason).toBe('degenerateLoop');
+    // The 5th call is refused pre-batch, so the provider was asked
+    // exactly 5 times and only 4 dispatches landed.
+    expect(handle.requests.length).toBe(5);
+    expect(result.detail).toContain('5 times');
+    expect(result.detail).toContain('last 10 calls');
+  });
+
+  test('degenerate loop: the hash window spans 10 dispatches, not 5', async () => {
+    // `same` at dispatch 1, 5 and 9, with distinct calls between.
+    // Under a 10-wide window all three are still resident when the
+    // third lands, so the cap of 3 trips. A 5-wide window would
+    // have evicted the first one and let the run continue.
+    const call = (msg: string): ScriptedStep => ({
+      tool_uses: [{ id: crypto.randomUUID(), name: 'echo', input: { msg } }],
+      stop_reason: 'tool_use',
+    });
+    const script = [
+      call('same'),
+      call('a'),
+      call('b'),
+      call('c'),
+      call('same'),
+      call('d'),
+      call('e'),
+      call('f'),
+      call('same'),
+      { text: 'never reached', stop_reason: 'end_turn' } as ScriptedStep,
+    ];
+    const { config } = buildConfig(script, { budget: { maxRepeatedToolHash: 3 } });
+    const result = await runAgent(config);
+    expect(result.reason).toBe('degenerateLoop');
+    expect(result.detail).toContain('3 times');
+  });
+
   test('tool_result blocks sent on the next request carry the function name (Gemini compat)', async () => {
     const { config, handle } = buildConfig([
       {

@@ -610,7 +610,7 @@ Three independent budgets bound the session against runaway behavior:
 
 Plus per-step bounds the global budgets can't see:
 - `maxToolErrors` (default 5) — consecutive failing tool calls.
-- `maxRepeatedToolHash` (default 8) — same (tool, args_hash) seen N times — degenerate-loop heuristic.
+- `maxRepeatedToolHash` (default 5) — same (tool, args_hash) seen N times within the last-10 sliding window — degenerate-loop heuristic.
 - `stepStalled` — provider went silent mid-stream past a timeout.
 
 Budget-exhausted exits feed `failure_events` and `outcome_signals.session_aborted` (slice 131). Operators reading audit trends can tune budgets per workflow.

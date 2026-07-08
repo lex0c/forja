@@ -465,7 +465,7 @@ export interface RunBudget {
   maxSteps: number;
   maxWallClockMs: number;
   maxToolErrors: number;
-  // Sliding window: if `maxRepeatedToolHash` of the last 5 tool calls hash
+  // Sliding window: if `maxRepeatedToolHash` of the last 10 tool calls hash
   // identically, abort with `degenerate_loop`.
   maxRepeatedToolHash: number;
   // Per-step stall watchdog (spec AGENTIC_CLI.md §5 line 372).
@@ -610,7 +610,7 @@ export const DEFAULT_BUDGET: RunBudget = {
   // while still bounding a true hang. An operator can lower it per-config.
   maxWallClockMs: 24 * 60 * 60 * 1000,
   maxToolErrors: 5,
-  maxRepeatedToolHash: 3,
+  maxRepeatedToolHash: 5,
   // 90s default step-stall watchdog. Long enough that legitimate
   // slow turns (extended thinking with high budget, large
   // structured outputs) don't trip; short enough that a hung

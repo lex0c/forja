@@ -34,7 +34,7 @@ All defaults are in `DEFAULT_BUDGET` (`src/harness/types.ts`).
 | Cap | Default | Trigger → exit |
 |---|---|---|
 | `maxSteps` | `200` | `steps >= maxSteps` → `maxSteps`. Backstop, not a task sizer. |
-| `maxRepeatedToolHash` | `3` | N identical tool-call hashes within the last-5 sliding window → `degenerateLoop`. |
+| `maxRepeatedToolHash` | `5` | N identical tool-call hashes within the last-10 sliding window → `degenerateLoop`. |
 | `maxToolErrors` | `5` | that many **consecutive** tool errors → `maxToolErrors`. |
 | `maxWallClockMs` | `3600000` (1 h) | session-wide timer (`setTimeout` → abort) → `maxWallClockMs`. |
 | `maxStepStallMs` | `90000` (90 s) | a single step's provider stream is silent (no text/thinking/tool/stop delta) for this long → `stepStalled`. `0` disables the watchdog. |

@@ -386,7 +386,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     return { tools: hits, notFound };
   };
   const recentToolHashes: string[] = [];
-  const HASH_WINDOW = 5;
+  const HASH_WINDOW = 10;
 
   let steps = 0;
   let consecutiveErrors = 0;
