@@ -516,6 +516,12 @@ type CommandResolver = (
   positional: string[],
   allTokens: readonly string[],
   ctx: ResolverContext,
+  // The resolved command basename (the COMMAND_TABLE key). Most resolvers ignore
+  // it; `cmdCurlWget` needs it to disambiguate flags that mean different things
+  // in curl vs wget — `-b` is curl's cookie-file but wget's `--background`. A
+  // resolver that omits this param still satisfies the type (TS structural
+  // typing lets a shorter function stand in), so existing resolvers are untouched.
+  name: string,
 ) => CommandResolverResult;
 
 const cmdRead: CommandResolver = (positional, _tokens, ctx) => {
@@ -1491,7 +1497,7 @@ const cmdMvCp: CommandResolver = (positional, tokens, ctx) => {
   };
 };
 
-const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
+const cmdCurlWget: CommandResolver = (positional, tokens, ctx, name) => {
   if (tokens.some((t) => t === '--proxy' || t === '-x')) {
     return { refuse: 'curl/wget: proxy-shaped flags suggest evasion' };
   }
@@ -1710,6 +1716,44 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
           if (path.length > 0) readTargets.push(path);
         }
       }
+    }
+    // COOKIE-FILE reads — a repo file whose contents leave on the request.
+    //   wget `--load-cookies FILE` / `--load-cookies=FILE` — always a file
+    //     (wget-only flag, so no curl ambiguity).
+    //   curl `-b`/`--cookie <data|filename>` — curl treats a value WITHOUT `=`
+    //     as a filename to read cookies from (a `name=value` is inline). `-b` is
+    //     GATED on name==='curl' because wget's `-b` is `--background` (its value
+    //     would be the URL, not a file); `--cookie` is curl-only, so safe.
+    if (t === '--load-cookies') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        readTargets.push(next);
+        i += 1;
+      }
+      continue;
+    }
+    if (t.startsWith('--load-cookies=')) {
+      readTargets.push(t.slice('--load-cookies='.length));
+      continue;
+    }
+    const isCurl = name === 'curl';
+    const cookieSpaced = t === '--cookie' || (isCurl && t === '-b');
+    if (cookieSpaced) {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        if (!next.includes('=')) readTargets.push(next); // no `=` → filename
+        i += 1;
+      }
+      continue;
+    }
+    if (t.startsWith('--cookie=')) {
+      const v = t.slice('--cookie='.length);
+      if (!v.includes('=')) readTargets.push(v);
+      continue;
+    }
+    if (isCurl && t.length > 2 && t[0] === '-' && t[1] === 'b') {
+      const v = t.slice(2); // attached `-b<value>`
+      if (!v.includes('=')) readTargets.push(v);
     }
   }
   const urlToken = positional[0];
@@ -2125,14 +2169,17 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
       // fast-forward-only and refuses otherwise) touches neither the working tree
       // nor local branch history — it only updates remote-tracking refs. Those
       // stay dev-loop-confined under autonomous (plain net-egress, like a doc
-      // fetch). But `-f`/`--force`, or a refspec with a leading `+`
-      // (`+main:main`, `+refs/heads/*:refs/heads/*`), FORCE-overwrites a local
-      // ref — discarding local commits — so those are destructive like push/pull.
-      // A `+` can only lead a refspec positional (options start with `-`), so a
-      // positional starting with `+` is a force refspec.
+      // fetch). Destructive when it FORCE-overwrites a LOCAL ref — discarding
+      // commits — or clobbers LOCAL tags:
+      //   • `-f`/`--force`, or a refspec with a leading `+` (`+main:main`,
+      //     `+refs/heads/*:refs/heads/*`) — a `+` can only lead a refspec
+      //     positional (options start with `-`).
+      //   • `-P`/`--prune-tags` — prunes AND clobbers local tags (distinct from
+      //     `-p`/`--prune`, which only drops stale remote-tracking refs and is
+      //     benign; `p` is deliberately NOT in the destructive set).
       const force =
-        tokens.some((t) => t === '--force') ||
-        bundleHasDestructiveFlag(tokens, new Set(['f']), new Set(['j', 'o'])) ||
+        tokens.some((t) => t === '--force' || t === '--prune-tags') ||
+        bundleHasDestructiveFlag(tokens, new Set(['f', 'P']), new Set(['j', 'o'])) ||
         positional.slice(1).some((p) => p.startsWith('+'));
       return {
         capabilities: [gitWrite(REPO, force), netEgress('*'), readFs(REPO)],
@@ -5131,7 +5178,7 @@ const analyzeCommand = (
     };
   }
   const positional = stripFlags(effectiveArgs);
-  const result = handler(positional, effectiveArgs, ctx);
+  const result = handler(positional, effectiveArgs, ctx, name);
   if ('refuse' in result) return { refuse: result.refuse };
   let finalConf: 'high' | 'medium' | 'low' = result.confidence;
   if (escalated || redir.escalated) finalConf = 'low';
