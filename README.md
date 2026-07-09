@@ -259,14 +259,17 @@ A profile relocates **both** levels at once:
   allowed.
 - **Operation mode.** Approval posture, per session. **Supervised** (default)
   sends every `confirm` to the modal; **Autonomous** (`--autonomous` at boot,
-  or Shift+Tab in the REPL) auto-approves by EFFECT — routine low-risk
-  `policy` confirms, plus **fully-modeled** bash whose every resolved
-  capability is repo-confined (reads/writes/deletes under cwd, local git).
-  Anything dangerous still prompts: network, outside-repo, unknown binary,
-  protected/sensitive paths, and anything the resolver can't fully model
-  (loops / dynamic `$vars`, where the capabilities are best-effort); a
-  degraded engine re-arms the modal; hard denies stay unreachable. Not
-  `bypass`: every engine floor holds, and each auto-approval is audited.
+  or Shift+Tab in the REPL) auto-approves the **dev loop** by EFFECT — run the
+  language toolchain, create/edit/delete project files, execute scripts, fetch
+  the web, and use non-destructive git. Anything OUTSIDE that loop still
+  prompts: paths outside the repo, protected/sensitive files, **destructive
+  git** (gated by verb — publishes / rewrites history / discards work /
+  deletes-or-forces a ref / plants `.git/config` authority), an **upload**
+  (egress paired with a repo-file read), secret/env mutation, and commands the
+  resolver can't fully model (loops / dynamic `$vars`, where the capabilities
+  are best-effort). A degraded engine re-arms the modal; hard denies stay
+  unreachable. Not `bypass`: every engine floor holds, and each auto-approval
+  is audited.
 - **No auto-commit.** Forja never creates git commits without explicit
   operator action.
 
