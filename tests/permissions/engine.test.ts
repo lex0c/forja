@@ -373,6 +373,9 @@ describe('approval posture (Supervised / Autonomous)', () => {
       'git checkout -b feat/api', // new-branch create (slash in name must stay free)
       'git branch feat',
       'git branch -m old new', // plain rename
+      'git branch -u origin/main feat', // set-upstream: -u consumes its value, not a bundle
+      'git branch -udev feat', // set-upstream "dev" attached: the 'd' is the value, not -d
+      'git switch -cf newbr', // -c consumes "f" → create branch "f" (bundle walk, NOT force)
       'git reset HEAD~1', // soft/mixed — working tree intact
       'git fetch origin', // updates remote-tracking refs only; `pull` is where the merge lands
       'git remote -v', // read
@@ -406,6 +409,9 @@ describe('approval posture (Supervised / Autonomous)', () => {
       'git branch -D feat',
       'git branch -f feat HEAD~5', // short force-move alias
       'git branch -C a b', // force copy
+      'git branch -df doomed', // BUNDLED delete+force — the exact-token check missed this
+      'git branch -fd doomed', // order-independent
+      'git switch -fc newbr', // BUNDLED force+create (discards) — distinct from -cf (create "f")
       'git tag -d v1', // ref delete
       'git remote add evil https://evil.test/r', // rewrites .git/config → later fetch hits it
       'git remote set-url origin https://evil.test/r',

@@ -1717,6 +1717,32 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
   }
 };
 
+// Walk short-flag BUNDLES (`-df`, `-fd`) and report whether any DESTRUCTIVE
+// letter appears. An exact-token check (`t === '-d'`) misses `git branch -df`
+// (delete + force), which git accepts as a forced ref deletion — under
+// autonomous that auto-approved, bypassing the modal. A value-consuming flag
+// ENDS the bundle (the rest of the token is its argument, not more flags), so
+// `git branch -uorigin/main` (set-upstream-to "origin/main") isn't misread as a
+// bundle containing the destructive letters in the branch name. Destructive is
+// checked before the value-break, so a flag that is BOTH (switch `-C`
+// force-create) still counts. Mirrors the `git tag` bundle walk; long
+// `--force`/`--delete` forms are matched by the caller as exact tokens.
+const bundleHasDestructiveFlag = (
+  tokens: readonly string[],
+  destructive: ReadonlySet<string>,
+  valueConsuming: ReadonlySet<string>,
+): boolean => {
+  for (const t of tokens) {
+    if (t.length < 2 || t[0] !== '-' || t[1] === '-') continue; // not a short bundle
+    for (let i = 1; i < t.length; i++) {
+      const c = t[i] as string;
+      if (destructive.has(c)) return true;
+      if (valueConsuming.has(c)) break; // rest of the token is this flag's value
+    }
+  }
+  return false;
+};
+
 const cmdGit: CommandResolver = (positional, tokens, ctx) => {
   // Slice 128 (R4 P0-Launder-2): `git -c <key>=<value>` sets a
   // one-shot config override. Several git config keys execute
@@ -2083,15 +2109,13 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
       // over-gate where `git switch feature/login` looked like a path). Discards
       // work only via `-f`/`--force`/`--discard-changes` or force create-or-reset
       // (`-C`/`--force-create`). `-c` (plain create) and a bare branch switch are
-      // free.
-      const destructive = tokens.some(
-        (t) =>
-          t === '-f' ||
-          t === '--force' ||
-          t === '--discard-changes' ||
-          t === '-C' ||
-          t === '--force-create',
-      );
+      // free. `-c`/`-C` take the new-branch name as their value, so `-cf` is
+      // create-branch-"f" (safe) while `-fc` is force-then-create (destructive) —
+      // the bundle walk with `c` value-consuming gets both right.
+      const destructive =
+        tokens.some(
+          (t) => t === '--force' || t === '--discard-changes' || t === '--force-create',
+        ) || bundleHasDestructiveFlag(tokens, new Set(['f', 'C']), new Set(['c']));
       return { capabilities: [gitWrite(REPO, destructive), readFs(REPO)], confidence: 'high' };
     }
     case 'restore':
@@ -2101,19 +2125,15 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
       // restores destructive rather than decode the matrix.
       return { capabilities: [gitWrite(REPO, true), readFs(REPO)], confidence: 'high' };
     case 'branch': {
-      // Listing and creating are free; deleting, force-moving (`-f`/`--force`),
-      // or force-copying (`-C`) / force-renaming (`-M`) a ref is not. `-m`/`-c`
-      // (plain rename/copy) are non-destructive.
-      const deletes = tokens.some(
-        (t) =>
-          t === '-d' ||
-          t === '-D' ||
-          t === '--delete' ||
-          t === '-f' ||
-          t === '--force' ||
-          t === '-M' ||
-          t === '-C',
-      );
+      // Listing and creating are free; deleting (`-d`/`-D`), force-moving/
+      // -renaming (`-f`/`-M`), or force-copying (`-C`) a ref is not. `-m`/`-c`
+      // (plain rename/copy) are non-destructive. The bundle walk catches
+      // `git branch -df doomed` (delete+force, a forced deletion the exact-token
+      // check missed); `-u` consumes the upstream name, so `git branch -u
+      // origin/main` isn't misread as carrying `-d`/`-f` from the branch name.
+      const deletes =
+        tokens.some((t) => t === '--delete' || t === '--force') ||
+        bundleHasDestructiveFlag(tokens, new Set(['d', 'D', 'f', 'M', 'C']), new Set(['u']));
       return { capabilities: [gitWrite(REPO, deletes), readFs(REPO)], confidence: 'high' };
     }
     default:
