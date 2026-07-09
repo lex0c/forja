@@ -5,6 +5,7 @@
 // the full set.
 
 export type {
+  ConservativeCause,
   Resolver,
   ResolverConfidence,
   ResolverContext,
@@ -12,6 +13,7 @@ export type {
 } from './registry.ts';
 export {
   __resetResolversForTest,
+  conservativeCapsAreHonest,
   conservativeFallback,
   getResolver,
   registerResolver,

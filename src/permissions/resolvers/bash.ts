@@ -53,6 +53,7 @@ import {
 } from '../protected_paths.ts';
 import { expandTilde } from '../tilde.ts';
 import {
+  type ConservativeCause,
   type Resolver,
   type ResolverContext,
   type ResolverResult,
@@ -1529,6 +1530,13 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
     { longForm: '--config', shortForm: '-K' },
     { longForm: '--netrc-file' },
     { longForm: '--cacert' },
+    // wget upload forms: `--post-file=FILE` / `--body-file=FILE` read a local
+    // file into the request body (the wget analogue of curl `-d @file`). Without
+    // these the emitted caps were `net-egress` ALONE, so `hasUploadShape` (which
+    // needs a repo file read alongside the egress) saw a plain fetch and the
+    // autonomous posture auto-approved the exfil.
+    { longForm: '--post-file' },
+    { longForm: '--body-file' },
   ];
   const writeTargets: string[] = [];
   const readTargets: string[] = [];
@@ -1817,7 +1825,10 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
           t === '--replace-all',
       );
       if (notPureRead) {
-        return { capabilities: [exec('arbitrary'), readFs(REPO)], confidence: 'medium' };
+        return {
+          capabilities: [exec('arbitrary'), gitWrite(REPO, true), readFs(REPO)],
+          confidence: 'medium',
+        };
       }
       const explicitRead = tokens.some(
         (t) =>
@@ -1837,7 +1848,19 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
       if (explicitRead || positional.length === 2) {
         return { capabilities: [readFs(REPO)], confidence: 'high' };
       }
-      return { capabilities: [exec('arbitrary'), readFs(REPO)], confidence: 'medium' };
+      // A config WRITE is marked `destructive` — not because it deletes, but
+      // because `exec:arbitrary` alone no longer gates under autonomous
+      // (AGENTIC_CLI §8.1) and a config write is not an ordinary arbitrary exec:
+      // it INSTALLS a persistent trigger (`core.sshCommand`, `core.pager`,
+      // `core.hooksPath`, `alias.*`) inside the protected `.git/config`, which
+      // then fires from later commands the gate considers benign — `git fetch`
+      // is auto-approved, and would run the planted `core.sshCommand`. Running
+      // `./deploy.sh` is code the operator already has in the repo; planting a
+      // hook is new persistent authority, so the operator sees it.
+      return {
+        capabilities: [exec('arbitrary'), gitWrite(REPO, true), readFs(REPO)],
+        confidence: 'medium',
+      };
     }
     case 'status':
     case 'log':
@@ -1845,7 +1868,6 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
     case 'show':
     case 'blame':
     case 'rev-parse':
-    case 'remote':
     // Read-only, local (non-network) plumbing/porcelain verbs. Pre-slice
     // these fell through to the `default` branch and got stamped
     // gitWrite + netEgress + low confidence — so a routine `git shortlog`
@@ -1882,18 +1904,20 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
       //   rebase      → pre-rebase, post-rewrite (and `--exec <cmd>` runs <cmd>)
       //   cherry-pick → the commit hooks, per replayed commit
       // A repo that ships an installed hook executes that code on a bare
-      // `git commit -m x`, so the honest capability is `exec:arbitrary`,
-      // NOT a repo-confined `git-write` — under autonomous this MUST keep
-      // the modal (exec:arbitrary is never repo-confined). The git-write +
-      // read-fs caps still ride along so the engine's §11 floors stay
-      // honest about the metadata write. `--no-verify` is NOT a safe
-      // downgrade: it bypasses ONLY pre-commit and commit-msg —
-      // prepare-commit-msg and post-commit still run — so honoring it would
-      // re-open the hole for a post-commit hook. (`git -c core.hooksPath=…`
-      // is refused upstream, so there is no "hooks proven absent" path to
-      // model here.)
+      // `git commit -m x`, so the honest capability is `exec:arbitrary`.
+      // `--no-verify` is NOT a safe downgrade: it bypasses ONLY pre-commit
+      // and commit-msg — prepare-commit-msg and post-commit still run — so
+      // honoring it would re-open the hole for a post-commit hook. (`git -c
+      // core.hooksPath=…` is refused upstream, so there is no "hooks proven
+      // absent" path to model here.)
+      //
+      // The `destructive` mark — not `exec:arbitrary` — is what keeps the
+      // modal under autonomous: the posture stopped gating `exec:arbitrary`
+      // (the operator runs `bun install` and `./deploy.sh` hands-off), so
+      // these verbs must declare themselves. They rewrite HISTORY and run
+      // hooks; the operator asked to see them.
       return {
-        capabilities: [exec('arbitrary'), gitWrite(REPO), readFs(REPO)],
+        capabilities: [exec('arbitrary'), gitWrite(REPO, true), readFs(REPO)],
         confidence: 'high',
       };
     case 'tag': {
@@ -1938,34 +1962,152 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
           }
         }
       }
+      // `git tag -d v1` DELETES a ref → destructive. A lightweight create is not.
+      const deletesTag = tokens.some((t) => t === '-d' || t === '--delete');
       if (usesGpg || (annotated && !hasMessage)) {
         return {
-          capabilities: [exec('arbitrary'), gitWrite(REPO), readFs(REPO)],
+          capabilities: [exec('arbitrary'), gitWrite(REPO, deletesTag), readFs(REPO)],
           confidence: 'high',
         };
       }
-      return { capabilities: [gitWrite(REPO), readFs(REPO)], confidence: 'high' };
+      return { capabilities: [gitWrite(REPO, deletesTag), readFs(REPO)], confidence: 'high' };
     }
     case 'add':
-    case 'stash':
-    case 'reset':
-      // Pure git-writes with NO hook / editor / gpg surface: git has no
-      // pre-add / reset hook, and `git stash` writes its commits through
-      // plumbing (`commit-tree`/`update-ref`) that bypasses the commit hooks.
-      // These stay repo-confined `git-write` → auto-approvable under autonomous.
+      // No hook / editor / gpg surface and no discard of work: git has no
+      // pre-add hook. Non-destructive `git-write` → auto-approved under autonomous.
       return { capabilities: [gitWrite(REPO), readFs(REPO)], confidence: 'high' };
+    case 'stash': {
+      // `git stash` (push/save) writes through plumbing (`commit-tree`/
+      // `update-ref`) that bypasses the commit hooks AND preserves the working
+      // tree in a ref → recoverable, non-destructive. `pop`/`apply` restore. But
+      // `clear` (drop ALL stashes) and `drop` (drop one) delete stashed work
+      // irrecoverably → destructive. positional[1] is the subcommand (flags
+      // already stripped); bare `git stash` has none → non-destructive.
+      const sub = positional[1];
+      const discardsStash = sub === 'clear' || sub === 'drop';
+      return { capabilities: [gitWrite(REPO, discardsStash), readFs(REPO)], confidence: 'high' };
+    }
+    case 'remote': {
+      // `git remote` / `-v` / `show` / `get-url` READ. `add`/`set-url`/`remove`/
+      // `rename`/`set-branches`/`set-head`/`prune` WRITE `.git/config` and can
+      // repoint fetch/push at an attacker host — a later auto-approved `git fetch`
+      // then contacts it. Same persistent-authority class as `git config`, so the
+      // mutating forms are `destructive` (bash never emits a write to `.git`, so
+      // the §11 protected-path floor can't catch this — the mark is the only gate).
+      const sub = positional[1];
+      const readOnly =
+        sub === undefined || sub === 'show' || sub === 'get-url' || sub === 'get-url-all';
+      if (readOnly) return { capabilities: [readFs(REPO)], confidence: 'high' };
+      return { capabilities: [gitWrite(REPO, true), readFs(REPO)], confidence: 'high' };
+    }
+    case 'reset':
+      // `git reset <path>` (unstage) and a soft/mixed reset move HEAD/index and
+      // leave the working tree intact. `--hard` DISCARDS uncommitted work;
+      // `--merge` / `--keep` also overwrite tracked files. Split them: the
+      // operator asked to see the discards, not every unstage.
+      return {
+        capabilities: [
+          gitWrite(
+            REPO,
+            tokens.some((t) => t === '--hard' || t === '--merge' || t === '--keep'),
+          ),
+          readFs(REPO),
+        ],
+        confidence: 'high',
+      };
     case 'push':
     case 'pull':
+      // Network + history. `pull` = fetch + merge, so it runs the merge hooks
+      // too. Both are on the operator's confirm list.
+      return {
+        capabilities: [gitWrite(REPO, true), netEgress('*'), readFs(REPO)],
+        confidence: 'high',
+      };
     case 'fetch':
+      // Talks to the remote but touches NEITHER the working tree nor local
+      // history — it only updates remote-tracking refs. Deliberately NOT
+      // destructive: the operator's confirm list is commit/push/pull/clone, and
+      // plain `net-egress` is dev-loop-confined under autonomous (same as a
+      // `curl` of a doc). `git pull` is where the merge (and its hooks) lands.
       return {
         capabilities: [gitWrite(REPO), netEgress('*'), readFs(REPO)],
         confidence: 'high',
       };
-    case 'clean':
-      if (tokens.some((t) => /^-f/.test(t))) {
-        return { capabilities: [deleteFs(REPO), gitWrite(REPO)], confidence: 'high' };
-      }
-      return { capabilities: [readFs(REPO)], confidence: 'high' };
+    case 'clone':
+      // Network + writes a whole tree. Pre-slice this fell to `default` (low
+      // confidence), which gated it only via the risk score.
+      return {
+        capabilities: [gitWrite(REPO, true), netEgress('*'), writeFs(REPO), readFs(REPO)],
+        confidence: 'high',
+      };
+    case 'clean': {
+      // `git clean` DELETES untracked files/dirs. It requires force to act, but
+      // `clean.requireForce` can be configured off, so fail closed: it is a
+      // destructive delete UNLESS it is an explicit dry run (`-n`/`--dry-run`).
+      // This also fixes the old `/^-f/` test, which matched `-f`/`-fd` but NOT
+      // the `--force` long form (`git clean --force -d` slipped through as a pure
+      // read). `deleteFs` alone reads as repo-confined to the autonomous gate —
+      // the destructive mark is what holds the modal.
+      const dryRun = tokens.some((t) => t === '-n' || t === '--dry-run');
+      if (dryRun) return { capabilities: [readFs(REPO)], confidence: 'high' };
+      return { capabilities: [deleteFs(REPO), gitWrite(REPO, true)], confidence: 'high' };
+    }
+    case 'checkout': {
+      // The legacy overloaded verb: `git checkout <branch>` switches, `git
+      // checkout <pathspec>` / `-- <pathspec>` / `.` RESTORES (discards work),
+      // and the two are not statically decidable. So fail CLOSED — destructive
+      // unless it is unambiguously a NEW-branch create (`-b`/`--orphan`) with no
+      // force/patch/pathspec. `git checkout main` now confirms (git actually
+      // refuses to clobber work without `-f`, but we can't know the operand is a
+      // branch); use `git switch main` for the free path. `-B` is force
+      // create-or-RESET, `-p` discards hunks, `--` introduces pathspecs.
+      const forced = tokens.some(
+        (t) => t === '-f' || t === '--force' || t === '-p' || t === '--patch' || t === '-B',
+      );
+      const createsBranch = tokens.some((t) => t === '-b' || t === '--orphan');
+      const hasPathspecSep = tokens.includes('--');
+      const destructive = forced || hasPathspecSep || !createsBranch;
+      return { capabilities: [gitWrite(REPO, destructive), readFs(REPO)], confidence: 'high' };
+    }
+    case 'switch': {
+      // `git switch` is branch-only by design — it NEVER takes a pathspec, so it
+      // is judged by FLAG alone, never by operand (which fixes the old
+      // over-gate where `git switch feature/login` looked like a path). Discards
+      // work only via `-f`/`--force`/`--discard-changes` or force create-or-reset
+      // (`-C`/`--force-create`). `-c` (plain create) and a bare branch switch are
+      // free.
+      const destructive = tokens.some(
+        (t) =>
+          t === '-f' ||
+          t === '--force' ||
+          t === '--discard-changes' ||
+          t === '-C' ||
+          t === '--force-create',
+      );
+      return { capabilities: [gitWrite(REPO, destructive), readFs(REPO)], confidence: 'high' };
+    }
+    case 'restore':
+      // `git restore <path>` overwrites the working tree from the index —
+      // discards edits by design. `--staged` alone only unstages, but the
+      // combined `--staged --worktree` discards; fail closed and mark all
+      // restores destructive rather than decode the matrix.
+      return { capabilities: [gitWrite(REPO, true), readFs(REPO)], confidence: 'high' };
+    case 'branch': {
+      // Listing and creating are free; deleting, force-moving (`-f`/`--force`),
+      // or force-copying (`-C`) / force-renaming (`-M`) a ref is not. `-m`/`-c`
+      // (plain rename/copy) are non-destructive.
+      const deletes = tokens.some(
+        (t) =>
+          t === '-d' ||
+          t === '-D' ||
+          t === '--delete' ||
+          t === '-f' ||
+          t === '--force' ||
+          t === '-M' ||
+          t === '-C',
+      );
+      return { capabilities: [gitWrite(REPO, deletes), readFs(REPO)], confidence: 'high' };
+    }
     default:
       // Slice 152 (review calibration): unknown git subcommand
       // drops to confidence='low', not 'medium'. The known
@@ -1980,8 +2122,13 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
       // by a wide margin. Pre-slice the default branch was
       // 'medium' (+0.10) which slipped under the threshold for
       // some compositions; 'low' (+0.30) hardens that.
+      //
+      // `destructive: true` is the fail-closed half of the `git-write` mark:
+      // the flag is opt-IN, so a git verb nobody classified must NOT inherit
+      // the non-destructive default and auto-approve under autonomous. An
+      // unknown verb is exactly the case where we cannot claim it is safe.
       return {
-        capabilities: [gitWrite(REPO), readFs(REPO), netEgress('*')],
+        capabilities: [gitWrite(REPO, true), readFs(REPO), netEgress('*')],
         confidence: 'low',
       };
   }
@@ -4621,12 +4768,36 @@ const classifyRedirects = (
   return { caps, escalated, cwdEscaped };
 };
 
+// Restrictiveness ladder for ConservativeCause. Higher wins when several
+// sub-commands (or a soft wrapper plus an inner miss) contribute a cause.
+// `unmodeled-tool` never originates in the bash resolver — it belongs to the
+// registry's no-resolver fallback — but it is ranked so the function is total.
+const CAUSE_RANK: Record<ConservativeCause, number> = {
+  'unknown-command': 0,
+  'unmodeled-tool': 1,
+  'dynamic-dataflow': 2,
+  'cwd-escape': 3,
+};
+
+const mostRestrictiveCause = (
+  a: ConservativeCause | null,
+  b: ConservativeCause,
+): ConservativeCause => (a === null || CAUSE_RANK[b] > CAUSE_RANK[a] ? b : a);
+
 const analyzeCommand = (
   shape: CommandShape,
   ctx: ResolverContext,
 ):
   | { refuse: string }
-  | { caps: Capability[]; confidence: 'high' | 'medium' | 'low'; conservative?: string } => {
+  | {
+      caps: Capability[];
+      confidence: 'high' | 'medium' | 'low';
+      conservative?: string;
+      // Typed sibling of `conservative`. Set whenever `conservative` is set, so
+      // the aggregate below never has to pattern-match the prose. See
+      // `ConservativeCause` in registry.ts.
+      conservativeCause?: ConservativeCause;
+    } => {
   // Hard-refuse check on BOTH the literal name and a quote/escape-
   // stripped "bare" form. literalText now strips raw_string quotes, but
   // backslash escapes (`\eval`) and mixed forms can still mask a hard
@@ -4847,6 +5018,10 @@ const analyzeCommand = (
       caps: [exec('arbitrary'), ...redir.caps, ...argCaps],
       confidence: 'low',
       conservative: `unknown_command: ${shape.name}`,
+      // Registry miss. The redirect + arg caps above ARE the honest effect of
+      // the invocation as written; what we can't see is inside the binary, and
+      // the sandbox's `cwd-rw` floor bounds that. Auto-approvable in autonomous.
+      conservativeCause: 'unknown-command',
     };
   }
   const positional = stripFlags(effectiveArgs);
@@ -4877,6 +5052,9 @@ const analyzeCommand = (
       caps: [...result.capabilities, ...redir.caps, ...extraArgCaps],
       confidence: 'low',
       conservative: 'cwd-scope escape: a path resolves outside the cwd via a symlink',
+      // The caps LIE: lexically inside cwd, canonically outside. Never
+      // auto-approved — this is the slice 176/178 defense.
+      conservativeCause: 'cwd-escape',
     };
   }
 
@@ -4991,6 +5169,9 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
         kind: 'conservative',
         capabilities: [exec('shell'), ...orphanRedir.caps, ...loopWordCaps],
         reason: `bash: ${walk.softReason ?? 'unmodeled shape'} (no resolvable command) → confirm`,
+        // Soft wrapper with nothing resolvable inside: the effect is unknowable,
+        // not merely unmodeled. Never auto-approved.
+        cause: 'dynamic-dataflow',
       };
     }
     return { kind: 'refuse', reason: 'bash: no commands recognized' };
@@ -5008,6 +5189,10 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
   const allCaps: Capability[] = [exec('shell'), ...orphanRedir.caps, ...loopWordCaps];
   let aggregateConf: 'high' | 'medium' | 'low' = 'high';
   let conservativeReason: string | null = null;
+  // Most restrictive cause wins across the sub-commands. An `unknown-command`
+  // sitting INSIDE a `for` body is `dynamic-dataflow`: the loop makes its caps
+  // best-effort, which is strictly less trustworthy than a bare registry miss.
+  let conservativeCause: ConservativeCause | null = null;
   // Does any sub-command run LOCAL arbitrary code without being an explicit
   // network tool (exec:arbitrary but NO explicitEgress of its own)? Tracked
   // PER-COMMAND — the aggregate `allCaps` flattens attribution, so the planner
@@ -5027,6 +5212,9 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
     if (cmdArbitrary && !cmdExplicitNet) hasLocalArbitraryExec = true;
     allCaps.push(...result.caps);
     if (result.conservative !== undefined) conservativeReason ??= result.conservative;
+    if (result.conservativeCause !== undefined) {
+      conservativeCause = mostRestrictiveCause(conservativeCause, result.conservativeCause);
+    }
     if (result.confidence === 'low') aggregateConf = 'low';
     else if (result.confidence === 'medium' && aggregateConf === 'high') aggregateConf = 'medium';
   }
@@ -5062,6 +5250,10 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
       kind: 'conservative',
       capabilities: allCaps,
       reason: 'bash: cwd-scope escape: a redirect target resolves outside the cwd via a symlink',
+      // The emitted `write-fs:<cwd>/escape` is LEXICAL — it reads as
+      // repo-confined while the kernel follows the symlink outside. This cause
+      // is the reason the modal survives the autonomous confinement check.
+      cause: 'cwd-escape',
     };
   }
 
@@ -5076,7 +5268,17 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
       conservativeReason !== null
         ? `bash: ${conservativeReason}`
         : `bash: ${walk.softReason ?? 'unmodeled shape (control flow / value expansion)'} → confirm`;
-    return { kind: 'conservative', capabilities: allCaps, reason };
+    // A soft WRAPPER (`for`, `if`, `$var`) makes every inner cap best-effort,
+    // so it dominates whatever the inner commands reported: `for f in /tmp/*;
+    // do rm "$f"; done` collects an honest-looking `delete-fs:<cwd>/$f` and
+    // nothing for the loop source. Without this line the loop would inherit the
+    // inner `unknown-command` (or no cause at all) and auto-approve.
+    const cause: ConservativeCause =
+      walk.soft === true
+        ? mostRestrictiveCause(conservativeCause, 'dynamic-dataflow')
+        : // Not soft ⇒ a per-command cause set it. Fail closed if it somehow didn't.
+          (conservativeCause ?? 'dynamic-dataflow');
+    return { kind: 'conservative', capabilities: allCaps, reason, cause };
   }
   // An escalate-tier orphan redirect target (`cat x; > /etc/foo`) degrades
   // confidence like the per-command escalate path. The lexical cap already

@@ -12,9 +12,57 @@ import { isMcpToolName } from '../mcp-naming.ts';
 
 export type ResolverConfidence = 'high' | 'medium' | 'low';
 
+// Why a result is `conservative`. The shapes bucketed under that kind have
+// DIFFERENT trust properties, and the autonomous approval posture
+// (AGENTIC_CLI.md §8.1) must tell them apart. It is a typed field rather than
+// something parsed back out of `reason` for the same reason `confirmCause` is:
+// so the auto-approve rule can never drift on a reworded string.
+//
+//   - 'unknown-command'   — command_resolver_registry miss (`./deploy.sh`,
+//                           `somebinary`). The caps emitted for the REST of the
+//                           command are honest; the only unknown is what the
+//                           binary does internally, which the sandbox's
+//                           `cwd-rw` floor contains. Auto-approvable.
+//   - 'dynamic-dataflow'  — soft control flow, `$var`, loop over a glob. Caps
+//                           are BEST-EFFORT and can UNDER-represent the runtime
+//                           target: `for f in /tmp/*; do rm "$f"; done` models
+//                           the body's `$f` as `<cwd>/$f` and emits no cap for
+//                           the `/tmp/*` loop source. Never auto-approved.
+//   - 'cwd-escape'        — a path (or orphan redirect target) resolves OUTSIDE
+//                           the cwd via a symlink. The lexical cap
+//                           `write-fs:<cwd>/escape` READS as repo-confined while
+//                           the write lands outside. This cause exists
+//                           PRECISELY to hold the modal against the posture's
+//                           confinement check (slices 176/178). Never
+//                           auto-approved.
+//   - 'unmodeled-tool'    — no resolver registered for the tool at all. No caps,
+//                           no basis. Never auto-approved.
+//
+// Precedence when a shape matches more than one: cwd-escape >
+// dynamic-dataflow > unknown-command (most restrictive wins — an
+// `unknown-command` INSIDE a `for` loop is `dynamic-dataflow`).
+export type ConservativeCause =
+  | 'unknown-command'
+  | 'dynamic-dataflow'
+  | 'cwd-escape'
+  | 'unmodeled-tool';
+
+// Whether a conservative result's capability set is a COMPLETE, honest
+// representation of the command's effect. Only `unknown-command` qualifies:
+// every other cause either under-represents the target or lies about it.
+// Fail-closed by construction — an unrecognized future cause is not listed and
+// therefore not trusted.
+export const conservativeCapsAreHonest = (cause: ConservativeCause): boolean =>
+  cause === 'unknown-command';
+
 export type ResolverResult =
   | { kind: 'ok'; capabilities: Capability[]; confidence: ResolverConfidence }
-  | { kind: 'conservative'; capabilities: Capability[]; reason: string }
+  | {
+      kind: 'conservative';
+      capabilities: Capability[];
+      reason: string;
+      cause: ConservativeCause;
+    }
   | { kind: 'refuse'; reason: string };
 
 export interface ResolverContext {
@@ -73,6 +121,7 @@ export const conservativeFallback = (toolName: string): ResolverResult => ({
   kind: 'conservative',
   capabilities: [],
   reason: `no resolver registered for tool '${toolName}'`,
+  cause: 'unmodeled-tool',
 });
 
 // MCP tools (`mcp__<server>__<tool>`) carry dynamic, server-supplied names,

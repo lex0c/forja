@@ -357,6 +357,17 @@ Salvaguarda (a parte load-bearing): o `walkAst` NÃO curto-circuita nos nós sof
 
 Headless / não-interativo: Conservative sem operador resolve como qualquer `confirm` não-respondível → deny. A postura de segurança não afrouxa; o que muda é parar de matar comando benigno quando existe humano (ou policy `allow`) pra aprovar.
 
+**Causa tipada.** `Conservative` agrega shapes com propriedades de confiança **diferentes**, e a postura `autonomous` (`AGENTIC_CLI.md` §8.1) precisa distingui-los sem parsear o `reason` — mesma disciplina que fez `confirmCause` um campo tipado. `ResolverResult.conservative` carrega então um `cause`:
+
+| `cause` | Shape | Caps | Auto-aprovável em autonomous |
+|---|---|---|---|
+| `unknown-command` | table-miss (`./deploy.sh`, `somebinary`) | honestas pro resto do comando; a incógnita é o **interior** do binário, contido pelo floor `cwd-rw` do sandbox | **sim** |
+| `dynamic-dataflow` | control flow, `$var`, loop sobre glob | **best-effort**; podem sub-representar o alvo (`for f in /tmp/*; do rm "$f"; done`) | não |
+| `cwd-escape` | path ou redirect órfão que resolve fora do cwd **via symlink** | **mentem**: a cap léxica `write-fs:<cwd>/escape` lê como confinada | não |
+| `unmodeled-tool` | nenhum resolver registrado pro tool | vazias | não |
+
+Precedência quando um shape casa mais de uma: `cwd-escape` > `dynamic-dataflow` > `unknown-command` (a mais restritiva vence — um `unknown-command` **dentro** de um `for` é `dynamic-dataflow`). Fail-closed: causa desconhecida não auto-aprova. A causa `cwd-escape` existe **precisamente** para segurar o modal contra a confinement-check da postura (slices 176/178); ela não é cosmética.
+
 ### 5.3 Resolvers de MCP tools
 
 MCP tool declara seu resolver no manifest (JS function ou TOML pattern). Resolver MCP roda **em isolamento** (worker separado, sem acesso a engine state). Output validado contra schema antes de aceitar.

