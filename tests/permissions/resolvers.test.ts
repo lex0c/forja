@@ -440,6 +440,26 @@ describe('bash resolver — simple commands', () => {
     expect(egress?.explicitEgress).not.toBe(true); // demoted → still trust-gated
   });
 
+  test('git remote: network subcommands carry net-egress; local-only ones do not', () => {
+    const egressOf = (cmd: string): boolean => {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      const caps = r.kind === 'ok' ? r.capabilities : [];
+      return caps.some((c) => c.kind === 'net-egress');
+    };
+    // Contact the remote → need net-egress so the sandbox provisions network.
+    expect(egressOf('git remote update origin')).toBe(true);
+    expect(egressOf('git remote update')).toBe(true);
+    expect(egressOf('git remote show origin')).toBe(true); // queries remote heads
+    expect(egressOf('git remote prune origin')).toBe(true);
+    expect(egressOf('git remote set-head origin --auto')).toBe(true);
+    // Local only → no network.
+    expect(egressOf('git remote -v')).toBe(false);
+    expect(egressOf('git remote get-url origin')).toBe(false);
+    expect(egressOf('git remote show -n origin')).toBe(false); // -n skips the remote query
+    expect(egressOf('git remote add x https://y')).toBe(false); // config write, local
+    expect(egressOf('git remote set-head origin main')).toBe(false); // explicit branch, local
+  });
+
   test('git status produces git-write read-only', () => {
     const r = resolveCapabilities('bash', { command: 'git status' }, CTX);
     if (r.kind === 'ok') {
