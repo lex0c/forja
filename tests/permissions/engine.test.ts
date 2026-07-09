@@ -355,7 +355,13 @@ describe('approval posture (Supervised / Autonomous)', () => {
     expect(eng.check('bash', 'bash', { command: 'git tag -s v1' }).kind).toBe('allow');
     expect(eng.check('bash', 'bash', { command: 'git add -A && git tag v1' }).kind).toBe('allow');
     expect(eng.check('bash', 'bash', { command: 'git tag -a v1 -m release' }).kind).toBe('allow');
+    // A message that merely looks like a flag is NOT force: -m consumes it.
+    expect(eng.check('bash', 'bash', { command: 'git tag -mf v1' }).kind).toBe('allow');
+    // Deleting OR force-replacing an existing tag loses the old ref → modal.
     expect(eng.check('bash', 'bash', { command: 'git tag -d v1' }).kind).toBe('confirm');
+    expect(eng.check('bash', 'bash', { command: 'git tag -f v1' }).kind).toBe('confirm');
+    expect(eng.check('bash', 'bash', { command: 'git tag --force v1' }).kind).toBe('confirm');
+    expect(eng.check('bash', 'bash', { command: 'git tag -fa v1 -m x' }).kind).toBe('confirm'); // bundled
   });
 
   test('autonomous separates the dev-loop git verbs from the destructive ones', () => {

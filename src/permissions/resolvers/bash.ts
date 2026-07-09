@@ -1996,15 +1996,22 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
           }
         }
       }
-      // `git tag -d v1` DELETES a ref → destructive. A lightweight create is not.
-      const deletesTag = tokens.some((t) => t === '-d' || t === '--delete');
+      // Destructive when it DELETES a ref (`-d`/`--delete`) or FORCE-replaces an
+      // existing tag (`-f`/`--force`) — both lose the old ref target. A
+      // lightweight or annotated CREATE is not. The bundle walk catches `-fa`/
+      // `-df`; `-m`/`-F`/`-u`/`-n` consume the rest of their token, so a message
+      // like `-mf` ("f") isn't misread as force. (`git tag` has no `--force=`
+      // attached form — it is boolean.)
+      const destructiveTag =
+        tokens.some((t) => t === '--delete' || t === '--force') ||
+        bundleHasDestructiveFlag(tokens, new Set(['d', 'f']), new Set(['m', 'F', 'u', 'n']));
       if (usesGpg || (annotated && !hasMessage)) {
         return {
-          capabilities: [exec('arbitrary'), gitWrite(REPO, deletesTag), readFs(REPO)],
+          capabilities: [exec('arbitrary'), gitWrite(REPO, destructiveTag), readFs(REPO)],
           confidence: 'high',
         };
       }
-      return { capabilities: [gitWrite(REPO, deletesTag), readFs(REPO)], confidence: 'high' };
+      return { capabilities: [gitWrite(REPO, destructiveTag), readFs(REPO)], confidence: 'high' };
     }
     case 'add':
       // No hook / editor / gpg surface and no discard of work: git has no
