@@ -311,7 +311,7 @@ describe('renderFooter', () => {
     });
   });
 
-  describe('context-used chip (`N% context used`, >= 95% only)', () => {
+  describe('context-used chip (`N% context used`, >= 90% only)', () => {
     test('surfaces at >= 97% occupancy', () => {
       const out =
         renderFooter(
@@ -334,21 +334,21 @@ describe('renderFooter', () => {
       expect(out.indexOf('$0.50')).toBeLessThan(out.indexOf('% context used'));
     });
 
-    test('surfaces in the 95%–96% band (early warn stage)', () => {
+    test('surfaces in the 90%–96% band (early warn stage)', () => {
       const out =
         renderFooter(
-          startedSession({ contextWindow: 200_000, lastTurnContextTokens: 192_000 }),
+          startedSession({ contextWindow: 200_000, lastTurnContextTokens: 180_000 }),
           caps,
-        ) ?? ''; // 96%
-      expect(out).toContain('96% context used');
+        ) ?? ''; // 90% — the band's lower edge
+      expect(out).toContain('90% context used');
     });
 
-    test('suppressed below 95%', () => {
+    test('suppressed below 90%', () => {
       const out =
         renderFooter(
-          startedSession({ contextWindow: 200_000, lastTurnContextTokens: 188_000 }),
+          startedSession({ contextWindow: 200_000, lastTurnContextTokens: 178_000 }),
           caps,
-        ) ?? ''; // 94%
+        ) ?? ''; // 89%
       expect(out).not.toContain('context used');
     });
 
@@ -396,7 +396,7 @@ describe('renderFooter', () => {
       expect(out).toContain(`${CSI}31m99% context used${CSI}0m`);
     });
 
-    test('painted warn (yellow) in the 95%–96% band when color is enabled', () => {
+    test('painted warn (yellow) in the 90%–96% band when color is enabled', () => {
       const colored: Capabilities = { ...caps, color: 'basic' };
       const out =
         renderFooter(
@@ -405,6 +405,22 @@ describe('renderFooter', () => {
         ) ?? ''; // 96%
       // warn = SGR 33 — the early heads-up before the red near-overflow alarm.
       expect(out).toContain(`${CSI}33m96% context used${CSI}0m`);
+    });
+
+    test('the 96%→97% boundary escalates warn (yellow) to error (red)', () => {
+      const colored: Capabilities = { ...caps, color: 'basic' };
+      const at96 =
+        renderFooter(
+          startedSession({ contextWindow: 200_000, lastTurnContextTokens: 193_000 }),
+          colored,
+        ) ?? ''; // 96.5% → floor 96
+      const at97 =
+        renderFooter(
+          startedSession({ contextWindow: 200_000, lastTurnContextTokens: 194_000 }),
+          colored,
+        ) ?? ''; // 97%
+      expect(at96).toContain(`${CSI}33m96% context used${CSI}0m`);
+      expect(at97).toContain(`${CSI}31m97% context used${CSI}0m`);
     });
   });
 
