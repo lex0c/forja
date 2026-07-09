@@ -1505,29 +1505,36 @@ const capDevLoopConfined = (cap: Capability, cwd: string, home: string): boolean
 };
 
 // Upload detection: egress that carries a repo FILE out. A property of the
-// capability SET — one cap can't see it.
+// capability SET — one cap can't see it. Two shapes count as an upload:
 //
-// The resolver already decodes the shapes that read a file into a request body
-// (`curl -d @file`, `--data-binary @file`, `-F key=@file`, `-T`/`--upload-file`)
-// and emits the corresponding `read-fs`. So "some net-egress AND some read-fs
-// strictly below the cwd" catches the exfil without a flag list to drift.
+//  1. A read STRICTLY below the repo root alongside ANY egress. The resolver
+//     decodes the request-body forms (`curl -d @file`, `--data-binary @file`,
+//     `-F key=@file`, `-T`/`--upload-file`, `wget --post-file`) into a `read-fs`,
+//     so `curl -d @src/data.txt` → `read-fs:<cwd>/src/data.txt` trips this.
+//  2. A read of the repo ROOT (`read-fs:<cwd>`) alongside an EXPLICIT network
+//     tool (`explicitEgress` — curl/wget/scp/ssh). This is the
+//     `tar -cf - . | curl -T -` shape: tar emits `read-fs:<cwd>` (the whole
+//     repo) and curl the egress. Keyed on `explicitEgress` because a
+//     DEP-MANAGER also reads the root (`bun install`/`cargo build` emit
+//     `read-fs:<cwd>` for the manifest scan) but its registry egress is
+//     INCIDENTAL, not explicit — so it must stay auto-approved. Without this
+//     the root-read exclusion (needed for the dep-manager) let a whole-repo
+//     pipe-to-curl clear.
 //
-// A dep-manager doesn't trip it: `bun install` / `cargo build` / `go test` emit
-// `read-fs:<cwd>` — the repo ROOT, equal to cwd, not strictly below it — plus
-// their registry egress. `curl -d @src/data.txt` emits `read-fs:<cwd>/src/data.txt`.
-//
-// Known false positive, accepted as fail-closed: a COMPOUND that both reads a
-// repo file and fetches (`cat src/x.ts && curl https://docs.dev`) unions its
-// caps into one set with no per-command attribution, so it reads as an upload
-// and keeps the modal. Cheaper than teaching the engine dataflow.
+// Residue: a network binary that emits NO `read-fs` (an unknown `nc`/`zip -r -`
+// piped to curl) is invisible here — same class as the declared "reads outside
+// the repo by an unmodeled command are not gated". Accepted false positive: a
+// compound that both reads a repo file and fetches (`cat src/x && curl docs`)
+// unions its caps and reads as an upload — cheaper than per-command dataflow.
 const hasUploadShape = (caps: readonly Capability[], cwd: string): boolean => {
   if (!caps.some((c) => c.kind === 'net-egress')) return false;
+  const hasExplicitEgress = caps.some((c) => c.kind === 'net-egress' && c.explicitEgress === true);
   return caps.some(
     (c) =>
       c.kind === 'read-fs' &&
       c.scope !== null &&
-      c.scope !== cwd &&
-      startsWithSegment(c.scope, cwd),
+      startsWithSegment(c.scope, cwd) &&
+      (c.scope !== cwd || hasExplicitEgress),
   );
 };
 

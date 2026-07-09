@@ -1689,21 +1689,29 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
   // emitted capability set so the engine's per-arg classifier sees
   // them.
   const readCaps = readTargets.map((p) => readFs(resolveArg(p, ctx)));
+  // curl/wget egress is EXPLICIT (the command's user-invoked purpose), like
+  // ssh/scp — not incidental to a build. Two consumers key on this: the sandbox
+  // build-egress trust-gate (sandbox-plan.ts, only when an exec:arbitrary rides
+  // along — the mixed-shell demotion re-gates it next to a local arbitrary exec),
+  // and `hasUploadShape` (engine.ts), which treats an explicit network tool
+  // reading ANY repo file — including the root via a pipe like
+  // `tar -cf - . | curl -T -` — as an upload, where a dep-manager's incidental
+  // registry egress + a root read (its manifest scan) is not.
   if (urlToken === undefined) {
     return {
-      capabilities: [netEgress('*'), ...writeCaps, ...readCaps],
+      capabilities: [netEgress('*', true), ...writeCaps, ...readCaps],
       confidence: 'medium',
     };
   }
   try {
     const host = new URL(urlToken).hostname.toLowerCase();
     return {
-      capabilities: [netEgress(host || '*'), ...writeCaps, ...readCaps],
+      capabilities: [netEgress(host || '*', true), ...writeCaps, ...readCaps],
       confidence: 'high',
     };
   } catch {
     return {
-      capabilities: [netEgress('*'), ...writeCaps, ...readCaps],
+      capabilities: [netEgress('*', true), ...writeCaps, ...readCaps],
       confidence: 'medium',
     };
   }

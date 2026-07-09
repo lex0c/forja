@@ -419,6 +419,27 @@ describe('bash resolver — simple commands', () => {
     }
   });
 
+  test('curl egress is EXPLICIT, and demotes next to a local arbitrary exec', () => {
+    // The explicit mark drives `hasUploadShape` (a whole-repo read piped to curl
+    // is an upload) but must NOT un-gate the sandbox build-egress trust-gate: the
+    // mixed-shell demotion strips it when a local arbitrary exec shares the shell,
+    // exactly as it does for ssh. Pins both halves so neither can silently drift.
+    const solo = resolveCapabilities('bash', { command: 'curl https://x.test' }, CTX);
+    if (solo.kind === 'ok') {
+      const egress = solo.capabilities.find((c) => c.kind === 'net-egress');
+      expect(egress?.explicitEgress).toBe(true);
+    }
+    const mixed = resolveCapabilities(
+      'bash',
+      { command: 'curl https://x.test && ./deploy.sh' },
+      CTX,
+    );
+    const caps = mixed.kind === 'ok' || mixed.kind === 'conservative' ? mixed.capabilities : [];
+    const egress = caps.find((c) => c.kind === 'net-egress');
+    expect(egress).toBeDefined();
+    expect(egress?.explicitEgress).not.toBe(true); // demoted → still trust-gated
+  });
+
   test('git status produces git-write read-only', () => {
     const r = resolveCapabilities('bash', { command: 'git status' }, CTX);
     if (r.kind === 'ok') {
