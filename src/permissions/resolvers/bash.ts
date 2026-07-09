@@ -2121,10 +2121,16 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
       // (`-C`/`--force-create`). `-c` (plain create) and a bare branch switch are
       // free. `-c`/`-C` take the new-branch name as their value, so `-cf` is
       // create-branch-"f" (safe) while `-fc` is force-then-create (destructive) —
-      // the bundle walk with `c` value-consuming gets both right.
+      // the bundle walk with `c` value-consuming gets both right. `--force-create`
+      // takes the name too, so it also appears attached (`--force-create=foo`);
+      // match both spellings (the bundle walk only sees SHORT options).
       const destructive =
         tokens.some(
-          (t) => t === '--force' || t === '--discard-changes' || t === '--force-create',
+          (t) =>
+            t === '--force' ||
+            t === '--discard-changes' ||
+            t === '--force-create' ||
+            t.startsWith('--force-create='),
         ) || bundleHasDestructiveFlag(tokens, new Set(['f', 'C']), new Set(['c']));
       return { capabilities: [gitWrite(REPO, destructive), readFs(REPO)], confidence: 'high' };
     }

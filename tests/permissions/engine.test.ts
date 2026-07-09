@@ -376,6 +376,7 @@ describe('approval posture (Supervised / Autonomous)', () => {
       'git branch -u origin/main feat', // set-upstream: -u consumes its value, not a bundle
       'git branch -udev feat', // set-upstream "dev" attached: the 'd' is the value, not -d
       'git switch -cf newbr', // -c consumes "f" → create branch "f" (bundle walk, NOT force)
+      'git switch --create=foo main', // plain create, attached long form — NOT destructive
       'git reset HEAD~1', // soft/mixed — working tree intact
       'git fetch origin', // updates remote-tracking refs only; `pull` is where the merge lands
       'git fetch --all',
@@ -415,6 +416,7 @@ describe('approval posture (Supervised / Autonomous)', () => {
       'git branch -df doomed', // BUNDLED delete+force — the exact-token check missed this
       'git branch -fd doomed', // order-independent
       'git switch -fc newbr', // BUNDLED force+create (discards) — distinct from -cf (create "f")
+      'git switch --force-create=foo main', // attached long form — the bundle walk only sees short opts
       'git fetch -f origin main:main', // force-overwrites a LOCAL ref (loses commits)
       'git fetch --force origin main:main',
       'git fetch origin +main:main', // '+' refspec forces the local-ref overwrite
