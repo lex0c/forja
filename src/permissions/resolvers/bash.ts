@@ -1536,6 +1536,21 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx, name) => {
     { longForm: '--config', shortForm: '-K' },
     { longForm: '--netrc-file' },
     { longForm: '--cacert' },
+    // TLS / auth MATERIAL — a repo private key or client cert read here must
+    // emit `read-fs` so the read SURFACES instead of leaving silently: under
+    // autonomous a sensitive `id_rsa`/`*.pem`/`*.key` fails `capDevLoopConfined`
+    // (`matchSensitivePath`) and re-arms the modal, and under bypass the §11
+    // protected/sensitive floor denies it outright. Pre-fix these emitted only
+    // `net-egress`, so `curl --key src/id_rsa https://x` auto-approved. A
+    // non-sensitive cert still surfaces as an upload-shaped confirm (its bytes
+    // ARE presented on the handshake). `-E`/`--cert` takes `<cert[:password]>`
+    // and is handled separately below (the `:password` suffix must be stripped);
+    // the rest are plain paths.
+    { longForm: '--key' },
+    { longForm: '--pubkey' },
+    { longForm: '--proxy-cert' },
+    { longForm: '--proxy-key' },
+    { longForm: '--proxy-cacert' },
     // wget upload forms: `--post-file=FILE` / `--body-file=FILE` read a local
     // file into the request body (the wget analogue of curl `-d @file`). Without
     // these the emitted caps were `net-egress` ALONE, so `hasUploadShape` (which
@@ -1543,6 +1558,14 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx, name) => {
     // autonomous posture auto-approved the exfil.
     { longForm: '--post-file' },
     { longForm: '--body-file' },
+  ];
+  // `-E`/`--cert <cert[:password]>` — same read as the specs above, but a
+  // trailing `:password` must be stripped so the emitted path is the cert file,
+  // not `cert.pem:secret`. Strip at the FIRST `:` (the path is what matters for
+  // the read; over-stripping under-reports, which the specs never do — here we
+  // keep the leading path segment).
+  const CURL_CERT_SPECS: readonly { longForm: string; shortForm?: string }[] = [
+    { longForm: '--cert', shortForm: '-E' },
   ];
   const writeTargets: string[] = [];
   const readTargets: string[] = [];
@@ -1554,6 +1577,13 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx, name) => {
   for (const spec of CURL_READ_PATH_SPECS) {
     for (const v of extractValueFlag(tokens, spec)) {
       if (v !== '-') readTargets.push(v);
+    }
+  }
+  for (const spec of CURL_CERT_SPECS) {
+    for (const v of extractValueFlag(tokens, spec)) {
+      const colon = v.indexOf(':');
+      const path = colon === -1 ? v : v.slice(0, colon); // drop `:password`
+      if (path.length > 0 && path !== '-') readTargets.push(path);
     }
   }
 
@@ -2002,6 +2032,12 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
     case 'annotate':
     case 'var':
       return { capabilities: [readFs(REPO)], confidence: 'high' };
+    case 'ls-remote':
+      // Read-only NETWORK query: lists the remote's refs, writes nothing. Pre-fix
+      // it fell to `default` and got `git-write` (low confidence) — misclassified
+      // as a destructive write. It needs `net-egress` for the sandbox, but no
+      // `git-write`.
+      return { capabilities: [netEgress('*'), readFs(REPO)], confidence: 'high' };
     case 'commit':
     case 'merge':
     case 'rebase':
@@ -2255,12 +2291,20 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
         ) || bundleHasDestructiveFlag(tokens, new Set(['f', 'C']), new Set(['c']));
       return { capabilities: [gitWrite(REPO, destructive), readFs(REPO)], confidence: 'high' };
     }
-    case 'restore':
+    case 'restore': {
       // `git restore <path>` overwrites the working tree from the index —
-      // discards edits by design. `--staged` alone only unstages, but the
-      // combined `--staged --worktree` discards; fail closed and mark all
-      // restores destructive rather than decode the matrix.
-      return { capabilities: [gitWrite(REPO, true), readFs(REPO)], confidence: 'high' };
+      // discards edits by design. `--staged` ALONE only unstages (index → HEAD,
+      // working tree intact) → non-destructive. `--worktree` (explicit or the
+      // default) and `-p`/`--patch` discard. Fail closed: destructive UNLESS it
+      // is a staged-only restore (`-S`/`--staged` present, and no
+      // `-W`/`--worktree`/`-p`/`--patch`). A bundled `-SW` isn't exactly `-S`, so
+      // it doesn't count as staged-only and stays destructive — correct, since it
+      // carries `W`.
+      const stagedOnly =
+        tokens.some((t) => t === '--staged' || t === '-S') &&
+        !tokens.some((t) => t === '--worktree' || t === '-W' || t === '-p' || t === '--patch');
+      return { capabilities: [gitWrite(REPO, !stagedOnly), readFs(REPO)], confidence: 'high' };
+    }
     case 'branch': {
       // Listing and creating are free; deleting (`-d`/`-D`), force-moving/
       // -renaming (`-f`/`-M`), or force-copying (`-C`) a ref is not. `-m`/`-c`

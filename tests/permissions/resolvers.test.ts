@@ -471,6 +471,10 @@ describe('bash resolver — simple commands', () => {
     expect(gitWriteOf('git remote update origin')).toBe(true);
     expect(gitWriteOf('git remote show origin')).toBe(false);
     expect(gitWriteOf('git remote -v')).toBe(false);
+    // `git ls-remote` is a read-only network query — net-egress, NOT git-write
+    // (it fell to the destructive `default` before).
+    expect(egressOf('git ls-remote origin')).toBe(true);
+    expect(gitWriteOf('git ls-remote origin')).toBe(false);
   });
 
   test('git status produces git-write read-only', () => {
