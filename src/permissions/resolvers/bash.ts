@@ -2135,7 +2135,19 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
         (sub === 'show' && !hasN) ||
         (sub === 'set-head' && auto);
       const caps: Capability[] = [];
-      if (mutates || sub === 'prune') caps.push(gitWrite(REPO, true));
+      if (mutates || sub === 'prune') {
+        caps.push(gitWrite(REPO, true));
+      } else if (sub === 'update') {
+        // `git remote update` is fetch-like: it updates remote-tracking refs
+        // (writes `.git` state), so it must emit `git-write` like `git fetch` —
+        // else a policy/subagent-envelope check that withholds `git-write` but
+        // allows egress would let this repo mutation through. Non-destructive
+        // (it only advances tracking refs). `--prune` inside it is caught by the
+        // `sub === 'prune'` branch? No — that is the `prune` SUBCOMMAND; the
+        // `--prune` FLAG on update just fetches-then-prunes stale tracking refs
+        // (recoverable), so update stays non-destructive.
+        caps.push(gitWrite(REPO));
+      }
       if (contactsRemote) caps.push(netEgress('*'));
       caps.push(readFs(REPO));
       return { capabilities: caps, confidence: 'high' };

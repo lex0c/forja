@@ -458,6 +458,19 @@ describe('bash resolver — simple commands', () => {
     expect(egressOf('git remote show -n origin')).toBe(false); // -n skips the remote query
     expect(egressOf('git remote add x https://y')).toBe(false); // config write, local
     expect(egressOf('git remote set-head origin main')).toBe(false); // explicit branch, local
+
+    // git-write honesty: `remote update` is fetch-like (writes tracking refs),
+    // so it must carry git-write like `git fetch` — else a git-write-withholding
+    // policy/envelope that allows egress would let the repo mutation through.
+    // `show`/`-v` only display → no git-write.
+    const gitWriteOf = (cmd: string): boolean => {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      const caps = r.kind === 'ok' ? r.capabilities : [];
+      return caps.some((c) => c.kind === 'git-write');
+    };
+    expect(gitWriteOf('git remote update origin')).toBe(true);
+    expect(gitWriteOf('git remote show origin')).toBe(false);
+    expect(gitWriteOf('git remote -v')).toBe(false);
   });
 
   test('git status produces git-write read-only', () => {
