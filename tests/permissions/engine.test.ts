@@ -378,6 +378,9 @@ describe('approval posture (Supervised / Autonomous)', () => {
       'git switch -cf newbr', // -c consumes "f" → create branch "f" (bundle walk, NOT force)
       'git reset HEAD~1', // soft/mixed — working tree intact
       'git fetch origin', // updates remote-tracking refs only; `pull` is where the merge lands
+      'git fetch --all',
+      'git fetch --prune origin',
+      'git fetch origin main:localonly', // plain refspec — fast-forward only, refuses otherwise
       'git remote -v', // read
       'git remote show origin',
       'git remote get-url origin',
@@ -412,6 +415,9 @@ describe('approval posture (Supervised / Autonomous)', () => {
       'git branch -df doomed', // BUNDLED delete+force — the exact-token check missed this
       'git branch -fd doomed', // order-independent
       'git switch -fc newbr', // BUNDLED force+create (discards) — distinct from -cf (create "f")
+      'git fetch -f origin main:main', // force-overwrites a LOCAL ref (loses commits)
+      'git fetch --force origin main:main',
+      'git fetch origin +main:main', // '+' refspec forces the local-ref overwrite
       'git tag -d v1', // ref delete
       'git remote add evil https://evil.test/r', // rewrites .git/config → later fetch hits it
       'git remote set-url origin https://evil.test/r',

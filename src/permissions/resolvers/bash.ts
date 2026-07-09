@@ -2057,16 +2057,26 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
         capabilities: [gitWrite(REPO, true), netEgress('*'), readFs(REPO)],
         confidence: 'high',
       };
-    case 'fetch':
-      // Talks to the remote but touches NEITHER the working tree nor local
-      // history — it only updates remote-tracking refs. Deliberately NOT
-      // destructive: the operator's confirm list is commit/push/pull/clone, and
-      // plain `net-egress` is dev-loop-confined under autonomous (same as a
-      // `curl` of a doc). `git pull` is where the merge (and its hooks) lands.
+    case 'fetch': {
+      // A PLAIN fetch (`git fetch`, `git fetch origin`, `--all`, `--prune`, a
+      // bare `<refspec>` into FETCH_HEAD, or a non-`+` `<src>:<dst>` which is
+      // fast-forward-only and refuses otherwise) touches neither the working tree
+      // nor local branch history — it only updates remote-tracking refs. Those
+      // stay dev-loop-confined under autonomous (plain net-egress, like a doc
+      // fetch). But `-f`/`--force`, or a refspec with a leading `+`
+      // (`+main:main`, `+refs/heads/*:refs/heads/*`), FORCE-overwrites a local
+      // ref — discarding local commits — so those are destructive like push/pull.
+      // A `+` can only lead a refspec positional (options start with `-`), so a
+      // positional starting with `+` is a force refspec.
+      const force =
+        tokens.some((t) => t === '--force') ||
+        bundleHasDestructiveFlag(tokens, new Set(['f']), new Set(['j', 'o'])) ||
+        positional.slice(1).some((p) => p.startsWith('+'));
       return {
-        capabilities: [gitWrite(REPO), netEgress('*'), readFs(REPO)],
+        capabilities: [gitWrite(REPO, force), netEgress('*'), readFs(REPO)],
         confidence: 'high',
       };
+    }
     case 'clone':
       // Network + writes a whole tree. Pre-slice this fell to `default` (low
       // confidence), which gated it only via the risk score.
