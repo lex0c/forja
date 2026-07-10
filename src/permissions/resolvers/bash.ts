@@ -1848,6 +1848,35 @@ const bundleHasDestructiveFlag = (
   return false;
 };
 
+// A `git <repository>` operand that points at a LOCAL filesystem repo — git
+// reads its objects, a read OUTSIDE the workspace that must emit `read-fs` so
+// the autonomous gate (outside-cwd → modal) and the bypass §11 floor see it.
+// Returns the path, or null for a network URL / scp-like `[user@]host:path` / a
+// bare NAMED remote (`origin`). No regex (policy rule) — scheme + shape by
+// prefix/index. A local path needing a `:` must be `./`-prefixed, matching git's
+// own disambiguation (`./a:b` is local, `a:b` is scp-like).
+const GIT_NETWORK_SCHEMES = [
+  'https://',
+  'http://',
+  'git://',
+  'ssh://',
+  'ftp://',
+  'ftps://',
+  'git+ssh://',
+] as const;
+const gitRepoLocalPath = (op: string): string | null => {
+  if (op.startsWith('file://')) return op.slice('file://'.length);
+  if (GIT_NETWORK_SCHEMES.some((s) => op.startsWith(s))) return null;
+  if (op.startsWith('/') || op.startsWith('./') || op.startsWith('../') || op.startsWith('~')) {
+    return op;
+  }
+  const colon = op.indexOf(':');
+  const slash = op.indexOf('/');
+  if (colon !== -1 && (slash === -1 || colon < slash)) return null; // [user@]host:path
+  if (slash !== -1) return op; // relative local path (`some/dir.git`)
+  return null; // bare word → a named remote (`origin`)
+};
+
 const cmdGit: CommandResolver = (positional, tokens, ctx) => {
   // Slice 128 (R4 P0-Launder-2): `git -c <key>=<value>` sets a
   // one-shot config override. Several git config keys execute
@@ -2032,12 +2061,22 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
     case 'annotate':
     case 'var':
       return { capabilities: [readFs(REPO)], confidence: 'high' };
-    case 'ls-remote':
-      // Read-only NETWORK query: lists the remote's refs, writes nothing. Pre-fix
-      // it fell to `default` and got `git-write` (low confidence) — misclassified
-      // as a destructive write. It needs `net-egress` for the sandbox, but no
-      // `git-write`.
+    case 'ls-remote': {
+      // Read-only query: lists a remote's refs, writes nothing. A URL / named
+      // remote is network (`net-egress`); a LOCAL repo operand
+      // (`git ls-remote ../other.git`) is a filesystem read OUTSIDE the workspace
+      // → `read-fs:<path>` so the outside-cwd read re-arms the modal. `-p`/`-P`
+      // don't take a value on ls-remote, so positional[1] is the repository.
+      const lsRepo = positional[1];
+      const lsLocal = lsRepo !== undefined ? gitRepoLocalPath(lsRepo) : null;
+      if (lsLocal !== null) {
+        return {
+          capabilities: [readFs(resolveArg(lsLocal, ctx)), readFs(REPO)],
+          confidence: 'high',
+        };
+      }
       return { capabilities: [netEgress('*'), readFs(REPO)], confidence: 'high' };
+    }
     case 'commit':
     case 'merge':
     case 'rebase':
@@ -2247,10 +2286,16 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
         bundleHasDestructiveFlag(tokens, new Set(['f', 'P']), new Set(['j', 'o'])) ||
         positional.slice(1).some((p) => p.startsWith('+')) ||
         extractValueFlag(tokens, { longForm: '--refmap' }).some((v) => v.startsWith('+'));
-      return {
-        capabilities: [gitWrite(REPO, force), netEgress('*'), readFs(REPO)],
-        confidence: 'high',
-      };
+      // A LOCAL repository operand (`git fetch ../other.git`) is a filesystem
+      // read of that repo — outside the workspace, so emit `read-fs:<path>` (no
+      // net-egress) and let the outside-cwd path re-arm the modal. A URL / named
+      // remote is network egress as before.
+      const fetchRepo = positional[1];
+      const fetchLocal = fetchRepo !== undefined ? gitRepoLocalPath(fetchRepo) : null;
+      const fetchCaps: Capability[] = [gitWrite(REPO, force), readFs(REPO)];
+      if (fetchLocal !== null) fetchCaps.push(readFs(resolveArg(fetchLocal, ctx)));
+      else fetchCaps.push(netEgress('*'));
+      return { capabilities: fetchCaps, confidence: 'high' };
     }
     case 'clone':
       // Network + writes a whole tree. Pre-slice this fell to `default` (low

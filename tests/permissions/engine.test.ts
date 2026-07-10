@@ -730,6 +730,30 @@ describe('approval posture (Supervised / Autonomous)', () => {
     expect(eng.check('bash', 'bash', { command: 'git fetch --prune origin' }).kind).toBe('allow');
   });
 
+  test('autonomous gates a fetch/ls-remote from a LOCAL repo outside the workspace', () => {
+    // `git fetch ../other.git` reads a git repo OUTSIDE cwd — the resolver must
+    // emit read-fs:<path> (not just net-egress) or the outside-repo read
+    // auto-approves. A URL / named remote stays a network fetch → free. Uses the
+    // `forja init` catch-all `confirm: ['*']` (the scenario the finding named):
+    // the read-fs:<outside> fails capDevLoopConfined and re-arms the modal.
+    const eng = createPermissionEngine(policy({ tools: { bash: { confirm: ['*'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+    });
+    for (const cmd of [
+      'git fetch ../other.git',
+      'git fetch /tmp/other.git',
+      'git fetch file:///tmp/other.git',
+      'git ls-remote ../other.git',
+    ]) {
+      expect(eng.check('bash', 'bash', { command: cmd }).kind).toBe('confirm');
+    }
+    // Network remotes (URL / named) — plain dev-loop fetch, still free.
+    expect(eng.check('bash', 'bash', { command: 'git fetch origin' }).kind).toBe('allow');
+    expect(eng.check('bash', 'bash', { command: 'git fetch https://x.test/y' }).kind).toBe('allow');
+    expect(eng.check('bash', 'bash', { command: 'git ls-remote origin' }).kind).toBe('allow');
+  });
+
   test('autonomous does NOT auto-approve a wget upload (--post-file / --body-file)', () => {
     // hasUploadShape needs a repo file read alongside the egress; the resolver
     // decodes wget's body-file flags into read-fs so the upload isn't seen as a
