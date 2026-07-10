@@ -1926,6 +1926,30 @@ const GIT_LS_REMOTE_VALUE_FLAGS: ReadonlySet<string> = new Set([
   '--server-option',
 ]);
 
+// Caps for a git op that CONTACTS a remote (fetch / ls-remote / remote
+// update|prune|show|set-head --auto). Contacting the remote runs whatever the
+// repo-local `.git/config` names for the transport — `core.sshCommand` (ssh
+// URLs), `core.gitProxy` (git://), `credential.helper` (http auth) — any of which
+// may be `!<shell>`. The sandbox masks the GLOBAL gitconfig's exec knobs but
+// DELIBERATELY leaves the repo `.git/config` UNMASKED and winning
+// (`sandbox-git-identity.ts`), so a hostile clone's config executes on a plain
+// `git fetch origin` — verified: `core.sshCommand` fires on fetch, ls-remote, and
+// `remote show|update|prune`. Same covert-exec-by-config class as `git commit`
+// hooks and `git tag -s`/`-a`: emit `exec:arbitrary` AND mark the git-write
+// `destructive`, because the autonomous posture stopped gating `exec:arbitrary`
+// alone — the `destructive` flag is what holds the modal. For the pure-QUERY ops
+// (ls-remote, `remote show`) the git-write writes no ref; it carries only that
+// modal-hold semantics, the same overload the exec-backed `git tag -s` uses (a
+// typed covert-exec signal would let those drop the synthetic write — the
+// registered altitude backstop). `push`/`pull`/`clone` already gate via their own
+// destructive git-write, so they are unaffected.
+const gitRemoteContactCaps = (repo: string): Capability[] => [
+  exec('arbitrary'),
+  gitWrite(repo, true),
+  netEgress('*'),
+  readFs(repo),
+];
+
 const cmdGit: CommandResolver = (positional, tokens, ctx) => {
   // Slice 128 (R4 P0-Launder-2): `git -c <key>=<value>` sets a
   // one-shot config override. Several git config keys execute
@@ -2123,12 +2147,15 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
       const lsRepo = lsPositional[1];
       const lsLocal = lsRepo !== undefined ? gitRepoLocalPath(lsRepo) : null;
       if (lsLocal !== null) {
+        // LOCAL repo operand — file/dir transport, no ssh/proxy/credential helper,
+        // so no repo-config transport exec. A pure filesystem read (outside cwd → gated).
         return {
           capabilities: [readFs(resolveArg(lsLocal, ctx)), readFs(REPO)],
           confidence: 'high',
         };
       }
-      return { capabilities: [netEgress('*'), readFs(REPO)], confidence: 'high' };
+      // REMOTE query — contacts the remote → repo-config transport exec.
+      return { capabilities: gitRemoteContactCaps(REPO), confidence: 'high' };
     }
     case 'commit':
     case 'merge':
@@ -2271,21 +2298,22 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
         sub === 'prune' ||
         (sub === 'show' && !hasN) ||
         (sub === 'set-head' && auto);
-      const caps: Capability[] = [];
-      if (mutates || sub === 'prune') {
-        caps.push(gitWrite(REPO, true));
-      } else if (sub === 'update') {
-        // `git remote update` is fetch-like: it updates remote-tracking refs
-        // (writes `.git` state), so it must emit `git-write` like `git fetch` —
-        // else a policy/subagent-envelope check that withholds `git-write` but
-        // allows egress would let this repo mutation through. Non-destructive
-        // (it only advances tracking refs). `--prune` inside it is caught by the
-        // `sub === 'prune'` branch? No — that is the `prune` SUBCOMMAND; the
-        // `--prune` FLAG on update just fetches-then-prunes stale tracking refs
-        // (recoverable), so update stays non-destructive.
-        caps.push(gitWrite(REPO));
+      if (contactsRemote) {
+        // Contacting the remote runs repo-config transport exec (ssh/proxy/
+        // credential) → gate as covert exec (see `gitRemoteContactCaps`). This
+        // supersedes the plain gitWrite/netEgress the branch used before and
+        // closes the pure-QUERY `show <name>` / `set-head --auto` that emitted
+        // neither destructive nor exec (auto-approved under autonomous). It also
+        // subsumes `update` (fetch-like tracking-ref write) and `prune` (stale-ref
+        // delete): the destructive git-write covers both.
+        return { capabilities: gitRemoteContactCaps(REPO), confidence: 'high' };
       }
-      if (contactsRemote) caps.push(netEgress('*'));
+      // LOCAL-only shapes: a config MUTATION (`add`/`set-url`/`rename`/…) that can
+      // repoint fetch/push at an attacker host is persistent-authority →
+      // destructive (bash never emits a `.git` write, so the mark is the only
+      // gate). A bare/`-v`/`get-url`/`show -n`/`set-head <branch>` is a pure read.
+      const caps: Capability[] = [];
+      if (mutates) caps.push(gitWrite(REPO, true));
       caps.push(readFs(REPO));
       return { capabilities: caps, confidence: 'high' };
     }
@@ -2313,13 +2341,14 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
         confidence: 'high',
       };
     case 'fetch': {
-      // A PLAIN fetch (`git fetch`, `git fetch origin`, `--all`, `--prune`, a
-      // bare `<refspec>` into FETCH_HEAD, or a non-`+` `<src>:<dst>` which is
-      // fast-forward-only and refuses otherwise) touches neither the working tree
-      // nor local branch history — it only updates remote-tracking refs. Those
-      // stay dev-loop-confined under autonomous (plain net-egress, like a doc
-      // fetch). Destructive when it FORCE-overwrites a LOCAL ref — discarding
-      // commits — or clobbers LOCAL tags:
+      // A REMOTE fetch (`git fetch`, `git fetch origin`, a URL) contacts the
+      // remote and therefore runs the repo-config transport program → it now gates
+      // under autonomous via `gitRemoteContactCaps` (below), like commit/tag/pull/
+      // push/clone. The `force`/destructive detection here governs the LOCAL-repo
+      // branch only (`git fetch ../other.git`), which touches neither the working
+      // tree nor branch history — it only updates remote-tracking refs — and is
+      // Destructive solely when it FORCE-overwrites a LOCAL ref (discarding
+      // commits) or clobbers LOCAL tags:
       //   • `-f`/`--force`, or a refspec with a leading `+` (`+main:main`,
       //     `+refs/heads/*:refs/heads/*`) — a `+` can only lead a refspec
       //     positional (options start with `-`). The same `+` can also ride
@@ -2345,16 +2374,25 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
         bundleHasDestructiveFlag(tokens, new Set(['f', 'P']), new Set(['j', 'o'])) ||
         fetchPositional.slice(1).some((p) => p.startsWith('+')) ||
         extractValueFlag(tokens, { longForm: '--refmap' }).some((v) => v.startsWith('+'));
-      // A LOCAL repository operand (`git fetch ../other.git`) is a filesystem
-      // read of that repo — outside the workspace, so emit `read-fs:<path>` (no
-      // net-egress) and let the outside-cwd path re-arm the modal. A URL / named
-      // remote is network egress as before.
       const fetchRepo = fetchPositional[1];
       const fetchLocal = fetchRepo !== undefined ? gitRepoLocalPath(fetchRepo) : null;
-      const fetchCaps: Capability[] = [gitWrite(REPO, force), readFs(REPO)];
-      if (fetchLocal !== null) fetchCaps.push(readFs(resolveArg(fetchLocal, ctx)));
-      else fetchCaps.push(netEgress('*'));
-      return { capabilities: fetchCaps, confidence: 'high' };
+      if (fetchLocal !== null) {
+        // A LOCAL repository operand (`git fetch ../other.git`) is a filesystem
+        // read of that repo — outside the workspace, so emit `read-fs:<path>` (no
+        // net-egress) and let the outside-cwd path re-arm the modal. File/dir
+        // transport uses no ssh/proxy/credential helper → no repo-config transport
+        // exec; the tracking-ref write is destructive only on a `+`/`--force` local
+        // ref overwrite (the `force` detection above).
+        return {
+          capabilities: [gitWrite(REPO, force), readFs(REPO), readFs(resolveArg(fetchLocal, ctx))],
+          confidence: 'high',
+        };
+      }
+      // REMOTE fetch (named remote / URL) — contacts the remote → repo-config
+      // transport exec (see `gitRemoteContactCaps`); gated under autonomous. (The
+      // `force` refinement no longer matters here — the branch is destructive
+      // regardless.)
+      return { capabilities: gitRemoteContactCaps(REPO), confidence: 'high' };
     }
     case 'clone':
       // Network + writes a whole tree. Pre-slice this fell to `default` (low

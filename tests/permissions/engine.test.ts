@@ -391,15 +391,8 @@ describe('approval posture (Supervised / Autonomous)', () => {
       'git switch --create=foo main', // plain create, attached long form — NOT destructive
       'git reset HEAD~1', // soft/mixed — working tree intact
       'git restore --staged src/x.ts', // unstage only — working tree intact, non-destructive
-      'git fetch origin', // updates remote-tracking refs only; `pull` is where the merge lands
-      'git fetch --all',
-      'git fetch --prune origin',
-      'git fetch origin main:localonly', // plain refspec — fast-forward only, refuses otherwise
-      'git ls-remote origin', // read-only network query — no git-write
-      'git remote -v', // read
-      'git remote show origin', // queries remote (net-egress) but non-destructive
-      'git remote update origin', // fetches tracking refs — network, not a discard
-      'git remote get-url origin',
+      'git remote -v', // read — no remote contact
+      'git remote get-url origin', // read — no remote contact
       'git clean -n', // dry run — deletes nothing
     ]) {
       expect(eng.check('bash', 'bash', { command: cmd }).kind).toBe('allow');
@@ -444,6 +437,19 @@ describe('approval posture (Supervised / Autonomous)', () => {
       'git remote add evil https://evil.test/r', // rewrites .git/config → later fetch hits it
       'git remote set-url origin https://evil.test/r',
       'git lfs install', // unknown verb → fail-closed destructive
+      // Remote-CONTACTING ops run the repo-config transport program
+      // (core.sshCommand / core.gitProxy / credential.helper, any of which may be
+      // `!<shell>`) — covert exec the sandbox does NOT mask for repo `.git/config`.
+      // All now gate under autonomous, even non-force / read-only forms:
+      'git fetch origin', // plain remote fetch — was the operator's "free" path
+      'git fetch --all',
+      'git fetch --prune origin',
+      'git fetch origin main:localonly', // plain fast-forward refspec, still remote-contact
+      'git ls-remote origin', // read-only query, but contacts the remote
+      'git remote show origin', // queries remote heads
+      'git remote update origin', // fetch-like tracking-ref write
+      'git remote prune origin', // contacts remote to find stale refs
+      'git remote set-head origin --auto', // fetches the remote HEAD
     ]) {
       expect(eng.check('bash', 'bash', { command: cmd }).kind).toBe('confirm');
     }
@@ -716,18 +722,34 @@ describe('approval posture (Supervised / Autonomous)', () => {
     }
   });
 
-  test('autonomous gates git fetch --prune-tags (clobbers local tags), not plain --prune', () => {
+  test('autonomous: remote fetch always gates; force detection still governs a local-repo fetch', () => {
     const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git*'] } } }), {
       cwd: CWD,
       approvalPosture: 'autonomous',
     });
-    expect(eng.check('bash', 'bash', { command: 'git fetch --prune-tags origin' }).kind).toBe(
+    // A REMOTE fetch contacts the remote → repo-config transport exec → gates
+    // regardless of prune flags (plain `--prune` is no longer a free path).
+    for (const cmd of [
+      'git fetch --prune-tags origin',
+      'git fetch -P origin',
+      'git fetch -p origin',
+      'git fetch --prune origin',
+    ]) {
+      expect(eng.check('bash', 'bash', { command: cmd }).kind).toBe('confirm');
+    }
+    // The `force`/destructive detection still changes the gate for a LOCAL repo
+    // INSIDE cwd (no transport exec, read is repo-confined): `--prune-tags`
+    // clobbers local tags → destructive → gate; a plain local fetch stays free.
+    expect(eng.check('bash', 'bash', { command: 'git fetch --prune-tags ./sub' }).kind).toBe(
       'confirm',
     );
-    expect(eng.check('bash', 'bash', { command: 'git fetch -P origin' }).kind).toBe('confirm');
-    // `-p`/`--prune` drops only stale remote-tracking refs (recoverable) → free.
-    expect(eng.check('bash', 'bash', { command: 'git fetch -p origin' }).kind).toBe('allow');
-    expect(eng.check('bash', 'bash', { command: 'git fetch --prune origin' }).kind).toBe('allow');
+    expect(eng.check('bash', 'bash', { command: 'git fetch ./sub' }).kind).toBe('allow');
+    expect(eng.check('bash', 'bash', { command: 'git fetch ./sub main:localonly' }).kind).toBe(
+      'allow',
+    );
+    expect(eng.check('bash', 'bash', { command: 'git fetch ./sub +main:main' }).kind).toBe(
+      'confirm',
+    ); // '+' force-overwrites a local ref
   });
 
   test('autonomous gates a fetch/ls-remote from a LOCAL repo outside the workspace', () => {
@@ -765,16 +787,17 @@ describe('approval posture (Supervised / Autonomous)', () => {
     ]) {
       expect(eng.check('bash', 'bash', { command: cmd }).kind).toBe('confirm');
     }
-    // Network remotes (URL / named) — plain dev-loop fetch, still free, and the
-    // value-aware pass must NOT over-gate them (a spaced value before a NAMED
-    // remote still resolves to the named remote → network, not a local read).
-    expect(eng.check('bash', 'bash', { command: 'git fetch origin' }).kind).toBe('allow');
-    expect(eng.check('bash', 'bash', { command: 'git fetch https://x.test/y' }).kind).toBe('allow');
-    expect(eng.check('bash', 'bash', { command: 'git ls-remote origin' }).kind).toBe('allow');
-    expect(eng.check('bash', 'bash', { command: 'git fetch --depth 1 origin' }).kind).toBe('allow');
-    expect(eng.check('bash', 'bash', { command: 'git ls-remote --sort key origin' }).kind).toBe(
-      'allow',
+    // Network remotes (URL / named) also gate now — they CONTACT the remote →
+    // repo-config transport exec (see the remote-contact test). At the ENGINE
+    // level the file:// fix is still discriminated (its bug makes the path look
+    // INSIDE cwd → allow), but the value-aware fix is not (a masked repo falls to
+    // the named-remote branch, which now also confirms); its exact-caps guard
+    // (read-fs vs net-egress) lives in the resolver test.
+    expect(eng.check('bash', 'bash', { command: 'git fetch origin' }).kind).toBe('confirm');
+    expect(eng.check('bash', 'bash', { command: 'git fetch https://x.test/y' }).kind).toBe(
+      'confirm',
     );
+    expect(eng.check('bash', 'bash', { command: 'git ls-remote origin' }).kind).toBe('confirm');
     // `--recurse-submodules` is optional-value (spaced form does NOT consume): the
     // next token is the repo, not the option's value. A bare form before a local
     // repo must still gate (the operand is not swallowed).

@@ -473,22 +473,40 @@ describe('bash resolver — simple commands', () => {
     expect(egressOf('git remote add x https://y')).toBe(false); // config write, local
     expect(egressOf('git remote set-head origin main')).toBe(false); // explicit branch, local
 
-    // git-write honesty: `remote update` is fetch-like (writes tracking refs),
-    // so it must carry git-write like `git fetch` — else a git-write-withholding
-    // policy/envelope that allows egress would let the repo mutation through.
-    // `show`/`-v` only display → no git-write.
+    // Remote-CONTACTING ops run the repo-config transport program (core.sshCommand
+    // etc.) → they carry exec:arbitrary + a destructive git-write that holds the
+    // autonomous modal (even the pure-query `show`/`ls-remote`, whose git-write
+    // writes no ref — it is the modal-hold overload). Local-only ops carry neither.
     const gitWriteOf = (cmd: string): boolean => {
       const r = resolveCapabilities('bash', { command: cmd }, CTX);
       const caps = r.kind === 'ok' ? r.capabilities : [];
       return caps.some((c) => c.kind === 'git-write');
     };
-    expect(gitWriteOf('git remote update origin')).toBe(true);
-    expect(gitWriteOf('git remote show origin')).toBe(false);
+    const execOf = (cmd: string): boolean => {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      const caps = r.kind === 'ok' ? r.capabilities : [];
+      return caps.some((c) => c.kind === 'exec' && c.scope === 'arbitrary');
+    };
+    for (const cmd of [
+      'git remote update origin',
+      'git remote show origin',
+      'git remote prune origin',
+      'git remote set-head origin --auto',
+    ]) {
+      expect(gitWriteOf(cmd)).toBe(true);
+      expect(execOf(cmd)).toBe(true); // transport-config exec
+    }
+    // Local-only ops: no transport exec, no synthetic git-write.
     expect(gitWriteOf('git remote -v')).toBe(false);
-    // `git ls-remote` is a read-only network query — net-egress, NOT git-write
-    // (it fell to the destructive `default` before).
+    expect(execOf('git remote -v')).toBe(false);
+    expect(execOf('git remote show -n origin')).toBe(false); // -n skips the remote query
+    expect(gitWriteOf('git remote add x https://y')).toBe(true); // config write (destructive), but
+    expect(execOf('git remote add x https://y')).toBe(false); // no remote contact → no exec
+    // `git ls-remote` CONTACTS the remote → same transport exec + modal-hold write.
     expect(egressOf('git ls-remote origin')).toBe(true);
-    expect(gitWriteOf('git ls-remote origin')).toBe(false);
+    expect(gitWriteOf('git ls-remote origin')).toBe(true);
+    expect(execOf('git ls-remote origin')).toBe(true);
+    expect(execOf('git ls-remote ../other.git')).toBe(false); // LOCAL operand → no transport exec
   });
 
   test('git fetch/ls-remote local repo: exact outside-cwd read-fs, no egress', () => {
