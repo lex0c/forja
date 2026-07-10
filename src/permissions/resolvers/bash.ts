@@ -2117,8 +2117,17 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
         tokens.some((t) => t === '--delete' || t === '--force') ||
         bundleHasDestructiveFlag(tokens, new Set(['d', 'f']), new Set(['m', 'F', 'u', 'n']));
       if (usesGpg || (annotated && !hasMessage)) {
+        // Signed/verified (`-s`/`-u`/`-v` → `gpg.program`) or annotated-without-
+        // message (opens `core.editor`) runs a CONFIGURED program on a command
+        // that doesn't look like it runs code — the same covert-exec class as
+        // `git commit`'s hooks, which gate. `exec:arbitrary` alone no longer
+        // holds the modal under autonomous, so mark it `destructive`: the config
+        // naming gpg/editor is benign only in a trusted repo, and directory trust
+        // gates EGRESS not EXEC — an untrusted clone's hostile `gpg.program`
+        // would otherwise run modal-free. (Still destructive if it also
+        // deletes/force-replaces.)
         return {
-          capabilities: [exec('arbitrary'), gitWrite(REPO, destructiveTag), readFs(REPO)],
+          capabilities: [exec('arbitrary'), gitWrite(REPO, true), readFs(REPO)],
           confidence: 'high',
         };
       }
@@ -2229,8 +2238,12 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
       //   • `-P`/`--prune-tags` — prunes AND clobbers local tags (distinct from
       //     `-p`/`--prune`, which only drops stale remote-tracking refs and is
       //     benign; `p` is deliberately NOT in the destructive set).
+      //   • `--stdin` — fetch reads ADDITIONAL refspecs from stdin, which the
+      //     resolver cannot see (`printf '+a:b' | git fetch --stdin origin` can
+      //     force-overwrite a local ref). The piped refspecs are unmodelable, so
+      //     fail closed: treat `--stdin` as destructive.
       const force =
-        tokens.some((t) => t === '--force' || t === '--prune-tags') ||
+        tokens.some((t) => t === '--force' || t === '--prune-tags' || t === '--stdin') ||
         bundleHasDestructiveFlag(tokens, new Set(['f', 'P']), new Set(['j', 'o'])) ||
         positional.slice(1).some((p) => p.startsWith('+')) ||
         extractValueFlag(tokens, { longForm: '--refmap' }).some((v) => v.startsWith('+'));

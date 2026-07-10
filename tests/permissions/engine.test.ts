@@ -341,22 +341,28 @@ describe('approval posture (Supervised / Autonomous)', () => {
     }
   });
 
-  test('autonomous auto-approves git tag creation, gates the delete', () => {
-    // `git tag -a` (no -m) opens core.editor and `git tag -s` runs gpg.program.
-    // Both are `exec:arbitrary`, which no longer gates — the operator runs
-    // arbitrary local programs hands-off, and the only way `.git/config` names a
-    // hostile editor/gpg is a `git config` write (gated) or an untrusted clone
-    // (gated by directory trust). Deleting a ref IS destructive → modal.
+  test('autonomous auto-approves a plain/annotated-with-message tag, gates the exec-backed and destructive ones', () => {
+    // A lightweight `git tag v1` and an annotated `-a … -m msg` (message supplied,
+    // no editor) are pure ref writes → auto-approved. But `-a` WITHOUT `-m` opens
+    // `core.editor` and `-s`/`-u`/`-v` run `gpg.program` — CONFIGURED programs run
+    // on a command that doesn't look like it runs code (the same covert-exec class
+    // as commit's hooks). `exec:arbitrary` no longer gates on its own, and
+    // directory trust gates egress NOT exec, so an untrusted clone's hostile
+    // gpg/editor would run modal-free — mark them destructive so they confirm.
     const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git*'] } } }), {
       cwd: CWD,
       approvalPosture: 'autonomous',
     });
-    expect(eng.check('bash', 'bash', { command: 'git tag -a v1' }).kind).toBe('allow');
-    expect(eng.check('bash', 'bash', { command: 'git tag -s v1' }).kind).toBe('allow');
+    // Free: lightweight + annotated-with-message (no exec).
     expect(eng.check('bash', 'bash', { command: 'git add -A && git tag v1' }).kind).toBe('allow');
     expect(eng.check('bash', 'bash', { command: 'git tag -a v1 -m release' }).kind).toBe('allow');
     // A message that merely looks like a flag is NOT force: -m consumes it.
     expect(eng.check('bash', 'bash', { command: 'git tag -mf v1' }).kind).toBe('allow');
+    // Exec-backed (gpg / editor) → modal.
+    expect(eng.check('bash', 'bash', { command: 'git tag -a v1' }).kind).toBe('confirm');
+    expect(eng.check('bash', 'bash', { command: 'git tag -s v1 -m msg' }).kind).toBe('confirm');
+    expect(eng.check('bash', 'bash', { command: 'git tag -u KEY v1 -m msg' }).kind).toBe('confirm');
+    expect(eng.check('bash', 'bash', { command: 'git tag -v v1' }).kind).toBe('confirm');
     // Deleting OR force-replacing an existing tag loses the old ref → modal.
     expect(eng.check('bash', 'bash', { command: 'git tag -d v1' }).kind).toBe('confirm');
     expect(eng.check('bash', 'bash', { command: 'git tag -f v1' }).kind).toBe('confirm');
@@ -433,6 +439,7 @@ describe('approval posture (Supervised / Autonomous)', () => {
       'git fetch origin +main:main', // '+' refspec forces the local-ref overwrite
       'git fetch --refmap=+refs/heads/m:refs/heads/o origin', // '+' inside --refmap (attached, stripFlags-dropped)
       'git fetch --refmap +refs/heads/m:refs/heads/o origin', // spaced form
+      'git fetch --stdin origin', // refspecs piped from stdin are unmodelable → fail-closed
       'git tag -d v1', // ref delete
       'git remote add evil https://evil.test/r', // rewrites .git/config → later fetch hits it
       'git remote set-url origin https://evil.test/r',
