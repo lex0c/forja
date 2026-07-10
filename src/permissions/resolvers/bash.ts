@@ -2221,14 +2221,19 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
       // commits — or clobbers LOCAL tags:
       //   • `-f`/`--force`, or a refspec with a leading `+` (`+main:main`,
       //     `+refs/heads/*:refs/heads/*`) — a `+` can only lead a refspec
-      //     positional (options start with `-`).
+      //     positional (options start with `-`). The same `+` can also ride
+      //     INSIDE a `--refmap` value (`--refmap=+refs/heads/x:refs/heads/y`),
+      //     which stripFlags drops before the positional scan — so extract the
+      //     refmap value (both `--refmap +v` and `--refmap=+v` shapes) and check
+      //     it too.
       //   • `-P`/`--prune-tags` — prunes AND clobbers local tags (distinct from
       //     `-p`/`--prune`, which only drops stale remote-tracking refs and is
       //     benign; `p` is deliberately NOT in the destructive set).
       const force =
         tokens.some((t) => t === '--force' || t === '--prune-tags') ||
         bundleHasDestructiveFlag(tokens, new Set(['f', 'P']), new Set(['j', 'o'])) ||
-        positional.slice(1).some((p) => p.startsWith('+'));
+        positional.slice(1).some((p) => p.startsWith('+')) ||
+        extractValueFlag(tokens, { longForm: '--refmap' }).some((v) => v.startsWith('+'));
       return {
         capabilities: [gitWrite(REPO, force), netEgress('*'), readFs(REPO)],
         confidence: 'high',

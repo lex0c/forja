@@ -431,6 +431,8 @@ describe('approval posture (Supervised / Autonomous)', () => {
       'git fetch -f origin main:main', // force-overwrites a LOCAL ref (loses commits)
       'git fetch --force origin main:main',
       'git fetch origin +main:main', // '+' refspec forces the local-ref overwrite
+      'git fetch --refmap=+refs/heads/m:refs/heads/o origin', // '+' inside --refmap (attached, stripFlags-dropped)
+      'git fetch --refmap +refs/heads/m:refs/heads/o origin', // spaced form
       'git tag -d v1', // ref delete
       'git remote add evil https://evil.test/r', // rewrites .git/config → later fetch hits it
       'git remote set-url origin https://evil.test/r',
