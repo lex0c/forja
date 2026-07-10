@@ -26,10 +26,16 @@ import { visualWidth } from './width.ts';
 // Card-head glyph (UI.md §4.10.5). One glyph for all statuses;
 // status is communicated by the verb ('Failed' vs the per-tool
 // finalVerb) plus color (error / denied / dim). The filled `●`
-// landed with the slice-1 card restyle — it gives the head a
-// visible anchor so a stack of cards reads as discrete blocks.
+// gives a head a visible anchor. Still used for SUBAGENT heads /
+// group titles; the top-level TOOL chips lead with CHIP_FINAL_GAP
+// instead (dot removed, verb indent kept).
 // ASCII keeps `*`; `●` has no reliable dumb-terminal equivalent.
 const CHIP_FINAL_GLYPH = { unicode: '●', ascii: '*' } as const;
+// Top-level tool chips lead with a BLANK the same width as the old
+// `●` glyph, so the verb keeps its col-2 indent (the head hangs in
+// the gutter, so `<gap> <verb>` == the frame margin) but no dot
+// anchors it. Width 1 to match the single-cell glyph it replaces.
+const CHIP_FINAL_GAP = ' ';
 // Glyph used in place of CHIP_FINAL_GLYPH when a tool-end has a
 // `parentId` — visually marks the chip as nested inside its
 // parent (today: a subagent run). `|_` reads as "branch from
@@ -230,11 +236,8 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // Color: dim for done, error palette for failed, warn palette
       // for denied — applied identically regardless of nesting.
       const nested = item.parentId !== undefined;
-      const glyph = nested
-        ? CHIP_NESTED_GLYPH
-        : caps.unicode
-          ? CHIP_FINAL_GLYPH.unicode
-          : CHIP_FINAL_GLYPH.ascii;
+      // Top-level: blank gap (no dot), verb stays at col 2. Nested: `|_`.
+      const glyph = nested ? CHIP_NESTED_GLYPH : CHIP_FINAL_GAP;
       // Indent prefix only on nested chips. Applied BEFORE the
       // glyph so the visual hierarchy reads "[indent][nest-glyph]
       // verb" — the indent IS the attribution signal.
@@ -376,13 +379,12 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
         }
       }
       if (item.outputTruncated === true) lines.push(truncationHint(caps, indent));
-      // Top-level chip: only the head hangs in the gutter — the `● ` prefix
-      // is exactly the frame-margin width, so dropping the margin on the head
-      // lands the verb back at col 2, with the glyph poking out at col 0 as a
-      // structural anchor (like the user-submit bar). Sub-content keeps the
-      // margin so subjects/diffs stay indented under the verb. Nested chips
-      // keep the margin throughout — their indent is the attribution signal.
-      // Head is at index 1 (after the leading blank).
+      // Top-level chip: only the head hangs in the gutter — the leading
+      // `CHIP_FINAL_GAP + space` is exactly the frame-margin width, so dropping
+      // the margin on the head lands the verb at col 2, aligned with the
+      // sub-content below (which keeps the margin). Nested chips keep the margin
+      // throughout — their indent is the attribution signal. Head is at index 1
+      // (after the leading blank).
       return nested ? lines.map(padFrame) : lines.map((l, i) => (i === 1 ? l : padFrame(l)));
     }
     case 'tool-end-batch': {
@@ -393,11 +395,8 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // mid rows, `└─` for the last — capped at MAX_BATCH_SUBJECTS so
       // a large batch can't bury the scrollback.
       const nested = item.parentId !== undefined;
-      const glyph = nested
-        ? CHIP_NESTED_GLYPH
-        : caps.unicode
-          ? CHIP_FINAL_GLYPH.unicode
-          : CHIP_FINAL_GLYPH.ascii;
+      // Top-level: blank gap (no dot), verb stays at col 2. Nested: `|_`.
+      const glyph = nested ? CHIP_NESTED_GLYPH : CHIP_FINAL_GAP;
       const indent = nested ? CHIP_NESTED_INDENT : '';
       const verb = finalVerbFor(item.status, item.verb);
       // `denied` takes the `error` tone too — a blocked call didn't
