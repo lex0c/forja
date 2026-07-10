@@ -440,6 +440,20 @@ describe('bash resolver — simple commands', () => {
     expect(egress?.explicitEgress).not.toBe(true); // demoted → still trust-gated
   });
 
+  test('scp/rsync remote egress is a transfer tool (upload detection, not via ~/.ssh)', () => {
+    // A repo-ROOT source to a remote (`scp -r . host:`, `rsync -a . host:`) is an
+    // upload; `hasUploadShape` catches it via `transferToolEgress`, so gating does
+    // NOT depend on the incidental `~/.ssh` read (which a rsync daemon `host::mod`
+    // doesn't genuinely use). Also `explicitEgress` for the sandbox, like ssh.
+    for (const cmd of ['scp -r . host:/tmp', 'rsync -a . host:/backup', 'rsync . host::module']) {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      const egress =
+        r.kind === 'ok' ? r.capabilities.find((c) => c.kind === 'net-egress') : undefined;
+      expect(egress?.transferToolEgress).toBe(true);
+      expect(egress?.explicitEgress).toBe(true);
+    }
+  });
+
   test('git remote: network subcommands carry net-egress; local-only ones do not', () => {
     const egressOf = (cmd: string): boolean => {
       const r = resolveCapabilities('bash', { command: cmd }, CTX);

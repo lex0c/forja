@@ -3357,13 +3357,17 @@ const cmdScp: CommandResolver = (positional, _tokens, ctx) => {
   const sources = positional.slice(0, -1);
   const caps: Capability[] = [readFs(resolveArg('~/.ssh', ctx))];
 
+  // scp is an explicit network TRANSFER tool — mark its egress `explicit`
+  // (sandbox trust-gate, like ssh) AND `transferToolEgress` (so `hasUploadShape`
+  // treats a repo-ROOT source, e.g. `scp -r . host:`, as an upload without
+  // relying on the incidental `~/.ssh` read to gate it).
   if (isRemote(dest)) {
-    caps.push(netEgress(extractHost(dest)));
+    caps.push(netEgress(extractHost(dest), true));
   } else {
     caps.push(writeFs(resolveArg(dest, ctx)));
   }
   for (const s of sources) {
-    if (isRemote(s)) caps.push(netEgress(extractHost(s)));
+    if (isRemote(s)) caps.push(netEgress(extractHost(s), true));
     else caps.push(readFs(resolveArg(s, ctx)));
   }
 
@@ -3582,14 +3586,18 @@ const cmdRsync: CommandResolver = (_positional, tokens, ctx) => {
   for (const p of flagWrites) caps.push(writeFs(resolveArg(p, ctx)));
   for (const p of flagReads) caps.push(readFs(resolveArg(p, ctx)));
 
+  // rsync is an explicit network TRANSFER tool — mark its egress `explicit` +
+  // `transferToolEgress` so `hasUploadShape` catches a repo-ROOT source
+  // (`rsync -a . host:/backup`) directly, not via the incidental `~/.ssh` read
+  // (which a daemon-mode `host::module` doesn't even genuinely touch).
   if (isRemote(dest)) {
-    caps.push(netEgress(extractHost(dest)));
+    caps.push(netEgress(extractHost(dest), true));
   } else {
     caps.push(writeFs(resolveArg(dest, ctx)));
     if (hasDelete) caps.push(deleteFs(resolveArg(dest, ctx)));
   }
   for (const s of sources) {
-    if (isRemote(s)) caps.push(netEgress(extractHost(s)));
+    if (isRemote(s)) caps.push(netEgress(extractHost(s), true));
     else caps.push(readFs(resolveArg(s, ctx)));
   }
 
