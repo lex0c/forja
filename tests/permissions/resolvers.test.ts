@@ -12,6 +12,7 @@ import {
   getResolver,
   resolveCapabilities,
 } from '../../src/permissions/resolvers/index.ts';
+import { selectSandboxProfile } from '../../src/permissions/sandbox-plan.ts';
 
 // Bash resolver needs the tree-sitter-bash grammar loaded. Init is
 // async + idempotent; calling once before any bash test runs is
@@ -507,6 +508,32 @@ describe('bash resolver — simple commands', () => {
     expect(gitWriteOf('git ls-remote origin')).toBe(true);
     expect(execOf('git ls-remote origin')).toBe(true);
     expect(execOf('git ls-remote ../other.git')).toBe(false); // LOCAL operand → no transport exec
+  });
+
+  test('remote git egress is EXPLICIT so the sandbox keeps network (not trust-gated to cwd-rw)', () => {
+    // gitRemoteContactCaps carries exec:arbitrary; selectSandboxProfile's build-
+    // egress trust gate drops a PLAIN net-egress next to exec:arbitrary in an
+    // untrusted dir. If git's egress weren't marked explicit, an approved
+    // `git fetch origin` would be planned cwd-rw (NO network) and fail. Marking it
+    // explicit (like ssh) keeps `cwd-rw-net`.
+    for (const cmd of ['git fetch origin', 'git ls-remote origin', 'git remote update origin']) {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      const caps = r.kind === 'ok' ? r.capabilities : [];
+      const egress = caps.find((c) => c.kind === 'net-egress');
+      expect(egress?.explicitEgress).toBe(true);
+      const plan = selectSandboxProfile({
+        capabilities: caps,
+        hostExplicitlyAllowed: false,
+        networkAllowed: true,
+        dirTrusted: false, // UNtrusted — the regression condition
+      });
+      expect(plan.kind).toBe('ok');
+      if (plan.kind === 'ok') expect(plan.profile).toBe('cwd-rw-net'); // network survives
+    }
+    // A LOCAL-repo fetch emits no egress → no network needed, unaffected.
+    const local = resolveCapabilities('bash', { command: 'git fetch ../other.git' }, CTX);
+    const localCaps = local.kind === 'ok' ? local.capabilities : [];
+    expect(localCaps.some((c) => c.kind === 'net-egress')).toBe(false);
   });
 
   test('git fetch/ls-remote local repo: exact outside-cwd read-fs, no egress', () => {

@@ -1503,6 +1503,15 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx, name) => {
   if (tokens.some((t) => t === '--proxy' || t === '-x')) {
     return { refuse: 'curl/wget: proxy-shaped flags suggest evasion' };
   }
+  // curl and wget SHARE this resolver but their SHORT flags diverge: `-E` is
+  // curl's `--cert` (a file path) but wget's `--adjust-extension` (a boolean);
+  // `-T` is curl's `--upload-file` but wget's `--timeout` (seconds); `-K` is
+  // curl's `--config` but wget's `--backup-converted` (boolean). Applying curl's
+  // value-consuming reading to wget would swallow the URL / a number as a bogus
+  // file READ — and under autonomous a read below cwd + the egress trips
+  // `hasUploadShape`, so a plain `wget -E`/`-T`/`-K` fetch would wrongly prompt.
+  // Gate those short forms on `isCurl`; wget's own material rides its long forms.
+  const isCurl = name === 'curl';
   // Detect `-o <path>` / `--output <path>` (curl) and `-O` /
   // `--output-document` (wget); also support combined-form
   // `-o<path>` and `--output=<path>` shapes (slice 98, R2 #200).
@@ -1534,8 +1543,10 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx, name) => {
     { longForm: '--trace-ascii' },
   ];
   const CURL_READ_PATH_SPECS: readonly { longForm: string; shortForm?: string }[] = [
-    { longForm: '--upload-file', shortForm: '-T' },
-    { longForm: '--config', shortForm: '-K' },
+    // `-T`/`-K` are curl-only (wget `-T` is a TIMEOUT number, `-K` is a boolean) —
+    // gate the short form so wget's operand isn't misread as an upload/config file.
+    { longForm: '--upload-file', ...(isCurl ? { shortForm: '-T' } : {}) },
+    { longForm: '--config', ...(isCurl ? { shortForm: '-K' } : {}) },
     { longForm: '--netrc-file' },
     { longForm: '--cacert' },
     // TLS / auth MATERIAL — a repo private key or client cert read here must
@@ -1553,6 +1564,17 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx, name) => {
     { longForm: '--proxy-cert' },
     { longForm: '--proxy-key' },
     { longForm: '--proxy-cacert' },
+    // wget TLS MATERIAL — wget's own spellings for the same class curl models via
+    // `--cert`/`--key`/`--cacert` above (curl has none of these, so applying them
+    // to curl matches nothing — safe). Without them `wget --certificate=src/client.pem
+    // --private-key=src/id.key https://x` read the repo key/cert with only
+    // net-egress emitted, skipping the sensitive-file / upload gate. `--certificate`
+    // and `--private-key` are the sensitive client material; `--ca-certificate` /
+    // `--crl-file` are CA bundles (still repo-file reads worth surfacing).
+    { longForm: '--certificate' },
+    { longForm: '--private-key' },
+    { longForm: '--ca-certificate' },
+    { longForm: '--crl-file' },
     // wget upload forms: `--post-file=FILE` / `--body-file=FILE` read a local
     // file into the request body (the wget analogue of curl `-d @file`). Without
     // these the emitted caps were `net-egress` ALONE, so `hasUploadShape` (which
@@ -1567,7 +1589,10 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx, name) => {
   // the read; over-stripping under-reports, which the specs never do — here we
   // keep the leading path segment).
   const CURL_CERT_SPECS: readonly { longForm: string; shortForm?: string }[] = [
-    { longForm: '--cert', shortForm: '-E' },
+    // `-E` is curl's `--cert`; for wget `-E` is `--adjust-extension` (a boolean),
+    // so gating the short form stops `wget -E https://x` consuming the URL as a
+    // fake cert path (an in-repo read that would then trip `hasUploadShape`).
+    { longForm: '--cert', ...(isCurl ? { shortForm: '-E' } : {}) },
   ];
   const writeTargets: string[] = [];
   const readTargets: string[] = [];
@@ -1768,7 +1793,6 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx, name) => {
       readTargets.push(t.slice('--load-cookies='.length));
       continue;
     }
-    const isCurl = name === 'curl';
     const cookieSpaced = t === '--cookie' || (isCurl && t === '-b');
     if (cookieSpaced) {
       const next = tokens[i + 1];
@@ -1946,7 +1970,15 @@ const GIT_LS_REMOTE_VALUE_FLAGS: ReadonlySet<string> = new Set([
 const gitRemoteContactCaps = (repo: string): Capability[] => [
   exec('arbitrary'),
   gitWrite(repo, true),
-  netEgress('*'),
+  // EXPLICIT egress: this exec:arbitrary IS the network transport (ssh/proxy),
+  // not a separate local exec that could piggyback on another command's network.
+  // `selectSandboxProfile` drops a plain (incidental) net-egress next to
+  // exec:arbitrary in an untrusted dir (the build-egress trust gate) — which would
+  // plan `git fetch origin` as cwd-rw with NO network and fail it under the sandbox
+  // after the operator approves the modal. Marking it explicit (like ssh/curl/scp)
+  // keeps the network; the mixed-shell demotion still re-gates it when a SEPARATE
+  // local arbitrary exec rides alongside (`git fetch && ./evil`).
+  netEgress('*', true),
   readFs(repo),
 ];
 
