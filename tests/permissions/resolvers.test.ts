@@ -12,6 +12,7 @@ import {
   getResolver,
   resolveCapabilities,
 } from '../../src/permissions/resolvers/index.ts';
+import { selectSandboxProfile } from '../../src/permissions/sandbox-plan.ts';
 
 // Bash resolver needs the tree-sitter-bash grammar loaded. Init is
 // async + idempotent; calling once before any bash test runs is
@@ -417,6 +418,150 @@ describe('bash resolver — simple commands', () => {
       const s = capStrings(r.capabilities).sort();
       expect(s).toContain('net-egress:api.github.com');
     }
+  });
+
+  test('curl egress is EXPLICIT, and demotes next to a local arbitrary exec', () => {
+    // The explicit mark drives `hasUploadShape` (a whole-repo read piped to curl
+    // is an upload) but must NOT un-gate the sandbox build-egress trust-gate: the
+    // mixed-shell demotion strips it when a local arbitrary exec shares the shell,
+    // exactly as it does for ssh. Pins both halves so neither can silently drift.
+    const solo = resolveCapabilities('bash', { command: 'curl https://x.test' }, CTX);
+    if (solo.kind === 'ok') {
+      const egress = solo.capabilities.find((c) => c.kind === 'net-egress');
+      expect(egress?.explicitEgress).toBe(true);
+    }
+    const mixed = resolveCapabilities(
+      'bash',
+      { command: 'curl https://x.test && ./deploy.sh' },
+      CTX,
+    );
+    const caps = mixed.kind === 'ok' || mixed.kind === 'conservative' ? mixed.capabilities : [];
+    const egress = caps.find((c) => c.kind === 'net-egress');
+    expect(egress).toBeDefined();
+    expect(egress?.explicitEgress).not.toBe(true); // demoted → still trust-gated
+  });
+
+  test('scp/rsync remote egress is a transfer tool (upload detection, not via ~/.ssh)', () => {
+    // A repo-ROOT source to a remote (`scp -r . host:`, `rsync -a . host:`) is an
+    // upload; `hasUploadShape` catches it via `transferToolEgress`, so gating does
+    // NOT depend on the incidental `~/.ssh` read (which a rsync daemon `host::mod`
+    // doesn't genuinely use). Also `explicitEgress` for the sandbox, like ssh.
+    for (const cmd of ['scp -r . host:/tmp', 'rsync -a . host:/backup', 'rsync . host::module']) {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      const egress =
+        r.kind === 'ok' ? r.capabilities.find((c) => c.kind === 'net-egress') : undefined;
+      expect(egress?.transferToolEgress).toBe(true);
+      expect(egress?.explicitEgress).toBe(true);
+    }
+  });
+
+  test('git remote: network subcommands carry net-egress; local-only ones do not', () => {
+    const egressOf = (cmd: string): boolean => {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      const caps = r.kind === 'ok' ? r.capabilities : [];
+      return caps.some((c) => c.kind === 'net-egress');
+    };
+    // Contact the remote → need net-egress so the sandbox provisions network.
+    expect(egressOf('git remote update origin')).toBe(true);
+    expect(egressOf('git remote update')).toBe(true);
+    expect(egressOf('git remote show origin')).toBe(true); // queries remote heads
+    expect(egressOf('git remote prune origin')).toBe(true);
+    expect(egressOf('git remote set-head origin --auto')).toBe(true);
+    // Local only → no network.
+    expect(egressOf('git remote -v')).toBe(false);
+    expect(egressOf('git remote get-url origin')).toBe(false);
+    expect(egressOf('git remote show -n origin')).toBe(false); // -n skips the remote query
+    expect(egressOf('git remote add x https://y')).toBe(false); // config write, local
+    expect(egressOf('git remote set-head origin main')).toBe(false); // explicit branch, local
+
+    // Remote-CONTACTING ops run the repo-config transport program (core.sshCommand
+    // etc.) → they carry exec:arbitrary + a destructive git-write that holds the
+    // autonomous modal (even the pure-query `show`/`ls-remote`, whose git-write
+    // writes no ref — it is the modal-hold overload). Local-only ops carry neither.
+    const gitWriteOf = (cmd: string): boolean => {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      const caps = r.kind === 'ok' ? r.capabilities : [];
+      return caps.some((c) => c.kind === 'git-write');
+    };
+    const execOf = (cmd: string): boolean => {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      const caps = r.kind === 'ok' ? r.capabilities : [];
+      return caps.some((c) => c.kind === 'exec' && c.scope === 'arbitrary');
+    };
+    for (const cmd of [
+      'git remote update origin',
+      'git remote show origin',
+      'git remote prune origin',
+      'git remote set-head origin --auto',
+    ]) {
+      expect(gitWriteOf(cmd)).toBe(true);
+      expect(execOf(cmd)).toBe(true); // transport-config exec
+    }
+    // Local-only ops: no transport exec, no synthetic git-write.
+    expect(gitWriteOf('git remote -v')).toBe(false);
+    expect(execOf('git remote -v')).toBe(false);
+    expect(execOf('git remote show -n origin')).toBe(false); // -n skips the remote query
+    expect(gitWriteOf('git remote add x https://y')).toBe(true); // config write (destructive), but
+    expect(execOf('git remote add x https://y')).toBe(false); // no remote contact → no exec
+    // `git ls-remote` CONTACTS the remote → same transport exec + modal-hold write.
+    expect(egressOf('git ls-remote origin')).toBe(true);
+    expect(gitWriteOf('git ls-remote origin')).toBe(true);
+    expect(execOf('git ls-remote origin')).toBe(true);
+    expect(execOf('git ls-remote ../other.git')).toBe(false); // LOCAL operand → no transport exec
+  });
+
+  test('remote git egress is EXPLICIT so the sandbox keeps network (not trust-gated to cwd-rw)', () => {
+    // gitRemoteContactCaps carries exec:arbitrary; selectSandboxProfile's build-
+    // egress trust gate drops a PLAIN net-egress next to exec:arbitrary in an
+    // untrusted dir. If git's egress weren't marked explicit, an approved
+    // `git fetch origin` would be planned cwd-rw (NO network) and fail. Marking it
+    // explicit (like ssh) keeps `cwd-rw-net`.
+    for (const cmd of ['git fetch origin', 'git ls-remote origin', 'git remote update origin']) {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      const caps = r.kind === 'ok' ? r.capabilities : [];
+      const egress = caps.find((c) => c.kind === 'net-egress');
+      expect(egress?.explicitEgress).toBe(true);
+      const plan = selectSandboxProfile({
+        capabilities: caps,
+        hostExplicitlyAllowed: false,
+        networkAllowed: true,
+        dirTrusted: false, // UNtrusted — the regression condition
+      });
+      expect(plan.kind).toBe('ok');
+      if (plan.kind === 'ok') expect(plan.profile).toBe('cwd-rw-net'); // network survives
+    }
+    // A LOCAL-repo fetch emits no egress → no network needed, unaffected.
+    const local = resolveCapabilities('bash', { command: 'git fetch ../other.git' }, CTX);
+    const localCaps = local.kind === 'ok' ? local.capabilities : [];
+    expect(localCaps.some((c) => c.kind === 'net-egress')).toBe(false);
+  });
+
+  test('git fetch/ls-remote local repo: exact outside-cwd read-fs, no egress', () => {
+    // The repository operand is a LOCAL path → the resolver must emit read-fs of
+    // the RESOLVED absolute path (and NOT net-egress). Two decode paths:
+    //   • `file://` host is ignored by git → URL-pathname is the absolute local
+    //     path (`file://localhost/tmp/other.git` reads /tmp/other.git, not a
+    //     cwd-relative `localhost/…`).
+    //   • a spaced option value (`--depth 1`, `--sort key`) must be consumed so it
+    //     doesn't mask the repo operand that follows it.
+    for (const { cmd, path } of [
+      { cmd: 'git fetch file://localhost/tmp/other.git', path: 'read-fs:/tmp/other.git' },
+      { cmd: 'git fetch file://otherhost/tmp/other.git', path: 'read-fs:/tmp/other.git' },
+      { cmd: 'git ls-remote file:///tmp/other.git', path: 'read-fs:/tmp/other.git' },
+      { cmd: 'git fetch --depth 1 ../other.git', path: 'read-fs:/work/other.git' },
+      { cmd: 'git ls-remote --sort refname ../other.git', path: 'read-fs:/work/other.git' },
+    ]) {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      const caps = r.kind === 'ok' ? capStrings(r.capabilities) : [];
+      expect(caps).toContain(path); // resolved absolute path, outside cwd
+      expect(caps.some((c) => c.startsWith('net-egress'))).toBe(false); // local read, no network
+    }
+    // Network remote with a value option: repo is the named remote → egress, no
+    // outside read (the value-aware pass must not turn `origin` into a local path).
+    const net = resolveCapabilities('bash', { command: 'git fetch --depth 1 origin' }, CTX);
+    const netCaps = net.kind === 'ok' ? capStrings(net.capabilities) : [];
+    expect(netCaps.some((c) => c.startsWith('net-egress'))).toBe(true);
+    expect(netCaps.some((c) => c.startsWith('read-fs:/work/other'))).toBe(false);
   });
 
   test('git status produces git-write read-only', () => {

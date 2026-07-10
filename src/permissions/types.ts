@@ -45,6 +45,26 @@ export type PolicyCategory =
 export const categoryIsEgress = (category: PolicyCategory): boolean =>
   category === 'web.fetch' || category === 'mcp.egress';
 
+// Categories the `autonomous` posture NEVER auto-approves, whatever the resolved
+// capabilities say. This is deliberately NARROWER than `categoryIsEgress`.
+//
+// `web.fetch` used to live here, and the asymmetry it created was the bug: a
+// `fetch_url` opened a modal while `curl <same url>` — arriving as category
+// `bash` with an honest `net-egress` capability — cleared silently. A model that
+// learns the modal is attached to the TOOL, not the EFFECT, simply reaches for
+// `curl`. So egress is now judged by capability (`capDevLoopConfined`: plain
+// egress is dev-loop, egress + a file read is an upload and keeps its modal),
+// uniformly across both tools, and `web.fetch` is no longer category-gated.
+//
+// `mcp.egress` stays: an MCP server is third-party code reached over a channel
+// the engine cannot decompose into capabilities, so there is nothing for the
+// capability gate to judge. Keeping it here rather than re-testing
+// `category === 'mcp.egress'` at the guard site means a FUTURE opaque-channel
+// category is excluded by adding one line to this predicate — not by remembering
+// to patch the engine.
+export const categoryNeverAutoApproved = (category: PolicyCategory): boolean =>
+  category === 'mcp.egress';
+
 export type PolicyMode = 'strict' | 'acceptEdits' | 'bypass';
 
 // Operation mode the operator flips from the prompt (shown as
