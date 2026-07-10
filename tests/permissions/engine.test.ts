@@ -745,13 +745,42 @@ describe('approval posture (Supervised / Autonomous)', () => {
       'git fetch /tmp/other.git',
       'git fetch file:///tmp/other.git',
       'git ls-remote ../other.git',
+      // file:// with a NON-EMPTY host: git IGNORES the host and reads the local
+      // path (`localhost` and even a bogus host both read /tmp/other.git). A bare
+      // `slice('file://')` produced the RELATIVE `localhost/tmp/other.git`, which
+      // rebased inside cwd and auto-approved; URL-pathname parsing keeps it absolute.
+      'git fetch file://localhost/tmp/other.git',
+      'git ls-remote file://localhost/tmp/other.git',
+      'git fetch file://otherhost/tmp/other.git',
+      // Value-aware positional: a spaced option value (`--depth 1`, `--sort key`)
+      // must not shove/mask the local-repo operand. Before the value-aware
+      // reparse, positional[1] was the bare value ('1'/'refname'/'blob:none' →
+      // read as a named remote) and the outside-cwd read was dropped → auto-approve.
+      'git fetch --depth 1 ../other.git',
+      'git fetch --negotiation-tip abcd123 ../other.git',
+      'git fetch --filter blob:none ../other.git',
+      'git fetch -j 4 /tmp/other.git',
+      'git ls-remote --sort refname ../other.git',
+      'git ls-remote --upload-pack /usr/bin/x ../other.git',
     ]) {
       expect(eng.check('bash', 'bash', { command: cmd }).kind).toBe('confirm');
     }
-    // Network remotes (URL / named) — plain dev-loop fetch, still free.
+    // Network remotes (URL / named) — plain dev-loop fetch, still free, and the
+    // value-aware pass must NOT over-gate them (a spaced value before a NAMED
+    // remote still resolves to the named remote → network, not a local read).
     expect(eng.check('bash', 'bash', { command: 'git fetch origin' }).kind).toBe('allow');
     expect(eng.check('bash', 'bash', { command: 'git fetch https://x.test/y' }).kind).toBe('allow');
     expect(eng.check('bash', 'bash', { command: 'git ls-remote origin' }).kind).toBe('allow');
+    expect(eng.check('bash', 'bash', { command: 'git fetch --depth 1 origin' }).kind).toBe('allow');
+    expect(eng.check('bash', 'bash', { command: 'git ls-remote --sort key origin' }).kind).toBe(
+      'allow',
+    );
+    // `--recurse-submodules` is optional-value (spaced form does NOT consume): the
+    // next token is the repo, not the option's value. A bare form before a local
+    // repo must still gate (the operand is not swallowed).
+    expect(
+      eng.check('bash', 'bash', { command: 'git fetch --recurse-submodules ../other.git' }).kind,
+    ).toBe('confirm');
   });
 
   test('autonomous does NOT auto-approve a wget upload (--post-file / --body-file)', () => {

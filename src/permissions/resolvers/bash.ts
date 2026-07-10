@@ -1867,7 +1867,23 @@ const GIT_NETWORK_SCHEMES = [
   'git+ssh://',
 ] as const;
 const gitRepoLocalPath = (op: string): string | null => {
-  if (op.startsWith('file://')) return op.slice('file://'.length);
+  // `file://` is ALWAYS local in git — the authority/host is IGNORED, not a
+  // network target (`git ls-remote file://anyhost/abs/repo.git` reads
+  // /abs/repo.git; verified against `file:///…`, `file://localhost/…`, and a
+  // bogus `file://otherhost/…`, all exit 0). Parse with URL semantics: a bare
+  // `op.slice('file://'.length)` turned `file://localhost/tmp/r.git` into the
+  // RELATIVE `localhost/tmp/r.git`, which `resolveArg` then rebased INSIDE cwd —
+  // hiding an outside-workspace read from the autonomous modal. `URL.pathname`
+  // is always absolute for the file scheme (host stripped for empty/localhost,
+  // and even a non-local host leaves the path absolute), so the outside-cwd gate
+  // always sees the real target. On a malformed URL, fall through to null.
+  if (op.startsWith('file://')) {
+    try {
+      return new URL(op).pathname;
+    } catch {
+      return null;
+    }
+  }
   if (GIT_NETWORK_SCHEMES.some((s) => op.startsWith(s))) return null;
   if (op.startsWith('/') || op.startsWith('./') || op.startsWith('../') || op.startsWith('~')) {
     return op;
@@ -1878,6 +1894,37 @@ const gitRepoLocalPath = (op: string): string | null => {
   if (slash !== -1) return op; // relative local path (`some/dir.git`)
   return null; // bare word → a named remote (`origin`)
 };
+
+// git `fetch` / `ls-remote` place the repository operand AFTER their options,
+// several of which take a SEPARATE spaced value (`--depth 1 <repo>`,
+// `--sort <key> <repo>`). The top-level `stripFlags` runs with no value set, so
+// those values leak into the positional list: a bare-word/number value (a rev,
+// ref, count, sort key) lands at index 1 and MASKS the real local-repo operand
+// at index 2 — the outside-cwd read is never emitted and autonomous auto-approves
+// a fetch that reads a repository outside the workspace. Re-run `stripFlags` with
+// each subcommand's own value options before selecting the repository. Only
+// REQUIRED-value options belong here; `--recurse-submodules[=…]` is optional-value
+// (spaced form does not consume) and must stay OUT, or it would swallow the repo.
+const GIT_FETCH_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  '--upload-pack',
+  '-j',
+  '--jobs',
+  '--depth',
+  '--shallow-since',
+  '--shallow-exclude',
+  '--deepen',
+  '--refmap',
+  '-o',
+  '--server-option',
+  '--negotiation-tip',
+  '--filter',
+]);
+const GIT_LS_REMOTE_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  '--upload-pack',
+  '--sort',
+  '-o',
+  '--server-option',
+]);
 
 const cmdGit: CommandResolver = (positional, tokens, ctx) => {
   // Slice 128 (R4 P0-Launder-2): `git -c <key>=<value>` sets a
@@ -2067,9 +2114,13 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
       // Read-only query: lists a remote's refs, writes nothing. A URL / named
       // remote is network (`net-egress`); a LOCAL repo operand
       // (`git ls-remote ../other.git`) is a filesystem read OUTSIDE the workspace
-      // → `read-fs:<path>` so the outside-cwd read re-arms the modal. `-p`/`-P`
-      // don't take a value on ls-remote, so positional[1] is the repository.
-      const lsRepo = positional[1];
+      // → `read-fs:<path>` so the outside-cwd read re-arms the modal. ls-remote's
+      // value options (`--sort <key>`, `--upload-pack <exec>`, `-o <opt>`) take a
+      // spaced value that the top-level `stripFlags` left in the positional list,
+      // so select the repository from a value-aware re-parse (a bare `--sort key`
+      // value would otherwise sit at index 1 and mask the real local repo).
+      const lsPositional = stripFlags(tokens, GIT_LS_REMOTE_VALUE_FLAGS);
+      const lsRepo = lsPositional[1];
       const lsLocal = lsRepo !== undefined ? gitRepoLocalPath(lsRepo) : null;
       if (lsLocal !== null) {
         return {
@@ -2283,16 +2334,22 @@ const cmdGit: CommandResolver = (positional, tokens, ctx) => {
       //     resolver cannot see (`printf '+a:b' | git fetch --stdin origin` can
       //     force-overwrite a local ref). The piped refspecs are unmodelable, so
       //     fail closed: treat `--stdin` as destructive.
+      // Value-aware positional: git-fetch's `--depth <n>` / `--negotiation-tip
+      // <rev>` / `--filter <args>` / … take a spaced value the top-level
+      // `stripFlags` left behind, which shifts or masks the repository operand.
+      // Reselect over a fetch-value-aware parse for BOTH the `+`-refspec force
+      // check and the repository operand.
+      const fetchPositional = stripFlags(tokens, GIT_FETCH_VALUE_FLAGS);
       const force =
         tokens.some((t) => t === '--force' || t === '--prune-tags' || t === '--stdin') ||
         bundleHasDestructiveFlag(tokens, new Set(['f', 'P']), new Set(['j', 'o'])) ||
-        positional.slice(1).some((p) => p.startsWith('+')) ||
+        fetchPositional.slice(1).some((p) => p.startsWith('+')) ||
         extractValueFlag(tokens, { longForm: '--refmap' }).some((v) => v.startsWith('+'));
       // A LOCAL repository operand (`git fetch ../other.git`) is a filesystem
       // read of that repo — outside the workspace, so emit `read-fs:<path>` (no
       // net-egress) and let the outside-cwd path re-arm the modal. A URL / named
       // remote is network egress as before.
-      const fetchRepo = positional[1];
+      const fetchRepo = fetchPositional[1];
       const fetchLocal = fetchRepo !== undefined ? gitRepoLocalPath(fetchRepo) : null;
       const fetchCaps: Capability[] = [gitWrite(REPO, force), readFs(REPO)];
       if (fetchLocal !== null) fetchCaps.push(readFs(resolveArg(fetchLocal, ctx)));

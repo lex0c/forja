@@ -491,6 +491,34 @@ describe('bash resolver — simple commands', () => {
     expect(gitWriteOf('git ls-remote origin')).toBe(false);
   });
 
+  test('git fetch/ls-remote local repo: exact outside-cwd read-fs, no egress', () => {
+    // The repository operand is a LOCAL path → the resolver must emit read-fs of
+    // the RESOLVED absolute path (and NOT net-egress). Two decode paths:
+    //   • `file://` host is ignored by git → URL-pathname is the absolute local
+    //     path (`file://localhost/tmp/other.git` reads /tmp/other.git, not a
+    //     cwd-relative `localhost/…`).
+    //   • a spaced option value (`--depth 1`, `--sort key`) must be consumed so it
+    //     doesn't mask the repo operand that follows it.
+    for (const { cmd, path } of [
+      { cmd: 'git fetch file://localhost/tmp/other.git', path: 'read-fs:/tmp/other.git' },
+      { cmd: 'git fetch file://otherhost/tmp/other.git', path: 'read-fs:/tmp/other.git' },
+      { cmd: 'git ls-remote file:///tmp/other.git', path: 'read-fs:/tmp/other.git' },
+      { cmd: 'git fetch --depth 1 ../other.git', path: 'read-fs:/work/other.git' },
+      { cmd: 'git ls-remote --sort refname ../other.git', path: 'read-fs:/work/other.git' },
+    ]) {
+      const r = resolveCapabilities('bash', { command: cmd }, CTX);
+      const caps = r.kind === 'ok' ? capStrings(r.capabilities) : [];
+      expect(caps).toContain(path); // resolved absolute path, outside cwd
+      expect(caps.some((c) => c.startsWith('net-egress'))).toBe(false); // local read, no network
+    }
+    // Network remote with a value option: repo is the named remote → egress, no
+    // outside read (the value-aware pass must not turn `origin` into a local path).
+    const net = resolveCapabilities('bash', { command: 'git fetch --depth 1 origin' }, CTX);
+    const netCaps = net.kind === 'ok' ? capStrings(net.capabilities) : [];
+    expect(netCaps.some((c) => c.startsWith('net-egress'))).toBe(true);
+    expect(netCaps.some((c) => c.startsWith('read-fs:/work/other'))).toBe(false);
+  });
+
   test('git status produces git-write read-only', () => {
     const r = resolveCapabilities('bash', { command: 'git status' }, CTX);
     if (r.kind === 'ok') {
