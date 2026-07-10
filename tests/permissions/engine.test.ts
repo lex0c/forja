@@ -929,6 +929,15 @@ describe('approval posture (Supervised / Autonomous)', () => {
     });
     expect(eng.check('bash', 'bash', { command: 'frobnicate x && echo b' }).kind).toBe('allow');
     expect(eng.check('bash', 'bash', { command: './scripts/deploy.sh' }).kind).toBe('allow');
+    // But an in-repo operand that is SENSITIVE (`.env`/`*.pem`) or a path OUTSIDE
+    // the cwd is NOT confined — the resolver emits the fs cap for it, so the
+    // unknown command re-arms the modal instead of the honest-caps claim quietly
+    // skipping the sensitive-path prompt.
+    expect(eng.check('bash', 'bash', { command: './deploy.sh .env' }).kind).toBe('confirm');
+    expect(eng.check('bash', 'bash', { command: 'frobnicate src/key.pem' }).kind).toBe('confirm');
+    expect(eng.check('bash', 'bash', { command: 'frobnicate ../other' }).kind).toBe('confirm');
+    // A benign in-repo operand keeps the dev-loop auto-approve.
+    expect(eng.check('bash', 'bash', { command: 'frobnicate src/x.ts' }).kind).toBe('allow');
   });
 
   test('autonomous does NOT auto-approve a conservative whose caps are dynamic', () => {

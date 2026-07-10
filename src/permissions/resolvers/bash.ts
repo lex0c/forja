@@ -50,7 +50,9 @@ import {
   classifyProtectedPath,
   isGlobSafeRunCarveout,
   protectedTargets,
+  startsWithSegment,
 } from '../protected_paths.ts';
+import { matchSensitivePath } from '../sensitive-paths.ts';
 import { expandTilde } from '../tilde.ts';
 import {
   type ConservativeCause,
@@ -5186,6 +5188,14 @@ const analyzeCommand = (
   // operand would be dropped. Dedupe against the handler's own caps so a
   // precise-modeling handler (cp/sed/…) doesn't double-count.
   const argCaps: Capability[] = [];
+  // Caps for SENSITIVE (`.env`/`*.pem`) or OUTSIDE-cwd operands — not
+  // `escalate`-tier (so `argCaps` misses them), but exactly what
+  // `capDevLoopConfined` rejects. Used ONLY on the registry-miss (unknown-command)
+  // return: a modeled handler emits its own honest caps, so adding these to the
+  // shared path would over-gate legit commands with a `../` operand. Without them
+  // an unknown command's `unknown-command` conservative auto-approves under
+  // autonomous while taking `.env` / an outside path — the honest-caps claim broke.
+  const looseArgCaps: Capability[] = [];
   if (!isPureOutputCommand(name)) {
     const targets = protectedTargets(ctx.home, ctx.cwd);
     for (const arg of effectiveArgs) {
@@ -5252,6 +5262,10 @@ const analyzeCommand = (
           // op is always 'write' for an unknown command (none are in
           // isReadOnlyCommand); the ternary stays correct if that changes.
           argCaps.push(op === 'write' ? writeFs(abs) : readFs(abs));
+        } else if (matchSensitivePath(abs) !== null || !startsWithSegment(abs, ctx.cwd)) {
+          // Sensitive or outside-cwd operand (not escalate-tier). Registry-miss
+          // only — see `looseArgCaps`.
+          looseArgCaps.push(op === 'write' ? writeFs(abs) : readFs(abs));
         }
         // Slice 178: cwd-scope symlink escape. Lexical inside cwd
         // but canonical outside means a glob policy like
@@ -5295,12 +5309,14 @@ const analyzeCommand = (
     // stays Conservative (confirm) for the normal case; the cap only
     // changes what the §10.1 envelope gate and the score observe.
     return {
-      caps: [exec('arbitrary'), ...redir.caps, ...argCaps],
+      caps: [exec('arbitrary'), ...redir.caps, ...argCaps, ...looseArgCaps],
       confidence: 'low',
       conservative: `unknown_command: ${shape.name}`,
       // Registry miss. The redirect + arg caps above ARE the honest effect of
-      // the invocation as written; what we can't see is inside the binary, and
-      // the sandbox's `cwd-rw` floor bounds that. Auto-approvable in autonomous.
+      // the invocation as written (incl. `looseArgCaps` for sensitive/outside-cwd
+      // operands, so a `.env`/`../x` operand re-arms the modal); what we can't see
+      // is inside the binary, and the sandbox's `cwd-rw` floor bounds that.
+      // Auto-approvable in autonomous only when all operands are cwd-confined.
       conservativeCause: 'unknown-command',
     };
   }

@@ -361,7 +361,7 @@ Headless / não-interativo: Conservative sem operador resolve como qualquer `con
 
 | `cause` | Shape | Caps | Auto-aprovável em autonomous |
 |---|---|---|---|
-| `unknown-command` | table-miss (`./deploy.sh`, `somebinary`) | honestas pro resto do comando; a incógnita é o **interior** do binário, contido pelo floor `cwd-rw` do sandbox | **sim** |
+| `unknown-command` | table-miss (`./deploy.sh`, `somebinary`) | honestas pro resto do comando — incluindo um `read-fs`/`write-fs` pros operandos sensíveis (`.env`) ou fora do cwd (`../x`); a incógnita é só o **interior** do binário, contido pelo floor `cwd-rw` do sandbox | **sim** — mas o operando sensível/externo re-arma o modal via `capDevLoopConfined` |
 | `dynamic-dataflow` | control flow, `$var`, loop sobre glob | **best-effort**; podem sub-representar o alvo (`for f in /tmp/*; do rm "$f"; done`) | não |
 | `cwd-escape` | path ou redirect órfão que resolve fora do cwd **via symlink** | **mentem**: a cap léxica `write-fs:<cwd>/escape` lê como confinada | não |
 | `unmodeled-tool` | nenhum resolver registrado pro tool | vazias | não |
