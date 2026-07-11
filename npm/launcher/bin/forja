@@ -1,0 +1,115 @@
+#!/usr/bin/env node
+'use strict';
+// Launcher for @lex0c/forja. Runs under the user's Node (npm creates the
+// PATH shim); resolves the platform-specific binary shipped as an
+// optionalDependency and hands off to it. The binary is a standalone Bun
+// executable — this shim exists only because the top-level package must
+// be cross-platform, while the actual binary is per-platform.
+//
+// PERFORMANCE.md §18.6. The platform/arch → target-id mapping mirrors
+// scripts/targets.ts and install.sh; keep the three in sync.
+
+const { spawn } = require('node:child_process');
+
+// process.platform / process.arch → our target-id tuple. Note the
+// target id uses `windows` (matching the asset name and package name
+// `@lex0c/forja-windows-x64`), NOT the npm manifest `os` value `win32`.
+const OS_MAP = { linux: 'linux', darwin: 'darwin', win32: 'windows' };
+const ARCH_MAP = { x64: 'x64', arm64: 'arm64' };
+
+function targetId(platform, arch) {
+  const os = OS_MAP[platform];
+  const cpu = ARCH_MAP[arch];
+  return os && cpu ? `${os}-${cpu}` : null;
+}
+
+function platformPackage(platform, arch) {
+  const id = targetId(platform, arch);
+  return id ? `@lex0c/forja-${id}` : null;
+}
+
+// Signals worth forwarding to the child, per platform. Windows has no
+// SIGHUP/SIGQUIT and libuv can reject registering them (which would crash
+// the launcher at startup); it uses SIGBREAK for Ctrl-Break instead. The
+// try/catch at the registration site is the belt to this suspenders.
+function forwardedSignals(platform) {
+  return platform === 'win32'
+    ? ['SIGINT', 'SIGBREAK', 'SIGTERM']
+    : ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'];
+}
+
+// Resolve the platform binary path. `resolve` is injected (require.resolve
+// in production) so the resolution is unit-testable without a real install.
+// Returns { pkg, binPath } on success, or { pkg, error } / { error }.
+function resolveBinary(platform, arch, resolve) {
+  const pkg = platformPackage(platform, arch);
+  if (!pkg) return { error: `unsupported platform: ${platform}-${arch}` };
+  const ext = platform === 'win32' ? '.exe' : '';
+  try {
+    // require.resolve honours however npm hoisted the optional dep —
+    // never hard-code a node_modules path.
+    return { pkg, binPath: resolve(`${pkg}/bin/forja${ext}`) };
+  } catch {
+    return { pkg, error: `${pkg} is not installed` };
+  }
+}
+
+function fail(msg) {
+  process.stderr.write(`forja: ${msg}\n`);
+  process.exit(1);
+}
+
+function main() {
+  const r = resolveBinary(process.platform, process.arch, require.resolve);
+  if (r.error) {
+    const hint = r.pkg
+      ? `The ${r.pkg} package was not installed — optional dependencies may have been ` +
+        `omitted (e.g. --omit=optional). Reinstall with optional deps, or install a ` +
+        `binary directly: https://github.com/lex0c/forja/releases`
+      : `Your platform (${process.platform}-${process.arch}) is not supported. ` +
+        `See https://github.com/lex0c/forja/releases`;
+    fail(`${r.error}.\n${hint}`);
+    return;
+  }
+
+  // stdio:'inherit' gives the Bun binary the real TTY fds (raw-mode TUI
+  // works) and puts it in our process group, so the terminal delivers
+  // Ctrl-C to it directly. We also forward signals a supervisor might
+  // send us explicitly.
+  const child = spawn(r.binPath, process.argv.slice(2), { stdio: 'inherit' });
+  const SIGNALS = forwardedSignals(process.platform);
+  // Attaching a listener overrides Node's default (which would kill the
+  // parent first), letting the child own the interrupt and restore the
+  // terminal before we exit.
+  for (const sig of SIGNALS) {
+    try {
+      process.on(sig, () => {
+        try {
+          child.kill(sig);
+        } catch {
+          // child already gone; nothing to forward to.
+        }
+      });
+    } catch {
+      // Platform rejects registering this signal — skip it rather than
+      // crash the launcher (defensive; SIGNALS is already platform-scoped).
+    }
+  }
+
+  child.on('error', (err) => fail(`failed to launch ${r.pkg}: ${err.message}`));
+  child.on('exit', (code, signal) => {
+    if (signal) {
+      // Re-raise so our exit status reflects death-by-signal (e.g. 130
+      // for SIGINT). Drop our handlers first, or the re-raise just loops
+      // back into the forwarder instead of terminating us.
+      for (const sig of SIGNALS) process.removeAllListeners(sig);
+      process.kill(process.pid, signal);
+      return;
+    }
+    process.exit(code === null ? 1 : code);
+  });
+}
+
+module.exports = { targetId, platformPackage, resolveBinary, forwardedSignals };
+
+if (require.main === module) main();
