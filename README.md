@@ -33,18 +33,11 @@ CycloneDX SBOM, and SLSA build provenance on the
 [Releases](https://github.com/lex0c/forja/releases) page — download the
 binary, verify its hash against `SHA256SUMS`, and drop it on your `PATH`.
 
-Prefer a package manager? The same binaries are on npm (published with build
-provenance) as a per-platform package, so `npm` fetches only the one for your
-OS/arch:
+**Prefer a package manager?**
 
 ```bash
 npm install -g @lex0c/forja
 ```
-
-The command stays `forja` — the `@lex0c/` scope only names the package. On a
-locked-down install that strips optional dependencies (`--omit=optional`), use
-`install.sh` or the [Releases](https://github.com/lex0c/forja/releases) page
-above instead.
 
 Verify the install:
 
