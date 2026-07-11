@@ -2220,6 +2220,34 @@ describe('bash resolver — read-only registry expansion (A, §5.2)', () => {
       expect(s.some((c) => c.startsWith('write-fs') || c === 'exec:arbitrary')).toBe(false);
     }
   });
+
+  test('sed /regex/ with an escaped delimiter is still recognized as read-only', () => {
+    // `/a\/b/d` deletes lines matching a regex that contains an escaped slash —
+    // a read-only stdout transform. The js/redos hardening (dropping `\` from
+    // the `/regex/` arm's negated class) must keep recognizing escaped
+    // delimiters, or a legitimate sed would wrongly escalate to exec:arbitrary.
+    const r = resolveCapabilities('bash', { command: "sed '/a\\/b/d' file.txt" }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const s = capStrings(r.capabilities);
+      expect(s.some((c) => c.startsWith('read-fs'))).toBe(true);
+      expect(s.some((c) => c.startsWith('write-fs') || c === 'exec:arbitrary')).toBe(false);
+    }
+  });
+
+  test('sed /regex/ with an unterminated escape run is gated, not ReDoS (js/redos)', () => {
+    // Pre-fix, `[^/\n]` also matched `\`, so each `\x` pair was ambiguous
+    // between the `\\.` and negated-class arms; a long run with no closing `/`
+    // forced exponential backtracking. This input would hang the old regex; the
+    // deterministic one returns promptly. Not provably read-only → exec:arbitrary
+    // (the caller gates it) — never a silent read-only pass.
+    const evil = `/${'\\a'.repeat(50)}`; // 50 escaped pairs, no closing delimiter
+    const r = resolveCapabilities('bash', { command: `sed '${evil}' file.txt` }, CTX);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      expect(capStrings(r.capabilities)).toContain('exec:arbitrary');
+    }
+  });
 });
 
 // Review regression: an UNKNOWN command (registry-miss → Conservative) that
