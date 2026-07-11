@@ -371,6 +371,18 @@ jobs:
       - name: Assemble npm packages
         run: bun run scripts/npm-pack.ts --version="${{ steps.ver.outputs.value }}"
 
+      # TEMPORARY bootstrap auth — REMOVE once Trusted Publishing is set up.
+      # Trusted Publishing (OIDC) can only be configured on a package that
+      # already exists, so the first release seeds the 6 names with a token.
+      # `npm publish --provenance` still attaches provenance (id-token:write
+      # is granted above); only auth comes from the token. After the first
+      # release: enable Trusted Publishing per package on npmjs.com, then
+      # delete this step AND the NPM_TOKEN secret so publishing is tokenless.
+      - name: Bootstrap npm auth (TEMPORARY — remove after Trusted Publishing)
+        run: echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" >> ~/.npmrc
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       # Publishes platform packages FIRST, launcher LAST; skips any version
       # already on the registry (npm has no --clobber, so re-dispatching the
       # same tag is safe). Auth is OIDC Trusted Publishing — no stored token
