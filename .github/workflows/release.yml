@@ -298,6 +298,7 @@ jobs:
               --title "$TAG" \
               --generate-notes \
               $bins dist/sbom.cdx.json dist/SHA256SUMS
+          fi
 
   # Additional distribution channel: npm (PERFORMANCE.md §18.6). Ships the
   # SAME binaries as the GitHub Release — pulled from the shared
@@ -371,4 +372,3 @@ jobs:
       #     NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish to npm
         run: bun run scripts/npm-publish.ts --out=dist-npm
-          fi
