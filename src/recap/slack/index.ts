@@ -1,5 +1,4 @@
 export { projectSlackDeterministic } from './deterministic.ts';
-export { renderSlackFromStructured } from './template.ts';
 export {
   SLACK_LIMITS,
   SLACK_RENDER_V1_JSON_SCHEMA,
@@ -8,6 +7,7 @@ export {
   type SlackSchemaVersion,
   validateSlackRenderV1,
 } from './schema.ts';
+export { renderSlackFromStructured } from './template.ts';
 
 import type { RenderOptions } from '../format.ts';
 import type { RecapIntermediate } from '../types.ts';

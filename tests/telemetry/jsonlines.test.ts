@@ -2,11 +2,11 @@ import { describe, expect, test } from 'bun:test';
 import {
   type ChainVerifyFailedEvent,
   type ClassifierUnavailableEvent,
+  createJsonLinesTelemetrySink,
   type PermissionDecisionEvent,
   type SealingFailureEvent,
   type StateTransitionEvent,
   type TelemetryEvent,
-  createJsonLinesTelemetrySink,
 } from '../../src/telemetry/index.ts';
 
 const captured = () => {

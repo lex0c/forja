@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { renderReverseSearch } from '../../../src/tui/render/reverse-search.ts';
 import type { ReverseSearchState } from '../../../src/tui/state.ts';
-import { CSI, type Capabilities } from '../../../src/tui/term.ts';
+import { type Capabilities, CSI } from '../../../src/tui/term.ts';
 
 const caps: Capabilities = {
   isTTY: true,

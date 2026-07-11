@@ -1,13 +1,13 @@
 import type { TodoStatus } from '../../todo/index.ts';
-import { ERROR_CODES, type Tool, type ToolResult, isToolError, toolError } from '../types.ts';
+import { ERROR_CODES, isToolError, type Tool, type ToolResult, toolError } from '../types.ts';
 import {
-  CREATABLE_STATUSES,
-  type TodoWireItem,
   activeItems,
+  CREATABLE_STATUSES,
   countByStatus,
   isCreatableStatus,
   mapItemToWire,
   requireTodoStore,
+  type TodoWireItem,
 } from './todo-shared.ts';
 
 // todo_list — read the session's LIVE task list (optionally filtered by

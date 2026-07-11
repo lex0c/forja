@@ -486,4 +486,4 @@ export const loadRetentionConfig = (input: LoadRetentionInput): LoadedRetentionC
 
 // Re-export for tests that want to pin the parser independently
 // of the layer merge.
-export { parseTtlMs, parseDays, PHASE_1_KEYS };
+export { PHASE_1_KEYS, parseDays, parseTtlMs };

@@ -16,16 +16,16 @@ import type {
 } from '../types.ts';
 import {
   type CacheTtl,
-  MAX_CACHE_BREAKPOINTS_PER_REQUEST,
   cacheMarker,
   countCacheBreakpoints,
+  MAX_CACHE_BREAKPOINTS_PER_REQUEST,
   messagesWithTailCacheBreakpoint,
   systemSegmentsWithCacheBreakpoints,
   systemWithCacheBreakpoint,
   toolsWithCacheBreakpoint,
 } from './cache.ts';
 import { ANTHROPIC_CAPS } from './capabilities.ts';
-import { type RawAnthropicEvent, normalizeAnthropicStream } from './stream.ts';
+import { normalizeAnthropicStream, type RawAnthropicEvent } from './stream.ts';
 
 export interface CreateAnthropicProviderOptions {
   apiKey?: string;

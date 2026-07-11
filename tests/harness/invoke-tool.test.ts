@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 import { invokeTool } from '../../src/harness/invoke-tool.ts';
 import type { HookChainResult, HookEventPayload } from '../../src/hooks/index.ts';
-import { createPermissionEngine } from '../../src/permissions/index.ts';
 import type { Policy } from '../../src/permissions/index.ts';
+import { createPermissionEngine } from '../../src/permissions/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { listApprovalsByToolCall } from '../../src/storage/repos/approvals.ts';

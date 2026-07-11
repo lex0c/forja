@@ -65,7 +65,7 @@
 
 import type { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
-import { lstatSync, readFileSync, readdirSync } from 'node:fs';
+import { lstatSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 // Single corpus entry — used by every layer that asks "what's in the

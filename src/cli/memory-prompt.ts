@@ -1,11 +1,11 @@
 import {
   type BootContext,
-  EMPTY_BOOT_CONTEXT,
   type EagerExposure,
+  EMPTY_BOOT_CONTEXT,
+  listingScopeOption,
   type MemoryFile,
   type MemoryRegistry,
   type MemoryScope,
-  listingScopeOption,
   serializeMemoryFile,
   shouldEagerLoadByTriggers,
 } from '../memory/index.ts';

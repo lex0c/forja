@@ -2,8 +2,8 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node
 import { dirname } from 'node:path';
 import { SkillFrontmatterError, serializeSkillFile, validateName } from './frontmatter.ts';
 import { readSkillByName } from './loader.ts';
-import { ScopeError, rootForScope, skillFilePath } from './paths.ts';
 import type { SkillScopeRoots } from './paths.ts';
+import { rootForScope, ScopeError, skillFilePath } from './paths.ts';
 import type { SkillScope } from './types.ts';
 
 // Skill-file lifecycle operations (spec SKILLS.md §6) — create, move

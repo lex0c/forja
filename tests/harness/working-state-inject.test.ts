@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { injectWorkingStateBlock } from '../../src/harness/working-state-inject.ts';
 import type { ProviderMessage } from '../../src/providers/types.ts';
-import { type WorkingState, emptyWorkingState } from '../../src/working-state/index.ts';
+import { emptyWorkingState, type WorkingState } from '../../src/working-state/index.ts';
 
 const panel: WorkingState = {
   focus: { text: 'investigate glob', atStep: 4 },

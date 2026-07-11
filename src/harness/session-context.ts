@@ -1,30 +1,30 @@
 import type { Provider, ProviderContentBlock, ProviderMessage } from '../providers/index.ts';
 import type { DB } from '../storage/db.ts';
 import {
-  type MessageSource,
   appendMessage,
   getMessage,
   listMessageTailBySession,
+  type MessageSource,
   retractMessage,
 } from '../storage/repos/messages.ts';
 import {
-  type RelevanceElideResult,
-  dedupElideMiddle,
-  relevanceElideMiddle,
-} from './compaction-relevance.ts';
-import {
+  alignTailStartToAssistant,
   type CompactionOptions,
   type CompactionResult,
-  alignTailStartToAssistant,
   compactMessages,
   goalText,
 } from './compaction.ts';
 import {
+  dedupElideMiddle,
+  type RelevanceElideResult,
+  relevanceElideMiddle,
+} from './compaction-relevance.ts';
+import {
   ALIGNMENT_FETCH_MARGIN,
   MAX_RESUME_MESSAGES,
-  STRANDED_TURN_PLACEHOLDER,
   messagesToProviderMessages,
   repairAlternation,
+  STRANDED_TURN_PLACEHOLDER,
 } from './resume.ts';
 
 // SessionContext — the single in-memory source of truth for a live

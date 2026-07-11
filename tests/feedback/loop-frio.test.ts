@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { runLoopFrio } from '../../src/feedback/loop-frio.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
-import { type OutcomeResult, createOutcome } from '../../src/storage/repos/outcomes.ts';
+import { createOutcome, type OutcomeResult } from '../../src/storage/repos/outcomes.ts';
 import { createPolicy, listPoliciesByState } from '../../src/storage/repos/policies.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';
 

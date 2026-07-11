@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { IDENTITY_PROMPT, composeWithIdentity } from '../../src/cli/identity-prompt.ts';
+import { composeWithIdentity, IDENTITY_PROMPT } from '../../src/cli/identity-prompt.ts';
 
 describe('identity-prompt', () => {
   test('IDENTITY_PROMPT states what the agent is and the policy it runs under', () => {

@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { atomicWrite } from './atomic.ts';
-import { disabledSeedsPath } from './paths.ts';
 import type { ScopeRoots } from './paths.ts';
+import { disabledSeedsPath } from './paths.ts';
 
 // Operator opt-out sentinel for individual vendor seeds (spec
 // MEMORY.md §5.7.6).

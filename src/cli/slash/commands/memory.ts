@@ -25,25 +25,24 @@ import { existsSync, readFileSync } from 'node:fs';
 import { appDirName, projectDirName } from '../../../config/app-namespace.ts';
 import { readTomlDoc, writeTomlDocAtomic } from '../../../config/writer.ts';
 import {
-  EMPTY_CORPUS_HASH,
-  type MemoryFile,
-  type MemoryListing,
-  type MemoryRegistry,
-  type MemoryScope,
-  type MemorySubdir,
-  type TombstoneEntry,
   applyProposal,
   clearSharedTrust,
   computeSharedFingerprint,
+  EMPTY_CORPUS_HASH,
   findLatestTombstone,
   getSharedTrust,
   installVendorSeeds,
   isExpired,
   isSeedDisabled,
-  listSharedCorpusFiles,
   listingScopeOption,
+  listSharedCorpusFiles,
   loadDisabledSeeds,
   loadSeedManifest,
+  type MemoryFile,
+  type MemoryListing,
+  type MemoryRegistry,
+  type MemoryScope,
+  type MemorySubdir,
   moveMemory,
   parseMemoryFile,
   removeMemory,
@@ -52,6 +51,7 @@ import {
   scanForPromotion,
   seedMemoryFilePath,
   setSharedTrust,
+  type TombstoneEntry,
   transitionMemoryState,
   writeDisabledSeeds,
   writeSeedManifest,
@@ -75,43 +75,43 @@ import {
 } from '../../../memory/verify-semantic.ts';
 import { sanitizeOneLineForDisplay } from '../../../sanitize/ansi.ts';
 import type { DB } from '../../../storage/db.ts';
+import type { MemoryEvent } from '../../../storage/index.ts';
 import {
   listMemoryEventsByName,
   listMemoryEventsBySession,
   listRecentMemoryEvents,
 } from '../../../storage/index.ts';
-import type { MemoryEvent } from '../../../storage/index.ts';
 import type { EvictionMotivo } from '../../../storage/repos/eviction-events.ts';
 import {
   DETECTOR_TRIGGERS,
+  listEvictionEventsByTrigger,
   OPERATOR_DRIVEN_EVIDENCE_MARKER,
   OPERATOR_DRIVEN_TRIGGER,
-  listEvictionEventsByTrigger,
 } from '../../../storage/repos/eviction-events.ts';
 import { evictionMetricsSnapshot } from '../../../storage/repos/eviction-metrics.ts';
 import {
-  SEMANTIC_CONFLICT_DEDUP_WINDOW_MS,
   listRecentConflictAttempts,
+  SEMANTIC_CONFLICT_DEDUP_WINDOW_MS,
 } from '../../../storage/repos/memory-conflict-attempts.ts';
 import type { MemoryEventSource } from '../../../storage/repos/memory-events.ts';
 import {
-  GOVERNANCE_PROPOSAL_STATUSES,
-  MAX_GOVERNANCE_PROPOSAL_DEFER_DAYS,
-  MIN_GOVERNANCE_PROPOSAL_DEFER_DAYS,
-  type MemoryGovernanceProposalRow,
-  type MemoryGovernanceProposalStatus,
   decideProposal,
   deferProposal,
+  GOVERNANCE_PROPOSAL_STATUSES,
   getProposalById,
   listProposals,
+  MAX_GOVERNANCE_PROPOSAL_DEFER_DAYS,
+  type MemoryGovernanceProposalRow,
+  type MemoryGovernanceProposalStatus,
+  MIN_GOVERNANCE_PROPOSAL_DEFER_DAYS,
 } from '../../../storage/repos/memory-governance.ts';
 import {
-  type MemoryProvenanceRow,
   listExposuresInRetrieval,
   listGlobalProvenanceByName,
   listGlobalProvenanceForMemory,
   listProvenanceByName,
   listProvenanceForToolCall,
+  type MemoryProvenanceRow,
 } from '../../../storage/repos/memory-provenance.ts';
 import { listRecentAttempts } from '../../../storage/repos/memory-verify-attempts.ts';
 import { listRecentOverrideAttempts } from '../../../storage/repos/memory-verify-override-attempts.ts';

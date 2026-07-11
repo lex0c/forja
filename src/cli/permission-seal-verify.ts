@@ -14,15 +14,15 @@
 // Exit code 0 (intact) or 1 (broken or bootstrap error).
 
 import {
+  ensureInstallId,
+  factoryForSealMode,
+  resolvePolicy,
   type SealPolicy,
   type SealStore,
   type VerifySealResult,
-  ensureInstallId,
-  factoryForSealMode,
   verifySealAgainstChain,
 } from '../permissions/index.ts';
-import { resolvePolicy } from '../permissions/index.ts';
-import { type DB, MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { type DB, defaultDbPath, MIGRATIONS, migrate, openDb } from '../storage/index.ts';
 
 export interface RunPermissionSealVerifyOptions {
   json?: boolean;

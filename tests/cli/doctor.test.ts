@@ -3,15 +3,15 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs } from '../../src/cli/args.ts';
-import { resetSharedDoctorCache } from '../../src/cli/doctor-cache.ts';
 import { runDoctor } from '../../src/cli/doctor.ts';
+import { resetSharedDoctorCache } from '../../src/cli/doctor-cache.ts';
 import {
-  type SealEntry,
-  type SealStore,
   createSqliteSink,
   ensureInstallId,
+  type SealEntry,
+  type SealStore,
 } from '../../src/permissions/index.ts';
-import { MIGRATIONS, closeDb, migrate, openDb } from '../../src/storage/index.ts';
+import { closeDb, MIGRATIONS, migrate, openDb } from '../../src/storage/index.ts';
 import { insertServer } from '../../src/storage/repos/mcp-servers.ts';
 
 // doctor reads mcp_servers unscoped (all rows), so any scope matches the seed.

@@ -46,7 +46,8 @@ export const googleThinkingBudget = (
     ? Math.min(budget, caps.max_thinking_budget)
     : budget;
 };
-import { type RawGoogleChunk, normalizeGoogleStream } from './stream.ts';
+
+import { normalizeGoogleStream, type RawGoogleChunk } from './stream.ts';
 
 export interface CreateGoogleProviderOptions {
   apiKey?: string;

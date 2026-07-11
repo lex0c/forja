@@ -22,7 +22,7 @@
 
 import type { ReasonChainEntry } from '../permissions/audit.ts';
 import { ensureInstallId } from '../permissions/index.ts';
-import { MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { defaultDbPath, MIGRATIONS, migrate, openDb } from '../storage/index.ts';
 import { type ApprovalLogRow, getApprovalsLogBySeq } from '../storage/repos/approvals-log.ts';
 
 export interface RunPermissionDiffOptions {

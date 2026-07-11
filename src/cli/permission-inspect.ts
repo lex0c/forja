@@ -17,7 +17,7 @@
 // the segment before deciding to clear.
 
 import { ensureInstallId } from '../permissions/index.ts';
-import { MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { defaultDbPath, MIGRATIONS, migrate, openDb } from '../storage/index.ts';
 import {
   clearQuarantine,
   getLatestChainMeta,

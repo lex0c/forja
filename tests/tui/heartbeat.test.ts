@@ -23,7 +23,9 @@ const makeHarness = (): {
     flushAll: () => {
       const snap = pending;
       pending = [];
-      snap.forEach((p) => p.fn());
+      snap.forEach((p) => {
+        p.fn();
+      });
     },
     pending: () => pending.slice(),
   };

@@ -22,7 +22,7 @@ import {
   type CreateOpenRouterProviderOptions,
   createOpenRouterProvider,
 } from './openrouter/index.ts';
-import { type ModelRegistry, createRegistry } from './registry.ts';
+import { createRegistry, type ModelRegistry } from './registry.ts';
 import { CANONICAL_MODEL_PROVIDERS } from './seed-catalog.ts';
 import type { ModelProviderEntry, Provider } from './types.ts';
 

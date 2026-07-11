@@ -1,15 +1,15 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
-import { openMemoryDb } from '../../src/storage/db.ts';
 import type { DB } from '../../src/storage/db.ts';
+import { openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';
 import {
-  type SkillEventAction,
-  type SkillEventScope,
   createSkillEvent,
   listRecentSkillEvents,
   listSkillEventsByName,
   listSkillEventsBySession,
+  type SkillEventAction,
+  type SkillEventScope,
 } from '../../src/storage/repos/skill-events.ts';
 
 let db: DB;

@@ -56,7 +56,7 @@
 
 import { type Dirent, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { join, sep } from 'node:path';
-import { SENSITIVE_PATH_DENY_LIST, matchSensitivePath } from './sensitive-paths.ts';
+import { matchSensitivePath, SENSITIVE_PATH_DENY_LIST } from './sensitive-paths.ts';
 
 export interface ValidateWorktreeOptions {
   // Absolute path to the worktree root. Must exist; this module
@@ -357,4 +357,4 @@ export const validateWorktreeContents = (opts: ValidateWorktreeOptions): Validat
 // have to import sensitive-paths. The matcher and constant stay
 // in their own module for read/write tool consumers (§8.4 points
 // 1 and 2) that don't need the worktree walker.
-export { SENSITIVE_PATH_DENY_LIST, matchSensitivePath };
+export { matchSensitivePath, SENSITIVE_PATH_DENY_LIST };

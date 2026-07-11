@@ -17,9 +17,9 @@
 import { existsSync, mkdirSync, readdirSync, renameSync, unlinkSync } from 'node:fs';
 import { dirname } from 'node:path';
 import {
-  type ScopeRoots,
   memoryFilePath,
   parseTombstoneFilename,
+  type ScopeRoots,
   tombstonePath,
   tombstonesDir,
 } from './paths.ts';

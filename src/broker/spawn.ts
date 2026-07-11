@@ -397,7 +397,7 @@ export const createSpawnBroker = (options: CreateSpawnBrokerOptions): Broker => 
     // guards against a future refactor that turns spawn async.
     let signalAborted = false;
     let signalListener: (() => void) | null = null;
-    let proc: SpawnedProcess | undefined = undefined;
+    let proc: SpawnedProcess | undefined;
     // SIGTERM → SIGKILL escalation timer (slice 113, R6 P1).
     // First-arm-wins guard — if both abort and timeout want to
     // escalate, the first arming captures the grace window;

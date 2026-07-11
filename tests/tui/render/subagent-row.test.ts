@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { type SubagentRowState, renderSubagentRows } from '../../../src/tui/render/subagent-row.ts';
+import { renderSubagentRows, type SubagentRowState } from '../../../src/tui/render/subagent-row.ts';
 import type { Capabilities } from '../../../src/tui/term.ts';
 
 const caps: Capabilities = {

@@ -30,7 +30,7 @@
 // (modal carries its own structure).
 
 import type { ConfirmState, PreviewLine } from '../state.ts';
-import { type Capabilities, type SgrToken, paint, paintMulti } from '../term.ts';
+import { type Capabilities, paint, paintMulti, type SgrToken } from '../term.ts';
 
 // Modal rule width adapts to the live region: full caps.cols so the
 // modal feels structural. truncateToWidth in the renderer will clip

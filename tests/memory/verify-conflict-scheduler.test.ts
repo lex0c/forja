@@ -275,7 +275,6 @@ describe('conflict scheduler — G6 shutdown during in-flight dispatch (C-HIGH-1
     seedMemory(roots.projectLocal, 'bar', 'authentication via oauth in src');
     writeIndex(roots.projectLocal, ['foo', 'bar']);
     seedWriteEvent('foo', 1_000);
-    // biome-ignore lint/style/useConst: late-bound circular ref into spawnFn
     let sched: ReturnType<typeof createConflictDetectorScheduler> | undefined;
     const spawnFn = (async () => {
       sched?.shutdown();

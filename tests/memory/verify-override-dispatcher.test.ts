@@ -20,11 +20,11 @@ import { join } from 'node:path';
 import { parseMemoryFile } from '../../src/memory/frontmatter.ts';
 import type { ScopeRoots } from '../../src/memory/paths.ts';
 import { createMemoryRegistry } from '../../src/memory/registry.ts';
-import { dispatchOverrideVerify } from '../../src/memory/verify-override-dispatcher.ts';
 import {
   SEMANTIC_OVERRIDE_COOLDOWN_MS,
   SEMANTIC_OVERRIDE_MIN_CONFIDENCE,
 } from '../../src/memory/verify-override.ts';
+import { dispatchOverrideVerify } from '../../src/memory/verify-override-dispatcher.ts';
 import type { PermissionEngine } from '../../src/permissions/index.ts';
 import type { Provider } from '../../src/providers/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';

@@ -15,8 +15,8 @@
 // usage report on some turn, so the totals are a lower bound — marked
 // with a leading `~` and an explanatory footnote.
 
-import { formatCostCell, isUnmeteredModel } from '../../../providers/cost-format.ts';
 import { computeCostBreakdown } from '../../../providers/cost.ts';
+import { formatCostCell, isUnmeteredModel } from '../../../providers/cost-format.ts';
 import {
   cacheHitRatio,
   cacheWriteAmplification,

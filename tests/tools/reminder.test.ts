@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
-import { type ReminderScheduler, createReminderScheduler } from '../../src/reminders/index.ts';
+import { createReminderScheduler, type ReminderScheduler } from '../../src/reminders/index.ts';
+import { reminderTool } from '../../src/tools/builtin/reminder.ts';
 import { reminderCancelTool } from '../../src/tools/builtin/reminder-cancel.ts';
 import { reminderListTool } from '../../src/tools/builtin/reminder-list.ts';
-import { reminderTool } from '../../src/tools/builtin/reminder.ts';
 import { isToolError } from '../../src/tools/types.ts';
 import { makeCtx } from './_helpers.ts';
 

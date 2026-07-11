@@ -4,10 +4,10 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import {
-  IllegalPolicyTransitionError,
   countPolicies,
   createPolicy,
   getPolicy,
+  IllegalPolicyTransitionError,
   isLegalPolicyTransition,
   listPoliciesByActionSignature,
   listPoliciesByState,

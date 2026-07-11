@@ -26,7 +26,7 @@
 // the dependent reference might point at the user-scope version
 // or the project-scope version; the detector flags both.
 
-import { type MemoryRegistry, listingScopeOption } from './registry.ts';
+import { listingScopeOption, type MemoryRegistry } from './registry.ts';
 import type { MemoryScope } from './types.ts';
 
 export interface MemoryDependent {

@@ -6,7 +6,7 @@
 
 import { appendMessage } from '../../../src/storage/repos/messages.ts';
 import { completeSession, createSession } from '../../../src/storage/repos/sessions.ts';
-import { type RecapFixture, padId } from './types.ts';
+import { padId, type RecapFixture } from './types.ts';
 
 const MAY_1_UTC = Date.UTC(2026, 4, 1, 0, 0, 0, 0);
 

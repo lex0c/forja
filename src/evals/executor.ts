@@ -21,7 +21,7 @@ import type { SandboxAvailability } from '../permissions/sandbox-availability.ts
 import { maybeWrapSandboxArgv } from '../permissions/sandbox-runner.ts';
 import { closeDb } from '../storage/db.ts';
 import { BUILTIN_TOOLS, createFetchUrlTool } from '../tools/builtin/index.ts';
-import { type ToolRegistry, createToolRegistry } from '../tools/index.ts';
+import { createToolRegistry, type ToolRegistry } from '../tools/index.ts';
 import type {
   EvalCase,
   EvalCaseResult,
@@ -611,6 +611,10 @@ const evaluateExpectations = (
         }
       }
     }
+    // Exhaustive over expectation.kind: if a new kind is added without a case,
+    // this assignment fails to typecheck (and gives map() its terminal return).
+    const _exhaustive: never = expectation;
+    return _exhaustive;
   });
 };
 

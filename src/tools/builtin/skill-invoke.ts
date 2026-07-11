@@ -1,6 +1,6 @@
 import type { SkillScope } from '../../skills/index.ts';
-import { ERROR_CODES, type Tool, type ToolResult, isToolError, toolError } from '../types.ts';
-import { SKILL_MARKER_CLOSE, resolveSkillForTool, wrapSkillBody } from './_skills.ts';
+import { ERROR_CODES, isToolError, type Tool, type ToolResult, toolError } from '../types.ts';
+import { resolveSkillForTool, SKILL_MARKER_CLOSE, wrapSkillBody } from './_skills.ts';
 
 // skill_invoke — load a skill and inject its procedure into the turn
 // (spec SKILLS.md §4.2, §5.1). Unlike skill_show this IS an

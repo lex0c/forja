@@ -28,8 +28,8 @@ import {
   type HarnessConfig,
   type HarnessEvent,
   type HarnessResult,
-  type SessionContext,
   runAgent,
+  type SessionContext,
 } from '../harness/index.ts';
 import { RESUME_FULL_WARN_THRESHOLD } from '../harness/resume.ts';
 import { effectiveBudget, isRecapEnabled, resolveMaxOutputTokens } from '../harness/types.ts';
@@ -46,9 +46,9 @@ import {
   stripControlKeepLines,
 } from '../sanitize/index.ts';
 import {
-  HISTORY_CAP,
   appendHistory,
   deleteLastHistoryIfMatches,
+  HISTORY_CAP,
   historyOptOutReason,
   loadHistory,
   searchHistory,
@@ -62,11 +62,6 @@ import { createTodoStore } from '../todo/index.ts';
 import type { ClarifyBridgeRequest } from '../tools/index.ts';
 import { addTrustedDir, isTrusted, trustListPath } from '../trust/index.ts';
 import {
-  type FocusHandler,
-  type HarnessAdapter,
-  type KeyEvent,
-  type SessionBannerEvent,
-  type UIEvent,
   applyKey,
   createBus,
   createFocusStack,
@@ -75,7 +70,12 @@ import {
   createModalManager,
   createRenderer,
   detectCapabilities,
+  type FocusHandler,
+  type HarnessAdapter,
+  type KeyEvent,
   lookupToolVocab,
+  type SessionBannerEvent,
+  type UIEvent,
 } from '../tui/index.ts';
 import { createWorkingStateStore } from '../working-state/index.ts';
 import type { ParsedArgs } from './args.ts';
@@ -90,10 +90,10 @@ import { replayProviderMessages, replaySessionMessages } from './resume-replay.t
 import { resolveResumeIdOnDb } from './run.ts';
 import { shapeSystemPrompt } from './shape-system-prompt.ts';
 import {
-  type SlashContext,
   createBuiltinRegistry,
   dispatch as dispatchSlash,
   parseSlashInput,
+  type SlashContext,
 } from './slash/index.ts';
 import { APP_NAME, VERSION } from './version.ts';
 
@@ -1834,8 +1834,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       if (
         event.result.abortCause === 'hard' &&
         lastTurnOperatorText !== null &&
-        liveContext !== null &&
-        liveContext.popLastUserMessage()
+        liveContext?.popLastUserMessage()
       ) {
         // Drop the un-sent prompt(s) from input history too — they left the
         // conversation, so they must not linger recallable via ↑/↓, Ctrl+R, or

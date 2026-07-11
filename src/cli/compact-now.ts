@@ -9,7 +9,6 @@
 // the resume bootstrap can call it. `bus` / `cumulative` / `refreshStats` are
 // optional: headless resume has no chip to bracket and no REPL cumulative.
 
-import type { RelevanceElideResult } from '../harness/compaction-relevance.ts';
 import {
   accountCompaction,
   compactionTriggerTokens,
@@ -17,6 +16,7 @@ import {
   recordCompactionEvent,
   relevanceVerbatimBudgetBytes,
 } from '../harness/compaction.ts';
+import type { RelevanceElideResult } from '../harness/compaction-relevance.ts';
 import type { SessionContext } from '../harness/session-context.ts';
 import type { RunBudget } from '../harness/types.ts';
 import type { Provider } from '../providers/index.ts';

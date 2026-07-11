@@ -1,5 +1,5 @@
 import type { SkillScope } from '../../skills/index.ts';
-import { ERROR_CODES, type Tool, type ToolResult, isToolError, toolError } from '../types.ts';
+import { ERROR_CODES, isToolError, type Tool, type ToolResult, toolError } from '../types.ts';
 import { resolveSkillForTool } from './_skills.ts';
 
 // skill_show — print a skill's full body for inspection WITHOUT

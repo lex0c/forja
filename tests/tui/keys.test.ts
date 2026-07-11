@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { type KeyEvent, createKeyParser } from '../../src/tui/keys.ts';
+import { createKeyParser, type KeyEvent } from '../../src/tui/keys.ts';
 import { BRACKETED_PASTE_END, BRACKETED_PASTE_START } from '../../src/tui/term.ts';
 
 const feed = (input: string): KeyEvent[] => createKeyParser().feed(input);

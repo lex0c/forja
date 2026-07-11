@@ -1,18 +1,18 @@
 import {
+  applyWorkingStatePatch,
   type HypothesisSource,
   type HypothesisStatus,
   type MutationDelta,
   type WorkingStatePatch,
   type WorkingStateStore,
-  applyWorkingStatePatch,
 } from '../../working-state/index.ts';
 import {
   ERROR_CODES,
+  isToolError,
   type Tool,
   type ToolContext,
   type ToolError,
   type ToolResult,
-  isToolError,
   toolError,
 } from '../types.ts';
 

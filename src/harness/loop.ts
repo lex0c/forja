@@ -9,13 +9,13 @@ import {
 import { maybeRewriteBashCommand } from '../feedback/dispatch-rewrite.ts';
 import { emitToolCallOutcome } from '../feedback/outcome-emitter.ts';
 import { buildScopeChain } from '../feedback/scope-detect.ts';
-import { type HookChainResult, type HookEventPayload, dispatchChain } from '../hooks/index.ts';
+import { dispatchChain, type HookChainResult, type HookEventPayload } from '../hooks/index.ts';
 import { resolveRepoRoot } from '../memory/paths.ts';
 import type { RecalledMemory } from '../memory/proactive-recall.ts';
-import { type MemoryRegistry, createScopeFilteredRegistry } from '../memory/registry.ts';
+import { createScopeFilteredRegistry, type MemoryRegistry } from '../memory/registry.ts';
 import {
-  type SemanticVerifyScheduler,
   createSemanticVerifyScheduler,
+  type SemanticVerifyScheduler,
 } from '../memory/verify-semantic-scheduler.ts';
 import {
   deriveParentCapabilities,
@@ -40,13 +40,13 @@ import { buildResumeContext, shouldSkipResumeContext } from '../recap/resume-con
 import { buildRetrievalRunner } from '../retrieval/index.ts';
 import { redactSecrets } from '../sanitize/secrets.ts';
 import {
-  type SessionStatus,
   completeSession,
   createSession,
   getSession,
   insertCostProgressEvent,
   insertSubagentGateDecision,
   reopenSession,
+  type SessionStatus,
   updateSessionCost,
 } from '../storage/index.ts';
 import { listApprovalsLogBySessionRecent } from '../storage/repos/approvals-log.ts';
@@ -58,10 +58,10 @@ import {
 } from '../storage/repos/context-pins.ts';
 import { createDispatchRewrite } from '../storage/repos/dispatch-rewrites.ts';
 import { getEagerProvenanceKeys, recordProvenance } from '../storage/repos/memory-provenance.ts';
-import { type SubagentHandleStore, createSubagentHandleStore } from '../subagents/handle-store.ts';
+import { createSubagentHandleStore, type SubagentHandleStore } from '../subagents/handle-store.ts';
 import type { PermissionDecision } from '../subagents/ipc.ts';
 import { MAX_SUBAGENT_DEPTH, runSubagent } from '../subagents/runtime.ts';
-import { type TodoStore, createTodoStore } from '../todo/index.ts';
+import { createTodoStore, type TodoStore } from '../todo/index.ts';
 import { rankDeferredTools } from '../tools/builtin/tool-search.ts';
 import { isDeferred, isSmallWindow } from '../tools/context-budget.ts';
 import type { ToolContext } from '../tools/index.ts';
@@ -71,11 +71,10 @@ import type {
   SpawnSubagentResult,
   ToolSearchHit,
 } from '../tools/types.ts';
-import { type WorkingStateStore, createWorkingStateStore } from '../working-state/index.ts';
-import { StepStallError, abortableIterable, stallWatchdog, withAbort } from './abortable.ts';
+import { createWorkingStateStore, type WorkingStateStore } from '../working-state/index.ts';
+import { abortableIterable, StepStallError, stallWatchdog, withAbort } from './abortable.ts';
 import { buildAssistantContent } from './assistant-content.ts';
-import { CollectStepError, type CollectedToolUse, collectStep } from './collect.ts';
-import type { RelevanceAudit } from './compaction-relevance.ts';
+import { type CollectedToolUse, CollectStepError, collectStep } from './collect.ts';
 import {
   accountCompaction,
   compactionTriggerTokens,
@@ -84,6 +83,7 @@ import {
   refineCompactionTrigger,
   relevanceVerbatimBudgetBytes,
 } from './compaction.ts';
+import type { RelevanceAudit } from './compaction-relevance.ts';
 import { resolveProviderEffort } from './effort.ts';
 import {
   type ExhaustionSynthesisResult,
@@ -92,9 +92,9 @@ import {
 } from './exhaustion-synthesis.ts';
 import { invokeTool } from './invoke-tool.ts';
 import {
-  type ProactiveRecallCacheEntry,
   createProactiveRecall,
   injectProactiveMemoryBlock,
+  type ProactiveRecallCacheEntry,
   recordProactiveExposures,
   resolveCachedRecall,
 } from './proactive-memory-inject.ts';
@@ -104,19 +104,19 @@ import { type HydrateInfo, SessionContext } from './session-context.ts';
 import { injectStaticGuidance } from './static-guidance.ts';
 import {
   type ExitReason,
+  effectiveBudget,
   type HarnessConfig,
   type HarnessEvent,
   type HarnessResult,
+  isRecapEnabled,
   MAX_CONCURRENT_SUBAGENTS_CAP,
   MAX_CONCURRENT_TOOL_CALLS_CAP,
   type RunBudget,
-  effectiveBudget,
-  isRecapEnabled,
   resolveMaxOutputTokens,
 } from './types.ts';
 import {
-  MAX_VERIFY_ATTEMPTS,
   createVerifyState,
+  MAX_VERIFY_ATTEMPTS,
   recordToolForVerify,
   unsatisfiedVerifyCommands,
   verifyGateNudge,

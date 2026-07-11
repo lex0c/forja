@@ -44,7 +44,7 @@
 
 import type { DB } from '../storage/db.ts';
 import { listApprovalsLogByInstall } from '../storage/repos/approvals-log.ts';
-import { type OutcomeAggregate, computeOutcomeForApproval } from './aggregator.ts';
+import { computeOutcomeForApproval, type OutcomeAggregate } from './aggregator.ts';
 
 export interface CalibrationTriple {
   // Foreign key back to approvals_log + outcome_signals.

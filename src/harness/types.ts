@@ -25,7 +25,7 @@ import type { TodoItem, TodoStore } from '../todo/index.ts';
 import type { ClarifyBridgeRequest, ClarifyBridgeResponse, ToolRegistry } from '../tools/index.ts';
 import type { WorkingState, WorkingStateStore } from '../working-state/index.ts';
 import type { RelevanceAudit } from './compaction-relevance.ts';
-import { type ForjaEffort, effortBudgetPatch } from './effort.ts';
+import { effortBudgetPatch, type ForjaEffort } from './effort.ts';
 import type { SessionContext } from './session-context.ts';
 
 // Lifecycle events the harness emits during a run. Synchronous (fire and

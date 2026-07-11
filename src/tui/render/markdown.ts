@@ -15,7 +15,7 @@ import type { List, ListItem, PhrasingContent, RootContent, Table, TableRow } fr
 import { remark } from 'remark';
 import remarkGfm from 'remark-gfm';
 import wrapAnsi from 'wrap-ansi';
-import { type Capabilities, type SgrToken, paint, paintMulti } from '../term.ts';
+import { type Capabilities, paint, paintMulti, type SgrToken } from '../term.ts';
 import { frameWidth } from './frame.ts';
 import { visualWidth } from './width.ts';
 

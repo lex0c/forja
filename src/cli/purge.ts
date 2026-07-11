@@ -33,22 +33,21 @@
 //      for emergencies with the FS reset still possible).
 
 import {
-  type Stats,
   accessSync,
   existsSync,
   constants as fsConstants,
   lstatSync,
   readdirSync,
   rmdirSync,
+  type Stats,
   unlinkSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { appDirName, projectDirName } from '../config/app-namespace.ts';
 import { resolveRepoRoot } from '../memory/paths.ts';
 import { ensureInstallId } from '../permissions/install_id.ts';
-import { closeDb, migrate, openDb } from '../storage/index.ts';
 import type { DB } from '../storage/index.ts';
-import { defaultDbPath } from '../storage/index.ts';
+import { closeDb, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import { insertPurgeEvent } from '../storage/repos/purge-events.ts';
 import { forjaCommand } from './forja-command.ts';
 import { VERSION } from './version.ts';

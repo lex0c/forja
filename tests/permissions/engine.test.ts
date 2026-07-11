@@ -5,8 +5,8 @@ import { join } from 'node:path';
 import type { AuditEmitInput } from '../../src/permissions/audit.ts';
 import { initBashParser } from '../../src/permissions/bash-parser.ts';
 import { createPermissionEngine } from '../../src/permissions/engine.ts';
-import { categoryIsEgress, categoryNeverAutoApproved } from '../../src/permissions/types.ts';
 import type { Policy } from '../../src/permissions/types.ts';
+import { categoryIsEgress, categoryNeverAutoApproved } from '../../src/permissions/types.ts';
 
 // Bash resolver (slice 6) walks the tree-sitter-bash AST. Init is
 // async + idempotent; needs to complete before any engine.check on
@@ -3046,23 +3046,25 @@ describe('engine — state machine integration (§2)', () => {
     expect(eng.state()).toBe('init');
   });
 
-  test.each(['init', 'loading-policy', 'validating-chain', 'refusing'] as const)(
-    'state=%s denies every check with engine-state reason',
-    (state) => {
-      const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
-        cwd: PROJ,
-        home: HOME,
-        initialState: state,
-      });
-      const d = eng.check('bash', 'bash', { command: 'ls -la' });
-      expect(d.kind).toBe('deny');
-      if (d.kind === 'deny') {
-        expect(d.reason).toContain('engine not ready');
-        expect(d.reason).toContain(`state=${state}`);
-        expect(d.source?.section).toBe('engine-state');
-      }
-    },
-  );
+  test.each([
+    'init',
+    'loading-policy',
+    'validating-chain',
+    'refusing',
+  ] as const)('state=%s denies every check with engine-state reason', (state) => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      initialState: state,
+    });
+    const d = eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(d.kind).toBe('deny');
+    if (d.kind === 'deny') {
+      expect(d.reason).toContain('engine not ready');
+      expect(d.reason).toContain(`state=${state}`);
+      expect(d.source?.section).toBe('engine-state');
+    }
+  });
 
   test('degraded upgrades allow → confirm but preserves source attribution', () => {
     const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { renderToolCardLive, spinnerGlyph } from '../../../src/tui/render/tool-card.ts';
 import type { ActiveTool } from '../../../src/tui/state.ts';
-import { CSI, type Capabilities } from '../../../src/tui/term.ts';
+import { type Capabilities, CSI } from '../../../src/tui/term.ts';
 
 const ascii: Capabilities = {
   isTTY: true,

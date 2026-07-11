@@ -2,8 +2,8 @@ import { lstatSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { DB } from '../storage/db.ts';
 import {
-  OPERATOR_DRIVEN_EVIDENCE_MARKER,
   getLastInvalidationEventsBatch,
+  OPERATOR_DRIVEN_EVIDENCE_MARKER,
 } from '../storage/repos/eviction-events.ts';
 import { atomicWrite } from './atomic.ts';
 import { isExpired } from './expires.ts';
@@ -18,15 +18,15 @@ import {
   upsertIndexEntry,
 } from './index-file.ts';
 import { readMemoryByName } from './loader.ts';
+import type { ScopeRoots } from './paths.ts';
 import {
-  ScopeError,
   indexFilePath,
   memoryFilePath,
+  ScopeError,
   seedIndexFilePath,
   seedMemoryFilePath,
 } from './paths.ts';
-import type { ScopeRoots } from './paths.ts';
-import { type MemoryRegistry, listingScopeOption } from './registry.ts';
+import { listingScopeOption, type MemoryRegistry } from './registry.ts';
 import { transitionMemoryState } from './transitions.ts';
 import type { MemoryFile, MemoryScope, MemorySource, MemorySubdir } from './types.ts';
 import { type WriteMemoryResult, writeMemory } from './writer.ts';

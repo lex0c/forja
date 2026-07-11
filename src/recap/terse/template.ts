@@ -3,7 +3,7 @@
 // in a single sentence but possible).
 
 import { stripAnsi } from '../../sanitize/ansi.ts';
-import { type RenderOptions, anonymizeText, redactSecrets, resolveHome } from '../format.ts';
+import { anonymizeText, type RenderOptions, redactSecrets, resolveHome } from '../format.ts';
 import type { TerseRenderV1 } from './schema.ts';
 
 export const renderTerseFromStructured = (

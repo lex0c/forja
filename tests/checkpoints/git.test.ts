@@ -3,7 +3,6 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  RESTORE_SAVED_REF_PREFIX,
   deleteSessionRef,
   diff,
   getHeadSha,
@@ -12,6 +11,7 @@ import {
   listRestoreSavedRefs,
   listSessionRefs,
   parseRestoreSavedTimestamp,
+  RESTORE_SAVED_REF_PREFIX,
   resolveRef,
   restore,
   sessionRef,

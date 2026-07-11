@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { HarnessEvent } from '../../src/harness/index.ts';
 import { runAgent } from '../../src/harness/loop.ts';
-import { type ScopeRoots, rootForScope } from '../../src/memory/paths.ts';
+import { rootForScope, type ScopeRoots } from '../../src/memory/paths.ts';
 import { createMemoryRegistry } from '../../src/memory/registry.ts';
 import { createPermissionEngine } from '../../src/permissions/index.ts';
 import type { GenerateRequest, Provider } from '../../src/providers/index.ts';

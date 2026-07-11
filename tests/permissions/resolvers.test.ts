@@ -8,8 +8,8 @@ import {
 // Importing the index file loads every builtin resolver via its
 // side-effecting register calls.
 import {
-  type ResolverContext,
   getResolver,
+  type ResolverContext,
   resolveCapabilities,
 } from '../../src/permissions/resolvers/index.ts';
 import { selectSandboxProfile } from '../../src/permissions/sandbox-plan.ts';
@@ -1270,13 +1270,19 @@ describe('bash resolver — simple commands', () => {
 });
 
 describe('bash resolver — refusals', () => {
-  test.each(['dd', 'mkfs.ext4', 'fdisk', 'parted', 'mkswap', 'shred', 'eval $X', 'source ./foo'])(
-    'refuses %s',
-    (cmd) => {
-      const r = resolveCapabilities('bash', { command: cmd }, CTX);
-      expect(r.kind === 'refuse' || r.kind === 'conservative').toBe(true);
-    },
-  );
+  test.each([
+    'dd',
+    'mkfs.ext4',
+    'fdisk',
+    'parted',
+    'mkswap',
+    'shred',
+    'eval $X',
+    'source ./foo',
+  ])('refuses %s', (cmd) => {
+    const r = resolveCapabilities('bash', { command: cmd }, CTX);
+    expect(r.kind === 'refuse' || r.kind === 'conservative').toBe(true);
+  });
 
   test('refuses bash -c (dynamic shell)', () => {
     const r = resolveCapabilities('bash', { command: 'bash -c "do something"' }, CTX);
@@ -1843,13 +1849,15 @@ describe('bash resolver — /run/media glob carve-out (removable-media repo)', (
     suppressDegradeWarnings: true,
   };
 
-  test.each(["find . -name '*.ts'", 'ls *.ts', "find . -path '*/node_modules*'", 'cat *.log'])(
-    'glob %s from a /run/media repo is NOT refused',
-    (cmd) => {
-      const r = resolveCapabilities('bash', { command: cmd }, CTX_MEDIA);
-      expect(r.kind).toBe('ok');
-    },
-  );
+  test.each([
+    "find . -name '*.ts'",
+    'ls *.ts',
+    "find . -path '*/node_modules*'",
+    'cat *.log',
+  ])('glob %s from a /run/media repo is NOT refused', (cmd) => {
+    const r = resolveCapabilities('bash', { command: cmd }, CTX_MEDIA);
+    expect(r.kind).toBe('ok');
+  });
 
   test('absolute glob under /run/media is NOT refused (independent of cwd)', () => {
     const r = resolveCapabilities(
@@ -1893,16 +1901,21 @@ describe('bash resolver — /run/media glob carve-out (removable-media repo)', (
 // blast-radius reasoning as `rm -rf /etc`. Subpaths still go
 // through the regular escalate tier.
 describe('bash resolver — home credential/config dir refuse', () => {
-  test.each(['~/.ssh', '~/.gnupg', '~/.aws', '~/.kube', '~/.config', '~/.local', '~/.docker'])(
-    'rm -rf %s is Refused (home credential/config dir)',
-    (target) => {
-      const r = resolveCapabilities('bash', { command: `rm -rf ${target}` }, CTX);
-      expect(r.kind).toBe('refuse');
-      if (r.kind === 'refuse') {
-        expect(r.reason).toContain('credential/config dir');
-      }
-    },
-  );
+  test.each([
+    '~/.ssh',
+    '~/.gnupg',
+    '~/.aws',
+    '~/.kube',
+    '~/.config',
+    '~/.local',
+    '~/.docker',
+  ])('rm -rf %s is Refused (home credential/config dir)', (target) => {
+    const r = resolveCapabilities('bash', { command: `rm -rf ${target}` }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain('credential/config dir');
+    }
+  });
 
   test('rm of SUBPATH inside ~/.ssh is NOT refused at the rm blocklist', () => {
     // ~/.ssh/old_id_rsa is a deeper path; it routes through the
@@ -1951,19 +1964,23 @@ describe('bash resolver — home credential/config dir refuse', () => {
 // gives them a stable refusal reason aligned with
 // `eval`/`source`/`command`/`builtin`.
 describe('bash resolver — shell-as-command hard-refuse', () => {
-  test.each(['bash', 'sh', 'zsh', 'dash', 'ksh', 'fish'])(
-    '%s as a command name is hard-refused',
-    (shell) => {
-      const r = resolveCapabilities('bash', { command: `${shell} script.sh` }, CTX);
-      expect(r.kind).toBe('refuse');
-      if (r.kind === 'refuse') {
-        // HARD_REFUSE pattern: "command '<name>' has no safe
-        // capability resolution".
-        expect(r.reason).toContain(`'${shell}'`);
-        expect(r.reason).toContain('no safe capability resolution');
-      }
-    },
-  );
+  test.each([
+    'bash',
+    'sh',
+    'zsh',
+    'dash',
+    'ksh',
+    'fish',
+  ])('%s as a command name is hard-refused', (shell) => {
+    const r = resolveCapabilities('bash', { command: `${shell} script.sh` }, CTX);
+    expect(r.kind).toBe('refuse');
+    if (r.kind === 'refuse') {
+      // HARD_REFUSE pattern: "command '<name>' has no safe
+      // capability resolution".
+      expect(r.reason).toContain(`'${shell}'`);
+      expect(r.reason).toContain('no safe capability resolution');
+    }
+  });
 
   test('bash with -c inline flag is also hard-refused (not interpreter path)', () => {
     // `bash` enters HARD_REFUSE before COMMAND_TABLE lookup, so

@@ -3,9 +3,9 @@ import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import {
   type ContextPinsStore,
+  createContextPinsStore,
   PIN_CAP,
   PIN_TEXT_MAX_LENGTH,
-  createContextPinsStore,
 } from '../../src/storage/repos/context-pins.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';
 import { pinContextTool } from '../../src/tools/builtin/pin-context.ts';

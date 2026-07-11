@@ -13,7 +13,7 @@
 
 import { ensureInstallId } from '../permissions/index.ts';
 import { isUlid } from '../permissions/ulid.ts';
-import { MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { defaultDbPath, MIGRATIONS, migrate, openDb } from '../storage/index.ts';
 import { getGrantById, revokeGrant } from '../storage/repos/grants.ts';
 
 export interface RunPermissionRevokeOptions {

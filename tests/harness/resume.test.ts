@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import {
   MAX_RESUME_MESSAGES,
-  TRUNCATION_PLACEHOLDER,
   messagesToProviderMessages,
   resumeWindowCut,
+  TRUNCATION_PLACEHOLDER,
 } from '../../src/harness/resume.ts';
 import type { Message } from '../../src/storage/repos/messages.ts';
 

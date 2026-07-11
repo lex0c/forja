@@ -2,7 +2,7 @@ import { appendFailureEvent } from '../../../src/storage/repos/failure-events.ts
 import { appendMessage } from '../../../src/storage/repos/messages.ts';
 import { completeSession, createSession } from '../../../src/storage/repos/sessions.ts';
 import { createToolCall, finishToolCall } from '../../../src/storage/repos/tool-calls.ts';
-import { type RecapFixture, padId } from './types.ts';
+import { padId, type RecapFixture } from './types.ts';
 
 // Two recovered failures of different shapes in one session: a
 // degraded MCP tool (kept going with reduced function) and a

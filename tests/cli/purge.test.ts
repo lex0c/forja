@@ -16,12 +16,12 @@
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
-  type Stats,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
+  type Stats,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';

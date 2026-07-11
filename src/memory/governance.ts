@@ -78,10 +78,10 @@ import {
 import {
   DEFAULT_GOVERNANCE_CONFIDENCE_THRESHOLD,
   type DecideProposalInput,
-  type MemoryGovernanceProposalRow,
-  type MemoryGovernanceProposalStatus,
   decideProposal,
   getProposalById,
+  type MemoryGovernanceProposalRow,
+  type MemoryGovernanceProposalStatus,
 } from '../storage/repos/memory-governance.ts';
 import { hashMemoryContent } from '../storage/repos/memory-provenance.ts';
 import { parseMemoryFile, serializeMemoryFile } from './frontmatter.ts';

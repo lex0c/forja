@@ -1,19 +1,19 @@
 import { describe, expect, test } from 'bun:test';
-import { matchesPayload } from '../../src/hooks/dispatcher-matching.ts';
-import {
-  STREAM_READ_CAP_BYTES,
-  _readStreamForTests,
-  dispatchChain,
-  dispatchOne,
-  filterMatchingHooks,
-  resolveHookShell,
-} from '../../src/hooks/dispatcher.ts';
 import type {
   DispatchedProcess,
   HookShellResolution,
   SpawnFn,
   SpawnOpts,
 } from '../../src/hooks/dispatcher.ts';
+import {
+  _readStreamForTests,
+  dispatchChain,
+  dispatchOne,
+  filterMatchingHooks,
+  resolveHookShell,
+  STREAM_READ_CAP_BYTES,
+} from '../../src/hooks/dispatcher.ts';
+import { matchesPayload } from '../../src/hooks/dispatcher-matching.ts';
 import type { HookEventPayload, HookSpec } from '../../src/hooks/types.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';

@@ -22,7 +22,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { sha256File } from './checksums.ts';
-import { type BuildTarget, TARGETS, assetName, findTarget } from './targets.ts';
+import { assetName, type BuildTarget, findTarget, TARGETS } from './targets.ts';
 
 const SOURCE_DATE_EPOCH = '1700000000'; // 2023-11-14T22:13:20Z, fixed.
 

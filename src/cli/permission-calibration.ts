@@ -20,7 +20,7 @@ import {
   extractCalibrationTriples,
 } from '../outcomes/calibration.ts';
 import { ensureInstallId } from '../permissions/install_id.ts';
-import { MIGRATIONS, closeDb, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { closeDb, defaultDbPath, MIGRATIONS, migrate, openDb } from '../storage/index.ts';
 
 export interface RunPermissionCalibrationExportOptions {
   json?: boolean;

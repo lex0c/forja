@@ -5,7 +5,7 @@ import { todoCreateTool } from '../../src/tools/builtin/todo-create.ts';
 import { todoGetTool } from '../../src/tools/builtin/todo-get.ts';
 import { todoListTool } from '../../src/tools/builtin/todo-list.ts';
 import { todoUpdateTool } from '../../src/tools/builtin/todo-update.ts';
-import { type ToolContext, isToolError } from '../../src/tools/types.ts';
+import { isToolError, type ToolContext } from '../../src/tools/types.ts';
 import { makeCtx } from './_helpers.ts';
 
 const setup = (): { store: ReturnType<typeof createTodoStore>; ctx: ToolContext } => {

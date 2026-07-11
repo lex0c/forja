@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { BUILTIN_TOOLS } from '../../src/tools/builtin/index.ts';
-import { TOOL_VOCAB, lookupToolVocab } from '../../src/tui/tool-vocab.ts';
+import { lookupToolVocab, TOOL_VOCAB } from '../../src/tui/tool-vocab.ts';
 
 describe('tool-vocab', () => {
   test('every registered builtin tool has a vocab entry (derived from the registry)', () => {

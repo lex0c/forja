@@ -21,9 +21,9 @@ import type { ApprovalPosture } from '../permissions/index.ts';
 import { sanitizeOneLineForDisplay } from '../sanitize/ansi.ts';
 import type { SessionBannerEnvEntry, TodoItemForUI, UIEvent } from './events.ts';
 import {
+  buildPermissionOptions,
   MEMORY_WRITE_DEFAULT_SELECTED_INDEX,
   PERMISSION_DEFAULT_SELECTED_INDEX,
-  buildPermissionOptions,
 } from './modal-manager.ts';
 
 export interface InputState {

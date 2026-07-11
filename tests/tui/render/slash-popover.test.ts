@@ -4,7 +4,7 @@ import {
   slashPopoverLineCount,
 } from '../../../src/tui/render/slash-popover.ts';
 import type { SlashAutocomplete } from '../../../src/tui/state.ts';
-import { CSI, type Capabilities } from '../../../src/tui/term.ts';
+import { type Capabilities, CSI } from '../../../src/tui/term.ts';
 
 const caps: Capabilities = {
   isTTY: true,

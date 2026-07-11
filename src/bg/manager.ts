@@ -7,9 +7,9 @@ import { maybeWrapSandboxArgv } from '../permissions/index.ts';
 import { redactSecrets, scrubEnv } from '../sanitize/index.ts';
 import type { DB } from '../storage/db.ts';
 import {
-  type BgProcess,
   advanceBgProcessStderrCursor,
   advanceBgProcessStdoutCursor,
+  type BgProcess,
   finalizeBgProcess,
   getBgProcess,
   incrementBgProcessStderrBytesDropped,

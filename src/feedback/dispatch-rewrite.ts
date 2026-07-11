@@ -30,7 +30,7 @@ import {
   isValidBinaryReplacement,
   rewriteCommandBinary,
 } from './bash-parser.ts';
-import { type ScopeChain, resolveActivePolicy } from './scope-resolver.ts';
+import { resolveActivePolicy, type ScopeChain } from './scope-resolver.ts';
 
 export interface DispatchRewriteResult {
   // True when the input was actually rewritten — caller mutates

@@ -1,7 +1,8 @@
-import { type Dirent, existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs';
+import { type Dirent, existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { FrontmatterError, parseMemoryFile } from './frontmatter.ts';
 import { type ParsedIndex, parseIndex } from './index-file.ts';
+import type { ScopeRoots } from './paths.ts';
 import {
   indexFilePath,
   memoryFilePath,
@@ -10,7 +11,6 @@ import {
   seedMemoryFilePath,
   seedsRoot,
 } from './paths.ts';
-import type { ScopeRoots } from './paths.ts';
 import type { MemoryFile, MemoryScope } from './types.ts';
 
 // Disk-side loader for the memory subsystem.

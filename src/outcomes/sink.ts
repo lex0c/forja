@@ -21,14 +21,14 @@ import { withImmediateTransaction } from '../storage/db.ts';
 import { getApprovalsLogBySeq } from '../storage/repos/approvals-log.ts';
 import {
   type AppendOutcomeSignalInput,
-  type OutcomeSignalRow,
   appendOutcomeSignal,
+  type OutcomeSignalRow,
 } from '../storage/repos/outcome-signals.ts';
 import {
   DEFAULT_SIGNAL_TTL_DAYS,
   DEFAULT_SIGNAL_WEIGHTS,
-  type OutcomeSignalKind,
   isOutcomeSignalKind,
+  type OutcomeSignalKind,
 } from './codes.ts';
 import { scrubOutcomePayload } from './scrub.ts';
 

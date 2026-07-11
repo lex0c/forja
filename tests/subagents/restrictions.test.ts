@@ -3,16 +3,16 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  RESTRICTION_ERROR_CODE,
   checkRestriction,
   enforceBashRestriction,
   enforcePathRestriction,
   matchAny,
+  RESTRICTION_ERROR_CODE,
   toRestrictionError,
   wrapToolWithRestrictions,
 } from '../../src/subagents/restrictions.ts';
 import { gitTool } from '../../src/tools/builtin/git.ts';
-import { type Tool, type ToolContext, isToolError } from '../../src/tools/types.ts';
+import { isToolError, type Tool, type ToolContext } from '../../src/tools/types.ts';
 import { makeCtx } from '../tools/_helpers.ts';
 
 const GIT_AVAILABLE = (() => {
@@ -574,10 +574,9 @@ describe('wrapToolWithRestrictions — integration with ToolContext.cwd', () => 
   // sees it. Production wires this in `subagent-child.ts` via
   // `wrapToolWithRestrictions(tool, restrictions)` over every
   // child-registered tool.
-  const makeFakeWriteFile = (recorded: { path?: string }): Tool<
-    { path: string },
-    { ok: boolean }
-  > => ({
+  const makeFakeWriteFile = (recorded: {
+    path?: string;
+  }): Tool<{ path: string }, { ok: boolean }> => ({
     name: 'write_file',
     description: 'fake write_file used for restriction-wrapper integration tests',
     metadata: { category: 'fs.write', writes: true, idempotent: false },

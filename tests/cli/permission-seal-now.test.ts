@@ -5,10 +5,10 @@ import { join } from 'node:path';
 import { parseArgs } from '../../src/cli/args.ts';
 import { runPermissionSealNow } from '../../src/cli/permission-seal-now.ts';
 import {
-  type SealEntry,
-  type SealStore,
   createSqliteSink,
   ensureInstallId,
+  type SealEntry,
+  type SealStore,
 } from '../../src/permissions/index.ts';
 import { MIGRATIONS, migrate, openDb } from '../../src/storage/index.ts';
 

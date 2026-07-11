@@ -18,16 +18,16 @@
 
 import { projectDirName } from '../config/app-namespace.ts';
 import {
+  formatBash,
+  formatFetch,
+  formatPath,
   type Layer,
   type LayerPolicy,
   type LockConflict,
   type Policy,
-  type SectionProvenance,
-  formatBash,
-  formatFetch,
-  formatPath,
   renderSandbox,
   resolvePolicy,
+  type SectionProvenance,
 } from '../permissions/index.ts';
 
 export interface ExplainPermissionsOptions {

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  TOOL_ERGONOMICS_PROMPT,
   composeWithToolErgonomics,
+  TOOL_ERGONOMICS_PROMPT,
 } from '../../src/cli/tool-ergonomics-prompt.ts';
 
 describe('tool-ergonomics-prompt', () => {

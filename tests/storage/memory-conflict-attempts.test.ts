@@ -8,12 +8,12 @@ import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import {
   type ConflictPairSide,
-  SEMANTIC_CONFLICT_DEDUP_WINDOW_MS,
   canonicalizePair,
   listRecentConflictAttempts,
   lookupRecentConflictAttempt,
   pruneConflictAttempts,
   recordConflictAttempt,
+  SEMANTIC_CONFLICT_DEDUP_WINDOW_MS,
 } from '../../src/storage/repos/memory-conflict-attempts.ts';
 
 let db: DB;

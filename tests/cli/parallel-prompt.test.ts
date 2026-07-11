@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { PARALLEL_HINT_PROMPT, composeWithParallelHint } from '../../src/cli/parallel-prompt.ts';
+import { composeWithParallelHint, PARALLEL_HINT_PROMPT } from '../../src/cli/parallel-prompt.ts';
 
 describe('parallel-prompt', () => {
   test('PARALLEL_HINT_PROMPT names the parallel-safe tools and the task_async family', () => {

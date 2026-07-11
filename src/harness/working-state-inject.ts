@@ -1,5 +1,5 @@
 import type { ProviderMessage } from '../providers/types.ts';
-import { type WorkingState, formatWorkingState } from '../working-state/index.ts';
+import { formatWorkingState, type WorkingState } from '../working-state/index.ts';
 import { appendTextToLastUserMessage } from './turn-append.ts';
 
 // Append the [working_state] panel to the bottom of [current_turn] — i.e. the

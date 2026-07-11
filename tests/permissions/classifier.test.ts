@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import { readFs, writeFs } from '../../src/permissions/capabilities.ts';
 import {
-  CLASSIFIER_ADJUST_BOUNDS,
   buildClassifierInput,
+  CLASSIFIER_ADJUST_BOUNDS,
   clampAdjust,
   createNoopClassifier,
   validateClassifierOutput,

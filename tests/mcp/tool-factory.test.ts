@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { buildMcpTool, mcpWireName, sanitizeMcpName } from '../../src/mcp/tool-factory.ts';
 import { McpCallError, type McpCallResult, type McpManifestTool } from '../../src/mcp/types.ts';
-import { type ToolContext, isToolError } from '../../src/tools/types.ts';
+import { isToolError, type ToolContext } from '../../src/tools/types.ts';
 
 const ctx = { signal: new AbortController().signal } as unknown as ToolContext;
 

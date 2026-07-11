@@ -5,11 +5,11 @@ import { join } from 'node:path';
 import type { DB } from '../../src/storage/db.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import {
-  HISTORY_CAP_DEFAULT,
   appendHistory,
   clearHistory,
   countHistory,
   deleteLastHistoryIfMatches,
+  HISTORY_CAP_DEFAULT,
   loadHistory,
   searchHistory,
 } from '../../src/storage/history.ts';

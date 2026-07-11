@@ -23,8 +23,8 @@
 
 import { resolve as resolvePath } from 'node:path';
 import { projectDirName } from '../config/app-namespace.ts';
-import { type ReasonChainEntry, createSqliteSink, ensureInstallId } from '../permissions/index.ts';
-import { MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { createSqliteSink, ensureInstallId, type ReasonChainEntry } from '../permissions/index.ts';
+import { defaultDbPath, MIGRATIONS, migrate, openDb } from '../storage/index.ts';
 import { getPolicyArchive } from '../storage/repos/policy-archive.ts';
 
 export interface RunPermissionPolicyRollbackOptions {

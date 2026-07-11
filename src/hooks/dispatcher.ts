@@ -2,8 +2,8 @@ import { redactSecrets } from '../sanitize/secrets.ts';
 import type { DB } from '../storage/db.ts';
 import { createHookRun } from '../storage/repos/hook-runs.ts';
 import { classifyExitCode, matchesPayload } from './dispatcher-matching.ts';
-import { type HookShellResolution, getCachedShell } from './dispatcher-shell.ts';
-import { type DispatchedProcess, type SpawnFn, defaultSpawn } from './dispatcher-spawn.ts';
+import { getCachedShell, type HookShellResolution } from './dispatcher-shell.ts';
+import { type DispatchedProcess, defaultSpawn, type SpawnFn } from './dispatcher-spawn.ts';
 import { readStream, truncate } from './dispatcher-stream.ts';
 import { expandTemplate } from './template.ts';
 import {
@@ -17,13 +17,13 @@ import {
 
 export { filterMatchingHooks } from './dispatcher-matching.ts';
 export {
+  _resetHookShellCacheForTests,
   type HookShellResolution,
   type ResolveHookShellOpts,
-  _resetHookShellCacheForTests,
   resolveHookShell,
 } from './dispatcher-shell.ts';
 export type { DispatchedProcess, SpawnFn, SpawnOpts } from './dispatcher-spawn.ts';
-export { STREAM_READ_CAP_BYTES, _readStreamForTests } from './dispatcher-stream.ts';
+export { _readStreamForTests, STREAM_READ_CAP_BYTES } from './dispatcher-stream.ts';
 
 // Hook dispatcher (spec AGENTIC_CLI.md §10.3 + CONTRACTS.md §3 +
 // §10).

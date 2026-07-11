@@ -6,9 +6,9 @@
 
 import { describe, expect, test } from 'bun:test';
 import {
+  buildProactiveRecall,
   PROACTIVE_RECALL_MIN_SCORE,
   PROACTIVE_RECALL_TOP_K,
-  buildProactiveRecall,
 } from '../../src/memory/proactive-recall.ts';
 import type { Candidate } from '../../src/retrieval/types.ts';
 

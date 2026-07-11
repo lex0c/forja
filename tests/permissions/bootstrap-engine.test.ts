@@ -8,10 +8,10 @@ import {
   preflightPermissionEngine,
 } from '../../src/permissions/bootstrap-engine.ts';
 import {
-  type SealEntry,
-  type SealStore,
   createSqliteSink,
   ensureInstallId,
+  type SealEntry,
+  type SealStore,
 } from '../../src/permissions/index.ts';
 import { DEFAULT_TRUSTED_HOSTS } from '../../src/permissions/risk-score.ts';
 import { type DB, MIGRATIONS, migrate, openMemoryDb } from '../../src/storage/index.ts';

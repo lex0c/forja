@@ -3,7 +3,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { skillCommand } from '../../../src/cli/slash/commands/skill.ts';
 import type { SlashContext } from '../../../src/cli/slash/types.ts';
-import { type SkillCatalog, createSkillCatalog } from '../../../src/skills/index.ts';
+import { createSkillCatalog, type SkillCatalog } from '../../../src/skills/index.ts';
 import {
   brokenDoc,
   cleanupTmpDirs,

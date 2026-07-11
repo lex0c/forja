@@ -35,11 +35,12 @@ describe('parseArgs — forja permission seal-verify', () => {
     if (!r.ok) expect(r.message).toContain('--reason only applies');
   });
 });
+
 import {
-  type SealEntry,
-  type SealStore,
   createSqliteSink,
   ensureInstallId,
+  type SealEntry,
+  type SealStore,
 } from '../../src/permissions/index.ts';
 import { MIGRATIONS, migrate, openDb } from '../../src/storage/index.ts';
 

@@ -9,4 +9,4 @@
 // move to the permissions path. Keeping it for now so the slice 159
 // surface is minimal.
 
-export { SENSITIVE_PATH_DENY_LIST, matchSensitivePath } from '../permissions/sensitive-paths.ts';
+export { matchSensitivePath, SENSITIVE_PATH_DENY_LIST } from '../permissions/sensitive-paths.ts';

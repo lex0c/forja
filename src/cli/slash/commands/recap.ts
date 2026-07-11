@@ -42,10 +42,10 @@ import type { Provider } from '../../../providers/types.ts';
 import { renderChangelogDeterministic } from '../../../recap/changelog/index.ts';
 import { renderChangelogViaLlm } from '../../../recap/changelog/llm.ts';
 import {
-  type RenderOptions,
   anonymize,
   anonymizeText,
   formatDuration,
+  type RenderOptions,
   redactSecrets,
   resolveHome,
 } from '../../../recap/format.ts';
@@ -53,14 +53,14 @@ import { renderHumanDeterministic } from '../../../recap/human/index.ts';
 import { renderHumanViaLlm } from '../../../recap/human/llm.ts';
 import type { RenderViaLlmResult } from '../../../recap/llm-shared.ts';
 import {
+  projectRecapMini,
   RECAP_MINI_SCHEMA_VERSION,
   type RecapMini,
-  projectRecapMini,
   validateRecapMini,
 } from '../../../recap/mini/index.ts';
 import { renderPrDeterministic } from '../../../recap/pr/index.ts';
 import { renderPrViaLlm } from '../../../recap/pr/llm.ts';
-import { type RecapScopeOption, projectRecap } from '../../../recap/projection.ts';
+import { projectRecap, type RecapScopeOption } from '../../../recap/projection.ts';
 import { CHANGELOG_PROMPT_VERSION } from '../../../recap/prompts/changelog-v1.ts';
 import { HUMAN_PROMPT_VERSION } from '../../../recap/prompts/human-v1.ts';
 import { PR_PROMPT_VERSION } from '../../../recap/prompts/pr-v1.ts';
@@ -79,8 +79,8 @@ import {
   writeRecapCache,
 } from '../../../storage/repos/recap-cache.ts';
 import { recordRecapRun } from '../../../storage/repos/recap-runs.ts';
-import { listSessions } from '../../../storage/repos/sessions.ts';
 import type { Session, SessionStatus } from '../../../storage/repos/sessions.ts';
+import { listSessions } from '../../../storage/repos/sessions.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
 const DEFAULT_STEP_LIMIT = 10;

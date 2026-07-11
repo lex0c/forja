@@ -26,12 +26,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ScopeRoots } from '../../src/memory/paths.ts';
 import { createMemoryRegistry } from '../../src/memory/registry.ts';
-import { probeSharedTrust } from '../../src/memory/trust-corpus-probe.ts';
 import {
   computeSharedFingerprint,
   getSharedTrust,
   setSharedTrust,
 } from '../../src/memory/trust-corpus.ts';
+import { probeSharedTrust } from '../../src/memory/trust-corpus-probe.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { workingStateUpdateTool } from '../../src/tools/builtin/working-state-update.ts';
-import { type ToolContext, isToolError } from '../../src/tools/types.ts';
-import { type WorkingStateStore, createWorkingStateStore } from '../../src/working-state/index.ts';
+import { isToolError, type ToolContext } from '../../src/tools/types.ts';
+import { createWorkingStateStore, type WorkingStateStore } from '../../src/working-state/index.ts';
 import { makeCtx } from './_helpers.ts';
 
 const setup = (

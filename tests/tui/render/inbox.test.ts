@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { renderQueued } from '../../../src/tui/render/inbox.ts';
-import { CSI, type Capabilities, SGR } from '../../../src/tui/term.ts';
+import { type Capabilities, CSI, SGR } from '../../../src/tui/term.ts';
 
 // color:'none' proves SGR 7 (reverse) is emitted as an attribute, not
 // a color — same invariant the user-submit bar relies on.

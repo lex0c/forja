@@ -1,14 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  type Capability,
-  INVALID_SCOPE_SENTINEL,
   bareDirScopeHint,
+  type Capability,
   capabilityCovers,
   capabilityCoversCwdAware,
   capabilityEquals,
   effectiveCovers,
   exec,
   formatCapability,
+  INVALID_SCOPE_SENTINEL,
   intersectCapabilities,
   isCapabilityKind,
   netEgress,

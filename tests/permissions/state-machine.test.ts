@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  type StateTransition,
   canTransition,
   createStateController,
   isRejectingState,
+  type StateTransition,
 } from '../../src/permissions/state-machine.ts';
 
 describe('canTransition', () => {

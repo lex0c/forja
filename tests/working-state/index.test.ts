@@ -1,11 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  WS_CAPS,
-  type WorkingState,
   applyWorkingStatePatch,
   createWorkingStateStore,
   emptyWorkingState,
   formatWorkingState,
+  type WorkingState,
+  WS_CAPS,
 } from '../../src/working-state/index.ts';
 
 // A fresh nextId generator for the pure-function tests (the store owns the real

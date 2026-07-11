@@ -11,14 +11,14 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  ScopeError,
-  type ScopeRoots,
   findLatestTombstone,
   listExpiredTombstones,
   listTombstones,
   moveToTombstone,
   parseTombstoneFilename,
   removeFromTombstones,
+  ScopeError,
+  type ScopeRoots,
   tombstonePath,
   tombstonesDir,
 } from '../../src/memory/index.ts';

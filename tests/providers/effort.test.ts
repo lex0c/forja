@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  EFFORT_THINKING_BUDGET,
-  OPENAI_REASONING_EFFORT,
   anthropicEffort,
+  EFFORT_THINKING_BUDGET,
   effortThinkingBudget,
+  OPENAI_REASONING_EFFORT,
 } from '../../src/providers/effort.ts';
 import type { ProviderEffort } from '../../src/providers/types.ts';
 

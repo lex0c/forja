@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  RESPONSE_FORMAT_PROMPT,
   composeWithResponseFormat,
+  RESPONSE_FORMAT_PROMPT,
 } from '../../src/cli/response-format.ts';
 
 describe('response-format', () => {

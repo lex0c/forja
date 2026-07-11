@@ -14,7 +14,7 @@ import { fixture as f12 } from '../../evals/memory/fixtures/12-s11-stale-snapsho
 import type { FixtureMemory, MemoryGovernanceFixture } from '../../evals/memory/fixtures/types.ts';
 import { parseMemoryFile } from '../../src/memory/frontmatter.ts';
 import { applyProposal } from '../../src/memory/governance.ts';
-import { type ScopeRoots, rootForScope } from '../../src/memory/paths.ts';
+import { rootForScope, type ScopeRoots } from '../../src/memory/paths.ts';
 import { createMemoryRegistry } from '../../src/memory/registry.ts';
 import { dispatchConflictVerify } from '../../src/memory/verify-conflict-dispatcher.ts';
 import { dispatchOverrideVerify } from '../../src/memory/verify-override-dispatcher.ts';

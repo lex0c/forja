@@ -1,10 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  UNMETERED_LABEL,
   formatCostCell,
   isSessionUnmetered,
   isUnmetered,
   isUnmeteredModel,
+  UNMETERED_LABEL,
 } from '../../src/providers/cost-format.ts';
 import type { ModelRegistry } from '../../src/providers/registry.ts';
 import type { Provider, ProviderCapabilities } from '../../src/providers/types.ts';

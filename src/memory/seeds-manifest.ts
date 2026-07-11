@@ -2,8 +2,8 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { atomicWrite } from './atomic.ts';
 import { validateName } from './frontmatter.ts';
-import { seedManifestPath } from './paths.ts';
 import type { ScopeRoots } from './paths.ts';
+import { seedManifestPath } from './paths.ts';
 
 // Seed-install manifest (spec MEMORY.md §5.7.5).
 //

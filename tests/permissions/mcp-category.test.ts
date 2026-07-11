@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { createPermissionEngine } from '../../src/permissions/engine.ts';
-import { categoryIsEgress } from '../../src/permissions/types.ts';
 import type { McpPolicy, Policy } from '../../src/permissions/types.ts';
+import { categoryIsEgress } from '../../src/permissions/types.ts';
 
 // The 'mcp' category gates tools imported from a trusted MCP server. The
 // per-manifest-hash trust prompt is the heavyweight gate (it approved the

@@ -1,10 +1,10 @@
-import { type HarnessResult, type SessionContext, runAgent } from '../harness/index.ts';
+import { type HarnessResult, runAgent, type SessionContext } from '../harness/index.ts';
 import { RESUME_FULL_WARN_THRESHOLD } from '../harness/resume.ts';
 import { effectiveBudget } from '../harness/types.ts';
 import { flattenControlToLine } from '../sanitize/ansi.ts';
 import {
-  type DB,
   closeDb,
+  type DB,
   defaultDbPath,
   getSession,
   listSessions,

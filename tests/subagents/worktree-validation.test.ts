@@ -11,8 +11,8 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  WorktreeValidationError,
   validateWorktreeContents,
+  WorktreeValidationError,
 } from '../../src/subagents/worktree-validation.ts';
 
 // Direct tests on the walker. These don't go through git

@@ -3,7 +3,7 @@ import { createBus } from '../../src/tui/bus.ts';
 import type { UIEvent } from '../../src/tui/events.ts';
 import { createRenderer, physicalCursorRowAfterRewrap } from '../../src/tui/renderer.ts';
 import type { LiveState } from '../../src/tui/state.ts';
-import { CSI, type Capabilities, type FrameSchedulerOptions } from '../../src/tui/term.ts';
+import { type Capabilities, CSI, type FrameSchedulerOptions } from '../../src/tui/term.ts';
 
 const caps: Capabilities = {
   isTTY: true,
@@ -37,7 +37,9 @@ const makeSchedulerOptions = (): {
     flushAll: () => {
       const snap = pending;
       pending = [];
-      snap.forEach((p) => p.fn());
+      snap.forEach((p) => {
+        p.fn();
+      });
     },
     pending: () => pending.length,
   };
@@ -1335,7 +1337,9 @@ describe('renderer side effects', () => {
     // it should NOT re-arm.
     const snapshot = hbPending.slice();
     hbPending = [];
-    snapshot.forEach((p) => p.fn());
+    snapshot.forEach((p) => {
+      p.fn();
+    });
     sched.flushAll();
     expect(hbPending.length).toBe(0);
     r.close();
@@ -1384,7 +1388,9 @@ describe('renderer side effects', () => {
     sched.flushAll();
     const snapshot = hbPending.slice();
     hbPending = [];
-    snapshot.forEach((p) => p.fn());
+    snapshot.forEach((p) => {
+      p.fn();
+    });
     sched.flushAll();
     expect(hbPending.length).toBe(0);
     r.close();

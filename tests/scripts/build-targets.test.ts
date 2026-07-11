@@ -10,7 +10,7 @@ import {
   sourcemapName,
   targetSourcemapName,
 } from '../../scripts/build-targets.ts';
-import { TARGETS, assetName } from '../../scripts/targets.ts';
+import { assetName, TARGETS } from '../../scripts/targets.ts';
 import { targetById } from './_helpers.ts';
 
 describe('parseArgs', () => {

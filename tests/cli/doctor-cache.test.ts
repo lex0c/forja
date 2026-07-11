@@ -5,15 +5,15 @@
 // critical checks bypass).
 
 import { beforeEach, describe, expect, test } from 'bun:test';
+import { runDoctor } from '../../src/cli/doctor.ts';
 import {
-  DOCTOR_CACHE_TTL_MS,
-  NON_CRITICAL_CHECK_NAMES,
   createInMemoryDoctorCache,
+  DOCTOR_CACHE_TTL_MS,
   isCacheable,
+  NON_CRITICAL_CHECK_NAMES,
   resetSharedDoctorCache,
   withDoctorCache,
 } from '../../src/cli/doctor-cache.ts';
-import { runDoctor } from '../../src/cli/doctor.ts';
 
 const okCheck = (name: string, detail = 'ok'): { name: string; status: 'ok'; detail: string } => ({
   name,

@@ -3,10 +3,10 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  PROJECT_GUIDE_FILENAMES,
-  PROJECT_GUIDE_MAX_BYTES,
   assembleProjectContext,
   composeWithProjectContext,
+  PROJECT_GUIDE_FILENAMES,
+  PROJECT_GUIDE_MAX_BYTES,
 } from '../../src/cli/project-context.ts';
 
 // Pin the contract spec/CONTEXT_TUNING.md §2.0 (post-amendment)

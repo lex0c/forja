@@ -17,11 +17,11 @@ import {
   createCheckpointManager,
   detectCheckpointSupport,
 } from '../checkpoints/index.ts';
-import { type OutcomeSink, createSqliteOutcomeSink } from '../outcomes/index.ts';
+import { createSqliteOutcomeSink, type OutcomeSink } from '../outcomes/index.ts';
 import {
   type Checkpoint,
-  type DB,
   closeDb,
+  type DB,
   defaultDbPath,
   getLatestCheckpointBySession,
   getSession,

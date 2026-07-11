@@ -18,7 +18,7 @@
 // but in practice it's a reliable indicator since the just-booted
 // policy gets its last_seen_ms bumped on every run.
 
-import { MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { defaultDbPath, MIGRATIONS, migrate, openDb } from '../storage/index.ts';
 import { listPolicyArchive } from '../storage/repos/policy-archive.ts';
 
 export interface RunPermissionPolicyListOptions {

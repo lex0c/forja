@@ -11,10 +11,10 @@ import type {
 } from '../types.ts';
 import { OLLAMA_CAPS } from './capabilities.ts';
 import {
+  createOllamaHttp,
   DEFAULT_OLLAMA_BASE_URL,
   type OllamaChatRequest,
   type OllamaHttpOptions,
-  createOllamaHttp,
 } from './http.ts';
 import {
   DEFAULT_OLLAMA_NUM_CTX,

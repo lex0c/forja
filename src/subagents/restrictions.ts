@@ -275,7 +275,7 @@ export const toRestrictionError = (
 
 // Re-export the shape from `tools/types.ts` so consumers don't have
 // to import twice.
-export type { ToolRestrictions, ToolRestrictionRules };
+export type { ToolRestrictionRules, ToolRestrictions };
 // Wrappers that bind a specific extraction strategy (how to pull
 // the command string or target path out of the tool's args object)
 // to the matching restriction rule. Defined as separate functions

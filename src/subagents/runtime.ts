@@ -8,11 +8,10 @@ import type { HookSpec } from '../hooks/types.ts';
 import type { PermissionEngine } from '../permissions/index.ts';
 import type { Provider, ProviderEffort } from '../providers/index.ts';
 import {
-  type DB,
-  type SubagentProcessExitReason,
   appendMessage,
   completeSession,
   createSession,
+  type DB,
   getSession,
   insertSubagentRun,
   insertSubagentWorktree,
@@ -20,25 +19,26 @@ import {
   markIpcHandshakeOk,
   recordProcessExit,
   recordProcessSpawn,
+  type SubagentProcessExitReason,
 } from '../storage/index.ts';
-import { type ToolRegistry, createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
+import { createToolRegistry, registerBuiltinTools, type ToolRegistry } from '../tools/index.ts';
 import { reapChildBgProcesses } from './bg-reaper.ts';
 import {
   IPC_PROTOCOL_VERSION,
   IPC_VERSION_MISMATCH_EXIT_CODE,
   type IpcMessage,
-  type PermissionDecision,
   isExpectedIpcTeardown,
   makeInterruptHard,
   makePermissionAnswer,
+  type PermissionDecision,
 } from './ipc.ts';
 import type { SubagentSet } from './load.ts';
-import { buildResultFromPayload } from './result-builder.ts';
 import type { RunSubagentResult } from './result-builder.ts';
+import { buildResultFromPayload } from './result-builder.ts';
 import {
   type ChildProcessHandle,
-  type SpawnChildProcess,
   defaultSpawnChildProcess,
+  type SpawnChildProcess,
 } from './spawn-factory.ts';
 import { MAX_SUBAGENT_DEPTH, type SubagentDefinition } from './types.ts';
 import {
@@ -50,20 +50,20 @@ import {
 } from './wait-loop.ts';
 import {
   type CleanupResult,
-  type WorktreeHandle,
   cleanupWorktree,
   createWorktree,
+  type WorktreeHandle,
 } from './worktree.ts';
 
 export type { RunSubagentResult, SubagentEnvelope } from './result-builder.ts';
 export { toEnvelope } from './result-builder.ts';
 export type {
   ChildProcessHandle,
-  SpawnChildProcessOptions,
   ResolveChildBinaryArgs,
   SpawnChildProcess,
+  SpawnChildProcessOptions,
 } from './spawn-factory.ts';
-export { resolveChildBinaryCmd, drainStderrToLogFile } from './spawn-factory.ts';
+export { drainStderrToLogFile, resolveChildBinaryCmd } from './spawn-factory.ts';
 
 // Filter the parent's registry down to a child registry. The
 // child runs in a SUBPROCESS and reads the

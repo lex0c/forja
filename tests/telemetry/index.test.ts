@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  type PermissionDecisionEvent,
   createNoopTelemetrySink,
   createRecordingTelemetrySink,
+  type PermissionDecisionEvent,
 } from '../../src/telemetry/index.ts';
 
 const exampleEvent = (

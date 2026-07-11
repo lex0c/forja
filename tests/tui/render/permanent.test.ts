@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { formatPermanent } from '../../../src/tui/render/permanent.ts';
-import { CSI, type Capabilities } from '../../../src/tui/term.ts';
+import { type Capabilities, CSI } from '../../../src/tui/term.ts';
 
 const ascii: Capabilities = {
   isTTY: true,

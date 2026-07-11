@@ -9,11 +9,11 @@ import {
   writeFs,
 } from '../../src/permissions/capabilities.ts';
 import {
+  computeRiskScore,
   DEFAULT_TRUSTED_HOSTS,
+  defaultIsMcpTool,
   RISK_SCORE_WEIGHTS,
   type RiskScoreInput,
-  computeRiskScore,
-  defaultIsMcpTool,
 } from '../../src/permissions/risk-score.ts';
 
 const baseInput = (overrides: Partial<RiskScoreInput> = {}): RiskScoreInput => ({
@@ -107,13 +107,15 @@ describe('computeRiskScore — workspace_escape', () => {
 });
 
 describe('computeRiskScore — blocklist_command', () => {
-  test.each(['rm -rf /tmp', 'chmod -R 777 .', 'chmod 777 /etc/passwd', 'sudo dd if=...'])(
-    '%s triggers blocklist_command',
-    (cmd) => {
-      const r = computeRiskScore(baseInput({ command: cmd }));
-      expect(r.components.blocklist_command).toBe(RISK_SCORE_WEIGHTS.blocklist_command);
-    },
-  );
+  test.each([
+    'rm -rf /tmp',
+    'chmod -R 777 .',
+    'chmod 777 /etc/passwd',
+    'sudo dd if=...',
+  ])('%s triggers blocklist_command', (cmd) => {
+    const r = computeRiskScore(baseInput({ command: cmd }));
+    expect(r.components.blocklist_command).toBe(RISK_SCORE_WEIGHTS.blocklist_command);
+  });
   test('safe command does not trigger blocklist_command', () => {
     const r = computeRiskScore(baseInput({ command: 'ls -la' }));
     expect(r.components.blocklist_command).toBeUndefined();
@@ -282,13 +284,16 @@ describe('computeRiskScore — recent_errors', () => {
 });
 
 describe('computeRiskScore — shell_complex', () => {
-  test.each(['ls | wc -l', 'a && b', '$(cat x)', 'cmd1; cmd2', 'echo x > out.txt'])(
-    '%s triggers shell_complex',
-    (cmd) => {
-      const r = computeRiskScore(baseInput({ command: cmd }));
-      expect(r.components.shell_complex).toBe(RISK_SCORE_WEIGHTS.shell_complex);
-    },
-  );
+  test.each([
+    'ls | wc -l',
+    'a && b',
+    '$(cat x)',
+    'cmd1; cmd2',
+    'echo x > out.txt',
+  ])('%s triggers shell_complex', (cmd) => {
+    const r = computeRiskScore(baseInput({ command: cmd }));
+    expect(r.components.shell_complex).toBe(RISK_SCORE_WEIGHTS.shell_complex);
+  });
   test('simple command does not trigger', () => {
     const r = computeRiskScore(baseInput({ command: 'git status' }));
     expect(r.components.shell_complex).toBeUndefined();

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { composeCursor, composeLive } from '../../../src/tui/render/compose.ts';
-import { type LiveState, createInitialState } from '../../../src/tui/state.ts';
+import { createInitialState, type LiveState } from '../../../src/tui/state.ts';
 import type { Capabilities } from '../../../src/tui/term.ts';
 
 const caps: Capabilities = { isTTY: true, cols: 100, rows: 24, color: 'none', unicode: true };

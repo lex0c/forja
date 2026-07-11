@@ -5,8 +5,8 @@ import type { Decision, PermissionEngine, PolicySource, ToolArgs } from '../perm
 import type { ProviderToolResultBlock } from '../providers/index.ts';
 import { sanitizeOneLineForDisplay, sanitizeToolOutput, stripAnsi } from '../sanitize/index.ts';
 import {
-  type DB,
   createToolCall,
+  type DB,
   finishToolCall,
   recordApproval,
   startToolCall,
@@ -15,11 +15,11 @@ import {
 import { linkApprovalToToolCall } from '../storage/repos/approval-call-links.ts';
 import type { Approval } from '../storage/repos/approvals.ts';
 import {
+  isToolError,
   type Tool,
   type ToolContext,
   type ToolError,
   type ToolRegistry,
-  isToolError,
 } from '../tools/index.ts';
 
 export interface InvokeToolInput {

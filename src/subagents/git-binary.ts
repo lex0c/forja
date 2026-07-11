@@ -1,4 +1,4 @@
-import { constants, accessSync, statSync } from 'node:fs';
+import { accessSync, constants, statSync } from 'node:fs';
 import { access, stat } from 'node:fs/promises';
 import { delimiter, isAbsolute, join } from 'node:path';
 

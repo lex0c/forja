@@ -4,15 +4,18 @@ import { listCheckpointsBySession } from '../storage/repos/checkpoints.ts';
 import { getActivePinsBySession } from '../storage/repos/context-pins.ts';
 import { listFailureEventsBySession } from '../storage/repos/failure-events.ts';
 import { listMemoryEventsBySession } from '../storage/repos/memory-events.ts';
-import { type Message, listMessagesBySession } from '../storage/repos/messages.ts';
+import { listMessagesBySession, type Message } from '../storage/repos/messages.ts';
 import {
-  type Session,
   getSession,
   listChildSessions,
   listSessionsInRange,
+  type Session,
 } from '../storage/repos/sessions.ts';
 import { getSubagentOutput } from '../storage/repos/subagent-outputs.ts';
-import { type ToolCall, listToolCallsByMessage } from '../storage/repos/tool-calls.ts';
+import { listToolCallsByMessage, type ToolCall } from '../storage/repos/tool-calls.ts';
+// Tool names that write a file at a known path (`input.path`) — shared with the
+// deterministic recap summary and the verify gate so the set can't drift.
+import { FILE_WRITER_TOOLS } from '../tools/file-writer-tools.ts';
 import {
   RECAP_SCHEMA_VERSION,
   type RecapCommandRun,
@@ -27,10 +30,6 @@ import {
   type RecapTestRun,
   type RecapTimelineEvent,
 } from './types.ts';
-
-// Tool names that write a file at a known path (`input.path`) — shared with the
-// deterministic recap summary and the verify gate so the set can't drift.
-import { FILE_WRITER_TOOLS } from '../tools/file-writer-tools.ts';
 
 // Bash family. Every shell call shows up under commands_run; the
 // foreground/background variant doesn't matter for category

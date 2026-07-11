@@ -1,12 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 import {
   type BrokerRequest,
+  createSpawnBroker,
   DEFAULT_TIMEOUT_MS,
   type SandboxRunner,
+  type SpawnedProcess,
   type SpawnFn,
   type SpawnFnOptions,
-  type SpawnedProcess,
-  createSpawnBroker,
 } from '../../src/broker/index.ts';
 
 const baseRequest = (overrides: Partial<BrokerRequest> = {}): BrokerRequest => ({

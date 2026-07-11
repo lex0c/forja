@@ -32,7 +32,6 @@ import type { FailureEventSink } from '../failures/index.ts';
 import { charsToTokens } from '../providers/tokens.ts';
 import type { DB } from '../storage/db.ts';
 import {
-  type McpServerRow,
   bumpServerCounters,
   deleteServer,
   getManifestDecision,
@@ -40,6 +39,7 @@ import {
   insertServer,
   latestTrustedManifest,
   listServers,
+  type McpServerRow,
   patchServer,
   recordManifestDecision,
   updateManifestDecision,
@@ -49,14 +49,13 @@ import type { ToolContext } from '../tools/types.ts';
 import { createMcpClient } from './client.ts';
 import type { LoadedMcpConfig } from './config.ts';
 import {
-  canonicalManifestJson,
   canonicalizeManifest,
+  canonicalManifestJson,
   hashManifest,
   hashManifestJson,
 } from './manifest.ts';
 import { isMcpTerminal, mcpTransition } from './state.ts';
 import { buildMcpTool, mcpWireName } from './tool-factory.ts';
-import { DEFAULT_MCP_BUDGET, McpCallError } from './types.ts';
 import type {
   ConfirmMcpTrust,
   McpCallResult,
@@ -74,6 +73,7 @@ import type {
   McpTransportConfig,
   McpTrustAnswer,
 } from './types.ts';
+import { DEFAULT_MCP_BUDGET, McpCallError } from './types.ts';
 
 export interface McpManagerDeps {
   db: DB;

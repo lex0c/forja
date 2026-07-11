@@ -31,7 +31,7 @@ import {
   releaseAliasLock,
   socketPath,
 } from '../../src/mesh/registry.ts';
-import { type MeshServer, connectMesh, listenMesh, probeSocket } from '../../src/mesh/transport.ts';
+import { connectMesh, listenMesh, type MeshServer, probeSocket } from '../../src/mesh/transport.ts';
 import {
   ABSOLUTE_MESH_LIMITS,
   DEFAULT_MESH_CONFIG,

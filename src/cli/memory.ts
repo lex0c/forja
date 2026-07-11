@@ -18,16 +18,16 @@
 // lookup is strict (no fallback) — same as `memory_read`.
 
 import {
+  createMemoryRegistry,
   FrontmatterError,
   type MemoryListing,
   type MemoryRegistry,
   type MemoryScope,
-  createMemoryRegistry,
   resolveRepoRoot,
   resolveScopeRoots,
   validateName,
 } from '../memory/index.ts';
-import { type DB, closeDb, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { closeDb, type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 
 export interface MemoryCliInput {
   verb: 'list' | 'show';

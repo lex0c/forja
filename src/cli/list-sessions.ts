@@ -9,9 +9,9 @@ import { isSessionUnmetered } from '../providers/cost-format.ts';
 import type { ModelRegistry } from '../providers/registry.ts';
 import type { Session } from '../storage/index.ts';
 import {
-  type DB,
   closeDb,
   countSessions,
+  type DB,
   defaultDbPath,
   getSubagentRun,
   listChildSessions,

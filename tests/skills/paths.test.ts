@@ -1,14 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 import { SkillFrontmatterError } from '../../src/skills/frontmatter.ts';
+import type { SkillScopeRoots } from '../../src/skills/paths.ts';
 import {
-  ScopeError,
   projectScopeRoots,
   resolveScopeRoots,
   rootForScope,
+  ScopeError,
   skillFilePath,
   userScopeRoot,
 } from '../../src/skills/paths.ts';
-import type { SkillScopeRoots } from '../../src/skills/paths.ts';
 
 const roots: SkillScopeRoots = {
   user: '/home/dev/.config/forja/skills',

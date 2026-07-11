@@ -35,13 +35,13 @@ import { homedir, arch as nodeArch, platform as nodePlatform } from 'node:os';
 import { dirname, resolve as resolvePath } from 'node:path';
 import { activeProfile, appDirName } from '../config/app-namespace.ts';
 import {
-  type SealStore,
-  type VerifyResult,
   createSqliteSink,
   detectSandboxAvailability,
   ensureInstallId,
   factoryForSealMode,
   resolvePolicy,
+  type SealStore,
+  type VerifyResult,
 } from '../permissions/index.ts';
 import { installIdPath } from '../permissions/paths.ts';
 import type { SandboxProfile } from '../permissions/sandbox-plan.ts';

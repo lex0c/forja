@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  WORKING_STATE_PANEL_HEADER,
   formatWorkingStatePanel,
+  WORKING_STATE_PANEL_HEADER,
 } from '../../../src/tui/render/working-state.ts';
-import { type WorkingState, emptyWorkingState } from '../../../src/working-state/index.ts';
+import { emptyWorkingState, type WorkingState } from '../../../src/working-state/index.ts';
 
 describe('formatWorkingStatePanel', () => {
   test('renders focus, next, and open hypotheses under the header — but NOT the log', () => {

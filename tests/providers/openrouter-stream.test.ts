@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  type RawORChunk,
   normalizeOpenRouterStream,
+  type RawORChunk,
 } from '../../src/providers/openrouter/stream.ts';
 import type { StreamEvent } from '../../src/providers/types.ts';
 

@@ -38,7 +38,6 @@ import type { ToolRegistry } from '../tools/index.ts';
 import { serializeMemoryFile } from './frontmatter.ts';
 import type { MemoryRegistry } from './registry.ts';
 import type { MemoryScope } from './types.ts';
-import { dispatchConflictVerify } from './verify-conflict-dispatcher.ts';
 import {
   CONFLICT_PREFILTER_K,
   MEMORY_VERIFY_CONFLICT_MAX_COST_USD,
@@ -46,6 +45,7 @@ import {
   SEMANTIC_CONFLICT_ELIGIBLE_TYPES,
   SEMANTIC_CONFLICT_SUBAGENT_MAX_COST_USD,
 } from './verify-conflict.ts';
+import { dispatchConflictVerify } from './verify-conflict-dispatcher.ts';
 
 // ─── shapes ───────────────────────────────────────────────────────────
 

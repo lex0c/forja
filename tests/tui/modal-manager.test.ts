@@ -3,7 +3,7 @@ import { createBus } from '../../src/tui/bus.ts';
 import type { UIEvent } from '../../src/tui/events.ts';
 import { createFocusStack } from '../../src/tui/focus-stack.ts';
 import type { KeyEvent, KeyName } from '../../src/tui/keys.ts';
-import { type ModalManager, createModalManager } from '../../src/tui/modal-manager.ts';
+import { createModalManager, type ModalManager } from '../../src/tui/modal-manager.ts';
 
 // Synchronous timer harness for deterministic timeout tests.
 const makeTimer = (): {

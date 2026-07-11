@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  type RawAnthropicEvent,
   normalizeAnthropicStream,
+  type RawAnthropicEvent,
 } from '../../src/providers/anthropic/stream.ts';
 import type { StreamEvent } from '../../src/providers/types.ts';
 import { collect, collectNonUsage } from './_stream-helpers.ts';

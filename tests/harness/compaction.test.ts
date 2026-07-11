@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  type CompactionResult,
   accountCompaction,
+  type CompactionResult,
   compactMessages,
   refineCompactionTrigger,
 } from '../../src/harness/compaction.ts';

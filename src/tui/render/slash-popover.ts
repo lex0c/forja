@@ -29,7 +29,7 @@
 //   tighter col-0 layout.
 
 import type { SlashAutocomplete } from '../state.ts';
-import { type Capabilities, type SgrToken, paint } from '../term.ts';
+import { type Capabilities, paint, type SgrToken } from '../term.ts';
 
 // Spec §5.3 caps the popover at 8 visible items.
 const MAX_VISIBLE = 8;

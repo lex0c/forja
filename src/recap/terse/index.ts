@@ -1,6 +1,5 @@
-export { projectTerseDeterministic } from './deterministic.ts';
 export type { TerseProjectionOptions } from './deterministic.ts';
-export { renderTerseFromStructured } from './template.ts';
+export { projectTerseDeterministic } from './deterministic.ts';
 export {
   TERSE_LIMITS,
   TERSE_RENDER_V1_JSON_SCHEMA,
@@ -9,10 +8,11 @@ export {
   type TerseSchemaVersion,
   validateTerseRenderV1,
 } from './schema.ts';
+export { renderTerseFromStructured } from './template.ts';
 
 import type { RenderOptions } from '../format.ts';
 import type { RecapIntermediate } from '../types.ts';
-import { type TerseProjectionOptions, projectTerseDeterministic } from './deterministic.ts';
+import { projectTerseDeterministic, type TerseProjectionOptions } from './deterministic.ts';
 import { renderTerseFromStructured } from './template.ts';
 
 export const renderTerseDeterministic = (

@@ -41,7 +41,7 @@ import {
   type FailureEventRow,
   listFailureEventsBySession,
 } from '../../storage/repos/failure-events.ts';
-import { type Message, listMessagesBySession } from '../../storage/repos/messages.ts';
+import { listMessagesBySession, type Message } from '../../storage/repos/messages.ts';
 import { type BM25Document, createBM25Index, tokenize } from '../bm25.ts';
 import { parseSessionNodeId } from '../node-ids.ts';
 import type { ViewSearch } from '../pipeline.ts';

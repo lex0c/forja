@@ -9,7 +9,7 @@
 // (rare, multi-install machines) stay invisible.
 
 import { ensureInstallId } from '../permissions/index.ts';
-import { MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { defaultDbPath, MIGRATIONS, migrate, openDb } from '../storage/index.ts';
 import { type GrantRow, listActiveGrants, listAllGrants } from '../storage/repos/grants.ts';
 
 export interface RunPermissionGrantsOptions {

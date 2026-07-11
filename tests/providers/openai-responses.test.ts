@@ -2,8 +2,8 @@ import { describe, expect, test } from 'bun:test';
 import type OpenAI from 'openai';
 import { createOpenAIProvider } from '../../src/providers/openai/index.ts';
 import {
-  type RawResponsesEvent,
   normalizeResponsesStream,
+  type RawResponsesEvent,
 } from '../../src/providers/openai/responses-stream.ts';
 import type { StreamEvent } from '../../src/providers/types.ts';
 

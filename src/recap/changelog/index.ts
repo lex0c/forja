@@ -1,5 +1,4 @@
 export { projectChangelogDeterministic } from './deterministic.ts';
-export { renderChangelogFromStructured } from './template.ts';
 export {
   CHANGELOG_CATEGORIES,
   CHANGELOG_LIMITS,
@@ -11,6 +10,7 @@ export {
   type ChangelogSchemaVersion,
   validateChangelogRenderV1,
 } from './schema.ts';
+export { renderChangelogFromStructured } from './template.ts';
 
 import type { RenderOptions } from '../format.ts';
 import type { RecapIntermediate } from '../types.ts';

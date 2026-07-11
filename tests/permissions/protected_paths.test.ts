@@ -97,34 +97,31 @@ describe('classifyProtectedPath — system deny tier', () => {
     // User systemd manager (notify socket, runtime units, etc.)
     ['/run/user/1000/systemd/notify', 'write'],
     ['/run/user/1000/systemd/units/.timer', 'read'],
-  ] as const)(
-    '%s (op=%s) → deny (XDG_RUNTIME_DIR IPC endpoint stays blocked under carve-out)',
-    (absPath, op) => {
-      expect(classifyProtectedPath({ absPath, op, home: HOME, cwd: CWD })).toBe('deny');
-    },
-  );
+  ] as const)('%s (op=%s) → deny (XDG_RUNTIME_DIR IPC endpoint stays blocked under carve-out)', (absPath, op) => {
+    expect(classifyProtectedPath({ absPath, op, home: HOME, cwd: CWD })).toBe('deny');
+  });
 });
 
 describe('classifyProtectedPath — escalate tier (writes only)', () => {
-  test.each(['/etc', '/etc/hosts', '/etc/passwd', '/etc/forja/policy.toml'])(
-    'absolute escalate root %s',
-    (absPath) => {
-      expect(classifyProtectedPath({ absPath, op: 'write', home: HOME, cwd: CWD })).toBe(
-        'escalate',
-      );
-      expect(classifyProtectedPath({ absPath, op: 'read', home: HOME, cwd: CWD })).toBeNull();
-    },
-  );
+  test.each([
+    '/etc',
+    '/etc/hosts',
+    '/etc/passwd',
+    '/etc/forja/policy.toml',
+  ])('absolute escalate root %s', (absPath) => {
+    expect(classifyProtectedPath({ absPath, op: 'write', home: HOME, cwd: CWD })).toBe('escalate');
+    expect(classifyProtectedPath({ absPath, op: 'read', home: HOME, cwd: CWD })).toBeNull();
+  });
 
-  test.each(['/home/op/.bashrc', '/home/op/.zshrc', '/home/op/.profile', '/home/op/.bash_profile'])(
-    'tilde escalate file %s',
-    (absPath) => {
-      expect(classifyProtectedPath({ absPath, op: 'write', home: HOME, cwd: CWD })).toBe(
-        'escalate',
-      );
-      expect(classifyProtectedPath({ absPath, op: 'read', home: HOME, cwd: CWD })).toBeNull();
-    },
-  );
+  test.each([
+    '/home/op/.bashrc',
+    '/home/op/.zshrc',
+    '/home/op/.profile',
+    '/home/op/.bash_profile',
+  ])('tilde escalate file %s', (absPath) => {
+    expect(classifyProtectedPath({ absPath, op: 'write', home: HOME, cwd: CWD })).toBe('escalate');
+    expect(classifyProtectedPath({ absPath, op: 'read', home: HOME, cwd: CWD })).toBeNull();
+  });
 
   test.each([
     '/home/op/.config/forja',
@@ -724,12 +721,13 @@ describe('classifyProtectedPath — slice 180 additions', () => {
 });
 
 describe('isGlobSafeRunCarveout — removable-media glob carve-out', () => {
-  test.each(['/run/media/op', '/run/media/op/extdrive', '/run/media/op/extdrive/proj/src'])(
-    '%s is a glob-safe carve-out (true)',
-    (p) => {
-      expect(isGlobSafeRunCarveout(p)).toBe(true);
-    },
-  );
+  test.each([
+    '/run/media/op',
+    '/run/media/op/extdrive',
+    '/run/media/op/extdrive/proj/src',
+  ])('%s is a glob-safe carve-out (true)', (p) => {
+    expect(isGlobSafeRunCarveout(p)).toBe(true);
+  });
 
   test.each([
     '/run', // the deny root itself

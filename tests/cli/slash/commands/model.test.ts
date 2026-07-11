@@ -14,7 +14,7 @@ import { modelCommand } from '../../../../src/cli/slash/commands/model.ts';
 import type { SlashContext } from '../../../../src/cli/slash/types.ts';
 import { projectDirName } from '../../../../src/config/app-namespace.ts';
 import { resolveRepoRoot } from '../../../../src/memory/paths.ts';
-import { type ModelEntry, createRegistry } from '../../../../src/providers/registry.ts';
+import { createRegistry, type ModelEntry } from '../../../../src/providers/registry.ts';
 import type { Provider } from '../../../../src/providers/types.ts';
 
 const mockProvider = (id: string): Provider =>

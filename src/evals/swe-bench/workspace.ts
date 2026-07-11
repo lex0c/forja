@@ -67,7 +67,10 @@ const existsAtRef = (repoRoot: string, ref: string, path: string): boolean =>
 export const sweTestPaths = ({
   commit,
   repoRoot,
-}: { commit: string; repoRoot: string }): string[] => {
+}: {
+  commit: string;
+  repoRoot: string;
+}): string[] => {
   // `-z` → NUL-separated, UNquoted paths: robust to non-ASCII names. Without it core.quotepath
   // octal-escapes + double-quotes them, and that literal then fails `git archive -- <path>`.
   const out = git(repoRoot, [
@@ -267,7 +270,12 @@ export const restoreSweTests = ({
   repoRoot,
   cwd,
   testPaths,
-}: { commit: string; repoRoot: string; cwd: string; testPaths: string[] }): void => {
+}: {
+  commit: string;
+  repoRoot: string;
+  cwd: string;
+  testPaths: string[];
+}): void => {
   // Fail loudly if the oracle itself is gone at C (a degenerate task) — nothing to verify against.
   if (!testPaths.some((p) => existsAtRef(repoRoot, commit, p))) {
     throw new Error(`swe-bench: none of the oracle test paths exist at ${commit} — cannot restore`);

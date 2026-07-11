@@ -1,16 +1,16 @@
 import type { TodoItem, TodoStatus } from '../../todo/index.ts';
-import { ERROR_CODES, type Tool, type ToolResult, isToolError, toolError } from '../types.ts';
+import { ERROR_CODES, isToolError, type Tool, type ToolResult, toolError } from '../types.ts';
 import {
-  CREATABLE_STATUSES,
-  MAX_ITEMS,
-  type TodoWireItem,
   activeItems,
   assertSingleInProgress,
+  CREATABLE_STATUSES,
   countByStatus,
   isCreatableStatus,
   isObject,
+  MAX_ITEMS,
   mapItemToWire,
   requireTodoStore,
+  type TodoWireItem,
   validateStringField,
 } from './todo-shared.ts';
 

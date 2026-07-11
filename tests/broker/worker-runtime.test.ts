@@ -2,8 +2,8 @@ import { describe, expect, test } from 'bun:test';
 import {
   type BrokerRequest,
   type BrokerResponse,
-  type WorkerToolHandler,
   runWorker,
+  type WorkerToolHandler,
 } from '../../src/broker/index.ts';
 
 const baseRequest = (overrides: Partial<BrokerRequest> = {}): BrokerRequest => ({

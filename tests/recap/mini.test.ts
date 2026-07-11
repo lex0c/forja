@@ -1,9 +1,9 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 import {
+  projectRecapMini,
   RECAP_MINI_LIMITS,
   RECAP_MINI_SCHEMA_VERSION,
   type RecapMini,
-  projectRecapMini,
   validateRecapMini,
 } from '../../src/recap/mini/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';

@@ -7,25 +7,25 @@ import type { AuditEmitInput, AuditSink, ReasonChainEntry } from './audit.ts';
 import { createNoopSink } from './audit.ts';
 import { canonicalHash } from './canonical.ts';
 import {
+  bareDirScopeHint,
   type Capability,
   type CapabilityKind,
-  bareDirScopeHint,
   effectiveCovers,
   formatCapability,
   hostPassthrough,
   sortCapabilities,
 } from './capabilities.ts';
 import {
-  type Classifier,
   buildClassifierInput,
+  type Classifier,
   clampAdjust,
   validateClassifierOutput,
 } from './classifier.ts';
 import {
-  DEFAULT_CONTEXT_SUMMARY_DEPTH,
-  DEFAULT_CONTEXT_SUMMARY_MAX_BYTES,
   buildContextSummary,
   createContextSummaryBuffer,
+  DEFAULT_CONTEXT_SUMMARY_DEPTH,
+  DEFAULT_CONTEXT_SUMMARY_MAX_BYTES,
 } from './context-summary.ts';
 import type { GrantSnapshot } from './grant-types.ts';
 import type { SectionProvenance } from './hierarchy.ts';
@@ -40,38 +40,38 @@ import {
   resolveSymlinks,
 } from './matcher.ts';
 import {
-  type ProtectedOp,
-  type ProtectedTier,
   classifyProtectedPath,
   isDevSafe,
+  type ProtectedOp,
+  type ProtectedTier,
   startsWithSegment,
 } from './protected_paths.ts';
 // Importing the resolver index registers every builtin resolver at
 // module load. Engine consumers don't need a separate wire-up step.
 import { topLevelCommandTexts } from './resolvers/bash.ts';
 import {
-  type ResolverResult,
   conservativeCapsAreHonest,
+  type ResolverResult,
   resolveCapabilities,
 } from './resolvers/index.ts';
 import {
+  computeRiskScore,
   DEFAULT_TRUSTED_HOSTS,
+  defaultIsMcpTool,
   type RiskScoreConfidence,
   type RiskScoreInput,
-  computeRiskScore,
-  defaultIsMcpTool,
 } from './risk-score.ts';
 import {
-  type SelectSandboxProfileResult,
   isSandboxProfile,
+  type SelectSandboxProfileResult,
   selectSandboxProfile,
 } from './sandbox-plan.ts';
 import { matchSensitivePath } from './sensitive-paths.ts';
 import {
-  type EngineState,
-  type StateController,
   createStateController,
+  type EngineState,
   isRejectingState,
+  type StateController,
 } from './state-machine.ts';
 import type {
   ApprovalPosture,

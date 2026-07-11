@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import {
   AbortError,
-  StepStallError,
   abortableIterable,
+  StepStallError,
   stallWatchdog,
   withAbort,
 } from '../../src/harness/abortable.ts';

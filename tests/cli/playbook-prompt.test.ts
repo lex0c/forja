@@ -1,10 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  composeWithPlaybookHint,
+  composeWithPlaybookHintLean,
   MAX_PLAYBOOK_TABLE_ROWS,
   PLAYBOOK_DELEGATION_PREAMBLE,
   PLAYBOOK_WORKFLOW_HEADER,
-  composeWithPlaybookHint,
-  composeWithPlaybookHintLean,
 } from '../../src/cli/playbook-prompt.ts';
 import type { SubagentSet } from '../../src/subagents/load.ts';
 import type { SubagentDefinition } from '../../src/subagents/types.ts';

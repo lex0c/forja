@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  REFLECTION_BLOCK_HEADER,
   buildReflectionBlock,
   composeWithReflectionBlock,
+  REFLECTION_BLOCK_HEADER,
 } from '../../src/cli/reflection-block.ts';
 
 describe('buildReflectionBlock', () => {

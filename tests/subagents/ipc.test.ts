@@ -1,12 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  IPC_PROTOCOL_VERSION,
-  type IpcMessage,
-  type IpcTransport,
-  type ProcessStreams,
   createChannel,
   encodeMessage,
   fakeTransportPair,
+  IPC_PROTOCOL_VERSION,
+  type IpcMessage,
+  type IpcTransport,
   isExpectedIpcTeardown,
   makeEvent,
   makeInterruptHard,
@@ -16,6 +15,7 @@ import {
   makeSessionFinished,
   makeSessionStart,
   makeShutdown,
+  type ProcessStreams,
   parseLine,
   processTransport,
   subprocessTransport,

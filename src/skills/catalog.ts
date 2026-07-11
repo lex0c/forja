@@ -1,9 +1,9 @@
 import { redactSecrets } from '../sanitize/secrets.ts';
 import { type DB, withTransaction } from '../storage/db.ts';
 import {
-  type SkillEventAction,
   createSkillEvent,
   listSkillEventsBySession,
+  type SkillEventAction,
 } from '../storage/repos/skill-events.ts';
 import { readSkillByName, scanScope } from './loader.ts';
 import type { SkillScopeRoots } from './paths.ts';

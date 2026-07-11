@@ -44,7 +44,7 @@
 import { scrubEnv } from '../sanitize/index.ts';
 import { createBashHandler } from './handlers/bash.ts';
 import type { BrokerRequest, BrokerResponse } from './types.ts';
-import { type WorkerToolHandler, runWorker } from './worker-runtime.ts';
+import { runWorker, type WorkerToolHandler } from './worker-runtime.ts';
 
 const echoHandler: WorkerToolHandler = {
   name: '__echo__',

@@ -16,8 +16,8 @@ import { type DB, openMemoryDb } from '../../../src/storage/db.ts';
 import { migrate } from '../../../src/storage/migrate.ts';
 import {
   type ContextPinsStore,
-  PIN_CAP,
   createContextPinsStore,
+  PIN_CAP,
 } from '../../../src/storage/repos/context-pins.ts';
 import { createSession } from '../../../src/storage/repos/sessions.ts';
 import { createBus } from '../../../src/tui/bus.ts';

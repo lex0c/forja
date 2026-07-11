@@ -11,8 +11,6 @@ import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import {
-  MAX_MCP_TOOLS,
-  MAX_TOOL_RESULT_CHARS,
   abortableConnect,
   boundStructuredContent,
   buildSpawnEnv,
@@ -21,6 +19,8 @@ import {
   extractMeta,
   flattenContent,
   isInvalidOutput,
+  MAX_MCP_TOOLS,
+  MAX_TOOL_RESULT_CHARS,
   narrowManifestTools,
   normalizeInputSchema,
   teeStderr,

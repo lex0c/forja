@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Decision } from '../../src/permissions/index.ts';
-import { type FetchUrlOutput, createFetchUrlTool } from '../../src/tools/builtin/fetch-url.ts';
+import { createFetchUrlTool, type FetchUrlOutput } from '../../src/tools/builtin/fetch-url.ts';
 import { MAX_FILE_BYTES } from '../../src/tools/builtin/read-file.ts';
 import { isToolError } from '../../src/tools/types.ts';
 import { makeCtx } from './_helpers.ts';

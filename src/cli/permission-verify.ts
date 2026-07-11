@@ -9,12 +9,12 @@
 
 import {
   type ChainBreakAcceptedRow,
-  type VerifyResult,
   createSqliteSink,
   ensureInstallId,
   listChainBreakAcceptedRows,
+  type VerifyResult,
 } from '../permissions/index.ts';
-import { MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { defaultDbPath, MIGRATIONS, migrate, openDb } from '../storage/index.ts';
 import { forjaCommand } from './forja-command.ts';
 
 export interface RunPermissionVerifyOptions {

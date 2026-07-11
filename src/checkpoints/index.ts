@@ -1,20 +1,7 @@
-export { detectCheckpointSupport } from './detect.ts';
 export type { CheckpointAvailability } from './detect.ts';
-
+export { detectCheckpointSupport } from './detect.ts';
+export type { RestoreResult, SnapshotResult } from './git.ts';
 export {
-  DEFAULT_RETENTION_DAYS,
-  createCheckpointManager,
-} from './manager.ts';
-export type {
-  CheckpointManager,
-  CreateManagerInput,
-  PurgeOptions,
-  SnapshotInput,
-  SnapshotOutcome,
-} from './manager.ts';
-
-export {
-  RESTORE_SAVED_REF_PREFIX,
   deleteRestoreSavedRef,
   deleteSessionRef,
   diff as gitDiff,
@@ -28,6 +15,7 @@ export {
   listRestoreSavedRefs,
   listSessionRefs,
   parseRestoreSavedTimestamp,
+  RESTORE_SAVED_REF_PREFIX,
   resolveRef,
   restore as gitRestore,
   rewriteCheckpointCommit,
@@ -35,4 +23,14 @@ export {
   setSessionRef,
   snapshot as gitSnapshot,
 } from './git.ts';
-export type { RestoreResult, SnapshotResult } from './git.ts';
+export type {
+  CheckpointManager,
+  CreateManagerInput,
+  PurgeOptions,
+  SnapshotInput,
+  SnapshotOutcome,
+} from './manager.ts';
+export {
+  createCheckpointManager,
+  DEFAULT_RETENTION_DAYS,
+} from './manager.ts';

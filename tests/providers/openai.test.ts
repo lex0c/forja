@@ -2,8 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import type OpenAI from 'openai';
 import { createOpenAIProvider, openaiPromptCacheKey } from '../../src/providers/openai/index.ts';
 import type { RawOpenAIChunk } from '../../src/providers/openai/stream.ts';
-import type { GenerateRequest, ProviderToolDef } from '../../src/providers/types.ts';
-import type { StreamEvent } from '../../src/providers/types.ts';
+import type { GenerateRequest, ProviderToolDef, StreamEvent } from '../../src/providers/types.ts';
 
 interface Call {
   params: unknown;
