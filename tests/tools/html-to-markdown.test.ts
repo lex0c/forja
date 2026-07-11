@@ -92,6 +92,18 @@ describe('htmlToMarkdown', () => {
     expect(md).toContain('| 1 | 2 |');
   });
 
+  test('table cells escape both pipe and backslash so a row cannot break (GFM)', async () => {
+    const BS = '\\'; // a single literal backslash — avoids counting source escapes
+    const md = await htmlToMarkdown(
+      `<table><tr><th>a|b</th></tr><tr><td>x${BS}|y</td></tr></table>`,
+    );
+    // The pipe is escaped so it is not read as a column delimiter…
+    expect(md).toContain(`a${BS}|b`);
+    // …and a literal backslash-before-pipe is FULLY escaped (\\ then \|), not
+    // left as `\` + an unescaped `|` that would split the row into two columns.
+    expect(md).toContain(`x${BS}${BS}${BS}|y`);
+  });
+
   test('script/style content is dropped, never leaked', async () => {
     const md = await htmlToMarkdown(
       '<style>.a{color:red}</style><p>visible</p><script>var s = "</p><h1>injected</h1>";</script>',

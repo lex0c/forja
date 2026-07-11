@@ -569,7 +569,13 @@ const renderTable = (rows: string[][]): string => {
   const pad = (r: string[]): string[] => {
     const copy = r.slice();
     while (copy.length < cols) copy.push('');
-    return copy.map((c) => c.replace(/\|/g, '\\|'));
+    // Escape the backslash AND the pipe in one pass over `[\\|]` (so the
+    // backslash is handled first). Escaping only `|` left a cell value like
+    // `\|` as `\` + an escaped-away pipe — `\\|` — which GFM renders as a
+    // literal backslash followed by an UNescaped `|`, splitting the row into
+    // an extra column. Matching both meta-characters keeps page content from
+    // forging the table structure.
+    return copy.map((c) => c.replace(/[\\|]/g, '\\$&'));
   };
   const header = pad(cleaned[0] as string[]);
   const out = [`| ${header.join(' | ')} |`, `| ${new Array(cols).fill('---').join(' | ')} |`];
