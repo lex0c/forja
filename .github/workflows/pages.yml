@@ -1,0 +1,56 @@
+name: GitHub Pages Report
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1' # Every Monday at 6am UTC
+  workflow_dispatch: {} # manual trigger (test / on-demand refresh)
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main # report main regardless of the repo's default branch
+          fetch-depth: 0 # Full history — the report is derived from it
+
+      - name: Install gitcortex (release binary, checksum-verified)
+        run: |
+          base=https://github.com/lex0c/gitcortex/releases/latest/download
+          curl -sSfL "$base/gitcortex-linux-amd64" -o gitcortex-linux-amd64
+          curl -sSfL "$base/SHA256SUMS" -o SHA256SUMS
+          grep 'gitcortex-linux-amd64$' SHA256SUMS | sha256sum -c -
+          install -m 0755 gitcortex-linux-amd64 gitcortex
+
+      - name: Extract
+        run: ./gitcortex extract --branch main --output forja.jsonl --ignore "bun.lock" --include-commit-messages
+
+      - name: Generate report
+        run: |
+          mkdir -p _site
+          ./gitcortex report --input forja.jsonl --output _site/index.html --top 30
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
