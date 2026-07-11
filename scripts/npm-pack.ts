@@ -12,6 +12,7 @@
 //
 //   bun run scripts/npm-pack.ts --version=1.2.3 [--dist=dist] [--out=dist-npm]
 //                               [--sums=<dist>/SHA256SUMS] [--launcher=npm/launcher]
+//                               [--readme=<path>]  (default: repo root README.md)
 
 import {
   chmodSync,
@@ -137,6 +138,10 @@ export interface PackOptions {
   version: string;
   sumsPath: string;
   launcherDir: string;
+  // README shipped in the launcher package — this is what npmjs.com
+  // renders on the package page. Defaults to the repo root README so the
+  // npm page mirrors GitHub.
+  readmePath: string;
 }
 
 export interface PackedPackage {
@@ -182,7 +187,8 @@ export const pack = (opts: PackOptions): PackedPackage[] => {
   mkdirSync(dirname(shimDest), { recursive: true });
   copyFileSync(join(opts.launcherDir, 'bin', 'forja'), shimDest);
   chmodSync(shimDest, 0o755);
-  copyFileSync(join(opts.launcherDir, 'README.md'), join(launcherOut, 'README.md'));
+  // The repo README (opts.readmePath) is what shows on the npm page.
+  copyFileSync(opts.readmePath, join(launcherOut, 'README.md'));
   packed.push({ name: launcherPkgName(), dir: launcherOut, kind: 'launcher' });
 
   return packed;
@@ -194,6 +200,7 @@ interface ParsedArgs {
   version: string;
   sumsPath: string;
   launcherDir: string;
+  readmePath: string;
 }
 
 const parseArgs = (argv: readonly string[]): ParsedArgs => {
@@ -202,12 +209,15 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
   let version = process.env.FORJA_RELEASE_VERSION ?? '';
   let sumsPath = '';
   let launcherDir = resolve(import.meta.dir, '../npm/launcher');
+  // Default to the repo root README so the npm page mirrors GitHub.
+  let readmePath = resolve(import.meta.dir, '../README.md');
   for (const a of argv) {
     if (a.startsWith('--dist=')) distDir = a.slice('--dist='.length);
     else if (a.startsWith('--out=')) outDir = a.slice('--out='.length);
     else if (a.startsWith('--version=')) version = a.slice('--version='.length);
     else if (a.startsWith('--sums=')) sumsPath = a.slice('--sums='.length);
     else if (a.startsWith('--launcher=')) launcherDir = a.slice('--launcher='.length);
+    else if (a.startsWith('--readme=')) readmePath = a.slice('--readme='.length);
     else {
       process.stderr.write(`unknown arg: ${a}\n`);
       process.exit(2);
@@ -218,7 +228,7 @@ const parseArgs = (argv: readonly string[]): ParsedArgs => {
     process.exit(2);
   }
   if (sumsPath === '') sumsPath = join(distDir, 'SHA256SUMS');
-  return { distDir, outDir, version, sumsPath, launcherDir };
+  return { distDir, outDir, version, sumsPath, launcherDir, readmePath };
 };
 
 const main = (): void => {

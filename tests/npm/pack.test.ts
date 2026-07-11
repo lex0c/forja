@@ -18,6 +18,7 @@ import { TARGETS } from '../../scripts/targets.ts';
 import { targetById } from '../scripts/_helpers.ts';
 
 const LAUNCHER_DIR = resolve(import.meta.dir, '../../npm/launcher');
+const README_PATH = resolve(import.meta.dir, '../../README.md');
 const VERSION = '1.2.3';
 
 const tmpDirs: string[] = [];
@@ -164,6 +165,7 @@ describe('pack (end to end)', () => {
       version: VERSION,
       sumsPath: join(dist, 'SHA256SUMS'),
       launcherDir: LAUNCHER_DIR,
+      readmePath: README_PATH,
     });
 
     expect(packed).toHaveLength(TARGETS.length + 1);
@@ -192,6 +194,11 @@ describe('pack (end to end)', () => {
     }
     expect(existsSync(join(launcherDir, 'bin', 'forja'))).toBe(true);
     expect(existsSync(join(launcherDir, 'README.md'))).toBe(true);
+    // The published launcher README is the repo root README verbatim, so
+    // the npm package page mirrors GitHub.
+    expect(readFileSync(join(launcherDir, 'README.md'), 'utf-8')).toBe(
+      readFileSync(README_PATH, 'utf-8'),
+    );
     expect(statSync(join(launcherDir, 'bin', 'forja')).mode & 0o111).not.toBe(0);
   });
 
@@ -206,6 +213,7 @@ describe('pack (end to end)', () => {
         version: VERSION,
         sumsPath: join(dist, 'SHA256SUMS'),
         launcherDir: LAUNCHER_DIR,
+        readmePath: README_PATH,
       }),
     ).toThrow(/hash mismatch/);
   });
