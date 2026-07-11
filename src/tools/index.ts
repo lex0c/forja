@@ -1,37 +1,4 @@
 export type {
-  ClarifyBridgeRequest,
-  ClarifyBridgeResponse,
-  DisplayHint,
-  SpawnSubagentArgs,
-  SpawnSubagentResult,
-  Tool,
-  ToolContext,
-  ToolError,
-  ToolMetadata,
-  ToolResult,
-} from './types.ts';
-export { ERROR_CODES, isToolError, toolError } from './types.ts';
-
-export { createToolRegistry } from './registry.ts';
-export type { ToolRegistry } from './registry.ts';
-
-export {
-  BUILTIN_TOOLS,
-  bashTool,
-  editFileTool,
-  globTool,
-  grepTool,
-  readFileTool,
-  registerBuiltinTools,
-  taskTool,
-  todoClearTool,
-  todoCreateTool,
-  todoGetTool,
-  todoListTool,
-  todoUpdateTool,
-  writeFileTool,
-} from './builtin/index.ts';
-export type {
   BashInput,
   BashOutput,
   EditFileInput,
@@ -59,3 +26,34 @@ export type {
   WriteFileInput,
   WriteFileOutput,
 } from './builtin/index.ts';
+export {
+  BUILTIN_TOOLS,
+  bashTool,
+  editFileTool,
+  globTool,
+  grepTool,
+  readFileTool,
+  registerBuiltinTools,
+  taskTool,
+  todoClearTool,
+  todoCreateTool,
+  todoGetTool,
+  todoListTool,
+  todoUpdateTool,
+  writeFileTool,
+} from './builtin/index.ts';
+export type { ToolRegistry } from './registry.ts';
+export { createToolRegistry } from './registry.ts';
+export type {
+  ClarifyBridgeRequest,
+  ClarifyBridgeResponse,
+  DisplayHint,
+  SpawnSubagentArgs,
+  SpawnSubagentResult,
+  Tool,
+  ToolContext,
+  ToolError,
+  ToolMetadata,
+  ToolResult,
+} from './types.ts';
+export { ERROR_CODES, isToolError, toolError } from './types.ts';

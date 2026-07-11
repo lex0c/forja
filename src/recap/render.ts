@@ -15,8 +15,8 @@
 // `redactSecretsInIntermediate`).
 
 import { renderChangelogDeterministic } from './changelog/index.ts';
-import { redactSecretsInIntermediate } from './format.ts';
 import type { RenderOptions } from './format.ts';
+import { redactSecretsInIntermediate } from './format.ts';
 import { renderHumanDeterministic } from './human/index.ts';
 import { renderPrDeterministic } from './pr/index.ts';
 import { renderSlackDeterministic } from './slack/index.ts';

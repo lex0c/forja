@@ -3,12 +3,12 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  type SealEntry,
-  type SealStore,
   createSealingScheduler,
   createSqliteSink,
   createWormFileSealer,
   ensureInstallId,
+  type SealEntry,
+  type SealStore,
   verifySealAgainstChain,
 } from '../../src/permissions/index.ts';
 import { MIGRATIONS, migrate, openMemoryDb } from '../../src/storage/index.ts';

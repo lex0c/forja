@@ -10,8 +10,8 @@ import {
   serializeIndex,
   upsertIndexEntry,
 } from './index-file.ts';
-import { ScopeError, indexFilePath, memoryFilePath } from './paths.ts';
 import type { ScopeRoots } from './paths.ts';
+import { indexFilePath, memoryFilePath, ScopeError } from './paths.ts';
 import type { IndexEntry, MemoryFile, MemoryFrontmatter, MemoryScope } from './types.ts';
 
 // Disk-side writer for the memory subsystem (spec MEMORY.md §5.1, §5.3).

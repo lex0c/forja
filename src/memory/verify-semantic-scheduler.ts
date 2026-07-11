@@ -35,6 +35,7 @@ import { sanitizeOneLineForDisplay } from '../sanitize/ansi.ts';
 // still bounded — a runaway error string can't blow up the log line.
 const ERR_MAX_CHARS = 1024;
 const displayErr = (s: string): string => sanitizeOneLineForDisplay(s, ERR_MAX_CHARS);
+
 import type { DB } from '../storage/db.ts';
 import { listPendingProposalsForMemory } from '../storage/repos/memory-governance.ts';
 import { listSessionExposuresSince } from '../storage/repos/memory-provenance.ts';
@@ -42,13 +43,13 @@ import type { SubagentDefinition } from '../subagents/types.ts';
 import type { ToolRegistry } from '../tools/index.ts';
 import type { MemoryRegistry } from './registry.ts';
 import type { MemoryScope } from './types.ts';
-import { dispatchSemanticVerify } from './verify-semantic-dispatcher.ts';
 import {
   MEMORY_VERIFY_SEMANTIC_MAX_COST_USD,
   MEMORY_VERIFY_SEMANTIC_MAX_DISPATCHES_PER_SESSION,
   SEMANTIC_VERIFY_ELIGIBLE_TYPES,
   SEMANTIC_VERIFY_SUBAGENT_MAX_COST_USD,
 } from './verify-semantic.ts';
+import { dispatchSemanticVerify } from './verify-semantic-dispatcher.ts';
 
 // ─── shapes ───────────────────────────────────────────────────────────
 

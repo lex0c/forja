@@ -5,7 +5,7 @@ import {
   setSubagentPayload,
 } from '../../../src/storage/repos/subagent-outputs.ts';
 import { createToolCall, finishToolCall } from '../../../src/storage/repos/tool-calls.ts';
-import { type RecapFixture, padId } from './types.ts';
+import { padId, type RecapFixture } from './types.ts';
 
 export const fixture: RecapFixture = {
   name: '04-with-subagent',

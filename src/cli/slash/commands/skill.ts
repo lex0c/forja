@@ -1,9 +1,9 @@
 import {
-  type SkillCatalog,
-  type SkillScope,
   createSkill,
   deleteSkill,
   moveSkill,
+  type SkillCatalog,
+  type SkillScope,
 } from '../../../skills/index.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 

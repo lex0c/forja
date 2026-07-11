@@ -6,7 +6,7 @@
 
 import { appendMessage } from '../../../src/storage/repos/messages.ts';
 import { completeSession, createSession } from '../../../src/storage/repos/sessions.ts';
-import { type RecapFixture, padId } from './types.ts';
+import { padId, type RecapFixture } from './types.ts';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MAY_1_UTC = Date.UTC(2026, 4, 1, 0, 0, 0, 0);

@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import { MIGRATIONS, migrate, openMemoryDb } from '../../src/storage/index.ts';
 import {
-  type InsertGrantInput,
   getGrantById,
+  type InsertGrantInput,
   insertGrant,
   listActiveGrants,
   listAllGrants,

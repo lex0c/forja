@@ -1,7 +1,7 @@
 // Ranking tests (RETRIEVAL.md §5, slice 4.6).
 
 import { describe, expect, test } from 'bun:test';
-import { WORKFLOW_WEIGHTS, rankCandidates } from '../../src/retrieval/ranking.ts';
+import { rankCandidates, WORKFLOW_WEIGHTS } from '../../src/retrieval/ranking.ts';
 import type {
   ExpandedCandidate,
   RetrievalQuery,

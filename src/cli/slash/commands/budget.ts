@@ -23,10 +23,10 @@
 // next-turn mutation convention (/model).
 
 import {
+  effectiveBudget,
   MAX_CONCURRENT_SUBAGENTS_CAP,
   MAX_CONCURRENT_TOOL_CALLS_CAP,
   type RunBudget,
-  effectiveBudget,
 } from '../../../harness/types.ts';
 import { formatCost, formatMs, withRunningCue } from '../format.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';

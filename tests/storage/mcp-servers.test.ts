@@ -2,17 +2,17 @@ import { beforeEach, describe, expect, test } from 'bun:test';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import {
-  type InsertServerInput,
-  type RecordManifestDecisionInput,
   bumpServerCounters,
   deleteServer,
   getManifestDecision,
   getServer,
+  type InsertServerInput,
   insertServer,
   latestTrustedManifest,
   listManifestHistory,
   listServers,
   patchServer,
+  type RecordManifestDecisionInput,
   recordManifestDecision,
   updateManifestDecision,
 } from '../../src/storage/repos/mcp-servers.ts';

@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  MAX_RETRY_AFTER_MS,
   generateWithRetry,
   isRetryableError,
+  MAX_RETRY_AFTER_MS,
   retryAfterMs,
 } from '../../src/harness/retry.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
@@ -139,12 +139,12 @@ describe('generateWithRetry', () => {
 
   test('does NOT retry non-retryable errors (e.g., 400)', async () => {
     let attempts = 0;
+    // biome-ignore lint/correctness/useYield: throw before yield
     const provider = minimalProvider(async function* () {
       attempts += 1;
       const e = new Error('bad request') as Error & { status: number };
       e.status = 400;
       throw e;
-      // biome-ignore lint/correctness/useYield: throw before yield
     });
     let caught: unknown = null;
     try {
@@ -160,12 +160,12 @@ describe('generateWithRetry', () => {
 
   test('exhausts retries and throws the last error', async () => {
     let attempts = 0;
+    // biome-ignore lint/correctness/useYield: throw before yield
     const provider = minimalProvider(async function* () {
       attempts += 1;
       const e = new Error(`fail ${attempts}`) as Error & { status: number };
       e.status = 503;
       throw e;
-      // biome-ignore lint/correctness/useYield: throw before yield
     });
     let caught: unknown = null;
     try {

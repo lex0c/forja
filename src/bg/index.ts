@@ -1,4 +1,3 @@
-export { createBgManager } from './manager.ts';
 export type {
   BgManager,
   BgManagerEvent,
@@ -11,3 +10,4 @@ export type {
   SpawnResult,
   StatusSnapshot,
 } from './manager.ts';
+export { createBgManager } from './manager.ts';

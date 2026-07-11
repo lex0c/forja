@@ -14,7 +14,7 @@ import type {
 } from '../types.ts';
 import { OPENROUTER_CAPS } from './capabilities.ts';
 import { buildReasoningParam, toOpenRouterMessages } from './messages.ts';
-import { type RawORChunk, normalizeOpenRouterStream } from './stream.ts';
+import { normalizeOpenRouterStream, type RawORChunk } from './stream.ts';
 
 export const DEFAULT_OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 

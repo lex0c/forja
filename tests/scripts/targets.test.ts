@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { TARGETS, assetName, findTarget } from '../../scripts/targets.ts';
+import { assetName, findTarget, TARGETS } from '../../scripts/targets.ts';
 import { VERSION } from '../../src/cli/version.ts';
 import { targetById } from './_helpers.ts';
 

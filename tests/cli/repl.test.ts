@@ -8,8 +8,8 @@ import type { ParsedArgs } from '../../src/cli/args.ts';
 import type { BootstrapInput, BootstrapResult } from '../../src/cli/bootstrap.ts';
 import {
   type RunReplOptions,
-  SUBAGENT_DISPLAY_MAX,
   runRepl,
+  SUBAGENT_DISPLAY_MAX,
   sanitizeForSubagentDisplay,
 } from '../../src/cli/repl.ts';
 import type {
@@ -19,7 +19,7 @@ import type {
   SessionContext,
 } from '../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../src/harness/types.ts';
-import { type PermissionEngine, createPermissionEngine } from '../../src/permissions/index.ts';
+import { createPermissionEngine, type PermissionEngine } from '../../src/permissions/index.ts';
 import { createDefaultRegistry } from '../../src/providers/catalog-file.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';

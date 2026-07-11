@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  canonicalManifestJson,
   canonicalizeManifest,
+  canonicalManifestJson,
   hashManifest,
 } from '../../src/mcp/manifest.ts';
 import type { CanonicalManifest, McpManifestTool } from '../../src/mcp/types.ts';

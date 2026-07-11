@@ -29,6 +29,7 @@ import type { Bus } from './bus.ts';
 import type { UIEvent } from './events.ts';
 import type { FocusHandler, FocusStack } from './focus-stack.ts';
 import type { ConfirmOption, PermissionAnswer } from './state.ts';
+
 export type { PermissionAnswer } from './state.ts';
 
 // One pending request in the queue.

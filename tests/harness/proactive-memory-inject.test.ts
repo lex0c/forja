@@ -7,10 +7,10 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  type ProactiveRecallCacheEntry,
   createProactiveRecall,
   formatProactiveRecallBlock,
   injectProactiveMemoryBlock,
+  type ProactiveRecallCacheEntry,
   recordProactiveExposures,
   resolveCachedRecall,
 } from '../../src/harness/proactive-memory-inject.ts';

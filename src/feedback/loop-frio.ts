@@ -34,15 +34,15 @@
 import type { DB } from '../storage/db.ts';
 import { levelOf, parseActionSignature } from '../storage/repos/action-signature.ts';
 import {
+  listOutcomesByActionSignature,
   type OutcomeResult,
   type ScopeKind,
-  listOutcomesByActionSignature,
 } from '../storage/repos/outcomes.ts';
 import {
-  type Policy,
-  type PolicyState,
   createPolicy,
   listPoliciesByActionSignature,
+  type Policy,
+  type PolicyState,
 } from '../storage/repos/policies.ts';
 import { findAccumulatedSignatures } from './accumulation.ts';
 import { type PosteriorStats, passesPromotionGate, posteriorFromOutcomes } from './bayesian.ts';

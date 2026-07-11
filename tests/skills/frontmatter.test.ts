@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  SkillFrontmatterError,
   parseSkillFile,
+  SkillFrontmatterError,
   serializeSkillFile,
   validateFrontmatter,
   validateName,

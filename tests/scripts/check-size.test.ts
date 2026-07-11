@@ -3,7 +3,7 @@ import { closeSync, ftruncateSync, mkdtempSync, openSync, rmSync, writeFileSync 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { classifyBytes, formatRow, runCheck } from '../../scripts/check-size.ts';
-import { TARGETS, assetName } from '../../scripts/targets.ts';
+import { assetName, TARGETS } from '../../scripts/targets.ts';
 import { targetById } from './_helpers.ts';
 
 const MIB = 1024 * 1024;

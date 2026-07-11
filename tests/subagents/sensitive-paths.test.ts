@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  SENSITIVE_PATH_DENY_LIST,
   matchSensitivePath,
+  SENSITIVE_PATH_DENY_LIST,
 } from '../../src/subagents/sensitive-paths.ts';
 
 // Direct tests on the matcher. The integration coverage lives in

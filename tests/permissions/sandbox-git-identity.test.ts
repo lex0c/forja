@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  type GitIdentity,
   ensureSanitizedGitconfigFile,
+  type GitIdentity,
   gitIdentityPassthroughEnv,
   renderSanitizedGitconfig,
   resolveGitIdentity,

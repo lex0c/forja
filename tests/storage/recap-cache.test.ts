@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import {
-  DEFAULT_RECAP_CACHE_TTL_MS,
   canonicalScopeHash,
+  DEFAULT_RECAP_CACHE_TTL_MS,
   getEffectiveRecapCacheTtlMs,
   purgeExpiredRecapCache,
   readRecapCache,

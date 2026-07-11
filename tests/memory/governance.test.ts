@@ -19,7 +19,7 @@ import { join } from 'node:path';
 import type { HookChainResult, HookEventPayload } from '../../src/hooks/types.ts';
 import { parseMemoryFile, serializeMemoryFile } from '../../src/memory/frontmatter.ts';
 import { applyProposal } from '../../src/memory/governance.ts';
-import { type ScopeRoots, indexFilePath, memoryFilePath } from '../../src/memory/paths.ts';
+import { indexFilePath, memoryFilePath, type ScopeRoots } from '../../src/memory/paths.ts';
 import { createMemoryRegistry } from '../../src/memory/registry.ts';
 import { transitionMemoryState } from '../../src/memory/transitions.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';

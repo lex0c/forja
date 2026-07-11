@@ -32,12 +32,13 @@ import {
 import type { Classifier } from '../../src/permissions/classifier.ts';
 import type { LayerPolicy } from '../../src/permissions/hierarchy.ts';
 import {
+  createPermissionEngine,
   type Decision,
   type EngineState,
+  loadPolicyFromString,
+  mergeLayers,
   type PolicyCategory,
-  createPermissionEngine,
 } from '../../src/permissions/index.ts';
-import { loadPolicyFromString, mergeLayers } from '../../src/permissions/index.ts';
 import type { InstallIdentity } from '../../src/permissions/install_id.ts';
 import { resolveCapabilities } from '../../src/permissions/resolvers/index.ts';
 import { selectSandboxProfile } from '../../src/permissions/sandbox-plan.ts';

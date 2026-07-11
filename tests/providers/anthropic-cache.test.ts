@@ -2,19 +2,19 @@ import { describe, expect, test } from 'bun:test';
 import type Anthropic from '@anthropic-ai/sdk';
 import {
   ANTHROPIC_CACHE_EPHEMERAL,
-  MAX_CACHE_BREAKPOINTS_PER_REQUEST,
   cacheMarker,
   countCacheBreakpoints,
+  MAX_CACHE_BREAKPOINTS_PER_REQUEST,
   messagesWithTailCacheBreakpoint,
   systemSegmentsWithCacheBreakpoints,
   systemWithCacheBreakpoint,
   toolsWithCacheBreakpoint,
 } from '../../src/providers/anthropic/cache.ts';
 import {
+  flattenSystemSegments,
   type ProviderContentBlock,
   type ProviderMessage,
   type SystemSegment,
-  flattenSystemSegments,
 } from '../../src/providers/types.ts';
 
 const tool = (name: string): Anthropic.Tool => ({

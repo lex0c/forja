@@ -1,9 +1,9 @@
 import { deriveSeedFromRequest } from '../seed.ts';
 import {
+  flattenSystemSegments,
   type GenerateRequest,
   type ProviderCapabilities,
   type ProviderToolDef,
-  flattenSystemSegments,
 } from '../types.ts';
 import type { OllamaMessage, OllamaToolCall } from './http.ts';
 

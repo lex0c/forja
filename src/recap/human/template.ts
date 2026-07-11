@@ -13,7 +13,6 @@
 
 import { stripAnsi } from '../../sanitize/ansi.ts';
 import {
-  type RenderOptions,
   anonymize,
   anonymizeText,
   formatDuration,
@@ -21,6 +20,7 @@ import {
   formatTokens,
   formatUsd,
   oneLine,
+  type RenderOptions,
   redactSecrets,
   resolveHome,
   shortStep,

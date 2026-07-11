@@ -3,19 +3,19 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
-  SEEDS_SUBDIR,
-  ScopeError,
   indexFilePath,
   memoryFilePath,
   projectScopeRoots,
   resolveRepoRoot,
   resolveScopeRoots,
+  ScopeError,
+  SEEDS_SUBDIR,
   scopeOfPath,
   seedIndexFilePath,
   seedMemoryFilePath,
+  seedsRoot,
   seedTombstonePath,
   seedTombstonesDir,
-  seedsRoot,
   userScopeRoot,
 } from '../../src/memory/paths.ts';
 

@@ -110,13 +110,13 @@
 import { sanitizeOneLineForDisplay } from '../sanitize/index.ts';
 import type { DB } from '../storage/db.ts';
 import type { ScopeRoots } from './paths.ts';
-import { type MemoryRegistry, listingScopeOption } from './registry.ts';
+import { listingScopeOption, type MemoryRegistry } from './registry.ts';
 import { transitionMemoryState } from './transitions.ts';
 import {
-  type SharedTrustRow,
   computeSharedFingerprint,
   getSharedTrust,
   listSharedCorpusFiles,
+  type SharedTrustRow,
   setSharedTrust,
 } from './trust-corpus.ts';
 

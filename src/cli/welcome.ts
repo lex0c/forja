@@ -46,10 +46,10 @@ import { runDoctor } from './doctor.ts';
 import { forjaCommand } from './forja-command.ts';
 import { runSandboxSetup } from './sandbox-setup.ts';
 import {
-  type SandboxSkipMetadata,
   createSandboxSkip,
   hasSandboxSkip,
   readSandboxSkipMetadata,
+  type SandboxSkipMetadata,
 } from './sandbox-skip.ts';
 
 export interface RunWelcomeOptions {

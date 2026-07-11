@@ -1,7 +1,7 @@
-import { lstatSync, readFileSync, readdirSync } from 'node:fs';
-import { SkillFrontmatterError, parseSkillFile } from './frontmatter.ts';
-import { ScopeError, rootForScope, skillFilePath } from './paths.ts';
+import { lstatSync, readdirSync, readFileSync } from 'node:fs';
+import { parseSkillFile, SkillFrontmatterError } from './frontmatter.ts';
 import type { SkillScopeRoots } from './paths.ts';
+import { rootForScope, ScopeError, skillFilePath } from './paths.ts';
 import type { SkillFile, SkillScope } from './types.ts';
 
 // Disk-side loader for the skills subsystem (spec SKILLS.md §4.1).

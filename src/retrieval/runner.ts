@@ -23,8 +23,8 @@ import { redactSecrets } from '../sanitize/secrets.ts';
 import type { DB } from '../storage/db.ts';
 import { hashMemoryContent, recordProvenance } from '../storage/repos/memory-provenance.ts';
 import { createCompressionResolver } from './compression.ts';
-import { runRetrieval } from './pipeline.ts';
 import type { ViewSearch } from './pipeline.ts';
+import { runRetrieval } from './pipeline.ts';
 import type {
   ContextSlotEntry,
   RetrievalView,

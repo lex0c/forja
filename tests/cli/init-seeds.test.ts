@@ -7,9 +7,9 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CANONICAL_SEEDS } from '../../src/cli/init-seeds/index.ts';
 import { runInit } from '../../src/cli/init.ts';
-import { SEED_BODY_MAX_LINES, parseMemoryFile } from '../../src/memory/frontmatter.ts';
+import { CANONICAL_SEEDS } from '../../src/cli/init-seeds/index.ts';
+import { parseMemoryFile, SEED_BODY_MAX_LINES } from '../../src/memory/frontmatter.ts';
 
 describe('CANONICAL_SEEDS — bundled vendor seed catalog', () => {
   test('ships 7 seeds (within the spec §5.7.7 hard cap of 11)', () => {

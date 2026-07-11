@@ -25,9 +25,9 @@ import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import type { HookChainResult, HookEventPayload } from '../hooks/types.ts';
 import type { DB } from '../storage/db.ts';
 import {
+  appendEvictionEvent,
   type EvictionActor,
   type EvictionMotivo,
-  appendEvictionEvent,
   getLastQuarantineEvent,
   isLegalTransition,
   preflightValidateEvidence,
@@ -45,7 +45,7 @@ import {
   upsertIndexEntry,
 } from './index-file.ts';
 import { readMemoryByName } from './loader.ts';
-import { type ScopeRoots, indexFilePath, memoryFilePath } from './paths.ts';
+import { indexFilePath, memoryFilePath, type ScopeRoots } from './paths.ts';
 import type { MemoryRegistry } from './registry.ts';
 import { findLatestTombstone, moveToTombstone, removeFromTombstones } from './tombstones.ts';
 import type { IndexEntry, MemoryFile, MemoryScope, MemoryState } from './types.ts';

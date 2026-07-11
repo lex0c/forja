@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import type { HarnessEvent, HarnessResult } from '../../src/harness/types.ts';
 import type { UIEvent } from '../../src/tui/events.ts';
-import { type HarnessAdapterCtx, createHarnessAdapter } from '../../src/tui/harness-adapter.ts';
-import { type WorkingState, emptyWorkingState } from '../../src/working-state/index.ts';
+import { createHarnessAdapter, type HarnessAdapterCtx } from '../../src/tui/harness-adapter.ts';
+import { emptyWorkingState, type WorkingState } from '../../src/working-state/index.ts';
 
 const baseCtx = (): HarnessAdapterCtx => {
   let counter = 1000;

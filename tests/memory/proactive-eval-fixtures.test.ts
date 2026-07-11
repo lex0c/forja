@@ -17,7 +17,7 @@ import {
   createProactiveRecall,
   formatProactiveRecallBlock,
 } from '../../src/harness/proactive-memory-inject.ts';
-import { type ScopeRoots, rootForScope } from '../../src/memory/paths.ts';
+import { rootForScope, type ScopeRoots } from '../../src/memory/paths.ts';
 import { createMemoryRegistry } from '../../src/memory/registry.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';

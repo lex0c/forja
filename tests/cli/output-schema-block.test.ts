@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  OUTPUT_SCHEMA_BLOCK_HEADER,
   buildOutputSchemaBlock,
   composeWithOutputSchemaBlock,
+  OUTPUT_SCHEMA_BLOCK_HEADER,
 } from '../../src/cli/output-schema-block.ts';
 
 describe('buildOutputSchemaBlock', () => {

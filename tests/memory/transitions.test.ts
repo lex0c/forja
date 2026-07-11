@@ -14,15 +14,15 @@ import { join } from 'node:path';
 import type { HookChainResult, HookEventPayload } from '../../src/hooks/types.ts';
 import { parseMemoryFile } from '../../src/memory/frontmatter.ts';
 import { findLatestTombstone, transitionMemoryState } from '../../src/memory/index.ts';
-import { type ScopeRoots, indexFilePath, memoryFilePath } from '../../src/memory/paths.ts';
+import { indexFilePath, memoryFilePath, type ScopeRoots } from '../../src/memory/paths.ts';
 import { createMemoryRegistry } from '../../src/memory/registry.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { getLastEvictionForObject } from '../../src/storage/repos/eviction-events.ts';
 import {
-  type MemoryEvent,
   createMemoryEvent,
   listMemoryEventsByName,
+  type MemoryEvent,
 } from '../../src/storage/repos/memory-events.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';
 

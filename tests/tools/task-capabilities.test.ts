@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { taskTool } from '../../src/tools/builtin/task.ts';
-import { isToolError } from '../../src/tools/types.ts';
 import type { SpawnSubagentArgs, SpawnSubagentResult } from '../../src/tools/types.ts';
+import { isToolError } from '../../src/tools/types.ts';
 import { makeCtx } from './_helpers.ts';
 
 const ranEnvelope = (): SpawnSubagentResult => ({

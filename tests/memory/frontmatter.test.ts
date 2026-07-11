@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import {
   FrontmatterError,
-  SEED_BODY_MAX_LINES,
   parseMemoryFile,
+  SEED_BODY_MAX_LINES,
   serializeMemoryFile,
   validateName,
   validateSeedBody,
@@ -279,10 +279,15 @@ describe('serializer guards', () => {
 });
 
 describe('memory frontmatter state field (spec §3.1.1)', () => {
-  test.each(['proposed', 'active', 'quarantined', 'invalidated', 'evicted', 'purged'])(
-    'parses state=%s round-trip',
-    (state) => {
-      const raw = `---
+  test.each([
+    'proposed',
+    'active',
+    'quarantined',
+    'invalidated',
+    'evicted',
+    'purged',
+  ])('parses state=%s round-trip', (state) => {
+    const raw = `---
 name: x
 description: y
 type: feedback
@@ -290,10 +295,9 @@ source: user_explicit
 state: ${state}
 ---
 `;
-      const file = parseMemoryFile(raw);
-      expect(file.frontmatter.state).toBe(state as Exclude<typeof state, never>);
-    },
-  );
+    const file = parseMemoryFile(raw);
+    expect(file.frontmatter.state).toBe(state as Exclude<typeof state, never>);
+  });
 
   test('absence of state preserves undefined (no default coerce on read)', () => {
     const raw = `---
@@ -361,10 +365,7 @@ body line
 });
 
 describe('memory frontmatter seed fields (spec §5.7)', () => {
-  const seedRaw = (override?: {
-    extras?: string;
-    body?: string;
-  }): string => `---
+  const seedRaw = (override?: { extras?: string; body?: string }): string => `---
 name: safe-edit-discipline
 description: ler antes de Edit; Edit em existente, Write so para novo
 type: feedback
@@ -400,13 +401,17 @@ ${override?.body ?? 'Body content for the seed.'}
     expect(file.frontmatter.seed_version).toBe(version);
   });
 
-  test.each(['1', '1.x', '1.0.0.0', '01.0', '1.0-beta', ''])(
-    'rejects malformed seed_version=%s',
-    (version) => {
-      const raw = seedRaw().replace('seed_version: "1.0"', `seed_version: "${version}"`);
-      expect(() => parseMemoryFile(raw)).toThrow(FrontmatterError);
-    },
-  );
+  test.each([
+    '1',
+    '1.x',
+    '1.0.0.0',
+    '01.0',
+    '1.0-beta',
+    '',
+  ])('rejects malformed seed_version=%s', (version) => {
+    const raw = seedRaw().replace('seed_version: "1.0"', `seed_version: "${version}"`);
+    expect(() => parseMemoryFile(raw)).toThrow(FrontmatterError);
+  });
 
   test('rejects unquoted seed_version (YAML parses as number, not string)', () => {
     // Operator footgun: `seed_version: 1.0` (no quotes) → YAML 1.2
@@ -472,10 +477,12 @@ body
     expect(file.frontmatter.trust).toBe('trusted');
   });
 
-  test.each(['user_explicit', 'inferred', 'imported'])(
-    'forbids seed_origin when source=%s',
-    (source) => {
-      const raw = `---
+  test.each([
+    'user_explicit',
+    'inferred',
+    'imported',
+  ])('forbids seed_origin when source=%s', (source) => {
+    const raw = `---
 name: x
 description: y
 type: feedback
@@ -485,14 +492,15 @@ seed_origin: vendor
 
 body
 `;
-      expect(() => parseMemoryFile(raw)).toThrow(/seed_origin: only valid when source=seed/);
-    },
-  );
+    expect(() => parseMemoryFile(raw)).toThrow(/seed_origin: only valid when source=seed/);
+  });
 
-  test.each(['user_explicit', 'inferred', 'imported'])(
-    'forbids seed_version when source=%s',
-    (source) => {
-      const raw = `---
+  test.each([
+    'user_explicit',
+    'inferred',
+    'imported',
+  ])('forbids seed_version when source=%s', (source) => {
+    const raw = `---
 name: x
 description: y
 type: feedback
@@ -502,9 +510,8 @@ seed_version: "1.0"
 
 body
 `;
-      expect(() => parseMemoryFile(raw)).toThrow(/seed_version: only valid when source=seed/);
-    },
-  );
+    expect(() => parseMemoryFile(raw)).toThrow(/seed_version: only valid when source=seed/);
+  });
 
   test(`enforces body <= ${SEED_BODY_MAX_LINES} lines on parse`, () => {
     const longBody = Array.from(

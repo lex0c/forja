@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { FOOTER_BLOCK_LINES, composeCursor, composeLive } from '../../../src/tui/render/compose.ts';
+import { composeCursor, composeLive, FOOTER_BLOCK_LINES } from '../../../src/tui/render/compose.ts';
 import {
   COGNITIVE_VERB_POOL,
   OUTPUT_VERB_POOL,
@@ -8,7 +8,7 @@ import {
 import { visualWidth } from '../../../src/tui/render/width.ts';
 import type { ActiveTool, LiveState } from '../../../src/tui/state.ts';
 import { createInitialState } from '../../../src/tui/state.ts';
-import { CSI, type Capabilities } from '../../../src/tui/term.ts';
+import { type Capabilities, CSI } from '../../../src/tui/term.ts';
 
 // Match a verb-shaped chip line: "<verb>… [..." — the chip's
 // rotating verb sits before the elapsed counter.

@@ -1,13 +1,13 @@
 import { describe, expect, test } from 'bun:test';
 import type { TodoItemForUI, UIEvent } from '../../src/tui/events.ts';
 import {
-  type LiveState,
-  type PermanentItem,
   applyEvent,
   capReasoning,
   createInitialState,
   flushPendingToolEndBatch,
+  type LiveState,
   liveRegionActive,
+  type PermanentItem,
 } from '../../src/tui/state.ts';
 
 const start = (overrides: Partial<UIEvent> = {}): UIEvent =>

@@ -22,7 +22,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { projectDirName } from '../../../config/app-namespace.ts';
-import { HISTORY_CAP, clearHistory, countHistory, loadHistory } from '../../../storage/history.ts';
+import { clearHistory, countHistory, HISTORY_CAP, loadHistory } from '../../../storage/history.ts';
 import type { SlashCommand, SlashContext } from '../types.ts';
 
 const LIST_LIMIT = 20;

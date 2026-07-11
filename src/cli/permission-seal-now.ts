@@ -17,14 +17,14 @@
 // chattr failure, append failure).
 
 import {
+  ensureInstallId,
+  factoryForSealMode,
+  resolvePolicy,
   type SealEntry,
   type SealPolicy,
   type SealStore,
-  ensureInstallId,
-  factoryForSealMode,
 } from '../permissions/index.ts';
-import { resolvePolicy } from '../permissions/index.ts';
-import { type DB, MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { type DB, defaultDbPath, MIGRATIONS, migrate, openDb } from '../storage/index.ts';
 import { getLastApprovalsLogByInstall } from '../storage/repos/approvals-log.ts';
 
 export interface RunPermissionSealNowOptions {

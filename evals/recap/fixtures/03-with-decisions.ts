@@ -2,7 +2,7 @@ import { recordApproval } from '../../../src/storage/repos/approvals.ts';
 import { appendMessage } from '../../../src/storage/repos/messages.ts';
 import { completeSession, createSession } from '../../../src/storage/repos/sessions.ts';
 import { createToolCall, finishToolCall } from '../../../src/storage/repos/tool-calls.ts';
-import { type RecapFixture, padId } from './types.ts';
+import { padId, type RecapFixture } from './types.ts';
 
 export const fixture: RecapFixture = {
   name: '03-with-decisions',

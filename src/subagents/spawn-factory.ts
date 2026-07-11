@@ -3,9 +3,9 @@ import { join } from 'node:path';
 import type { ProviderEffort } from '../providers/index.ts';
 import { PROVIDER_API_KEY_VARS, scrubEnv } from '../sanitize/env.ts';
 import {
+  createChannel,
   IPC_PROTOCOL_VERSION,
   type IpcChannel,
-  createChannel,
   subprocessTransport,
 } from './ipc.ts';
 

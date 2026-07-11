@@ -16,7 +16,7 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { type BuildTarget, TARGETS, assetName, findTarget } from './targets.ts';
+import { assetName, type BuildTarget, findTarget, TARGETS } from './targets.ts';
 
 // Minimal spawn-result shape consumed by this script. We only need
 // `status`; using the full SpawnSyncReturns<Buffer> would force test

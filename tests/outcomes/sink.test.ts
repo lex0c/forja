@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 import {
-  DEFAULT_SIGNAL_WEIGHTS,
   createNoopOutcomeSink,
   createSqliteOutcomeSink,
+  DEFAULT_SIGNAL_WEIGHTS,
 } from '../../src/outcomes/index.ts';
 import { type DB, MIGRATIONS, migrate, openMemoryDb } from '../../src/storage/index.ts';
 import { appendApprovalsLog } from '../../src/storage/repos/approvals-log.ts';

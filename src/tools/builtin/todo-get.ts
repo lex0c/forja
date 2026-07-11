@@ -1,5 +1,5 @@
-import { ERROR_CODES, type Tool, type ToolResult, isToolError, toolError } from '../types.ts';
-import { type TodoWireItem, findActive, mapItemToWire, requireTodoStore } from './todo-shared.ts';
+import { ERROR_CODES, isToolError, type Tool, type ToolResult, toolError } from '../types.ts';
+import { findActive, mapItemToWire, requireTodoStore, type TodoWireItem } from './todo-shared.ts';
 
 // todo_get — fetch a single LIVE todo by id. Read-only and parallel-safe.
 // A soft-deleted (removed) id resolves to todo.not_found, same as an id

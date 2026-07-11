@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
-import { StorageJsonError, canonicalJson, parseJsonObject } from '../../src/storage/json-safe.ts';
+import { canonicalJson, parseJsonObject, StorageJsonError } from '../../src/storage/json-safe.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { getMessage } from '../../src/storage/repos/messages.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';

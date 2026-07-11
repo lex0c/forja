@@ -8,7 +8,7 @@ import {
 } from '../../src/providers/ollama/capabilities.ts';
 import { OPENAI_MODEL_NAMES } from '../../src/providers/openai/capabilities.ts';
 import { OPENROUTER_MODEL_NAMES } from '../../src/providers/openrouter/capabilities.ts';
-import { type ModelEntry, createRegistry } from '../../src/providers/registry.ts';
+import { createRegistry, type ModelEntry } from '../../src/providers/registry.ts';
 
 const dummyEntry = (id: string): ModelEntry => ({
   id,

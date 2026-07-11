@@ -128,7 +128,7 @@ const PATH_REGEX_TILDE = /~[A-Za-z0-9_-]*\/[^\s'":\\]+/g;
 // `mongodb+srv://`, `data:`, `git+ssh://`, etc. The captured-and-
 // replaced text is operator-visible reason fields where the
 // scheme + host together are the secret-bearing context.
-const URL_REGEX = /\b[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s'"<>\]\)]+/g;
+const URL_REGEX = /\b[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s'"<>\])]+/g;
 const IPV4_REGEX = /\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b/g;
 // Slice 125 (R2 P1): IPv6 with optional bracketed port.
 // Matches `[::1]:8080`, `[2001:db8::1]:443`, also bare

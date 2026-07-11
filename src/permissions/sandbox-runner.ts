@@ -74,7 +74,7 @@ import {
 } from './sandbox-cache-dirs.ts';
 import { buildCacheRedirectEnv, getCachePersistenceOverride } from './sandbox-cache-env.ts';
 import { HIDE_PATHS_FILES, hidePathsDirs } from './sandbox-hide-paths.ts';
-import { SANDBOX_PROFILE_ORDER, type SandboxProfile, isSandboxProfile } from './sandbox-plan.ts';
+import { isSandboxProfile, SANDBOX_PROFILE_ORDER, type SandboxProfile } from './sandbox-plan.ts';
 import { buildSandboxExecArgv } from './sandbox-runner-macos.ts';
 
 // Session-cached empty regular file used to mask credential FILES (the

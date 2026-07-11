@@ -6,8 +6,8 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CANONICAL_SKILLS } from '../../src/cli/init-skills/index.ts';
 import { runInit } from '../../src/cli/init.ts';
+import { CANONICAL_SKILLS } from '../../src/cli/init-skills/index.ts';
 import { createSkillCatalog, parseSkillFile } from '../../src/skills/index.ts';
 
 describe('CANONICAL_SKILLS — bundled seed catalog', () => {

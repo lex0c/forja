@@ -29,7 +29,7 @@
 // no runtime deps. This is what lets the command dispatch from index.ts
 // (before run.ts's harness/storage graph) and survive a partial install.
 import { loadModelProvidersFile } from '../providers/catalog-io.ts';
-import { UNMETERED_LABEL, isUnmetered } from '../providers/cost-format.ts';
+import { isUnmetered, UNMETERED_LABEL } from '../providers/cost-format.ts';
 import { DEFAULT_MODEL } from '../providers/default-model.ts';
 import type { ModelProviderEntry } from '../providers/types.ts';
 import { formatCost } from './slash/format.ts';

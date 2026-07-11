@@ -26,26 +26,26 @@ import { archivePolicy } from '../storage/repos/policy-archive.ts';
 import type { TelemetryEvent } from '../telemetry/index.ts';
 import {
   type AuditSink,
+  createSqliteSink,
   type ReasonChainEntry,
   type VerifyResult,
-  createSqliteSink,
 } from './audit.ts';
 import { initBashParser } from './bash-parser.ts';
 import { canonicalHash, canonicalize } from './canonical.ts';
-import { type PermissionEngine, createPermissionEngine } from './engine.ts';
+import { createPermissionEngine, type PermissionEngine } from './engine.ts';
 import {
   type Layer,
   type LayerPolicy,
   type LockConflict,
-  type SectionProvenance,
   resolvePolicy,
+  type SectionProvenance,
 } from './hierarchy.ts';
-import { type InstallIdentity, ensureInstallId } from './install_id.ts';
+import { ensureInstallId, type InstallIdentity } from './install_id.ts';
 import { type PolicyWatcher, watchAndReload } from './policy-watcher.ts';
 import { mergeTrustedHosts } from './risk-score.ts';
-import { type SealingScheduler, createSealingScheduler } from './sealing-scheduler.ts';
-import { type SealStore, factoryForSealMode } from './sealing.ts';
-import { type EngineState, type StateTransition, createStateController } from './state-machine.ts';
+import { factoryForSealMode, type SealStore } from './sealing.ts';
+import { createSealingScheduler, type SealingScheduler } from './sealing-scheduler.ts';
+import { createStateController, type EngineState, type StateTransition } from './state-machine.ts';
 import type { ApprovalPosture, Policy, SealPolicy } from './types.ts';
 
 export interface BootstrapPermissionEngineInput {

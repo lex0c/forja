@@ -340,6 +340,7 @@ export const capabilityCovers = (parent: Capability, child: Capability): boolean
 
 import { resolve as resolvePath } from 'node:path';
 import { matchPath } from './matcher.ts';
+
 // Cwd-aware coverage variant for child-side enforcement. The
 // spawn-time intersection (`capabilityCovers` above) is string-
 // symmetric — both `parent_caps` and `declared_caps` arrive in the

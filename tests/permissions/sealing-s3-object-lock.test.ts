@@ -7,14 +7,14 @@
 //   - factory wiring + dispatcher.
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  type S3SubmitParams,
-  type S3Submitter,
   createS3ObjectLockSealer,
   defaultS3ObjectLockFactory,
+  type S3SubmitParams,
+  type S3Submitter,
 } from '../../src/permissions/sealing-s3-object-lock.ts';
 
 const SHA256_HASH = 'a'.repeat(64);

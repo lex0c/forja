@@ -10,7 +10,7 @@
 
 import { statSync } from 'node:fs';
 import { join } from 'node:path';
-import { type BuildTarget, SIZE_BLOCK_RATIO, TARGETS, assetName } from './targets.ts';
+import { assetName, type BuildTarget, SIZE_BLOCK_RATIO, TARGETS } from './targets.ts';
 
 export type Verdict = 'ok' | 'warn' | 'block';
 

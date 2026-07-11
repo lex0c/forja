@@ -22,17 +22,17 @@ import type { PermissionEngine } from '../permissions/index.ts';
 import type { Provider } from '../providers/index.ts';
 import { type DB, withTransaction } from '../storage/db.ts';
 import {
-  type MemorySnapshot,
   canonicalJsonStringify,
   decideProposal,
+  type MemorySnapshot,
   recordProposal,
 } from '../storage/repos/memory-governance.ts';
 import { hashMemoryContent } from '../storage/repos/memory-provenance.ts';
 import {
-  type MemoryVerifyAttemptRow,
-  type SemanticVerifyVerdict,
   lookupRecentAttempt,
+  type MemoryVerifyAttemptRow,
   recordAttempt,
+  type SemanticVerifyVerdict,
 } from '../storage/repos/memory-verify-attempts.ts';
 import { parseOutputAsObject } from '../subagents/output-schema.ts';
 import { runSubagent } from '../subagents/runtime.ts';

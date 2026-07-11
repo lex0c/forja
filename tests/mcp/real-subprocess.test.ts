@@ -16,7 +16,7 @@ import type { McpServerConfig } from '../../src/mcp/types.ts';
 import { maybeWrapSandboxArgv } from '../../src/permissions/sandbox-runner.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
-import { type ToolRegistry, createToolRegistry } from '../../src/tools/registry.ts';
+import { createToolRegistry, type ToolRegistry } from '../../src/tools/registry.ts';
 import type { ToolContext } from '../../src/tools/types.ts';
 
 const FIXTURE = join(import.meta.dir, '../../evals/mcp/fixtures/echo-server.ts');

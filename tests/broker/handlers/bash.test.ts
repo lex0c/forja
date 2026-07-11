@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  type BashSpawnedProcess,
   type BashSpawnFn,
   type BashSpawnFnOptions,
-  type BashSpawnedProcess,
   type BrokerRequest,
   createBashHandler,
 } from '../../../src/broker/index.ts';

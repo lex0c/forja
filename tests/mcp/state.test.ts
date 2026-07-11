@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  MCP_SERVER_STATES,
   canMcpTransition,
   isMcpTerminal,
+  MCP_SERVER_STATES,
   mcpTransition,
 } from '../../src/mcp/state.ts';
 

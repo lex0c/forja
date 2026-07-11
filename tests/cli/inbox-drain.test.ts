@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { INBOX_DRAIN_SEPARATOR, concatQueuedBodies } from '../../src/cli/inbox-drain.ts';
+import { concatQueuedBodies, INBOX_DRAIN_SEPARATOR } from '../../src/cli/inbox-drain.ts';
 
 describe('concatQueuedBodies (INBOX §5.1)', () => {
   test('separator is a blank-line-delimited markdown horizontal rule', () => {

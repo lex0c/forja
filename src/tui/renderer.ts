@@ -34,26 +34,23 @@
 
 import type { Bus } from './bus.ts';
 import type { UIEvent } from './events.ts';
-import { type Heartbeat, type HeartbeatOptions, createHeartbeat } from './heartbeat.ts';
+import { createHeartbeat, type Heartbeat, type HeartbeatOptions } from './heartbeat.ts';
 import { composeCursor, composeLive as defaultComposeLiveFn } from './render/compose.ts';
 import { formatPermanent } from './render/permanent.ts';
 import { truncateToWidth, visualWidth } from './render/width.ts';
 import type { ComposeLive } from './renderer-types.ts';
 import {
   type ApplyResult,
-  type LiveState,
-  type PermanentItem,
   applyEvent,
   createInitialState,
   flushPendingToolEndBatch,
+  type LiveState,
   liveRegionActive,
+  type PermanentItem,
 } from './state.ts';
 import {
-  type Capabilities,
-  type FrameSchedulerOptions,
-  type RawModeStdin,
-  type ResizeStream,
   beginSyncOutput,
+  type Capabilities,
   clearDown,
   clearLine,
   createFrameScheduler,
@@ -68,6 +65,9 @@ import {
   enableBracketedPasteOn,
   enableRawMode,
   endSyncOutput,
+  type FrameSchedulerOptions,
+  type RawModeStdin,
+  type ResizeStream,
 } from './term.ts';
 
 // Re-export the canonical compose function, its type, and the

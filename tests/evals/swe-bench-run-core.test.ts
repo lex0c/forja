@@ -3,10 +3,10 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  type CatalogEntry,
   agentRunIsInfraFailure,
   allowHostsFor,
   apiKeyEnvsFor,
+  type CatalogEntry,
   costForModel,
   loadCatalogEntries,
   parseMetrics,

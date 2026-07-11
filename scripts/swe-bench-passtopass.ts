@@ -9,7 +9,7 @@
 // runner's verifier uses, so a sibling that only passes unsandboxed can't false-regress a real run.
 // Run: bun run scripts/swe-bench-passtopass.ts
 
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
@@ -40,7 +40,10 @@ const MAX_KEEP = 3;
 export const computePassToPass = ({
   task,
   repoRoot,
-}: { task: Task; repoRoot: string }): string[] => {
+}: {
+  task: Task;
+  repoRoot: string;
+}): string[] => {
   const cwd = mkdtempSync(join(tmpdir(), 'swe-p2p-'));
   try {
     materializeSweWorkspace({ commit: task.commit, repoRoot, cwd });

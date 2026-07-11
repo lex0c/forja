@@ -34,8 +34,9 @@ export const openaiReasoningParam = (
   req.effort !== undefined && caps.supports_reasoning_effort === true
     ? { reasoning_effort: OPENAI_REASONING_EFFORT[req.effort] }
     : {};
+
 import { generateConstrainedViaResponses, generateViaResponses } from './responses.ts';
-import { type RawOpenAIChunk, normalizeOpenAIStream } from './stream.ts';
+import { normalizeOpenAIStream, type RawOpenAIChunk } from './stream.ts';
 
 export interface CreateOpenAIProviderOptions {
   apiKey?: string;

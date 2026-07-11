@@ -4,8 +4,8 @@ import { guideMaxBytes, isSmallWindow } from '../tools/context-budget.ts';
 import { composeSystemPrompt } from './memory-prompt.ts';
 import {
   type AcquiredGuide,
-  PROJECT_GUIDE_MAX_BYTES,
   composeWithProjectContext,
+  PROJECT_GUIDE_MAX_BYTES,
   renderProjectContext,
 } from './project-context.ts';
 

@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { type ParsePolicyContext, defaultPolicy, loadPolicyFromFile } from './config.ts';
+import { defaultPolicy, loadPolicyFromFile, type ParsePolicyContext } from './config.ts';
 import { enterprisePolicyPath, projectPolicyPath, userPolicyPath } from './paths.ts';
 import type { Policy, PolicyDefaults, PolicyMode, PolicyToolsSection } from './types.ts';
 

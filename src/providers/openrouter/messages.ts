@@ -1,8 +1,8 @@
 import { OPENAI_REASONING_EFFORT } from '../effort.ts';
 import {
+  flattenSystemSegments,
   type GenerateRequest,
   type ProviderCapabilities,
-  flattenSystemSegments,
 } from '../types.ts';
 
 // OpenRouter messages are OpenAI-shape with one superset field we use:

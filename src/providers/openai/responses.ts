@@ -10,9 +10,9 @@ import type {
   StreamEvent,
 } from '../types.ts';
 import {
+  normalizeResponsesStream,
   type RawResponsesEvent,
   type RawResponsesUsage,
-  normalizeResponsesStream,
   responsesUsageToCanonical,
 } from './responses-stream.ts';
 

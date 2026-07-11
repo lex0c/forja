@@ -9,7 +9,7 @@ import { createPin } from '../../src/storage/repos/context-pins.ts';
 import { appendFailureEvent } from '../../src/storage/repos/failure-events.ts';
 import { createMemoryEvent } from '../../src/storage/repos/memory-events.ts';
 import { appendMessage, retractMessage } from '../../src/storage/repos/messages.ts';
-import { type Session, completeSession, createSession } from '../../src/storage/repos/sessions.ts';
+import { completeSession, createSession, type Session } from '../../src/storage/repos/sessions.ts';
 import {
   insertSubagentOutput,
   setSubagentPayload,

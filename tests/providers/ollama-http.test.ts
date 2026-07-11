@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  createOllamaHttp,
   type OllamaChatRequest,
   type OllamaChatResponse,
   type OllamaHttpError,
-  createOllamaHttp,
 } from '../../src/providers/ollama/http.ts';
 
 const REQ: OllamaChatRequest = {

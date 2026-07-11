@@ -6,7 +6,7 @@
 // LLM emitted them in.
 
 import { stripAnsi } from '../../sanitize/ansi.ts';
-import { type RenderOptions, anonymizeText, redactSecrets, resolveHome } from '../format.ts';
+import { anonymizeText, type RenderOptions, redactSecrets, resolveHome } from '../format.ts';
 import {
   CHANGELOG_CATEGORIES,
   type ChangelogCategory,

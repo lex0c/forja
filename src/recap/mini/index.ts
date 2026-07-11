@@ -1,4 +1,4 @@
-export { projectRecapMini, type ProjectRecapMiniInput } from './deterministic.ts';
+export { type ProjectRecapMiniInput, projectRecapMini } from './deterministic.ts';
 export {
   RECAP_MINI_JSON_SCHEMA,
   RECAP_MINI_LIMITS,

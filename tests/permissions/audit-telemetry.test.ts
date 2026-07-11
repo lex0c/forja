@@ -5,9 +5,9 @@ import { join } from 'node:path';
 import { createSqliteSink, ensureInstallId } from '../../src/permissions/index.ts';
 import { MIGRATIONS, migrate, openMemoryDb } from '../../src/storage/index.ts';
 import {
+  createRecordingTelemetrySink,
   type PermissionDecisionEvent,
   type TelemetryEvent,
-  createRecordingTelemetrySink,
 } from '../../src/telemetry/index.ts';
 
 let tmpRoot: string;

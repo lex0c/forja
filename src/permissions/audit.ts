@@ -35,10 +35,10 @@ import {
   type ApprovalLogConfidence,
   type ApprovalLogDecision,
   type ApprovalLogRow,
-  PERSISTED_COLUMNS,
   appendApprovalsLog,
   getLastApprovalsLogByInstall,
   listApprovalsLogByInstall,
+  PERSISTED_COLUMNS,
 } from '../storage/repos/approvals-log.ts';
 import { getLatestChainMeta } from '../storage/repos/chain-rotation.ts';
 import type { TelemetryEvent } from '../telemetry/index.ts';

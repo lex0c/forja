@@ -5,8 +5,8 @@ import {
   renderFooterPath,
 } from '../../../src/tui/render/footer.ts';
 import { visualWidth } from '../../../src/tui/render/width.ts';
-import { type ActiveTool, type LiveState, createInitialState } from '../../../src/tui/state.ts';
-import { CSI, type Capabilities } from '../../../src/tui/term.ts';
+import { type ActiveTool, createInitialState, type LiveState } from '../../../src/tui/state.ts';
+import { type Capabilities, CSI } from '../../../src/tui/term.ts';
 
 const caps: Capabilities = {
   isTTY: true,

@@ -18,12 +18,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ScopeRoots } from '../../src/memory/paths.ts';
 import { createMemoryRegistry } from '../../src/memory/registry.ts';
-import { createOverrideVerifyScheduler } from '../../src/memory/verify-override-scheduler.ts';
 import {
   MEMORY_VERIFY_OVERRIDE_MAX_COST_USD,
   MEMORY_VERIFY_OVERRIDE_MAX_DISPATCHES_PER_SESSION,
   SEMANTIC_OVERRIDE_SUBAGENT_MAX_COST_USD,
 } from '../../src/memory/verify-override.ts';
+import { createOverrideVerifyScheduler } from '../../src/memory/verify-override-scheduler.ts';
 import type { PermissionEngine } from '../../src/permissions/index.ts';
 import type { Provider } from '../../src/providers/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
@@ -32,8 +32,8 @@ import { recordProposal } from '../../src/storage/repos/memory-governance.ts';
 import {
   MEMORY_OVERRIDE_THRESHOLD_COUNT,
   MEMORY_OVERRIDE_THRESHOLD_WINDOW_MS,
+  recordOverrideEvent,
 } from '../../src/storage/repos/memory-override-events.ts';
-import { recordOverrideEvent } from '../../src/storage/repos/memory-override-events.ts';
 import { listRecentOverrideAttempts } from '../../src/storage/repos/memory-verify-override-attempts.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';
 import type { RunSubagentResult } from '../../src/subagents/runtime.ts';

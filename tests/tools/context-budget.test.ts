@@ -2,10 +2,10 @@ import { describe, expect, test } from 'bun:test';
 import {
   DEFER_BELOW_TOKENS_SMALL,
   GUIDE_WINDOW_FRACTION,
-  MEMORY_MIN_ENTRIES,
   guideMaxBytes,
   isDeferred,
   isSmallWindow,
+  MEMORY_MIN_ENTRIES,
   memoryMaxEntries,
 } from '../../src/tools/context-budget.ts';
 

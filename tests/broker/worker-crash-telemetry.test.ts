@@ -7,14 +7,14 @@
 import { describe, expect, test } from 'bun:test';
 import {
   type BrokerRequest,
-  type SpawnFn,
-  type SpawnedProcess,
   createSpawnBroker,
+  type SpawnedProcess,
+  type SpawnFn,
 } from '../../src/broker/index.ts';
 import {
-  type WorkerCrashEvent,
   createRecordingTelemetrySink,
   createScrubbingTelemetrySink,
+  type WorkerCrashEvent,
 } from '../../src/telemetry/index.ts';
 
 const baseRequest = (overrides: Partial<BrokerRequest> = {}): BrokerRequest => ({

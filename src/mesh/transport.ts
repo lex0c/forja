@@ -5,7 +5,7 @@
 
 import { chmodSync } from 'node:fs';
 import type { Socket } from 'bun';
-import { type LineFramer, createLineFramer } from '../wire/ndjson.ts';
+import { createLineFramer, type LineFramer } from '../wire/ndjson.ts';
 
 export interface MeshTransport {
   // Write an already-framed line (encodeMeshMessage output, trailing LF included).

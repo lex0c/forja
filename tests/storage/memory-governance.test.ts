@@ -16,21 +16,21 @@ import { beforeEach, describe, expect, test } from 'bun:test';
 import { type DB, openMemoryDb, withTransaction } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import {
-  GOVERNANCE_PROPOSAL_TTL_MS,
-  MAX_GOVERNANCE_PROPOSAL_DEFER_DAYS,
-  MAX_GOVERNANCE_PROPOSAL_DEFER_HORIZON_MS,
-  type MemoryKey,
-  type MemorySnapshot,
-  type RecordProposalInput,
   computeProposalFingerprint,
   decideProposal,
   deferProposal,
   expirePendingProposals,
+  GOVERNANCE_PROPOSAL_TTL_MS,
   getProposalById,
   listPendingProposals,
   listPendingProposalsForMemory,
   listProposals,
   listProposalsForMemory,
+  MAX_GOVERNANCE_PROPOSAL_DEFER_DAYS,
+  MAX_GOVERNANCE_PROPOSAL_DEFER_HORIZON_MS,
+  type MemoryKey,
+  type MemorySnapshot,
+  type RecordProposalInput,
   recordProposal,
 } from '../../src/storage/repos/memory-governance.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';

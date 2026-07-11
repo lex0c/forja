@@ -9,14 +9,14 @@ import { beforeEach, describe, expect, test } from 'bun:test';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import {
-  MEMORY_VERIFY_ATTEMPTS_RETENTION_MS,
-  type RecordAttemptInput,
-  SEMANTIC_VERIFY_DEDUP_WINDOW_MS,
-  type SemanticVerifyVerdict,
   listRecentAttempts,
   lookupRecentAttempt,
+  MEMORY_VERIFY_ATTEMPTS_RETENTION_MS,
   pruneVerifyAttempts,
+  type RecordAttemptInput,
   recordAttempt,
+  SEMANTIC_VERIFY_DEDUP_WINDOW_MS,
+  type SemanticVerifyVerdict,
 } from '../../src/storage/repos/memory-verify-attempts.ts';
 
 let db: DB;

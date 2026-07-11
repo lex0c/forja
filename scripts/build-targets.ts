@@ -30,7 +30,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, renameSync, rmSync } from 'node:fs';
 import { arch as nodeArch, platform as nodePlatform } from 'node:os';
 import { basename, join, resolve } from 'node:path';
-import { type BuildTarget, TARGETS, assetName, findTarget } from './targets.ts';
+import { assetName, type BuildTarget, findTarget, TARGETS } from './targets.ts';
 
 // Bun --compile emits the external sourcemap as
 // `<entry-basename-without-ext>.js.map` next to the outfile, not as

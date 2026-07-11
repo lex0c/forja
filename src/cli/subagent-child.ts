@@ -16,29 +16,29 @@ import {
 import { mergeTrustedHosts } from '../permissions/bootstrap-engine.ts';
 import { parseCapability } from '../permissions/capabilities.ts';
 import {
-  type SandboxTmpdir,
   acquireSandboxTmpdir,
   createPermissionEngine,
   createSqliteSink,
   detectSandboxAvailability,
   ensureInstallId,
   generateUlid,
+  type SandboxTmpdir,
 } from '../permissions/index.ts';
 import { setWritableCacheDirsOverride } from '../permissions/sandbox-cache-dirs.ts';
 import { setCachePersistenceOverride } from '../permissions/sandbox-cache-env.ts';
 import {
-  type Provider,
-  type ProviderEffort,
   buildRegistryFromEntries,
   isSupportedFamily,
   lazyModelRegistry,
   loadModelRegistry,
+  type Provider,
+  type ProviderEffort,
 } from '../providers/index.ts';
 import type { SystemSegment } from '../providers/types.ts';
 import {
-  type DB,
   closeDb,
   completeSession,
+  type DB,
   defaultDbPath,
   getMessage,
   getSession,
@@ -62,11 +62,11 @@ import {
   wrapToolWithRestrictions,
 } from '../subagents/index.ts';
 import {
+  createChannel,
   IPC_PROTOCOL_VERSION,
   IPC_VERSION_MISMATCH_EXIT_CODE,
   type IpcChannel,
   type IpcTransport,
-  createChannel,
   makeEvent,
   makeSessionFinished,
   makeSessionStart,

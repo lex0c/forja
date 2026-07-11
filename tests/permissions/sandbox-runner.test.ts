@@ -421,24 +421,26 @@ describe('buildBwrapArgv — home-rw profile', () => {
 });
 
 describe('buildBwrapArgv — common flags', () => {
-  test.each(['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw'] as const)(
-    'profile %s has die-with-parent + tmpfs/proc/dev + chdir',
-    (profile) => {
-      const argv = buildBwrapArgv({
-        profile,
-        cwd: CWD,
-        home: HOME,
-        innerArgv: INNER,
-        env: {},
-        realpath: (p) => p,
-      });
-      expect(argv).toContain('--die-with-parent');
-      expect(argv).toContain('--tmpfs');
-      expect(argv).toContain('--proc');
-      expect(argv).toContain('--dev');
-      expect(argv).toContain('--chdir');
-    },
-  );
+  test.each([
+    'ro',
+    'cwd-rw',
+    'cwd-rw-net',
+    'home-rw',
+  ] as const)('profile %s has die-with-parent + tmpfs/proc/dev + chdir', (profile) => {
+    const argv = buildBwrapArgv({
+      profile,
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+    });
+    expect(argv).toContain('--die-with-parent');
+    expect(argv).toContain('--tmpfs');
+    expect(argv).toContain('--proc');
+    expect(argv).toContain('--dev');
+    expect(argv).toContain('--chdir');
+  });
 });
 
 describe('buildBwrapArgv — innerArgv preservation', () => {
@@ -1576,23 +1578,25 @@ describe('buildBwrapArgv — XDG_CONFIG_HOME unmask defense (slice 146)', () => 
 // Pin each flag's presence so a future refactor of
 // `COMMON_PROFILE_FLAGS` can't silently drop one.
 describe('buildBwrapArgv — slice 145 S1 namespace + session isolation', () => {
-  test.each(['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw'] as const)(
-    '%s profile includes --unshare-uts / --unshare-ipc / --unshare-cgroup-try / --new-session',
-    (profile) => {
-      const argv = buildBwrapArgv({
-        profile,
-        cwd: CWD,
-        home: HOME,
-        innerArgv: INNER,
-        env: {},
-        realpath: (p) => p,
-      });
-      expect(argv).toContain('--unshare-uts');
-      expect(argv).toContain('--unshare-ipc');
-      expect(argv).toContain('--unshare-cgroup-try');
-      expect(argv).toContain('--new-session');
-    },
-  );
+  test.each([
+    'ro',
+    'cwd-rw',
+    'cwd-rw-net',
+    'home-rw',
+  ] as const)('%s profile includes --unshare-uts / --unshare-ipc / --unshare-cgroup-try / --new-session', (profile) => {
+    const argv = buildBwrapArgv({
+      profile,
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+    });
+    expect(argv).toContain('--unshare-uts');
+    expect(argv).toContain('--unshare-ipc');
+    expect(argv).toContain('--unshare-cgroup-try');
+    expect(argv).toContain('--new-session');
+  });
 
   test('host profile remains a verbatim passthrough (no bwrap flags)', () => {
     const argv = buildBwrapArgv({
@@ -1617,20 +1621,22 @@ describe('buildBwrapArgv — slice 145 S1 namespace + session isolation', () => 
 // collapsed the boundary. Pin: clearenv present, allowed vars
 // forwarded, disallowed vars NOT forwarded.
 describe('buildBwrapArgv — slice 145 S2 env allowlist via --clearenv + --setenv', () => {
-  test.each(['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw'] as const)(
-    '%s profile starts with --clearenv',
-    (profile) => {
-      const argv = buildBwrapArgv({
-        profile,
-        cwd: CWD,
-        home: HOME,
-        innerArgv: INNER,
-        env: {},
-        realpath: (p) => p,
-      });
-      expect(argv).toContain('--clearenv');
-    },
-  );
+  test.each([
+    'ro',
+    'cwd-rw',
+    'cwd-rw-net',
+    'home-rw',
+  ] as const)('%s profile starts with --clearenv', (profile) => {
+    const argv = buildBwrapArgv({
+      profile,
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+      env: {},
+      realpath: (p) => p,
+    });
+    expect(argv).toContain('--clearenv');
+  });
 
   test('allowed vars (PATH/HOME/USER/LANG/TZ etc.) flow through as --setenv', () => {
     const argv = buildBwrapArgv({

@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import {
-  type IpcChannel,
-  type IpcMessage,
   createChannel,
   fakeTransportPair,
+  type IpcChannel,
+  type IpcMessage,
   makePermissionAnswer,
 } from '../../src/subagents/ipc.ts';
 import { createChildPermissionBridge } from '../../src/subagents/permission-bridge.ts';

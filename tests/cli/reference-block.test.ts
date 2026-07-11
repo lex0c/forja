@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  REFERENCE_BLOCK_HEADER,
   buildReferenceBlock,
   composeWithReferenceBlock,
+  REFERENCE_BLOCK_HEADER,
 } from '../../src/cli/reference-block.ts';
 
 describe('buildReferenceBlock', () => {

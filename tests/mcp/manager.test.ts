@@ -1,14 +1,14 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 import {
+  createSqliteFailureSink,
   type EmitFailureEventInput,
   type FailureEventSink,
-  createSqliteFailureSink,
 } from '../../src/failures/index.ts';
 import type { LoadedMcpConfig } from '../../src/mcp/config.ts';
 import { createMcpManager } from '../../src/mcp/manager.ts';
 import {
-  canonicalManifestJson,
   canonicalizeManifest,
+  canonicalManifestJson,
   hashManifest,
 } from '../../src/mcp/manifest.ts';
 import type {
@@ -31,7 +31,7 @@ import {
   listManifestHistory,
   recordManifestDecision,
 } from '../../src/storage/repos/mcp-servers.ts';
-import { type ToolRegistry, createToolRegistry } from '../../src/tools/registry.ts';
+import { createToolRegistry, type ToolRegistry } from '../../src/tools/registry.ts';
 import type { ToolContext } from '../../src/tools/types.ts';
 
 const ctx = {

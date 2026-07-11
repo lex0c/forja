@@ -6,14 +6,14 @@
 //   - factory wiring from SealPolicy.
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  type Rfc3161Submitter,
   createRfc3161TsaSealer,
   defaultRfc3161TsaFactory,
   encodeTimestampQuery,
+  type Rfc3161Submitter,
 } from '../../src/permissions/sealing-rfc3161.ts';
 
 const SHA256_OID_HEX = '060960864801650304020105 00'.replace(/\s/g, '');

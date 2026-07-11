@@ -2,10 +2,10 @@ import { describe, expect, test } from 'bun:test';
 import {
   COGNITIVE_VERB_POOL,
   OUTPUT_VERB_POOL,
-  TOOL_VERB_POOL,
   pickCognitiveVerb,
   pickOutputVerb,
   pickToolVerb,
+  TOOL_VERB_POOL,
 } from '../../../src/tui/render/spinner-verbs.ts';
 
 // Pool composition is the public contract: a verb leaves the pool

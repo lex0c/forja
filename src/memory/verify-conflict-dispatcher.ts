@@ -27,9 +27,9 @@ import {
   recordConflictAttempt,
 } from '../storage/repos/memory-conflict-attempts.ts';
 import {
-  type MemorySnapshot,
   canonicalJsonStringify,
   decideProposal,
+  type MemorySnapshot,
   recordProposal,
 } from '../storage/repos/memory-governance.ts';
 import { hashMemoryContent } from '../storage/repos/memory-provenance.ts';

@@ -18,8 +18,8 @@
 
 import type { DB } from '../storage/db.ts';
 import {
-  type OutcomeSignalRow,
   listOutcomeSignalsByApproval,
+  type OutcomeSignalRow,
 } from '../storage/repos/outcome-signals.ts';
 import { COMPOSITE_HARMFUL_THRESHOLD } from './codes.ts';
 

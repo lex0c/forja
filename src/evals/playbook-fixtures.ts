@@ -33,7 +33,7 @@
 // the future eval CLI. Every test in the suite calling this
 // loader is shape-only.
 
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 

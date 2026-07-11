@@ -25,9 +25,9 @@
 
 import { stripAnsi } from '../../sanitize/ansi.ts';
 import {
-  type RenderOptions,
   anonymize,
   anonymizeText,
+  type RenderOptions,
   redactSecrets,
   resolveHome,
 } from '../format.ts';

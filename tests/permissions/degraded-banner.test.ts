@@ -7,8 +7,8 @@
 
 import { describe, expect, test } from 'bun:test';
 import {
-  type DegradedBannerEvent,
   createDegradedBannerEmitter,
+  type DegradedBannerEvent,
 } from '../../src/permissions/degraded-banner.ts';
 import type { EngineState } from '../../src/permissions/state-machine.ts';
 

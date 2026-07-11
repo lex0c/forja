@@ -48,4 +48,4 @@ export const getPriorForSignature = (actionSignature: string): BetaPrior => {
   return level === null ? DEFAULT_PRIOR : PRIORS_BY_LEVEL[level];
 };
 
-export { PRIORS_BY_LEVEL, DEFAULT_PRIOR };
+export { DEFAULT_PRIOR, PRIORS_BY_LEVEL };

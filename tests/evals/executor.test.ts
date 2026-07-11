@@ -11,7 +11,7 @@ import {
 import type { EvalCase } from '../../src/evals/types.ts';
 import type { SandboxAvailability } from '../../src/permissions/sandbox-availability.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
-import { type ToolContext, isToolError } from '../../src/tools/types.ts';
+import { isToolError, type ToolContext } from '../../src/tools/types.ts';
 import { seedModelCatalog } from '../helpers/seed-catalog.ts';
 
 interface ScriptedStep {
@@ -759,11 +759,16 @@ describe('executeCase — approval posture (operation mode, AGENTIC_CLI §8.1)',
 
   test('autonomous does NOT auto-approve a compound with a non-repo-confined effect (headless → denied)', async () => {
     // Autonomous auto-approves a bash compound only when EVERY resolved
-    // capability is repo-confined. `frobnicate` is an unknown binary →
-    // `exec:arbitrary`, which is never repo-confined, so the compound stays
-    // a modal; headless has no approver, so the confirm resolves to a deny.
-    // (A repo-confined compound like `echo a && echo b` WOULD auto-approve —
+    // capability is dev-loop-confined. `git push` is a DESTRUCTIVE git-write
+    // (never confined — see capDevLoopConfined), so the compound stays a
+    // modal; headless has no approver, so the confirm resolves to a deny.
+    // (A confined compound like `echo a && echo b` WOULD auto-approve —
     // pinned in tests/permissions/engine.test.ts.)
+    //
+    // Sandbox pinned canonical (like the sibling posture cases): without it,
+    // a host lacking bwrap boots `degraded`, whose confirm cause is NOT
+    // auto-approvable — so the deny would come from engine health, not from
+    // the confinement gate this test means to exercise.
     const c = baseCase({
       setup: {
         approvalPosture: 'autonomous',
@@ -777,9 +782,14 @@ describe('executeCase — approval posture (operation mode, AGENTIC_CLI §8.1)',
     const r = await executeCase(c, {
       bootstrapOverride: {
         providerOverride: mockProvider([
-          { tool_uses: [{ id: 't1', name: 'bash', input: { command: 'frobnicate a && echo b' } }] },
+          {
+            tool_uses: [
+              { id: 't1', name: 'bash', input: { command: 'git push origin main && echo b' } },
+            ],
+          },
           { text: 'tried' },
         ]),
+        sandboxAvailabilityOverride: HERMETIC_SANDBOX,
       },
     });
     expect(r.passed).toBe(true);

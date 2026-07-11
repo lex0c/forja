@@ -1,13 +1,13 @@
 import { describe, expect, test } from 'bun:test';
 import {
   EFFORT_PROFILES,
+  effortBudgetPatch,
   FORJA_EFFORT_LEVELS,
   type ForjaEffort,
-  effortBudgetPatch,
   providerEffortFor,
   resolveProviderEffort,
 } from '../../src/harness/effort.ts';
-import { DEFAULT_BUDGET, type RunBudget, effectiveBudget } from '../../src/harness/types.ts';
+import { DEFAULT_BUDGET, effectiveBudget, type RunBudget } from '../../src/harness/types.ts';
 
 describe('EFFORT_PROFILES', () => {
   test('defines exactly the five ordered levels', () => {

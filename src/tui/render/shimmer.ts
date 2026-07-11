@@ -11,7 +11,7 @@
 // evaluation; the spec is NOT amended. If the shimmer stays, §13
 // needs a deliberate revision first.
 
-import { type Capabilities, type SgrToken, paint } from '../term.ts';
+import { type Capabilities, paint, type SgrToken } from '../term.ts';
 
 // The highlight centre advances one position every SPEED ms; the
 // GAP idle slots past the text give a pause between passes.

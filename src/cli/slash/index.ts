@@ -26,7 +26,7 @@ import { skillCommand } from './commands/skill.ts';
 import { statsCommand } from './commands/stats.ts';
 import { subagentsCommand } from './commands/subagents.ts';
 import { parseSlashInput } from './parse.ts';
-import { type SlashRegistry, createRegistry } from './registry.ts';
+import { createRegistry, type SlashRegistry } from './registry.ts';
 import type { SlashCommand, SlashContext, SlashResult } from './types.ts';
 
 export type { ParsedSlash } from './parse.ts';

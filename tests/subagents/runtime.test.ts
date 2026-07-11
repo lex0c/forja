@@ -3,16 +3,16 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
   readdirSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createPermissionEngine } from '../../src/permissions/index.ts';
 import type { Policy } from '../../src/permissions/index.ts';
+import { createPermissionEngine } from '../../src/permissions/index.ts';
 import type { Provider } from '../../src/providers/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import {
@@ -29,22 +29,22 @@ import {
 } from '../../src/storage/index.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import {
-  type IpcChannel,
-  type IpcMessage,
   createChannel,
   fakeTransportPair,
+  type IpcChannel,
+  type IpcMessage,
   makeEvent,
   makePermissionAsk,
   makeSessionFinished,
   makeSessionStart,
 } from '../../src/subagents/ipc.ts';
 import {
-  MAX_SUBAGENT_DEPTH,
-  type SpawnChildProcess,
   computeArgvHash,
   drainStderrToLogFile,
+  MAX_SUBAGENT_DEPTH,
   resolveChildBinaryCmd,
   runSubagent,
+  type SpawnChildProcess,
   toEnvelope,
 } from '../../src/subagents/runtime.ts';
 import type { SubagentDefinition } from '../../src/subagents/types.ts';
@@ -4218,43 +4218,40 @@ describe('runSubagent — review fixes (round 4)', () => {
     // distinguishing "model violated the contract" from generic
     // `internalError` need the verbatim reason on the wire.
     ['playbook.output_invalid', 'error'],
-  ] as const)(
-    'child publishing reason=%s is preserved verbatim, not coerced',
-    async (reason, statusForReason) => {
-      const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
-        model: 'mock/m',
-        cwd: '/p',
+  ] as const)('child publishing reason=%s is preserved verbatim, not coerced', async (reason, statusForReason) => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake: SpawnChildProcess = (opts) => {
+      insertSubagentOutput(db, { sessionId: opts.sessionId });
+      setSubagentPayload(db, opts.sessionId, {
+        status: statusForReason,
+        reason,
+        output: '',
+        cost_usd: 0,
+        steps: 0,
+        duration_ms: 0,
       });
-      const fake: SpawnChildProcess = (opts) => {
-        insertSubagentOutput(db, { sessionId: opts.sessionId });
-        setSubagentPayload(db, opts.sessionId, {
-          status: statusForReason,
-          reason,
-          output: '',
-          cost_usd: 0,
-          steps: 0,
-          duration_ms: 0,
-        });
-        return {
-          exited: Promise.resolve({ exitCode: 0 }),
-          kill: () => undefined,
-        };
+      return {
+        exited: Promise.resolve({ exitCode: 0 }),
+        kill: () => undefined,
       };
-      const result = await runSubagent({
-        definition: definition(),
-        prompt: 'go',
-        parentSessionId: parent.id,
-        provider: stubProvider(),
-        parentToolRegistry: buildParentRegistry(echoTool),
-        permissionEngine: buildEngine(),
-        db,
-        cwd: '/p',
-        spawnChildProcess: fake,
-      });
-      expect(result.reason).toBe(reason);
-      expect(result.status).toBe(statusForReason);
-    },
-  );
+    };
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      spawnChildProcess: fake,
+    });
+    expect(result.reason).toBe(reason);
+    expect(result.status).toBe(statusForReason);
+  });
 
   test('soft→hard promotion resets interruptAt so 2×grace cushion measures from SIGTERM', async () => {
     // Pre-fix: on promotion the cushion shrunk to ~1×grace

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
-import { TRUST_GATE_FLAVORS, renderModal } from '../../../src/tui/render/modal.ts';
+import { renderModal, TRUST_GATE_FLAVORS } from '../../../src/tui/render/modal.ts';
 import type { ConfirmOption, ConfirmState } from '../../../src/tui/state.ts';
-import { CSI, type Capabilities } from '../../../src/tui/term.ts';
+import { type Capabilities, CSI } from '../../../src/tui/term.ts';
 
 const ascii: Capabilities = {
   isTTY: true,
@@ -283,7 +283,7 @@ describe('renderModal (UI.md §4.10.13 layout)', () => {
   test('empty preview entry becomes a blank spacer (no indent)', () => {
     const out = renderModal(baseModal({ preview: ['line a', '', 'line c'] }), unicode);
     // Find the spacer line — it should be exactly '' (not '  ').
-    const spacerIdx = out.findIndex((l) => l === '');
+    const spacerIdx = out.indexOf('');
     expect(spacerIdx).toBeGreaterThan(-1);
   });
 });

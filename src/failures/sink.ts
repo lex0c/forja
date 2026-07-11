@@ -27,8 +27,7 @@
 // 0-2 bootstrap events ever).
 
 import type { OutcomeSink } from '../outcomes/sink.ts';
-import { sha256Hex } from '../permissions/canonical.ts';
-import { canonicalize } from '../permissions/canonical.ts';
+import { canonicalize, sha256Hex } from '../permissions/canonical.ts';
 import { generateUlid } from '../permissions/ulid.ts';
 import { redactSecrets } from '../sanitize/secrets.ts';
 import type { DB } from '../storage/db.ts';
@@ -36,11 +35,11 @@ import { withImmediateTransaction } from '../storage/db.ts';
 import { getApprovalsLogBySeq } from '../storage/repos/approvals-log.ts';
 import {
   type AppendFailureEventInput,
-  type FailureEventRow,
-  PERSISTED_COLUMNS,
   appendFailureEvent,
+  type FailureEventRow,
   getLastFailureEventBySession,
   listFailureEventsBySession,
+  PERSISTED_COLUMNS,
 } from '../storage/repos/failure-events.ts';
 import {
   BOOTSTRAP_SESSION_ID,

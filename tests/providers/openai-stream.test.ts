@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { type RawOpenAIChunk, normalizeOpenAIStream } from '../../src/providers/openai/stream.ts';
+import { normalizeOpenAIStream, type RawOpenAIChunk } from '../../src/providers/openai/stream.ts';
 import type { StreamEvent } from '../../src/providers/types.ts';
 import { collect, collectNonUsage } from './_stream-helpers.ts';
 

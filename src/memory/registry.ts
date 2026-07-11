@@ -1,27 +1,27 @@
 import { redactSecrets } from '../sanitize/secrets.ts';
 import type { DB } from '../storage/db.ts';
-import { type MemoryEventAction, createMemoryEvent } from '../storage/repos/memory-events.ts';
+import { createMemoryEvent, type MemoryEventAction } from '../storage/repos/memory-events.ts';
 import {
   type OverrideSignal,
   recordOverrideEvent,
 } from '../storage/repos/memory-override-events.ts';
 import {
-  type MemoryProvenanceRow,
   hashMemoryContent,
   listProvenanceForToolCall,
   listRecentSessionExposures,
+  type MemoryProvenanceRow,
   recordProvenance,
 } from '../storage/repos/memory-provenance.ts';
 import { isExpired } from './expires.ts';
 import { serializeMemoryFile } from './frontmatter.ts';
 import {
-  type MemoryFileResult,
-  type ScopeIndexResult,
   loadScopeIndex,
   loadSeedsIndex,
+  type MemoryFileResult,
   memoryNameFromPath,
   readMemoryByName,
   readSeedByName,
+  type ScopeIndexResult,
 } from './loader.ts';
 import type { ScopeRoots } from './paths.ts';
 import { isSeedDisabled, loadDisabledSeeds } from './seeds-disabled.ts';

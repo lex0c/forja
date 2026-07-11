@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import {
-  CSI,
   type Capabilities,
+  CSI,
   clearDown,
   clearLine,
   createFrameScheduler,
@@ -208,7 +208,9 @@ describe('createResizeWatcher', () => {
     watcher.onResize((e) => seen.push(e));
     stream.columns = 120;
     stream.rows = 40;
-    listeners.forEach((l) => l());
+    listeners.forEach((l) => {
+      l();
+    });
     expect(seen).toEqual([{ cols: 120, rows: 40 }]);
     watcher.close();
   });
@@ -228,9 +230,13 @@ describe('createResizeWatcher', () => {
     const off = watcher.onResize(() => {
       count++;
     });
-    listeners.forEach((l) => l());
+    listeners.forEach((l) => {
+      l();
+    });
     off();
-    listeners.forEach((l) => l());
+    listeners.forEach((l) => {
+      l();
+    });
     expect(count).toBe(1);
     watcher.close();
   });
@@ -258,7 +264,9 @@ describe('createFrameScheduler', () => {
       flushAll: () => {
         const snap = pending;
         pending = [];
-        snap.forEach((p) => p.fn());
+        snap.forEach((p) => {
+          p.fn();
+        });
       },
       pending: () => pending.slice(),
     };

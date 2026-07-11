@@ -20,12 +20,12 @@ import { buildRetrievalRunner } from '../../src/retrieval/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import {
-  MEMORY_PROVENANCE_RETENTION_MS,
   listExposuresInRetrieval,
   listGlobalProvenanceForMemory,
   listProvenanceByName,
   listProvenanceForMemory,
   listProvenanceForToolCall,
+  MEMORY_PROVENANCE_RETENTION_MS,
   pruneMemoryProvenance,
   recordProvenance,
 } from '../../src/storage/repos/memory-provenance.ts';

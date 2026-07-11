@@ -647,7 +647,6 @@ describe('scheduler — G6 shutdown during in-flight dispatch', () => {
     // `shutdown()` on the scheduler that's about to be built, so the
     // identifier is captured before assignment. `const` would trip
     // the temporal dead zone at closure-build time.
-    // biome-ignore lint/style/useConst: late-bound circular ref into spawnFn
     let sched: ReturnType<typeof createSemanticVerifyScheduler> | undefined;
     const spawnFn = (async () => {
       // Trigger shutdown mid-dispatch. The post-await guard must

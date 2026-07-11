@@ -12,10 +12,10 @@
 //   bun run scripts/checksums.ts verify   [--dist=...]
 
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { SBOM_FILENAME } from './sbom.ts';
-import { TARGETS, assetName } from './targets.ts';
+import { assetName, TARGETS } from './targets.ts';
 
 export const sha256File = (path: string): string => {
   const hash = createHash('sha256');

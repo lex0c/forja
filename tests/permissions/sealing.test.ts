@@ -4,12 +4,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createSqliteSink, ensureInstallId } from '../../src/permissions/index.ts';
 import {
-  type SealEntry,
   createGitAnchoredSealer,
   createWormFileSealer,
   defaultGitAnchoredFactory,
   defaultWormFileFactory,
   factoryForSealMode,
+  type SealEntry,
   verifySealAgainstChain,
 } from '../../src/permissions/sealing.ts';
 import { MIGRATIONS, migrate, openMemoryDb } from '../../src/storage/index.ts';

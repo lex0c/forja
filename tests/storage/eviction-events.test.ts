@@ -3,8 +3,6 @@ import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import {
   type AppendEvictionEventInput,
-  IllegalTransitionError,
-  InvalidEvictionInputError,
   appendEvictionEvent,
   countEvictionEvents,
   detectTriggerThrashing,
@@ -12,6 +10,8 @@ import {
   getLastEvictionForObject,
   getLastInvalidationEventsBatch,
   getLastQuarantineEvent,
+  IllegalTransitionError,
+  InvalidEvictionInputError,
   isLegalTransition,
   listEvictableInWindow,
   listEvictedDueForPurge,

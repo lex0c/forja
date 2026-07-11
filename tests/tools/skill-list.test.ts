@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { createSkillCatalog } from '../../src/skills/index.ts';
 import type { SkillScope } from '../../src/skills/index.ts';
+import { createSkillCatalog } from '../../src/skills/index.ts';
 import { skillListTool } from '../../src/tools/builtin/skill-list.ts';
 import { isToolError } from '../../src/tools/types.ts';
 import { cleanupTmpDirs, makeRoots, makeTmp, skillDoc, writeSkill } from '../skills/_helpers.ts';

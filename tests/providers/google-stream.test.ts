@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { type RawGoogleChunk, normalizeGoogleStream } from '../../src/providers/google/stream.ts';
+import { normalizeGoogleStream, type RawGoogleChunk } from '../../src/providers/google/stream.ts';
 import type { StreamEvent } from '../../src/providers/types.ts';
 import { collect, collectNonUsage } from './_stream-helpers.ts';
 

@@ -11,12 +11,12 @@
 //                         the plan only; --force lifts the
 //                         skip on dirty preserved + orphans
 
-import { type DB, closeDb, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { closeDb, type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import {
-  type WorktreeGcEntry,
-  type WorktreeGcPlan,
   applyGcPlan,
   buildGcPlan,
+  type WorktreeGcEntry,
+  type WorktreeGcPlan,
 } from '../subagents/worktree-gc.ts';
 
 export interface WorktreesCliInput {

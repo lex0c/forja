@@ -31,12 +31,14 @@
 
 import { safeJsonParse } from '../broker/safe-json.ts';
 import {
-  DEFAULT_SCORE_CONFIRM_THRESHOLD,
+  canonicalHash,
   createNoopSink,
   createPermissionEngine,
+  DEFAULT_SCORE_CONFIRM_THRESHOLD,
   ensureInstallId,
+  type Policy,
+  resolvePolicy,
 } from '../permissions/index.ts';
-import { type Policy, canonicalHash, resolvePolicy } from '../permissions/index.ts';
 
 // Slice 128 (R4 P0-Inj-2): strip CC0+CC1 control characters from
 // audit-row-derived strings before stdout interpolation. The
@@ -47,9 +49,10 @@ import { type Policy, canonicalHash, resolvePolicy } from '../permissions/index.
 // biome-ignore lint/suspicious/noControlCharactersInRegex: rule's purpose IS to match control chars
 const REPLAY_CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g;
 const stripControlChars = (s: string): string => s.replace(REPLAY_CONTROL_CHAR_RE, '');
+
 import type { ApprovalPosture, ToolArgs } from '../permissions/index.ts';
 import type { Decision, PolicyCategory } from '../permissions/types.ts';
-import { type DB, MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { type DB, defaultDbPath, MIGRATIONS, migrate, openDb } from '../storage/index.ts';
 import { getToolCallByApprovalSeq } from '../storage/repos/approval-call-links.ts';
 import { type ApprovalLogRow, getApprovalsLogBySeq } from '../storage/repos/approvals-log.ts';
 import { getPolicyArchive } from '../storage/repos/policy-archive.ts';

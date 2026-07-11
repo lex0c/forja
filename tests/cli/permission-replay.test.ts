@@ -5,9 +5,9 @@ import { join } from 'node:path';
 import { parseArgs } from '../../src/cli/args.ts';
 import { runPermissionReplay } from '../../src/cli/permission-replay.ts';
 import {
-  type ReasonChainEntry,
   createSqliteSink,
   ensureInstallId,
+  type ReasonChainEntry,
 } from '../../src/permissions/index.ts';
 import { MIGRATIONS, migrate, openDb } from '../../src/storage/index.ts';
 

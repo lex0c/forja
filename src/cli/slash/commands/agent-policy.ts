@@ -17,13 +17,13 @@
 
 import { runLoopFrio } from '../../../feedback/loop-frio.ts';
 import {
-  IllegalPolicyTransitionError,
-  type Policy,
-  type PolicyState,
   getPolicy,
+  IllegalPolicyTransitionError,
   listPoliciesByActionSignature,
   listPoliciesByState,
   listPolicyHistory,
+  type Policy,
+  type PolicyState,
   transitionPolicy,
 } from '../../../storage/repos/policies.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';

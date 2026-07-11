@@ -3,11 +3,11 @@ import { maybeWrapSandboxArgv } from '../../permissions/index.ts';
 import { getGitBinaryWithEnv } from '../../subagents/git-binary.ts';
 import {
   ERROR_CODES,
+  isToolError,
   type Tool,
   type ToolContext,
   type ToolError,
   type ToolResult,
-  isToolError,
   toolError,
 } from '../types.ts';
 

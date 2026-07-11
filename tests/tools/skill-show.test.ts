@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { type SkillScope, createSkillCatalog } from '../../src/skills/index.ts';
+import { createSkillCatalog, type SkillScope } from '../../src/skills/index.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';

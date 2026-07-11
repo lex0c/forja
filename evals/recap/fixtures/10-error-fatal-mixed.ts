@@ -2,7 +2,7 @@ import { appendFailureEvent } from '../../../src/storage/repos/failure-events.ts
 import { appendMessage } from '../../../src/storage/repos/messages.ts';
 import { completeSession, createSession } from '../../../src/storage/repos/sessions.ts';
 import { createToolCall, finishToolCall } from '../../../src/storage/repos/tool-calls.ts';
-import { type RecapFixture, padId } from './types.ts';
+import { padId, type RecapFixture } from './types.ts';
 
 // A session that recovered one failure but then hit a fatal one and
 // ended in `error`. Exercises both `recovered` states in errors[]

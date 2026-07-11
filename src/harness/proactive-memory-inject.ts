@@ -1,11 +1,11 @@
 import {
+  listingScopeOption,
   type MemoryFile,
   type MemoryRegistry,
   type MemoryScope,
-  listingScopeOption,
   serializeMemoryFile,
 } from '../memory/index.ts';
-import { type RecalledMemory, buildProactiveRecall } from '../memory/proactive-recall.ts';
+import { buildProactiveRecall, type RecalledMemory } from '../memory/proactive-recall.ts';
 import type { ProviderMessage } from '../providers/types.ts';
 import { parseMemoryNodeId } from '../retrieval/node-ids.ts';
 import { createMemoryView } from '../retrieval/views/memory.ts';

@@ -42,8 +42,8 @@
 //     `0700` (was 0777-minus-umask). On multi-tenant hosts,
 //     0755+ exposes the marker's existence to other users.
 
-import { constants, closeSync, lstatSync, mkdirSync, openSync, readSync, writeSync } from 'node:fs';
 import type { Stats } from 'node:fs';
+import { closeSync, constants, lstatSync, mkdirSync, openSync, readSync, writeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { appDirName } from '../config/app-namespace.ts';

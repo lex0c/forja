@@ -1,11 +1,20 @@
 // Retrieval subsystem barrel (RETRIEVAL.md).
 
-export {
-  COMPRESSION_LEVELS,
-  RETRIEVAL_QUERY_TYPES,
-  RETRIEVAL_VIEWS,
-  RETRIEVAL_WORKFLOWS,
-} from './types.ts';
+export type { BM25Document, BM25Hit, BM25Index } from './bm25.ts';
+export { createBM25Index, tokenize } from './bm25.ts';
+export type {
+  CompressGreedyInput,
+  CompressionResolver,
+  CompressionResolverDeps,
+  ResolvedContent,
+} from './compression.ts';
+export { compressGreedy, createCompressionResolver } from './compression.ts';
+export type { PipelineDeps, ViewSearch } from './pipeline.ts';
+export { runRetrieval } from './pipeline.ts';
+export type { RankCandidatesInput } from './ranking.ts';
+export { rankCandidates, WORKFLOW_WEIGHTS } from './ranking.ts';
+export type { BuildRetrievalRunnerDeps } from './runner.ts';
+export { buildRetrievalRunner } from './runner.ts';
 export type {
   Candidate,
   CompressionLevel,
@@ -31,29 +40,13 @@ export type {
   ScoreBreakdown,
   SkippedCandidate,
 } from './types.ts';
-
-export { runRetrieval } from './pipeline.ts';
-export type { PipelineDeps, ViewSearch } from './pipeline.ts';
-
-export { createBM25Index, tokenize } from './bm25.ts';
-export type { BM25Document, BM25Hit, BM25Index } from './bm25.ts';
-
-export { createMemoryView } from './views/memory.ts';
+export {
+  COMPRESSION_LEVELS,
+  RETRIEVAL_QUERY_TYPES,
+  RETRIEVAL_VIEWS,
+  RETRIEVAL_WORKFLOWS,
+} from './types.ts';
 export type { MemoryViewDeps } from './views/memory.ts';
-
-export { createSessionView } from './views/session.ts';
+export { createMemoryView } from './views/memory.ts';
 export type { SessionViewDeps } from './views/session.ts';
-
-export { WORKFLOW_WEIGHTS, rankCandidates } from './ranking.ts';
-export type { RankCandidatesInput } from './ranking.ts';
-
-export { compressGreedy, createCompressionResolver } from './compression.ts';
-export type {
-  CompressGreedyInput,
-  CompressionResolver,
-  CompressionResolverDeps,
-  ResolvedContent,
-} from './compression.ts';
-
-export { buildRetrievalRunner } from './runner.ts';
-export type { BuildRetrievalRunnerDeps } from './runner.ts';
+export { createSessionView } from './views/session.ts';

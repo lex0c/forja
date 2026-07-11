@@ -15,11 +15,11 @@ import { beforeEach, describe, expect, test } from 'bun:test';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import {
-  MEMORY_OVERRIDE_THRESHOLD_COUNT,
-  MEMORY_OVERRIDE_THRESHOLD_WINDOW_MS,
   countOverridesInWindow,
   listOverrideEventsSince,
   listRecentOverridesForMemory,
+  MEMORY_OVERRIDE_THRESHOLD_COUNT,
+  MEMORY_OVERRIDE_THRESHOLD_WINDOW_MS,
   pruneOverrideEvents,
   recordOverrideEvent,
 } from '../../src/storage/repos/memory-override-events.ts';

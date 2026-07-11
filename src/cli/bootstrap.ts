@@ -4,10 +4,10 @@ import { dirname, join, resolve } from 'node:path';
 import { loadRetentionConfig } from '../audit/config-loader.ts';
 import {
   type Broker,
-  type SandboxRunner,
   createBashHandler,
   createInProcessBroker,
   createSpawnBroker,
+  type SandboxRunner,
 } from '../broker/index.ts';
 import { appDirName, projectDirName } from '../config/app-namespace.ts';
 import {
@@ -32,7 +32,7 @@ import {
   resolveHookShell,
 } from '../hooks/index.ts';
 import { loadMcpConfig } from '../mcp/config.ts';
-import { type McpInitReport, type McpManager, createMcpManager } from '../mcp/manager.ts';
+import { createMcpManager, type McpInitReport, type McpManager } from '../mcp/manager.ts';
 import type {
   ConfirmMcpTrust,
   McpClient,
@@ -40,6 +40,7 @@ import type {
   McpSandboxWrap,
   McpTransportConfig,
 } from '../mcp/types.ts';
+import type { ProbeSharedTrustResult } from '../memory/index.ts';
 import {
   computeSharedFingerprint,
   createMemoryRegistry,
@@ -52,22 +53,21 @@ import {
   resolveRepoRoot,
   resolveScopeRoots,
 } from '../memory/index.ts';
-import type { ProbeSharedTrustResult } from '../memory/index.ts';
 import { loadMeshConfig } from '../mesh/config.ts';
 import { createMeshManager } from '../mesh/manager.ts';
 import { meshRuntimeDir } from '../mesh/registry.ts';
 import { createSqliteOutcomeSink } from '../outcomes/index.ts';
 import {
   type ApprovalPosture,
-  type LockConflict,
-  type SandboxAvailability,
-  type SandboxTmpdir,
   acquireSandboxTmpdir,
   bootstrapPermissionEngine,
   detectSandboxAvailability,
   generateUlid,
+  type LockConflict,
   maybeWrapSandboxArgv,
   preflightPermissionEngine,
+  type SandboxAvailability,
+  type SandboxTmpdir,
 } from '../permissions/index.ts';
 import { setWritableCacheDirsOverride } from '../permissions/sandbox-cache-dirs.ts';
 import { setCachePersistenceOverride } from '../permissions/sandbox-cache-env.ts';
@@ -77,8 +77,8 @@ import {
   resolveGitIdentity,
   resolveGlobalGitIdentity,
 } from '../permissions/sandbox-git-identity.ts';
-import { type ModelRegistry, loadModelRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
+import { loadModelRegistry, type ModelRegistry } from '../providers/index.ts';
 import { resolveProviderFromId } from '../providers/resolve.ts';
 import type { SystemSegment } from '../providers/types.ts';
 import { scrubEnv } from '../sanitize/index.ts';
@@ -87,11 +87,11 @@ import {
   createSkillCatalog,
   resolveScopeRoots as resolveSkillScopeRoots,
 } from '../skills/index.ts';
-import { type DB, closeDb, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { closeDb, type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import { forjaCacheDir, forjaCachePersistBase } from '../storage/paths.ts';
 import {
-  GOVERNANCE_PROPOSAL_TTL_MS,
   expirePendingProposals,
+  GOVERNANCE_PROPOSAL_TTL_MS,
 } from '../storage/repos/memory-governance.ts';
 import {
   MEMORY_PROVENANCE_RETENTION_MS,
@@ -108,7 +108,7 @@ import {
   resolveAuthor,
 } from '../storage/repos/prompt-versions.ts';
 import { setRecapCacheTtlOverride } from '../storage/repos/recap-cache.ts';
-import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
+import { loadSubagents, type SubagentSet, validateSubagentSet } from '../subagents/index.ts';
 import { isSmallWindow, memoryMaxEntries } from '../tools/context-budget.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { isEnvelopeSideEffect } from '../tools/types.ts';
@@ -134,6 +134,7 @@ import { composeWithToolErgonomics } from './tool-ergonomics-prompt.ts';
 // transitive closure (storage, providers, hooks, ...) on lighter
 // paths like `forja init`.
 export { DEFAULT_MODEL } from '../providers/default-model.ts';
+
 import { DEFAULT_MODEL } from '../providers/default-model.ts';
 
 export interface BootstrapInput {

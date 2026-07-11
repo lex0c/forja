@@ -2,11 +2,11 @@ import { describe, expect, test } from 'bun:test';
 import {
   type ChainVerifyFailedEvent,
   type ClassifierUnavailableEvent,
+  createRecordingTelemetrySink,
   type PermissionDecisionEvent,
   type SealingFailureEvent,
   type StateTransitionEvent,
   type TelemetryEvent,
-  createRecordingTelemetrySink,
 } from '../../src/telemetry/index.ts';
 import {
   createScrubbingTelemetrySink,

@@ -19,6 +19,7 @@ import { join } from 'node:path';
 import { CANONICAL_SEEDS, type CanonicalSeed } from '../../src/cli/init-seeds/index.ts';
 import { parseIndex } from '../../src/memory/index-file.ts';
 import { loadSeedsIndex, readSeedByName } from '../../src/memory/loader.ts';
+import type { ScopeRoots } from '../../src/memory/paths.ts';
 import {
   seedArchivedDir,
   seedIndexFilePath,
@@ -26,7 +27,6 @@ import {
   seedMemoryFilePath,
   seedsRoot,
 } from '../../src/memory/paths.ts';
-import type { ScopeRoots } from '../../src/memory/paths.ts';
 import { writeDisabledSeeds } from '../../src/memory/seeds-disabled.ts';
 import { installVendorSeeds } from '../../src/memory/seeds-installer.ts';
 import { hashSeedContent, loadSeedManifest } from '../../src/memory/seeds-manifest.ts';

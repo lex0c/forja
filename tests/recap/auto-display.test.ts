@@ -1,11 +1,11 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
-import { TERSE_DETERMINISTIC_VERSION, buildAutoTerse } from '../../src/recap/auto-display.ts';
+import { buildAutoTerse, TERSE_DETERMINISTIC_VERSION } from '../../src/recap/auto-display.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { appendMessage } from '../../src/storage/repos/messages.ts';
 import { readRecapCache, writeRecapCache } from '../../src/storage/repos/recap-cache.ts';
 import { listRecentRecapRuns } from '../../src/storage/repos/recap-runs.ts';
-import { type Session, completeSession, createSession } from '../../src/storage/repos/sessions.ts';
+import { completeSession, createSession, type Session } from '../../src/storage/repos/sessions.ts';
 
 let db: DB;
 

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { type TodoItem, createTodoStore } from '../../src/todo/index.ts';
+import { createTodoStore, type TodoItem } from '../../src/todo/index.ts';
 
 describe('TodoStore', () => {
   test('returns empty list for unknown sessionId', () => {

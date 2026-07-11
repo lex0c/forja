@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { meshPeersTool } from '../../src/tools/builtin/mesh-peers.ts';
 import { meshSendTool } from '../../src/tools/builtin/mesh-send.ts';
-import { type ToolContext, isEnvelopeSideEffect, isToolError } from '../../src/tools/types.ts';
+import { isEnvelopeSideEffect, isToolError, type ToolContext } from '../../src/tools/types.ts';
 
 const ctxWith = (meshManager: unknown): ToolContext =>
   ({ meshManager, signal: new AbortController().signal }) as unknown as ToolContext;

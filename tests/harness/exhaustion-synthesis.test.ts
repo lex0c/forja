@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  EXHAUSTION_DIRECTIVE,
   buildSynthesisMessages,
   buildSynthesisRequest,
+  EXHAUSTION_DIRECTIVE,
   endsWithSettledAnswer,
 } from '../../src/harness/exhaustion-synthesis.ts';
 import type { HarnessConfig, RunBudget } from '../../src/harness/types.ts';

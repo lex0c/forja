@@ -10,7 +10,7 @@ import { createFocusStack } from '../../src/tui/focus-stack.ts';
 import type { KeyEvent, KeyName } from '../../src/tui/keys.ts';
 import { createModalManager } from '../../src/tui/modal-manager.ts';
 import { renderModal } from '../../src/tui/render/modal.ts';
-import { type LiveState, applyEvent, createInitialState } from '../../src/tui/state.ts';
+import { applyEvent, createInitialState, type LiveState } from '../../src/tui/state.ts';
 import type { Capabilities } from '../../src/tui/term.ts';
 
 const caps: Capabilities = {

@@ -1,11 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import type { CapabilityKind } from '../../src/permissions/capabilities.ts';
 import {
+  buildContextSummary,
   type ContextSummaryEntry,
+  createContextSummaryBuffer,
   DEFAULT_CONTEXT_SUMMARY_DEPTH,
   DEFAULT_CONTEXT_SUMMARY_MAX_BYTES,
-  buildContextSummary,
-  createContextSummaryBuffer,
 } from '../../src/permissions/context-summary.ts';
 
 const entry = (

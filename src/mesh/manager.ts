@@ -31,10 +31,10 @@ import {
   socketPath,
 } from './registry.ts';
 import {
-  type MeshServer,
-  type MeshTransport,
   connectMesh,
   listenMesh,
+  type MeshServer,
+  type MeshTransport,
   probeSocket,
 } from './transport.ts';
 import {

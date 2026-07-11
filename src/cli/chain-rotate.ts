@@ -14,7 +14,7 @@
 // normally.
 
 import { ensureInstallId } from '../permissions/index.ts';
-import { MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { defaultDbPath, MIGRATIONS, migrate, openDb } from '../storage/index.ts';
 import { rotateChain } from '../storage/repos/chain-rotation.ts';
 
 export interface RunChainRotateOptions {

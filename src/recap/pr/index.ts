@@ -6,7 +6,6 @@
 // fallback contract.
 
 export { projectPrDeterministic } from './deterministic.ts';
-export { renderPrFromStructured } from './template.ts';
 export {
   PR_LIMITS,
   PR_RENDER_V1_JSON_SCHEMA,
@@ -18,6 +17,7 @@ export {
   type PrTestPlanStatus,
   validatePrRenderV1,
 } from './schema.ts';
+export { renderPrFromStructured } from './template.ts';
 
 import type { RenderOptions } from '../format.ts';
 import type { RecapIntermediate } from '../types.ts';

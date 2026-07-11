@@ -4,9 +4,9 @@ import {
   type MemoryScope,
   type MemorySource,
   type MemoryType,
-  type WriteMemoryResult,
   scanForInjection,
   validateFrontmatter,
+  type WriteMemoryResult,
 } from '../../memory/index.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 

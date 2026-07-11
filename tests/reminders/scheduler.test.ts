@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  createReminderScheduler,
   DEFAULT_HORIZON_CAP_MS,
   type Reminder,
-  createReminderScheduler,
 } from '../../src/reminders/index.ts';
 
 // A controllable fake clock + timer so reminders fire synchronously on

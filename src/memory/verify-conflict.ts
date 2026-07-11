@@ -38,8 +38,8 @@ export const SEMANTIC_CONFLICT_SUBAGENT_MAX_COST_USD = 0.06;
 // Re-export the dedup window from the substrate repo so callers
 // have one import surface for all S13 constants.
 export {
-  SEMANTIC_CONFLICT_DEDUP_WINDOW_MS,
   MEMORY_CONFLICT_ATTEMPTS_RETENTION_MS,
+  SEMANTIC_CONFLICT_DEDUP_WINDOW_MS,
 } from '../storage/repos/memory-conflict-attempts.ts';
 
 // ─── shapes ───────────────────────────────────────────────────────────

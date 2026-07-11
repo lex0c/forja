@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs';
 import { CANONICAL_SEEDS, type CanonicalSeed } from '../cli/init-seeds/index.ts';
 import { atomicWrite } from './atomic.ts';
 import { INDEX_HEADER, serializeIndex } from './index-file.ts';
+import type { ScopeRoots } from './paths.ts';
 import {
   seedArchivedDir,
   seedArchivedFilePath,
@@ -9,13 +10,12 @@ import {
   seedMemoryFilePath,
   seedsRoot,
 } from './paths.ts';
-import type { ScopeRoots } from './paths.ts';
 import { isSeedDisabled, loadDisabledSeeds } from './seeds-disabled.ts';
 import {
-  type SeedManifest,
-  type SeedManifestEntry,
   hashSeedContent,
   loadSeedManifest,
+  type SeedManifest,
+  type SeedManifestEntry,
   writeSeedManifest,
 } from './seeds-manifest.ts';
 import type { IndexEntry } from './types.ts';

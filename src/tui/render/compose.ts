@@ -27,7 +27,7 @@
 // pinned phase chip, then the bottom anchor (rule/input/rule/footer).
 
 import type { ComposeLive } from '../renderer-types.ts';
-import { type LiveState, flushPendingToolEndBatch } from '../state.ts';
+import { flushPendingToolEndBatch, type LiveState } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
 import { renderAssistantChip } from './assistant-chip.ts';
 import { renderAwaitingChip } from './awaiting-chip.ts';

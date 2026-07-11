@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { DEFAULT_MODEL, bootstrap } from '../../src/cli/bootstrap.ts';
+import { bootstrap, DEFAULT_MODEL } from '../../src/cli/bootstrap.ts';
 import { userConfigPath } from '../../src/config/loaders.ts';
 import { createSqliteSink, ensureInstallId } from '../../src/permissions/index.ts';
 import { setWritableCacheDirsOverride } from '../../src/permissions/sandbox-cache-dirs.ts';

@@ -28,17 +28,17 @@ import type { PermissionEngine } from '../permissions/index.ts';
 import type { Provider } from '../providers/index.ts';
 import { type DB, withTransaction } from '../storage/db.ts';
 import {
-  type MemorySnapshot,
   canonicalJsonStringify,
   decideProposal,
+  type MemorySnapshot,
   recordProposal,
 } from '../storage/repos/memory-governance.ts';
 import type { MemoryOverrideEventRow } from '../storage/repos/memory-override-events.ts';
 import { hashMemoryContent } from '../storage/repos/memory-provenance.ts';
 import {
+  lookupRecentOverrideAttempt,
   type MemoryVerifyOverrideAttemptRow,
   type OverrideSuggestedMotivo,
-  lookupRecentOverrideAttempt,
   recordOverrideAttempt,
 } from '../storage/repos/memory-verify-override-attempts.ts';
 import { parseOutputAsObject } from '../subagents/output-schema.ts';

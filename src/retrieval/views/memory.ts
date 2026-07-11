@@ -22,7 +22,7 @@
 // they'll fold into the weighted token stream alongside title +
 // description.
 
-import { type MemoryRegistry, type MemoryScope, listingScopeOption } from '../../memory/index.ts';
+import { listingScopeOption, type MemoryRegistry, type MemoryScope } from '../../memory/index.ts';
 import { type BM25Document, createBM25Index, tokenize } from '../bm25.ts';
 import type { ViewSearch } from '../pipeline.ts';
 import type { Candidate, RetrievalQuery, RetrievalView } from '../types.ts';

@@ -48,14 +48,15 @@ import type { RetentionConfig } from './config-loader.ts';
 // gc-tables.ts.
 export {
   GC_TABLES,
+  type GcTable,
   PHASE_1_TABLES,
   PHASE_2_TABLES,
   PHASE_3_TABLES,
-  type GcTable,
   type Phase1Table,
   type Phase2Table,
   type Phase3Table,
 } from './gc-tables.ts';
+
 import { GC_TABLES, type GcTable } from './gc-tables.ts';
 
 export interface TableReport {

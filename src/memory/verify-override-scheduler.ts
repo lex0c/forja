@@ -31,24 +31,24 @@ import { sanitizeOneLineForDisplay } from '../sanitize/ansi.ts';
 import type { DB } from '../storage/db.ts';
 import { listPendingProposalsForMemory } from '../storage/repos/memory-governance.ts';
 import {
-  MEMORY_OVERRIDE_THRESHOLD_COUNT,
-  MEMORY_OVERRIDE_THRESHOLD_WINDOW_MS,
-  type MemoryOverrideEventRow,
   countOverridesInWindow,
   listOverrideEventsSince,
   listRecentOverridesForMemory,
+  MEMORY_OVERRIDE_THRESHOLD_COUNT,
+  MEMORY_OVERRIDE_THRESHOLD_WINDOW_MS,
+  type MemoryOverrideEventRow,
 } from '../storage/repos/memory-override-events.ts';
 import type { SubagentDefinition } from '../subagents/types.ts';
 import type { ToolRegistry } from '../tools/index.ts';
 import type { MemoryRegistry } from './registry.ts';
 import type { MemoryScope } from './types.ts';
-import { dispatchOverrideVerify } from './verify-override-dispatcher.ts';
 import {
   MEMORY_VERIFY_OVERRIDE_MAX_COST_USD,
   MEMORY_VERIFY_OVERRIDE_MAX_DISPATCHES_PER_SESSION,
   SEMANTIC_OVERRIDE_ELIGIBLE_TYPES,
   SEMANTIC_OVERRIDE_SUBAGENT_MAX_COST_USD,
 } from './verify-override.ts';
+import { dispatchOverrideVerify } from './verify-override-dispatcher.ts';
 
 const ERR_MAX_CHARS = 1024;
 const displayErr = (s: string): string => sanitizeOneLineForDisplay(s, ERR_MAX_CHARS);

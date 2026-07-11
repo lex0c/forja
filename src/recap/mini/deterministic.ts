@@ -19,10 +19,9 @@
 import { basename } from 'node:path';
 import type { DB } from '../../storage/db.ts';
 import { getSession } from '../../storage/repos/sessions.ts';
-import { RECAP_MINI_LIMITS, RECAP_MINI_SCHEMA_VERSION, type RecapMini } from './schema.ts';
-
 // File-writing tools, shared with projection.ts + the verify gate (one source).
 import { FILE_WRITER_TOOLS } from '../../tools/file-writer-tools.ts';
+import { RECAP_MINI_LIMITS, RECAP_MINI_SCHEMA_VERSION, type RecapMini } from './schema.ts';
 
 // First user message content. Sessions almost always have at
 // least one (the original prompt); the rare race where the

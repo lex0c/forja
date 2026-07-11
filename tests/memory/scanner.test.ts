@@ -8,8 +8,8 @@
 
 import { describe, expect, test } from 'bun:test';
 import {
-  SHARED_BODY_LINE_CAP,
   redactSecrets,
+  SHARED_BODY_LINE_CAP,
   scanForInjection,
   scanForPromotion,
   scanForSecrets,
