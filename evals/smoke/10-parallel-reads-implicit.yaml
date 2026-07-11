@@ -1,0 +1,27 @@
+name: parallel reads emerge from the system-prompt hint alone
+prompt: |
+  Take a look at alpha.txt, beta.txt, and gamma.txt in this directory and
+  summarize what each says with one short sentence per file.
+setup:
+  fixture: ../fixtures/parallel-reads
+expect:
+  - tool_called: read_file
+  - output_contains: agile
+  - output_contains: bright
+  - output_contains: graceful
+  - status: done
+budget:
+  # Counterpart to smoke 09. There the prompt EXPLICITLY says
+  # "emit all three calls in a single turn"; here it does not —
+  # just "take a look". The cap of 4 steps gives a small margin
+  # while still being strict enough to fail on full
+  # serialization: 3 sequential reads + 1 summary = 4 steps
+  # with no slack, so any branch that re-reads or interleaves
+  # text turns trips. With parallelization the case lands in
+  # 2 steps (1 turn with 3 read_file blocks + 1 summary turn).
+  # The only signal pointing at parallelism is the system-prompt
+  # hint injected by `composeWithParallelHint` (D227) plus the
+  # "Parallel-safe: ..." line on each tool description (D227).
+  # If either guidance is absent or weak, the model defaults
+  # to one read per turn and trips this cap.
+  maxSteps: 4

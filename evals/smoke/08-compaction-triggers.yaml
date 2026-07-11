@@ -1,0 +1,45 @@
+name: compaction triggers and folds history
+evaluates: harness
+prompt: |
+  Process the 5 TypeScript files under src/ STRICTLY ONE AT A TIME,
+  in alphabetical order: a.ts, b.ts, c.ts, d.ts, e.ts.
+
+  For EACH file in turn, follow this exact protocol:
+    1. Call read_file with that single file path. Only one
+       read_file tool call per assistant turn — do NOT batch
+       multiple reads in a single turn.
+    2. After the tool result lands, in your NEXT assistant turn
+       reply with one short line stating which dependency that
+       file imports from (quote the import path verbatim).
+    3. Only AFTER you have replied with the dependency line in
+       text, proceed to the next file's read.
+
+  Do NOT issue parallel read_file calls. Do NOT batch reads. Each
+  file's read must complete and be acknowledged in your reply text
+  before the next file's read begins. This serial pattern is
+  required even if it feels redundant.
+
+  Once all 5 files have been processed this way, finish with a
+  single summary line that names the common dependency every file
+  imports from.
+setup:
+  fixture: ../fixtures/chunky-modules
+expect:
+  - tool_called: read_file
+  - compaction_triggered:
+      strategy: llm
+      min_count: 1
+  - status: done
+  - output_contains: forja-core
+budget:
+  maxSteps: 14
+  # Loose by necessity: this case's cost is intrinsically variable
+  # (observed ~$0.21-0.33) because LLM-judge compaction consumes a
+  # variable amount of context per run. The gate catches a gross
+  # (~2x) regression, not normal run-to-run swing.
+  maxCostUsd: 0.50
+  compactionThreshold: 0.02
+  compactionPreserveTail: 1
+  # Pin the pure-LLM path: asserts strategy=llm. compactionRelevance now
+  # defaults ON, so opt out explicitly to keep this smoke deterministic.
+  compactionRelevance: false

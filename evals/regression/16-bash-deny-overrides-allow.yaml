@@ -1,0 +1,30 @@
+name: bash.deny wins over bash.allow
+evaluates: harness
+prompt: |
+  Use the bash tool to run `rm doomed.txt`. Set `read_only: false`. Report
+  whatever the tool returns, even if it's a denial. Do NOT switch tools, do
+  NOT retry with a different command.
+setup:
+  files:
+    doomed.txt: |
+      should survive the run
+    .forja/permissions.yaml: |
+      defaults:
+        mode: strict
+      tools:
+        bash:
+          allow:
+            - '*'
+          deny:
+            - 'rm *'
+expect:
+  - tool_called: bash
+  - tool_denied: bash
+  - file_exists: doomed.txt
+  - file_contains:
+      path: doomed.txt
+      pattern: should survive
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

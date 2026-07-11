@@ -91,14 +91,14 @@ Atualizada por release. Valores são representativos; ver `~/.config/agent/model
 
 | Capability | sonnet-4-6 | haiku-4-5 | opus-4-7 | gpt-4o | gpt-4o-mini | qwen-coder-14b (ollama) | llama-3-8b (llama.cpp) |
 |---|---|---|---|---|---|---|---|
-| tools | native | native | native | native | native | adapted | adapted |
+| tools | native | native | native | native | native | native | adapted |
 | cache | server_5min | server_5min | server_5min | client_only* | client_only* | none | none |
 | vision | yes | yes | yes | yes | yes | no | no |
 | streaming | yes | yes | yes | yes | yes | yes | yes |
 | constrained | tools | tools | tools | tools+json | tools+json | json_mode | gbnf |
 | context (k) | 200 | 200 | 200 | 128 | 128 | 32 | 8 |
-| out max | 64k | 64k | 64k | 16k | 16k | 4k | 2k |
-| max tools/step | 12+ | 12+ | 12+ | 12+ | 12+ | 3 | 2 |
+| out max | 64k | 64k | 64k | 16k | 16k | 8k | 2k |
+| max tools/step | 12+ | 12+ | 12+ | 12+ | 12+ | 4 | 2 |
 
 \* OpenAI tem prefix-cache automático (não controlável; hit é probabilístico).
 
@@ -152,28 +152,25 @@ Provider adicionado depois faz PR atualizando esta tabela.
 
 ### 3.3 Ollama
 
-> **Detalhamento operacional:** [`LOCAL_MODELS.md`](./LOCAL_MODELS.md) — hardware detection, model lifecycle (load/warm-up/keep_alive), tool calling adapter formal, prompt template dialects, setup/bootstrap, remote LAN scenarios, failure modes específicas. Esta seção é overview de quirks.
+> **Detalhamento operacional:** [`LOCAL_MODELS.md`](./LOCAL_MODELS.md) — hardware detection, model lifecycle (load/warm-up/keep_alive), remote LAN scenarios, failure modes específicas. A F1 implementa o caminho **nativo `/api/chat`** com catálogo curado de tool calling nativo; o adapter de tool calling formal (§3 do LOCAL_MODELS) para modelos **sem** suporte nativo é trabalho futuro.
 
 **Strengths:**
-- **Custo zero** (recurso local)
-- **Privacidade** (nada sai do host)
-- Funciona offline
-- JSON mode em versões recentes
-- API simples (compatible-mode com OpenAI também)
+- **Custo zero** (recurso local) e **privacidade** (nada sai do host); funciona offline.
+- **Tool calling nativo** nos modelos do catálogo (qwen2.5-coder, qwen3, qwen3-coder, llama3.1, mistral-nemo, gpt-oss, devstral) — `message.tool_calls` com `arguments` já como objeto.
+- **Structured output** via `format` — aceita `"json"` e um JSON Schema completo (local).
+- API simples; o template de chat é aplicado pelo próprio Ollama no `/api/chat` (o adapter **não** monta dialect).
 
 **Quirks:**
-- **Tool calling não-nativo** na maioria dos models — precisa adapter (regex extract / few-shot prompt)
-- **JSON mode falha em ~5-10%** dos casos — validation + retry obrigatório
-- **Context window limitado** (8k-32k típico) — compaction agressiva
-- **Latência alta em CPU**; aceitável em GPU
-- **Quality degrada em multi-step reasoning** vs frontier — usar em DAG decomposto, não freeform
-- **Prompts model-specific** (llama-3 ≠ qwen ≠ deepseek-coder ≠ codestral) — template dialect importa
+- **`num_ctx` default baixo** (~2–4K): sem setá-lo, a janela declarada vira ficção (truncamento silencioso). O adapter envia `num_ctx` explícito, **capado em 32K** por default — a janela cheia (até 256K) alocaria um KV-cache que dá OOM em hardware típico; override via `numCtx` / `FORJA_OLLAMA_NUM_CTX`.
+- **`tool_calls` sem id** — o resultado correlaciona por `tool_name` (o harness preenche o nome).
+- **`format`/JSON falha em ~5–10%** — o caller valida o schema; `generateConstrained` sinaliza truncamento (`done_reason: 'length'`) em vez de devolver JSON inválido.
+- **`done_reason` pobre** — não distingue `stop_sequence`, refusal nem overflow de janela (caem em `end_turn`); `length` tem precedência sobre `tool_use` no mapeamento.
+- **Sem prompt cache** server-side; **sem vision** nos modelos de código do catálogo.
 
 **Defesas no adapter:**
-- Adapter de tool calling via regex + retry (pattern: `<tool>name</tool><args>{...}</args>`)
-- Validation pós-generation com retry-with-hint (≤2 retries)
-- Auto-truncation de context se exceder window
-- Template dialect detection via model name
+- **Capabilities honestas** por modelo (catálogo estático curado; `tools: native`, `cache: false`, custo `$0`).
+- `num_ctx` explícito e capado, com override; erros tipados (`local.daemon.unavailable` / `local.model.not_loaded`) com hint acionável.
+- Validação do payload `/api/chat` antes do parse; `generateConstrained` falha cedo em truncamento.
 
 ### 3.4 llama.cpp
 

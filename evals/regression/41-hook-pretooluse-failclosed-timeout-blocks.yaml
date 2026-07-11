@@ -1,0 +1,24 @@
+name: PreToolUse failClosed timeout denies the tool
+evaluates: harness
+prompt: |
+  Use the write_file tool to create `out.txt` with content `landed`.
+  Report what the tool returned, even if it's an error.
+setup:
+  files:
+    .forja/permissions.yaml: |
+      defaults:
+        mode: bypass
+    .forja/hooks.toml: |
+      [[hooks]]
+      event = "PreToolUse"
+      command = "sleep 1"
+      timeout_ms = 200
+      fail_closed = true
+expect:
+  - tool_called: write_file
+  - tool_denied: write_file
+  - file_not_exists: out.txt
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

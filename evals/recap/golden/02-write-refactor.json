@@ -1,0 +1,112 @@
+{
+  "schemaVersion": "v1",
+  "generatedAt": 200000,
+  "scope": {
+    "kind": "session_specific",
+    "sessionIds": [
+      "a2000001-0000-0000-0000-000000000000"
+    ],
+    "range": {
+      "start": 0,
+      "end": 0
+    }
+  },
+  "completeness": {
+    "incomplete": false,
+    "incompleteSessions": [],
+    "incompleteReason": ""
+  },
+  "goal": {
+    "text": "extract computeBackoff from src/queue.ts into its own pure module with tests",
+    "sourceStepId": "a2000100-0000-0000-0000-000000000000"
+  },
+  "goalStack": [],
+  "decisions": [],
+  "pinnedContext": [],
+  "actions": {
+    "filesRead": [
+      {
+        "path": "/home/lex/proj/src/queue.ts",
+        "count": 1
+      }
+    ],
+    "filesWritten": [
+      {
+        "path": "/home/lex/proj/src/queue.ts",
+        "linesAdded": 0,
+        "linesRemoved": 0,
+        "semanticSummary": ""
+      },
+      {
+        "path": "/home/lex/proj/src/queue/backoff.ts",
+        "linesAdded": 0,
+        "linesRemoved": 0,
+        "semanticSummary": ""
+      },
+      {
+        "path": "/home/lex/proj/tests/queue/backoff.test.ts",
+        "linesAdded": 0,
+        "linesRemoved": 0,
+        "semanticSummary": ""
+      }
+    ],
+    "commandsRun": [
+      {
+        "command": "bun test tests/queue/backoff.test.ts",
+        "exitCode": 0,
+        "durationMs": 1540
+      }
+    ],
+    "webFetches": [],
+    "subagentsSpawned": []
+  },
+  "outcomes": {
+    "testsRun": [
+      {
+        "command": "bun test tests/queue/backoff.test.ts",
+        "passed": true,
+        "durationMs": 1540
+      }
+    ],
+    "checkpoints": [
+      {
+        "id": "a2000700-0000-0000-0000-000000000000",
+        "stepId": "a2000200-0000-0000-0000-000000000000",
+        "filesAffected": 0
+      }
+    ],
+    "artifacts": []
+  },
+  "timeline": [
+    {
+      "ts": 100000,
+      "event": "session_start",
+      "detail": "a2000001-0000-0000-0000-000000000000"
+    },
+    {
+      "ts": 100400,
+      "event": "checkpoint",
+      "detail": "a2000700-0000-0000-0000-000000000000"
+    },
+    {
+      "ts": 102000,
+      "event": "session_end",
+      "detail": "a2000001-0000-0000-0000-000000000000 (done)"
+    }
+  ],
+  "costs": {
+    "tokens": {
+      "in": 4200,
+      "out": 350,
+      "cached": 3400
+    },
+    "usd": 0.022,
+    "durationMs": 2000,
+    "model": "sonnet-4-6",
+    "cacheHitRatio": 0.4473684210526316
+  },
+  "errors": [],
+  "notDone": [],
+  "unresolvedQuestions": [],
+  "memoryProposed": []
+}

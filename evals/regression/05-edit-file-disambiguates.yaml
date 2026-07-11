@@ -1,0 +1,24 @@
+name: edit_file targets a single occurrence using context
+prompt: |
+  In `compute.ts`, change the expression `price + tax` to `price * (1 + tax)`,
+  but ONLY inside the body of the `compute` function (the line that starts
+  with `return`). The same expression also appears in the `total` const at
+  the top of the file — leave that line completely unchanged.
+setup:
+  files:
+    compute.ts: |
+      const total = price + tax;
+      export function compute(price: number, tax: number): number {
+        return price + tax;
+      }
+expect:
+  - tool_called: edit_file
+  - file_contains:
+      path: compute.ts
+      pattern: const total = price + tax;
+  - file_contains:
+      path: compute.ts
+      pattern: return price * (1 + tax);
+  - status: done
+budget:
+  maxSteps: 8

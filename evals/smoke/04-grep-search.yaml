@@ -1,0 +1,16 @@
+name: search and report matches
+prompt: |
+  Search the working directory for files containing the literal string "TODO".
+  List the matching file names. Use a search command, not by reading every file.
+setup:
+  fixture: ../fixtures/code-with-todos
+expect:
+  # The dedicated `grep` tool is deferred at every window (CONTEXT_TUNING §2.2 —
+  # `bash` covers `rg`/`grep`), so the base search path is `bash`. The model may
+  # still reveal `grep` via tool_search, but bash is the expected route.
+  - tool_called: bash
+  - output_contains: a.ts
+  - output_contains: c.ts
+  - status: done
+budget:
+  maxSteps: 5

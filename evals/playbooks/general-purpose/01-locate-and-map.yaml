@@ -1,0 +1,11 @@
+name: 01-locate-and-map
+playbook: general-purpose
+prompt: |-
+  Map how subagent budget exhaustion is enforced in this codebase: where the
+  pre-spawn gate lives, what it compares, and the refusal code it returns.
+  Return the relevant files and a short explanation.
+expect:
+  output_schema_valid: true
+  output_contains:
+    - summary
+    - not_checked

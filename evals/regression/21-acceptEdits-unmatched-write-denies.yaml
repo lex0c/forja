@@ -1,0 +1,19 @@
+name: acceptEdits without matching rule still denies
+evaluates: harness
+prompt: |
+  Use the write_file tool to create `output.txt` with the single line `hi`.
+  Report whatever the tool returns. Do NOT retry with a different path, do
+  NOT switch tools.
+setup:
+  files:
+    .forja/permissions.yaml: |
+      defaults:
+        mode: acceptEdits
+expect:
+  - tool_called: write_file
+  - tool_denied: write_file
+  - file_not_exists: output.txt
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

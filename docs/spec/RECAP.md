@@ -43,6 +43,7 @@ Filtros de `/recap list` (mesmos de `agent --list-sessions`):
 Flags universais:
 - `--out <path>` — escreve em arquivo (default: stdout)
 - `--no-llm-render` — força modo determinístico (sem LLM)
+- `--model <id>` — modelo do render LLM (override por-call; precede `[recap].render_model` e o modelo da sessão; id desconhecido avisa e cai no modelo da sessão — §8.2)
 - `--include-tool-output` — inclui output completo de tools (default: omite, só metadata)
 - `--limit <N>` — corta a N steps mais relevantes
 - `--lang pt|en` — idioma de renderização
@@ -131,7 +132,7 @@ recap_intermediate:
     duration_ms: int
     model: string
     cache_hit_ratio: float
-  errors:                            # falhas tratadas que valem mencionar
+  errors:                            # falhas user-visible (failure_events); recovered E não-recovered, distinguidas pelo flag
     - { code: string, recovered: bool, summary: string }
   not_done:                          # honestidade epistêmica (de subagent_outputs.not_done, schema de playbooks, etc)
     - { what: string, reason: string }
@@ -144,7 +145,7 @@ Campos **sempre presentes** mesmo se vazios (array `[]`, string `""`). Ausência
 
 ### 3.1 Schema `recap_mini` (subset pra listagens)
 
-Pra `agent --list-sessions --with-recap`, `/recap list`, e `<SessionPicker>`, projeção menor + barata:
+Pra `agent --list-sessions --with-recap`, `/recap list`, e o session picker (CLI separada, fora da TUI viva), projeção menor + barata:
 
 ```yaml
 recap_mini:
@@ -182,6 +183,30 @@ recap_mini:
 - `not_done[]` — surface no primeiro turno pós-resume
 
 **Garantia operacional:** hook `Stop` **deve** popular `recap_cache` antes da sessão terminar — caso contrário, resume cai em fallback degradado (apenas `goal.text` literal + warning `incomplete: true`). Crash em `tool_exec` antes de `Stop` rodar é o caso esperado em produção; eval `evals/resume/auto_rehydrate/` cobre que projeção determinística (`§3` puro SQL) reconstrói `goal.text` + `decisions[]` direto do SQLite, **sem depender de cache**. Cache é otimização, não correctness path.
+
+### 3.3 Auto-display surfaces (terse on session-end + Alt+R)
+
+Além do `/recap` explícito (§1) e do auto-rehydrate (§3.2), o operador encontra recap em **dois pontos automáticos** dentro do REPL — ambos servem a mesma função: lembrar o que aconteceu sem custo de digitar `/recap`.
+
+**Surfaces:**
+
+1. **Session-end terse line.** Quando a sessão atinge estado terminal (`done` / `error` / `exhausted`), a TUI projeta `RecapIntermediate` da sessão atual, renderiza `terse` (1 frase ≤ 200 chars), e imprime no scrollback acima da linha de exit. Mesma chamada popula `recap_cache` para a entrada `(scope=session_specific, renderer=terse)`. **Importante:** isso fecha o gap operacional de §3.2 **apenas para o renderer `terse`** — o `recap_mini` consumido pelo session picker do `--resume` continua dependendo de hook `Stop` dedicado ou de `/recap list` explícito. Cache de outros renderers (`pr`, `human`, `changelog`, `slack`) também continua frio até alguém rodar `/recap <renderer>` manualmente.
+
+2. **Alt+R keybind.** Em qualquer ponto do REPL idle, `Alt+R` projeta o recap da sessão corrente e imprime a linha terse no scrollback acima do prompt (mesmo formato do session-end). Útil quando o operador rola o scrollback longe do prompt e perde a referência. A linha vira parte do histórico do terminal — UI.md §0 ("inline > alt-screen") proíbe ephemeral overlays que reescrevem o scrollback; remoção depende do `Ctrl+L` / scroll do terminal, igual qualquer output do `/recap`.
+
+**Render mode em ambas as surfaces: determinístico, sem LLM.** Justificativa:
+
+- **Custo invisível.** Auto-display dispara muitas vezes por sessão; mesmo Haiku acumula em $/dia se cada sessão fecha + 5 Alt+R. Determinístico é grátis e instantâneo.
+- **Cache hit perfeito.** Determinístico é byte-stable (`§7.4`); Alt+R repetido sem mudança no intermediate é o mesmo bytes — TUI pode no-op o redraw.
+- **Sem dependência de provider.** Operador sem API key configurada ainda recebe a linha. LLM render fica disponível só via `/recap terse` explícito.
+
+**O que aparece:** o output de `renderTerseDeterministic(intermediate, { omitMetrics: true })` — o renderer de §4.6 com a variante compacta. **Diferença vs §4.6:** auto-display **omite** o suffix `<duration>, <cost>.` porque a TUI já mostra a duração no footer "Cogitated for X" imediatamente acima da linha de recap, e o custo aparece no spend line do session:end. Repetir essas duas métricas na mesma região visual polui sem informar. `/recap terse --no-llm-render` **mantém** o suffix completo (forma canonical de §4.6) — é uma surface explicit-render, sem o footer adjacente fazendo o trabalho.
+
+**Escopo:** `session_current` em ambas as surfaces. Alt+R não suporta `last N` ou `range` — esses ficam exclusivamente no `/recap` explícito (UX: keybind global é "current state"; argumentos pertencem ao slash).
+
+**Auditoria:** ambas as projeções automáticas registram em `recap_runs` (§6.3) com renderer = `terse`, used_llm = 0, prompt_version = NULL, cache_hit conforme aplicável. Distinguir auto-display de chamada explícita não é exigido pela spec — o operador raramente precisa filtrar; quando precisa, agregação por `created_at` no contexto da sessão resolve.
+
+**Falhas não bloqueiam.** Projeção que falha (DB lock, sessão recém-criada sem mensagens) é silenciosamente swallow no auto-display — operador ainda vê o exit/prompt normal. `/recap` explícito permanece o caminho oficial e fala em voz alta sobre erros.
 
 ---
 
@@ -270,18 +295,20 @@ Curto, sem detalhe técnico:
 
 ### 4.4 `slack` (markdown Slack-compatible)
 
+ASCII-only template (sem `✓` / `•`): a regra anti-decoração de §7.3 vale uniformemente para output de modelo e de template, e Slack renderiza `*` / `-` limpinho.
+
 ```
 *Refactor: queue retry logic* (4m32s, $0.04)
 
-✓ Extracted `computeBackoff` to pure function
-✓ Added 5 unit tests (all passing)
-✓ Removed dead code
+* Extracted `computeBackoff` to pure function
+* Added 5 unit tests (all passing)
+* Removed dead code
 
 Files: `src/queue.ts`, `src/queue/backoff.ts` (new), `tests/queue/backoff.test.ts` (new)
 
 Decisions:
-• Did NOT rename `validateToken` (3 untracked callers)
-• Did NOT touch `queue-consumer.ts` (out of scope)
+- Did NOT rename `validateToken` (3 untracked callers)
+- Did NOT touch `queue-consumer.ts` (out of scope)
 ```
 
 ### 4.5 `json` (intermediate cru)
@@ -303,6 +330,18 @@ Refactored queue retry logic — extracted `computeBackoff` to pure function wit
 
 Útil pra footer / status line / commit body.
 
+### 4.7 Curadoria de `errors[]` por renderer
+
+A projeção popula `errors[]` **completo** — toda falha `user_visible=1`, recovered e não-recovered. Cada renderer decide o que é relevante pro seu público: a projeção é source of truth, o renderer é vista (§0.1). A regra é uniforme em §0.6 — **nenhuma surface pode ler como sucesso sobre uma sessão que terminou em falha não-recuperada**.
+
+| Renderer | Mostra | Por quê |
+|---|---|---|
+| `human` / `json` | **todas** (com flag `recovered`) | retrospecto completo; esconder uma falha fatal que encerrou a sessão engana o operador |
+| `pr` / `changelog` | apenas **recovered** | descrição de mudança / entry user-facing fala do que foi feito — uma falha fatal não é um `Fixed` nem uma nota de PR |
+| `terse` / `slack` | apenas **não-recovered** | a linha-resumo muda de sentido se a sessão falhou; uma falha recuperada não alterou o desfecho, então é omitida por concisão |
+
+Falhas tratadas pelo harness mas **não** user-visible (stream forense de `failure_events`, `FAILURE_MODES.md §19`) nunca entram em `errors[]` — recap é narrativa, não o log forense (§0.7).
+
 ---
 
 ## 5. Source of truth (o que é carregado de onde)
@@ -320,7 +359,7 @@ Refactored queue retry logic — extracted `computeBackoff` to pure function wit
 | `outcomes.tests_run` | heurística sobre `bash` commands matching test runners |
 | `outcomes.checkpoints` | tabela `checkpoints` |
 | `costs` | agregado de `messages.tokens_*` + custo por modelo |
-| `errors` | `failure_events` (apenas user-visible, recovered) |
+| `errors` | `failure_events` com `user_visible=1` — recovered **e** não-recovered (`recovered = recovery_action ∉ {fatal, pending_repair}`); o flag distingue, o renderer cura (§4.7) |
 | `not_done` | extraído de subagent outputs + playbook reports + assistant messages com explicit "not done" markers |
 | `memory_proposed` | tabela `memory_events` (action='proposed') |
 
@@ -360,17 +399,24 @@ Cada execução de `/recap` é gravada em tabela `recap_runs`:
 
 ```sql
 recap_runs(
-  id TEXT PRIMARY KEY,
-  scope_kind TEXT NOT NULL,
-  session_ids TEXT NOT NULL,        -- JSON array
-  renderer TEXT NOT NULL,
-  used_llm BOOLEAN NOT NULL,
-  output_path TEXT,                  -- se --out usado
-  created_at INTEGER NOT NULL
+  id              TEXT PRIMARY KEY,
+  scope_kind      TEXT NOT NULL,
+  session_ids     TEXT NOT NULL,                -- JSON array
+  renderer        TEXT NOT NULL,
+  used_llm        INTEGER NOT NULL,             -- 0/1
+  output_path     TEXT,                          -- preenchido quando --out
+  created_at      INTEGER NOT NULL,
+  cost_usd        REAL    NOT NULL DEFAULT 0,   -- 0 quando determinístico ou cache hit
+  tokens_in       INTEGER NOT NULL DEFAULT 0,
+  tokens_out      INTEGER NOT NULL DEFAULT 0,
+  prompt_version  TEXT,                          -- e.g. 'pr-v1'; NULL quando determinístico
+  cache_hit       INTEGER NOT NULL DEFAULT 0    -- 0/1; 1 sinaliza render servido do recap_cache
 );
 ```
 
-Útil pra: detectar uso anormal (script gerando recaps em loop), debugar regressões, prove compliance.
+`cost_usd` / `tokens_*` permitem rastrear gasto agregado por dia/sessão sem juntar com os logs do provider. `prompt_version` deixa filtrar runs por versão de prompt durante regressão de eval. `cache_hit` separa quem pagou de quem reaproveitou, condição necessária pra avaliar utilidade do cache em produção.
+
+Útil pra: detectar uso anormal (script gerando recaps em loop), debugar regressões, prove compliance, e medir cost-per-render real ao longo do tempo.
 
 ---
 
@@ -379,15 +425,17 @@ recap_runs(
 ### 7.1 Prompt versionado
 
 ```
-prompts/recap/
-  human-v1.j2
-  pr-v1.j2
-  changelog-v1.j2
-  slack-v1.j2
-  terse-v1.j2
+src/recap/prompts/
+  human-v1.ts
+  pr-v1.ts
+  changelog-v1.ts
+  slack-v1.ts
+  terse-v1.ts
 ```
 
-Cada um tem versão; mudança bumpa versão + entra em eval.
+Cada arquivo exporta `version: 'pr-v1'` (etc.) + função `render(input) -> string`. Versionamento por **nome de arquivo** (não por placeholder dentro do conteúdo): bumpar de `pr-v1.ts` para `pr-v2.ts` é uma cópia explícita do arquivo, e a versão antiga continua presente até que evals confirmem a substituição. Mudança de prompt obriga evals + invalida `recap_cache` (chave inclui `prompt_version`, §8.3).
+
+Templating embutido em TS — sem dependência de Jinja/handlebars; o render é uma função pura que recebe o intermediate (e nada mais) e devolve o prompt final.
 
 ### 7.2 Schema enforcement
 
@@ -449,15 +497,57 @@ Recaps recentes ficam em `recap_cache` (tabela com TTL 1h):
 
 ```sql
 recap_cache(
-  scope_hash TEXT PRIMARY KEY,       -- hash do scope_kind + session_ids
-  renderer TEXT,
-  output TEXT,
-  generated_at INTEGER,
-  expires_at INTEGER
+  scope_hash      TEXT PRIMARY KEY,
+  renderer        TEXT NOT NULL,
+  output          TEXT NOT NULL,
+  prompt_version  TEXT NOT NULL,
+  generated_at    INTEGER NOT NULL,
+  expires_at      INTEGER NOT NULL,
+  cost_usd        REAL    NOT NULL DEFAULT 0,
+  tokens_in       INTEGER NOT NULL DEFAULT 0,
+  tokens_out      INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX recap_cache_expires ON recap_cache(expires_at);
 ```
 
-Re-executar `/recap` em sessão ativa nos últimos 1h: hit do cache, ~10ms.
+`scope_hash` cobre **escopo + conteúdo + versão do prompt**:
+
+```
+scope_hash = sha256(
+  scope_kind || \0 || sorted(session_ids).join(\0) || \0 ||
+  renderer   || \0 || prompt_version          || \0 ||
+  render_model || \0 ||
+  sha256(canonicalize(intermediate))
+)
+```
+
+`render_model` na chave é correctness, não cosmético: `--model` / `[recap].render_model` deixam o mesmo escopo+renderer+prompt ser renderizado por modelos diferentes — sem isso, um render do modelo A seria servido a um request do modelo B. String vazia no path determinístico/legado mantém chaves antigas estáveis.
+
+`canonicalize(intermediate)` é `JSON.stringify` com chaves ordenadas lexicograficamente (helper único em `src/storage/json-safe.ts`). Hash de conteúdo é necessário, não cosmético: sem ele, `/recap pr` no step 5 cacheia um render que continuaria sendo servido após o usuário rodar mais 3 steps na mesma sessão, e o cache devolveria um render obsoleto. Com ele, qualquer mudança no audit log que afete a projeção produz miss novo. TTL de 1h vira **eviction** (limita o tamanho da tabela), não mecanismo de correctness.
+
+`prompt_version` na chave garante que bump de prompt (ex.: `pr-v1` → `pr-v2`) invalida cache automaticamente, dispensa migration ad-hoc, e impede comparação direta entre saídas de prompts diferentes.
+
+Custos: o sha256 do intermediate é O(tamanho-do-intermediate); ~5–10ms num intermediate típico (~50 KB JSON). Re-executar `/recap` em sessão ativa nos últimos 1h sem mudança intermediária: hit do cache, ~10ms total. Com mudança: miss, render LLM completo, escrita.
+
+Re-executar `/recap` em sessão ativa nos últimos 1h sem alterações no audit log: hit do cache, ~10ms.
+
+### 8.4 Configuração & master switch (`[recap]` / `--no-recap`)
+
+Seção `[recap]` no `config.toml` (camadas project > user > default, mesma mecânica de `[providers]`/`[budget]`):
+
+```toml
+[recap]
+render_model = "anthropic/claude-haiku-4-5"   # modelo default do render LLM; validado contra o registry
+enabled = true                                 # master switch; default true
+```
+
+- **`render_model`** — default do render LLM (`pr`/`changelog`/`slack`/`terse`/`human`). Precedência: `--model` (por-call) > `[recap].render_model` > **modelo da sessão**. Id desconhecido **avisa no boot** e é ignorado (fallback ao modelo da sessão); o runtime não força Haiku — §8.2 cita Haiku como recomendação de custo, mas o default é o modelo da sessão.
+- **`enabled = false`** (ou a flag global **`--no-recap`**, que precede a config) é um **master switch** que desliga as **três** superfícies automáticas/de custo, mantendo `/recap` explícito usável:
+  1. **auto-display** (linha terse no fim da sessão + `Alt+R`, §3.3) — não emitida;
+  2. **resume auto-rehydrate** (bloco `[resume_context]`, §3.2) — não injetado;
+  3. **render LLM** — todo `/recap` cai no determinístico (sem custo de modelo).
+
+Valores inválidos (`render_model` desconhecido, `enabled` não-booleano) **degradam com warning** no stderr (mesma postura fail-soft dos outros loaders), nunca abortam o boot.
 
 ---
 

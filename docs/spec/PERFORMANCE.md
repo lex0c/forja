@@ -113,15 +113,16 @@ Provider domina; nosso overhead ≤ 5% de step LLM típico.
 | Repo map update (1 file changed) | 30ms | 100ms |
 | Repo map full rebuild (10k arquivos) | 5s | 15s |
 
-### 2.6 UI rendering (Ink)
+### 2.6 UI rendering (TUI inline)
 
 | Operação | P50 | P99 |
 |---|---|---|
 | First paint após layout change | 16ms | 33ms (= 1 frame) |
-| Stream token render | 1ms | 5ms |
-| Tool card update | 5ms | 20ms |
-| Diff render (100 hunks) | 30ms | 100ms |
-| TodoList update | 5ms | 20ms |
+| Stream token render (coalescido) | 1ms | 5ms |
+| Tool card update (região viva) | 5ms | 20ms |
+| Diff render (100 hunks, permanente) | 30ms | 100ms |
+| TodoList update (região viva) | 5ms | 20ms |
+| Modal open/close | 8ms | 20ms |
 
 ---
 
@@ -269,7 +270,7 @@ Total típico: 500MB–2GB para usuário normal.
 Pra atingir os 80ms P50 cold:
 
 1. **Bun runtime** (~30ms cold vs Node ~100ms)
-2. **Lazy imports** — só carrega módulos quando usados (Ink só se interactive, OTEL só se enabled, etc)
+2. **Lazy imports** — só carrega módulos quando usados (renderer/raw-stdin só se TTY, OTEL só se enabled, etc)
 3. **Config cached** — `~/.config/agent/.cache/` com config compilada (TTL by mtime)
 4. **SQLite prepared statements** cached entre runs (via cached statements file)
 5. **Repo map skipped on startup** — só constrói se requested ou em DAG (incremental updates após)
@@ -586,16 +587,33 @@ target = "bun"                           # AOT pra cada plataforma
 
 ### 18.2 Binary size targets
 
-| Plataforma | Target |
-|---|---|
-| Linux x86_64 (glibc) | < 50 MB |
-| Linux x86_64 (musl) | < 50 MB |
-| Linux ARM64 | < 50 MB |
-| macOS x86_64 | < 50 MB |
-| macOS ARM64 | < 45 MB |
-| Windows x86_64 | < 60 MB |
+Os targets abaixo são **MiB binários** (1 MiB = 2²⁰ bytes), medidos sobre `bun build --compile --minify --sourcemap=external` em Bun 1.3.13. Os números refletem `runtime Bun + deps bundladas + código Forja`; o sourcemap viaja em arquivo separado e não conta.
 
-Hit do target = warning; +20% = bloqueia release.
+| Plataforma | Baseline (atual) | Budget (warning) | Block (+20%) |
+|---|---|---|---|
+| Linux x86_64 (glibc) | 100.9 MiB | 110 MiB | 132 MiB |
+| Linux ARM64 | 100.4 MiB | 110 MiB | 132 MiB |
+| macOS x86_64 | 68.9 MiB | 75 MiB | 90 MiB |
+| macOS ARM64 | 63.9 MiB | 70 MiB | 84 MiB |
+| Windows x86_64 | 116.0 MiB | 125 MiB | 150 MiB |
+
+`Hit do target = warning; +20% = bloqueia release.` O budget é setado ~9-10% acima do baseline atual: dá folga pra crescimento orgânico (uma SDK nova, um patch de Bun) sem virar warning, mas qualquer salto material aparece. O block (+20% sobre o budget) cobre o caso "alguém adicionou 30 MiB sem perceber".
+
+#### 18.2.1 Por que tão maior que o draft inicial
+
+A primeira versão deste spec mirava `< 50 MB` por target. Quando a M4 distribution mediu, o piso real é maior porque o binário standalone embute três coisas indivisíveis:
+
+| Componente | Contribuição típica | Notas |
+|---|---|---|
+| Bun runtime + JSC | ~50-90 MiB | Varia por plataforma; macOS é o menor (Apple toolchain compila JSC mais enxuto), Windows o maior. |
+| Vendor SDKs (`@anthropic-ai/sdk`, `@google/genai`, `openai`) | ~10-15 MiB | TypeScript transpilado + zod + tooling; cada SDK traz overlap. |
+| Forja (código + deps internas) | ~3-5 MiB | Resto. |
+
+Trimmar pra `< 50 MB` exigiria ou (a) trocar Bun por Node + esbuild (perde startup AOT, `bun:sqlite`, `Bun.serve`), ou (b) substituir os SDKs por `fetch` cru — caminho coerente com `SECURITY_GUIDELINE.md §7.3` ("trust no provider") mas que reescreve três adapters. Nenhuma das duas paga o custo agora; o budget acima reflete a realidade do stack escolhido em §3.
+
+#### 18.2.2 Linux musl
+
+Não no matrix v1. Bun suporta `--target=bun-linux-x64-musl`, mas entrega-lo significa testar em Alpine + glibc + ARM, três pipelines com sinais distintos. Adicionado quando houver demanda concreta de ambiente musl (Alpine container, distroless musl). Pull-in signal: relato de operador rodando em `/lib/ld-musl-*` que não consegue executar o binário glibc.
 
 ### 18.3 Compression opcional
 
@@ -619,17 +637,20 @@ Não bundlados (disponíveis via PATH):
 ### 18.5 Cross-platform CI
 
 ```yaml
-# .github/workflows/build.yaml
-strategy:
-  matrix:
-    target: [linux-x64, linux-arm64, darwin-x64, darwin-arm64, windows-x64]
+# .github/workflows/release.yml — disparado em push de tag `v*`
+# (também aceita workflow_dispatch com `inputs.tag` para retry de release).
+# Bun --target produz qualquer plataforma a partir de qualquer host,
+# então o cross-build roda em UM runner ubuntu-latest, não em matrix
+# de runners por OS. Os 5 targets são produzidos sequencialmente e
+# publicados no mesmo GitHub Release.
+targets: [linux-x64, linux-arm64, darwin-x64, darwin-arm64, windows-x64]
 ```
 
 Cada release:
-- SBOM por target
-- SHA256 publicado
-- Cosign signature
-- Reproducible build (mesmo source = mesmo binary)
+- SBOM por target (CycloneDX 1.5 — 1 SBOM cobre todos os targets, deps idênticas)
+- SHA256 publicado em `SHA256SUMS` (formato GNU sha256sum)
+- Cosign signature *(deferred — `id-token: write` reservado no workflow)*
+- Reproducible build (mesmo source = mesmo binary; verificado com `SOURCE_DATE_EPOCH` fixo)
 
 ---
 
@@ -637,15 +658,15 @@ Cada release:
 
 ### 12.1 Frame budget
 
-Ink target 60fps em re-renders → 16ms/frame.
+Região viva (3-15 linhas) redesenha a 30fps soft / 60fps em bursts → 16ms/frame P99.
 
-Re-render full screen é evitado. Componentes memoizam aggressively. `<DiffView>` com 1000 linhas é virtualizado.
+Histórico **nunca redesenha** (vai pra scrollback do terminal e fica imutável). Coalescer de `assistant:delta` em janela de 33ms: vários chunks viram 1 redraw. Diffs grandes (>100 hunks) imprimem permanente, não vivem na região viva.
 
 ### 12.2 Input lag
 
-Tecla pressionada → caractere na tela: < 10ms P99.
+Tecla pressionada → caractere na tela: < 16ms P99 (1 frame).
 
-Stream de modelo + input concorrente: input lag não pode degradar (input loop separado de render loop).
+Input loop (raw stdin parser) é separado do render loop. Stream de modelo + digitação concorrente: input nunca trava. Bracketed paste processa em batch antes de redraw.
 
 ---
 

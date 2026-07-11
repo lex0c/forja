@@ -1,0 +1,190 @@
+// Memory subsystem barrel.
+
+export { MEMORY_STATES } from './types.ts';
+export type {
+  EagerExposure,
+  IndexEntry,
+  MemoryFile,
+  MemoryFrontmatter,
+  MemoryScope,
+  MemorySource,
+  MemoryState,
+  MemorySubdir,
+  MemoryTrust,
+  MemoryType,
+} from './types.ts';
+
+export {
+  FrontmatterError,
+  parseMemoryFile,
+  serializeMemoryFile,
+  validateFrontmatter,
+  validateName,
+} from './frontmatter.ts';
+
+export { isExpired, parseExpiresEndOfDayMs } from './expires.ts';
+
+export {
+  IndexError,
+  INDEX_LINE_SOFT_MAX,
+  parseIndex,
+  removeIndexEntry,
+  serializeIndex,
+  upsertIndexEntry,
+} from './index-file.ts';
+export type { ParsedIndex, SerializeIndexResult } from './index-file.ts';
+
+export {
+  ScopeError,
+  indexFilePath,
+  memoryFilePath,
+  parseTombstoneFilename,
+  projectScopeRoots,
+  resolveRepoRoot,
+  resolveScopeRoots,
+  rootForScope,
+  scopeOfPath,
+  seedMemoryFilePath,
+  tombstonePath,
+  tombstonesDir,
+  userScopeRoot,
+} from './paths.ts';
+export type { ScopeRoots } from './paths.ts';
+
+export {
+  findLatestTombstone,
+  listExpiredTombstones,
+  listTombstones,
+  moveToTombstone,
+  removeFromTombstones,
+} from './tombstones.ts';
+export type {
+  MoveToTombstoneOptions,
+  MoveToTombstoneResult,
+  TombstoneEntry,
+} from './tombstones.ts';
+
+export { transitionMemoryState } from './transitions.ts';
+export type {
+  TransitionMemoryStateInput,
+  TransitionMemoryStateResult,
+} from './transitions.ts';
+
+export { applyProposal } from './governance.ts';
+export type {
+  ApplyProposalInput,
+  ApplyProposalResult,
+  ApplyRejectionReason,
+  DriftedSnapshot,
+  TransitionRecord,
+} from './governance.ts';
+
+export { DEFAULT_AGENT_GITIGNORE, ensureAgentGitignore } from './gitignore.ts';
+export type { EnsureAgentGitignoreResult } from './gitignore.ts';
+
+export {
+  listOrphanFiles,
+  loadScopeIndex,
+  memoryNameFromPath,
+  readMemoryByName,
+} from './loader.ts';
+export type { MemoryFileResult, ScopeIndexResult } from './loader.ts';
+
+export { createMemoryRegistry, listingScopeOption } from './registry.ts';
+export type {
+  AuditOverride,
+  CreateMemoryRegistryInput,
+  ListOptions,
+  MemoryListing,
+  MemoryRegistry,
+  MemorySearchHit,
+  ReadOptions,
+  RegistryEventInput,
+  RegistryReadResult,
+  RegistryWriteResult,
+  ScopeOption,
+  SearchOptions,
+  WriteOptions,
+} from './registry.ts';
+
+export { writeMemory } from './writer.ts';
+export type { WriteMemoryInput, WriteMemoryResult, WriteWarning } from './writer.ts';
+
+export { installVendorSeeds } from './seeds-installer.ts';
+export type {
+  InstallVendorSeedsOptions,
+  SeedAction,
+  SeedsInstallResult,
+} from './seeds-installer.ts';
+export {
+  isSeedDisabled,
+  loadDisabledSeeds,
+  writeDisabledSeeds,
+} from './seeds-disabled.ts';
+export type {
+  DisabledSeedEntry,
+  DisabledSeeds,
+} from './seeds-disabled.ts';
+export { loadSeedManifest, writeSeedManifest } from './seeds-manifest.ts';
+export type { SeedManifest, SeedManifestEntry } from './seeds-manifest.ts';
+
+export { detectMemoryDependents } from './dependents.ts';
+export type { MemoryDependent } from './dependents.ts';
+export {
+  findExpiredMemories,
+  gcExpiredMemories,
+  gcPurgeExpiredTombstones,
+  gcStaleInvalidatedMemories,
+  moveMemory,
+  removeMemory,
+} from './lifecycle.ts';
+export type {
+  ExpiredMemory,
+  GcExpiredAuditOverride,
+  GcExpiredOptions,
+  GcExpiredResult,
+  GcPurgeOptions,
+  GcPurgeResult,
+  MoveMemoryInput,
+  MoveMemoryResult,
+  PurgedTombstone,
+  RemoveMemoryInput,
+  RemoveMemoryResult,
+} from './lifecycle.ts';
+
+export {
+  EMPTY_BOOT_CONTEXT,
+  evaluateBootTriggers,
+  shouldEagerLoadByTriggers,
+} from './triggers.ts';
+export type { BootContext, BootTrigger } from './triggers.ts';
+
+export {
+  SHARED_BODY_LINE_CAP,
+  redactSecrets,
+  scanForInjection,
+  scanForPromotion,
+  scanForSecrets,
+} from './scanner.ts';
+export type { ScanResult } from './scanner.ts';
+
+export {
+  EMPTY_CORPUS_HASH,
+  clearSharedTrust,
+  computeSharedFingerprint,
+  getSharedTrust,
+  listSharedCorpusFiles,
+  setSharedTrust,
+} from './trust-corpus.ts';
+export type { CorpusFile, CorpusListing, SharedTrustRow } from './trust-corpus.ts';
+
+export { probeSharedTrust } from './trust-corpus-probe.ts';
+export type {
+  ProbeCorpusFile,
+  ProbeSharedTrustInput,
+  ProbeSharedTrustResult,
+  SharedTrustModalMode,
+  SharedTrustProbeAnswer,
+} from './trust-corpus-probe.ts';
+
+export { MAX_OVERRIDE_ATTRIBUTION_DEPTH } from './registry.ts';

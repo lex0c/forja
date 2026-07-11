@@ -1,0 +1,21 @@
+name: read_file honors offset and limit
+prompt: |
+  Read ONLY lines 3 and 4 of the file `notes.txt` using the read_file tool's
+  offset and limit arguments. Do not read the whole file. Then reply with the
+  exact text of those two lines, one per line, with no extra commentary.
+setup:
+  files:
+    notes.txt: |
+      line one
+      line two
+      line three
+      line four
+      line five
+      line six
+expect:
+  - tool_called: read_file
+  - output_contains: line three
+  - output_contains: line four
+  - status: done
+budget:
+  maxSteps: 5

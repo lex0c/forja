@@ -1,0 +1,99 @@
+{
+  "schemaVersion": "v1",
+  "generatedAt": 250000,
+  "scope": {
+    "kind": "session_specific",
+    "sessionIds": [
+      "a3000001-0000-0000-0000-000000000000"
+    ],
+    "range": {
+      "start": 0,
+      "end": 0
+    }
+  },
+  "completeness": {
+    "incomplete": false,
+    "incompleteSessions": [],
+    "incompleteReason": ""
+  },
+  "goal": {
+    "text": "cleanup tmp dir and confirm with me before any bash",
+    "sourceStepId": "a3000100-0000-0000-0000-000000000000"
+  },
+  "goalStack": [],
+  "decisions": [
+    {
+      "stepId": "a3000200-0000-0000-0000-000000000000",
+      "what": "bash: rm -rf /tmp/forja-staging",
+      "why": "cleanup is intentional",
+      "decidedBy": "user"
+    },
+    {
+      "stepId": "a3000200-0000-0000-0000-000000000000",
+      "what": "bash: curl -X POST https://example.com/webhook",
+      "why": "network egress blocked by policy",
+      "decidedBy": "hook"
+    }
+  ],
+  "pinnedContext": [],
+  "actions": {
+    "filesRead": [],
+    "filesWritten": [],
+    "commandsRun": [
+      {
+        "command": "rm -rf /tmp/forja-staging",
+        "exitCode": 0,
+        "durationMs": 18
+      },
+      {
+        "command": "echo done",
+        "exitCode": 0,
+        "durationMs": 4
+      }
+    ],
+    "webFetches": [],
+    "subagentsSpawned": []
+  },
+  "outcomes": {
+    "testsRun": [],
+    "checkpoints": [],
+    "artifacts": []
+  },
+  "timeline": [
+    {
+      "ts": 200000,
+      "event": "session_start",
+      "detail": "a3000001-0000-0000-0000-000000000000"
+    },
+    {
+      "ts": 200311,
+      "event": "approval_allow",
+      "detail": "bash (user)"
+    },
+    {
+      "ts": 200312,
+      "event": "approval_deny",
+      "detail": "bash (hook)"
+    },
+    {
+      "ts": 201000,
+      "event": "session_end",
+      "detail": "a3000001-0000-0000-0000-000000000000 (done)"
+    }
+  ],
+  "costs": {
+    "tokens": {
+      "in": 1800,
+      "out": 110,
+      "cached": 1400
+    },
+    "usd": 0.005,
+    "durationMs": 1000,
+    "model": "sonnet-4-6",
+    "cacheHitRatio": 0.4375
+  },
+  "errors": [],
+  "notDone": [],
+  "unresolvedQuestions": [],
+  "memoryProposed": []
+}

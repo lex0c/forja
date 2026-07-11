@@ -1,0 +1,67 @@
+{
+  "name": "forja",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Agentic CLI — terminal-first, multi-provider, self-hostable",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "forja": "./dist/forja-0.0.0-linux-x64"
+  },
+  "scripts": {
+    "dev": "FORJA_PROFILE=dev bun run --watch src/cli/index.ts",
+    "start": "bun run src/cli/index.ts",
+    "test": "bun test",
+    "eval:smoke": "bun run src/evals/cli.ts evals/smoke",
+    "eval:smoke:ollama": "bun run src/evals/cli.ts evals/smoke --model ollama/qwen2.5-coder:14b",
+    "eval:smoke:openrouter": "bun run src/evals/cli.ts evals/smoke --model openrouter/deepseek/deepseek-v4-flash",
+    "eval:regression": "bun run src/evals/cli.ts evals/regression --model anthropic/claude-haiku-4-5",
+    "eval:skills": "bun run src/evals/cli.ts evals/skills --model anthropic/claude-opus-4-8",
+    "eval:edit-format": "bun run src/evals/cli.ts evals/edit-format --model anthropic/claude-opus-4-8",
+    "eval:verify-gate": "bun run src/evals/cli.ts evals/verify-gate --model anthropic/claude-opus-4-8",
+    "eval:tool-search": "bun run src/evals/cli.ts evals/tool-search --model anthropic/claude-opus-4-8",
+    "eval:fetch-url": "bun run src/evals/cli.ts evals/fetch-url --model anthropic/claude-opus-4-8",
+    "eval:long-horizon": "bun run src/evals/cli.ts evals/long-horizon --model anthropic/claude-opus-4-8",
+    "eval:long-horizon:ab": "bun run src/evals/ab.ts evals/long-horizon --model anthropic/claude-opus-4-8 --repeat 10 --thinking-budget 4096",
+    "eval:smoke:mcp": "bash evals/smoke-mcp.sh",
+    "eval:mcp": "bun run src/evals/cli.ts evals/mcp --model anthropic/claude-opus-4-8",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "format": "biome format --write .",
+    "typecheck": "tsc --noEmit",
+    "build": "bun run scripts/build-targets.ts --target=linux-x64 --no-minify",
+    "build:release": "bun run scripts/build-targets.ts",
+    "build:size": "bun run scripts/check-size.ts",
+    "build:checksums": "bun run scripts/checksums.ts generate",
+    "build:verify": "bun run scripts/checksums.ts verify",
+    "build:repro": "bun run scripts/repro-check.ts",
+    "build:sbom": "bun run scripts/sbom.ts",
+    "build:compress": "bun run scripts/upx-compress.ts"
+  },
+  "engines": {
+    "bun": ">=1.1.30"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.0",
+    "@types/bun": "~1.3.13",
+    "@types/mdast": "^4.0.4",
+    "typescript": "^5.6.0"
+  },
+  "trustedDependencies": ["@biomejs/biome"],
+  "overrides": {
+    "ws": "^8.21.0",
+    "protobufjs": "^7.6.4"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "~0.91.1",
+    "@google/genai": "~1.50.1",
+    "@modelcontextprotocol/sdk": "~1.29.0",
+    "openai": "~6.34.0",
+    "remark": "^15.0.1",
+    "remark-gfm": "^4.0.1",
+    "string-width": "^8.2.1",
+    "web-tree-sitter": "^0.26.8",
+    "wrap-ansi": "^10.0.0",
+    "yaml": "^2.8.3"
+  }
+}

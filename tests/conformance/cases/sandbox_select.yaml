@@ -1,0 +1,198 @@
+# Conformance: §6.5 sandbox profile selection (PERMISSION_ENGINE.md §6.5,
+# src/permissions/sandbox-plan.ts).
+#
+# These cases exercise `selectSandboxProfile` directly (engine-bypass
+# mode, same pattern as subagent_intersection cases). The planner is
+# pure: given a resolved capability set + the `host_explicitly_allowed`
+# flag, it picks the most-restrictive viable profile from the fixed
+# order [ro, cwd-rw, cwd-rw-net, home-rw, host] or refuses with
+# `no_viable_sandbox` + the uncovered kinds.
+#
+# Coverage groups (counts per §16.2 minimum of 6):
+#   A. Tier ladder per profile                     (4)   ro, cwd-rw,
+#                                                        cwd-rw-net,
+#                                                        home-rw
+#   B. Host gate                                   (2)   eligible +
+#                                                        blocked
+#   C. exec:arbitrary floor + net posture +        (6)   unmodeled → cwd-rw;
+#      build-egress trust-gate                            posture+trusted →
+#                                                        cwd-rw-net, posture+
+#                                                        untrusted → cwd-rw;
+#                                                        modeled dep-manager
+#                                                        gated on dir_trusted;
+#                                                        curl-style net ungated
+#
+# Together these pin: (1) the per-kind capability table that decides
+# what each profile covers, (2) the tie-break order (most restrictive
+# wins), (3) the "drop host when alternatives exist" rule, and (4)
+# the dual gate on `host` (operator flag AND `host-passthrough`
+# capability — either missing prunes host).
+
+# ─────────────────────────────────────────────────────────────────────
+# Group A — Tier ladder (one case per restrictive-side profile)
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "sandbox select: read-fs only → ro (most restrictive)"
+  setup:
+    sandbox_capabilities:
+      - "read-fs:**"
+  expect:
+    # ro covers {read-fs, exec}; with read-fs alone every other profile
+    # also covers. Tie-break left-to-right → ro wins.
+    sandbox_profile: "ro"
+
+- name: "sandbox select: read+write+exec under cwd → cwd-rw (drops host as last-resort)"
+  setup:
+    # write-fs eliminates ro (which only allows reads). cwd-rw covers
+    # all three kinds; cwd-rw-net / home-rw / host also cover. host is
+    # dropped because alternatives exist (spec §6.5 "host é sempre
+    # último recurso"). Tie-break: cwd-rw wins among non-host.
+    sandbox_capabilities:
+      - "read-fs:src/**"
+      - "write-fs:src/**"
+      - "exec:shell"
+    host_explicitly_allowed: true
+  expect:
+    sandbox_profile: "cwd-rw"
+
+- name: "sandbox select: net-egress promotes to cwd-rw-net"
+  setup:
+    # net-egress NOT in cwd-rw (write-only without net). cwd-rw-net
+    # is the next viable profile after the tie-break order.
+    sandbox_capabilities:
+      - "read-fs:**"
+      - "write-fs:src/**"
+      - "net-egress:github.com"
+  expect:
+    sandbox_profile: "cwd-rw-net"
+
+- name: "sandbox select: secret-access requires home-rw (cwd-rw-net does NOT cover)"
+  setup:
+    # secret-access only appears in home-rw and host's capability
+    # tables. cwd-rw-net covers net-egress but NOT secret-access; tie-
+    # break walks past it. host is gated (no operator flag + no
+    # host-passthrough cap), so home-rw is the only viable option.
+    sandbox_capabilities:
+      - "read-fs:**"
+      - "secret-access:~/.config/forja"
+  expect:
+    sandbox_profile: "home-rw"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group B — Host gate (dual: operator flag AND host-passthrough cap)
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "sandbox select: host eligible (operator flag + host-passthrough cap) → host"
+  setup:
+    # host-passthrough capability is ONLY in host's profile table.
+    # Without the explicit operator flag, host is pruned and nothing
+    # else covers the kind → refuse. With the flag set, host becomes
+    # eligible and is the only viable profile.
+    sandbox_capabilities:
+      - "read-fs:**"
+      - "host-passthrough"
+    host_explicitly_allowed: true
+  expect:
+    sandbox_profile: "host"
+
+- name: "sandbox select: host-passthrough WITHOUT operator flag → no_viable_sandbox"
+  setup:
+    # Same capabilities, but `host_explicitly_allowed` omitted (default
+    # false). host is pruned BEFORE the subset check; no other profile
+    # covers host-passthrough → no candidates → refuse with the
+    # `host-passthrough` kind reported in `uncovered`. Note: read-fs is
+    # also in `uncovered` because the refuse envelope reports EVERY
+    # required kind (per src/permissions/sandbox-plan.ts:151-157, the
+    # refuse path returns `Array.from(requiredKinds).sort()`).
+    sandbox_capabilities:
+      - "read-fs:**"
+      - "host-passthrough"
+  expect:
+    sandbox_refuse: "no_viable_sandbox"
+    # Sorted ascending per the planner's `requiredKinds.sort()`.
+    sandbox_uncovered:
+      - "host-passthrough"
+      - "read-fs"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group C — exec:arbitrary floor (unmodeled binary is never `ro`)
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "sandbox select: exec:arbitrary is floored to cwd-rw (unmodeled binary, never ro)"
+  setup:
+    # An unmodeled binary (go/dotnet/./local-tool) resolves to exec:arbitrary
+    # (+ read-fs:cwd) with NO write-fs. The set {exec, read-fs} alone would
+    # pick `ro` and every legitimate build/codegen write would EROFS. The
+    # exec:arbitrary floor requires write-fs → `ro` is pruned, cwd-rw wins.
+    # (PERMISSION_ENGINE.md §6.5; net-egress posture covered in unit tests.)
+    sandbox_capabilities:
+      - "exec:arbitrary"
+      - "read-fs:."
+  expect:
+    sandbox_profile: "cwd-rw"
+
+- name: "sandbox select: exec:arbitrary + network_allowed + dir_trusted → cwd-rw-net (posture, trusted)"
+  setup:
+    # Coarse operator posture `[sandbox] network = on` (threaded as
+    # network_allowed), in a TRUSTED dir → an unmodeled exec:arbitrary call is
+    # bumped to cwd-rw-net. Egress is an operator axis AND trust-gated: the
+    # posture bump requires BOTH network_allowed AND dir_trusted. (§6.5.)
+    sandbox_capabilities:
+      - "exec:arbitrary"
+      - "read-fs:."
+    network_allowed: true
+    dir_trusted: true
+  expect:
+    sandbox_profile: "cwd-rw-net"
+
+- name: "sandbox select: exec:arbitrary + network_allowed but UNtrusted → cwd-rw (posture egress trust-gated)"
+  setup:
+    # Posture on but the dir is NOT trusted → the bump does not fire → cwd-rw.
+    # A global `network = on` does not grant egress to a build in an untrusted
+    # repo (kills the drive-by exfil vector). (PERMISSION_ENGINE.md §6.5.)
+    sandbox_capabilities:
+      - "exec:arbitrary"
+      - "read-fs:."
+    network_allowed: true
+    dir_trusted: false
+  expect:
+    sandbox_profile: "cwd-rw"
+
+- name: "sandbox select: modeled dep-manager (exec:arbitrary + net-egress) UNtrusted → cwd-rw (egress trust-gated)"
+  setup:
+    # A modeled dep-manager (npm/go/pip) resolves to exec:arbitrary + net-egress.
+    # In an UNtrusted dir the build's egress is dropped → cwd-rw (no network),
+    # killing the clone-and-build exfil vector. (PERMISSION_ENGINE.md §6.5.)
+    sandbox_capabilities:
+      - "exec:arbitrary"
+      - "net-egress:registry.npmjs.org"
+      - "read-fs:."
+    dir_trusted: false
+  expect:
+    sandbox_profile: "cwd-rw"
+
+- name: "sandbox select: modeled dep-manager + dir_trusted → cwd-rw-net (deps fetch, no posture)"
+  setup:
+    # Same caps, but the dir is TRUSTED → net-egress honored → cwd-rw-net.
+    sandbox_capabilities:
+      - "exec:arbitrary"
+      - "net-egress:registry.npmjs.org"
+      - "read-fs:."
+    dir_trusted: true
+  expect:
+    sandbox_profile: "cwd-rw-net"
+
+- name: "sandbox select: net-egress WITHOUT exec:arbitrary (curl/git) is NOT trust-gated → cwd-rw-net"
+  setup:
+    # Plain explicit net (curl/wget/git/scp) emits net-egress but NOT
+    # exec:arbitrary → never reaches the gate → cwd-rw-net even untrusted.
+    # (`ssh host <cmd>` DOES carry exec:arbitrary but marks its egress explicit
+    # — Capability.explicitEgress — so it's also exempt; that flag-level path is
+    # covered by sandbox-plan.test.ts + bootstrap.test.ts, not the string-based
+    # conformance harness.)
+    sandbox_capabilities:
+      - "net-egress:github.com"
+      - "read-fs:."
+    dir_trusted: false
+  expect:
+    sandbox_profile: "cwd-rw-net"

@@ -1,0 +1,8 @@
+# .forja/.gitignore (auto-generated; safe to edit)
+sessions.db
+sessions.db-*
+traces/
+checkpoints/
+memory/local/
+skills/local/
+*.log

@@ -131,7 +131,7 @@ Anthropic com thinking enabled (Opus 4.x) emite `thinking_delta` antes do output
 - **Compaction:** descarta automaticamente (não vai pro summary)
 - **Replay:** re-gera (não-determinístico mesmo com `temperature=0`)
 
-UI: `<ThinkingIndicator>` opcional no rodapé mostra `🧠 thinking... (12s)` durante `thinking_delta` events. Removido quando output começa.
+UI: thinking indicator opcional na status line mostra `thinking... (12s)` durante `thinking:delta` events (ver UI.md §3.2). Some quando output começa.
 
 ### 1.5 Provider error mid-stream
 
@@ -306,13 +306,61 @@ const [out1, out2, out3] = await Promise.all([h1, h2, h3].map(task_await));
 
 Pai vê **só os outputs finais**. History intermediária dos subagents nunca chega ao pai (§11.1 do AGENTIC_CLI.md — contexto isolado).
 
-### 3.5 Budget shared, não pre-aloca
+### 3.5 Budget shared
 
-- Pai tem $5 budget restante
-- Spawna 3 subagents com `task_async`
-- Cada um pode usar até $5 (todo disponível) **competindo**
-- Hit do limite global: subagent ativo recebe sinal de finalizar; novos spawns rejeitam com `budget_exhausted`
-- Audit em `failure_events`
+Cap de cost (`maxCostUsd` do `RunBudget`) é **compartilhado** entre o pai e seus filhos `task_async`. O contrato:
+
+- Pai tem `$cap` total — **único hard cap** que mata um run mid-flight.
+- `priorCostUsd + totalCostUsd` rastreia spend do pai (próprias provider calls + compaction calls)
+- Cada filho settled contribui com seu `costUsd` real ao tracker compartilhado
+- Cada filho **in-flight** contribui com sua **reserva pessimista**: `definition.budget.maxCostUsd` (worst-case declarado pelo playbook)
+- `task_async` pré-checa: se `parentSpend + settledChildCost + reservedChildCost + novaReserva > cap`, refusa com `subagent.budget_exhausted` (`SubagentOutput.reason` em `CONTRACTS.md §2.6.4.1`)
+- Reserva libera quando o filho settla; spend real do filho então conta direto
+- **Operator opt-out:** se o pai tem `maxCostUsd === undefined` (operador desabilitou via `/budget cost off`, ver `AGENTIC_CLI.md §5`), todos os gates desta seção viram no-op — não há cap pra projetar contra. Filhos herdam o mesmo opt-out via snapshot do `audit.budgetMaxCostUsd`. Esta é uma ação deliberada do operador, registrada em audit; o threat model `SECURITY_GUIDELINE.md §1.5` cobre por que não é vulnerabilidade (loop/modelo/repo malicioso não consegue escrever em `baseConfig.budget`).
+
+#### 3.5.0 Per-playbook cap é soft, não hard
+
+O `definition.budget.maxCostUsd` declarado no frontmatter de um playbook (ex: `explain.md` com `max_cost_usd: 1.00`) tem **duas funções distintas** que merecem nomes distintos:
+
+1. **Reserva pessimística pré-spawn** — quanto o pai precisa "guardar" no orçamento global ao admitir esse spawn. Continua hard-load-bearing pra impedir over-commit no momento do spawn (§3.5.1, §3.5.2).
+2. **Sinal de regressão durante execução** — "esse playbook normalmente custa até X; se ele cruzou X, está fora do esperado". Soft, NÃO mata o run.
+
+Quando o filho ativo cruza o **per-playbook cap** mid-run:
+- O harness do filho emite um `HarnessEvent` `cost_soft_cap_warn { threshold, cumulative }` uma vez (idempotent — não re-emite a cada novo cost_update). O evento atravessa o canal IPC `event` (`IPC.md`) e o pai o desembrulha via `subagent_progress.lastEvent`; o `subagentId`/`handleId` é decoração do pai (vem do envelope `subagent_progress`), não viaja dentro do payload do evento.
+- Renderiza no scrollback como aviso ao operador: `subagent <id-prefix> over budget estimate ($X.XX > $Y.YY)` (ou sem prefixo, em runs top-level).
+- O run **continua** até o pai-side hard cap (§3.5.2) ou até o término natural.
+
+Isto é uma mudança consciente vs versões anteriores que matavam o filho com `exhausted/maxCostUsd` quando ele cruzava o per-playbook cap. A motivação: o cap de playbook é estimativa de custo, não SLO. Mata-lo no cruzamento gerava "filho morreu por estourar 30¢ de cap quando o pai tinha $4 disponíveis" — falso positivo que descartava trabalho útil. O global cap continua sendo o gate real, e o pai-side watchdog (§3.5.2) garante que cumulative cruzar global derruba todos os filhos.
+
+**Trade-off honesto:** um playbook com cap declarado bem abaixo do uso real não para mais sozinho — pode consumir até o global cap. Mitigação: soft-cap warn é visível ao operador (não é silenciado) e o pai-side watchdog mantém o teto absoluto. Calibração de caps por playbook continua útil como sinal de regressão, mas não é mais ponto único de falha.
+
+#### 3.5.1 Cost-progress via IPC
+
+O filho emite um `HarnessEvent` `cost_update { delta, cumulative }` após cada provider call (turn settle, compaction, partial provider-error). O canal IPC `event` envelopa o evento; o runtime do pai forward via `subagent_progress.lastEvent`. O `spawnSubagentImpl` no pai intercepta e chama `subagentHandleStore.recordLiveCost(handleId, cumulative)` — que atualiza um campo `liveCostUsd` per-record monotonically (eventos out-of-order não regridem).
+
+A reserva por handle é `max(estimateCostUsd, liveCostUsd)`:
+
+- **Antes do primeiro `cost_update`** (bootstrap window): reserva = `definition.budget.maxCostUsd` (worst-case declarado pelo playbook). Sem isto, três `task_async` concorrentes cada um veria `liveCostUsd = 0` (filhos ainda não reportaram) e o cap seria cruzado antes do primeiro `cost_update` chegar. A janela bootstrap é unavoidable mesmo com IPC: existe um delay físico entre spawn e primeiro provider turn.
+- **Após `cost_update`**: reserva tracks o gasto real. Se filho excede sua própria budget (`liveCostUsd > estimateCostUsd`), a reserva cresce com o real — não é silenciada.
+- **Cancelled** (`cancel`/`cancelAll`): reserva → 0 imediatamente. O record permanece `'running'` até a IIFE settlar, mas `getReservedChildCostUsd` filtra rows com flag `cancelled` para não contar. Eventos `cost_update` em vôo após o cancel são no-op para evitar reativar a reserva.
+- **Settled**: reserva → 0; o cost real (`result.costUsd`) flui para `cumulativeChildCostUsd`.
+
+Reconciliação com `§0` princípio 7 ("Budget é compartilhado, não pre-alocado") e `§12` anti-pattern: o `estimateCostUsd` floor NÃO é pre-alocação no sentido do anti-pattern (que ali se refere a "reservar 1/N do cap por subagent paralelo"). É um **placeholder pessimista de duração curta** (até primeiro `cost_update` arrival, tipicamente milissegundos). Após o primeiro report, o tracker é puro live-shared. A janela bootstrap mantém a invariante "novos spawns não over-committam no momento de issue"; sem ela, a leitura literal "competindo" tem o footgun de over-commit transient documentado acima.
+
+#### 3.5.2 Falhas no cap
+
+A tabela abaixo refere-se ao **global cap** (parent's `maxCostUsd`). O per-playbook cap é soft (§3.5.0) — não aparece aqui.
+
+| Hit | Comportamento |
+|---|---|
+| Pré-spawn projetado > cap | `task_async` (e `task_sync`/dispatcher) retornam `subagent.budget_exhausted`. Reserva soma de in-flight + estimate do novo spawn impede over-commit no momento do spawn. |
+| Filho ativo cruza global cap mid-run (cumulative) | A cada `cost_update` recebido, watchdog em `spawnSubagentImpl` projeta `priorCostUsd + totalCostUsd + cumulativeChildCostUsd + getReservedChildCostUsd()`. Se > cap, dispara `subagentHandleStore.cancelAll()` — todos os filhos ativos recebem hard-signal via per-handle controller, gracefully terminam via interrupt:hard IPC. |
+| Pai self-cost cruza cap | `runAgent.costCapDetailIfExceeded()` finaliza com `maxCostUsd` no próximo turn boundary. Inclui cumulative + reserved ao computar (consistente com pré-spawn gate). |
+| Filho cruza per-playbook cap (soft) | `cost_soft_cap_warn` event emitido uma vez; run continua. Ver §3.5.0. |
+
+#### 3.5.3 Audit
+
+Recusa de spawn com `budget_exhausted` é registrada como tool error normal em `tool_calls`. Não há entry separada em `failure_events` para esse caso (caller pode rastrear via `error_code = 'subagent.budget_exhausted'` em queries de audit).
 
 ### 3.6 Cancel cascading
 
@@ -323,6 +371,127 @@ Pai vê **só os outputs finais**. History intermediária dos subagents nunca ch
 - `task_await` retorna `{ status: 'interrupted', ... }`
 
 Cancel é paralelo (§7).
+
+---
+
+## 3B. Background process lifecycle (persistente + notify + wake)
+
+> **Status:** proposta. Reescreve a semântica operacional de `bash_background` (`AGENTIC_CLI.md §7.3`, `CONTRACTS.md §2.6.5d`). **Cross-refs:** `BgManager` injetável espelha o padrão `todoStore` (`AGENTIC_CLI.md §11` injeção session-scoped); envelope de notificação em `CONTRACTS.md §2.6.5d`; transição `idle → running` por wake em `STATE_MACHINE.md §2.2`/§9; inbox in-memory em `MEMORY.md`; cancellation em §7; limites em §11; flag em `FEATURE_FLAGS.md`.
+
+**Problema.** `bash_background` é uma tool de background que, hoje, **não roda em background de verdade**: o `BgManager` é criado por `runAgent` (por-turn) e seu `cleanup()` mata todos os processos no outer finally de **cada turn**. Um processo "em background" morre quando o turn fecha — o propósito da tool é anulado. Esta seção corrige isso: o processo roda genuinamente em background, sobrevive ao turn, e **notifica o modelo** quando termina, em vez de exigir que ele lembre de pollar com `bash_output`.
+
+Diferença de escopo vs `task_async` (§3): aquilo é paralelismo de **subagents** (LLM filhos) dentro de um turn; isto é o lifecycle de **processos de shell** que atravessam turns. Não há tool nova nem flag de modo — é a `bash_background` cumprindo o que o nome promete.
+
+### 3B.1 Lifecycle cross-turn
+
+O `BgManager` passa de **per-`runAgent`** a **session-scoped**: o REPL constrói um no boot e o injeta em cada turn (mesmo padrão de `todoStore`/`contextPinsStore`). `cleanup()` deixa de rodar no fim do turn — roda só no **exit da sessão**. Um processo vive até um destes:
+
+| Gatilho | Efeito |
+|---|---|
+| Fim **normal** do turn | **sobrevive** — segue rodando |
+| Término natural do processo | settla → notificação (§3B.3) |
+| `bash_kill(process_id)` | SIGTERM → 5s → SIGKILL; settla com `status: killed` |
+| Ctrl+C no turn (interrupt) | **sobrevive** — interrupt do turn não recebe AbortSignal (§7.1, comportamento já existente) |
+| Ctrl+C 3× / exit do agente | `cleanup()` mata os sobreviventes — fim da **sessão/processo** |
+
+Escopo é **cross-turn, não cross-process**: o processo morre com o agente (não é daemon). Isto preserva a filosofia "nada de background cross-session" (`AGENTIC_CLI.md §0`) — a sessão REPL é um único processo; nada sobrevive ao seu exit. Em **one-shot** (`run.ts`, não-REPL) não há próximo turn: o `BgManager` é per-run e `cleanup()` roda no fim, como hoje.
+
+### 3B.2 Output durável e recuperação
+
+Nenhum storage novo: stdout/stderr já vão para **arquivos de log** em disco, com a linha em `background_processes` (SQLite, durável) apontando para eles. `bash_output` lê **direto dos logs**, independente do status — funciona em processo `running`, `exited` ou `killed`. Logo o output é recuperável **cross-turn** e **pós-compaction**, enquanto o modelo tiver o `process_id`.
+
+Para o caso em que o modelo perde o `process_id` (turns depois, compaction), uma tool de listagem `bash_list` (`CONTRACTS.md §2.6.5d`) snapshota os bg da sessão (id, comando, status, exit code, spawn time, label) — o análogo de `task_list` para processos. Read-only.
+
+Caveat herdado: logs muito grandes têm o head descartado (truncate-head); para um processo verboso o início pode se perder, sobra o tail. Não é regressão — é o cap de tamanho atual.
+
+### 3B.3 Notificação na conclusão (canal de notifications)
+
+Quando um processo settla (`exited`/`killed`/`failed`), o REPL empurra **um item num canal de NOTIFICATIONS in-memory — distinto do inbox**. O inbox carrega *intenção do operador* (input enfileirado durante um turn); o canal de notifications carrega *eventos de sistema* que devem alcançar o modelo. Separar os dois mantém responsabilidades distintas e habilita render próprio (§3B.7). O canal é **genérico, discriminado por `kind`**: `bg_done` é o primeiro produtor; a família `reminder` (§3B.9, `CONTRACTS.md §2.6.10`) é o segundo, adicionando o `kind: 'reminder'` sem alterar o canal — cada produtor traz sua própria lógica (o `BgManager` observa exits; o `ReminderScheduler` observa o relógio), o canal só armazena, formata e drena.
+
+Shape do item `bg_done` (`CONTRACTS.md §2.6.5d`):
+
+```
+{ kind: 'bg_done', processId, command, status, exitCode }
+```
+
+- A detecção (`proc.exited`) já existe; o que muda é o **sink**: o evento ia pelo `onEvent` do turn que spawnou (que morre com o turn). Passa pelo canal **session-scoped** que o REPL detém (via o holder do `BgManager`, §3B.1) — vive entre turns.
+- O output completo é recuperável via `bash_output` (`process_id` no item). Inline de um head-tail do output é refinamento, não normativo.
+- O drain faz duas coisas: injeta as notificações como input do turn (§3B.4) **e** as ecoa no scrollback como linha de sistema (`● …`), distinta de uma barra de operador — o operador vê *por que* a sessão acordou.
+
+### 3B.4 Wake-when-idle
+
+Onde a notificação é processada depende do estado da sessão no settle:
+
+- **Turn em curso** → o item fica no canal e drena no **próximo boundary** (o boundary drena o inbox primeiro — precedência do operador — e cai no canal de notifications quando o inbox está vazio). Sem wake.
+- **Sessão `idle`** → **wake**: dispara um turn automático cujo input são as notificações drenadas. Transição em `STATE_MACHINE.md §2.2`: `[idle] --(bg_done ∧ guards)--> [running]`, gatilho `bg_done` (não `user_prompt`).
+
+O auto-wake é o **comportamento default**, protegido por guardas medidas **antes** de disparar (premissa raiz — meça duas vezes); não há flag de gate (as guardas são a proteção):
+
+| Guarda | Regra |
+|---|---|
+| **Coalescing** | o drain esvazia **todas** as notificações pendentes num único wake-turn. Sem timer de debounce: responsividade no caso comum (1 processo) > agrupar um burst espaçado raro, e o cap abaixo já limita a contagem de turns. Um micro-debounce (~100-200ms) é otimização opcional se o burst espaçado virar problema real. |
+| **Budget gate** | wake só com budget remanescente (§8): `cumulative.costUsd ≥ maxCostUsd` → degrada para **semi-push** (notificação espera o próximo input). Nunca estoura cap para avisar. |
+| **Operator-typing gate** | input buffer não-vazio no instante do drain → segura até submit/clear. Não rouba o turno do humano. |
+| **Consecutive-wake cap** | no máximo `max_consecutive_wakes` (default 3) wake-turns sem input do operador entre eles. Atingido → para, aguarda o operador. Resetado em qualquer submit do operador. Backstop anti-loop (complementa §1.6). |
+| **User-submit precedence** | o boundary drena o inbox antes do canal; um submit do operador reseta a cadeia de wakes. O operador sempre vence. |
+
+### 3B.5 Concurrency & cancel
+
+- Limites na matriz §11 (background processes default/cap já existem; o wake-turn herda os limites de turn normais).
+- `bash_kill` reusa o cascade SIGTERM → 5s → SIGKILL.
+- Cancellation (§7.1) inalterada: bg processes não recebem o AbortSignal do interrupt do turn — agora isso é consistente com sobreviverem ao turn (antes a inconsistência era: não recebiam o sinal, mas eram mortos pelo cleanup do finally mesmo assim).
+
+### 3B.6 Comportamento default (sem flags)
+
+- **Persistência + notificação + auto-wake são o comportamento default** — é o conserto do propósito da tool, não um opt-in. Não há flag de gate: o auto-wake é protegido pelas guardas de §3B.4 (typing, budget, cap, precedência do operador), que são a proteção real; um toggle adicional só seria duplicação.
+- Um toggle de transição (reverter ao kill-at-turn-end antigo, ou forçar semi-push em vez de auto-wake) fica **deferido** — adicionável como flag se demanda real aparecer, mas não normativo. O backstop de `max_consecutive_wakes` cobre o medo principal (turns disparando sozinhos sem fim).
+
+### 3B.7 UI
+
+- Async em vôo aparece em **dois chips distintos** do footer (`UI.md §4.10.6`), por fonte: `N bash bg` (processos `bash_background`, `state.bgProcesses`) e `N subagents` (subagentes em vôo, `state.subagents`). Ambos verdes, suprimidos em 0.
+- O **wake-turn** ecoa cada notificação drenada como uma **linha de sistema** no scrollback (`● <texto da notificação>`, tom secundário), distinta de uma barra de submit do operador — o operador vê *por que* a sessão acordou e sobre o que é o turn. (Um head-tail do output inline na notificação é refinamento.)
+
+### 3B.8 Anti-patterns
+
+| Anti-pattern | Por quê ruim |
+|---|---|
+| Tratar `bash_background` como within-turn (esperar que morra no fim do turn) | Agora persiste; um processo esquecido vive até o exit da sessão. Use `bash_kill` quando não precisar mais. |
+| Auto-wake sem budget gate | Queima cap só para avisar; wake degrada para semi-push quando exausto (§3B.4). |
+| Pollar `bash_output` em loop quando a notificação resolveria | A notificação na conclusão é o mecanismo push; o poll é para inspeção mid-run. |
+
+**Eval acoplado:** `evals/bg/persistent_notify_wake/` — lança um bg de duração conhecida, fecha o turn, verifica que (a) o processo sobrevive ao boundary, (b) `bash_output` recupera o output depois, (c) a notificação aterrissa no inbox, (d) o wake dispara quando idle, (e) as guardas seguram (budget exausto → semi-push; burst → coalescing; cap de wakes para o loop).
+
+### 3B.9 Produtor #2 — reminders (observa o relógio)
+
+O canal de §3B.3 foi desenhado genérico; o `reminder` é o segundo produtor sem nenhuma mudança na mecânica de enqueue/drain/wake/guardas. ADR e reconciliação com o princípio guia ("meta-cognição não é tool") em `CONTRACTS.md §2.6.10`; catálogo em `CONTRACTS.md §2.6.5f`.
+
+**O produtor.** Um `ReminderScheduler` **in-memory, session-scoped** — mesma natureza e ciclo de vida do `BgManager` (§3B.1) e do inbox: criado pelo REPL, morre no `cleanup()` do exit da sessão. **Não** precisa do padrão *holder* do `BgManager`: o scheduler não depende do `sessionId` (não escreve em SQLite — não há storage novo, §0/§13 preservados), então o REPL o constrói direto no boot e injeta em cada turn como o `todoStore`.
+
+**Disponibilidade — só o REPL interativo.** A família `reminder` depende do scheduler + wake-when-idle, que **só** o REPL tem. Quando o scheduler é ausente, as tools são **escondidas do surface do modelo** (`buildToolDefs` filtra `requiresReminderScheduler` quando `config.reminderScheduler` é `undefined`, espelhando o gate de `requiresOperatorConfirm`) — não basta retornar tool-error, o modelo não deve ver uma tool que não pode usar. Dois contextos sem scheduler:
+
+- **one-shot** (`run.ts`): sem próximo turn, um reminder nunca dispararia. Tools escondidas.
+- **subagent**: sessão headless *run-to-completion*, sem estado idle para acordar. Tools escondidas do filho **e** barradas no `validate` (`requiresReminderScheduler` é o 4º check — um whitelist que liste reminder falha no bootstrap com mensagem clara). Distinto de `bash_background`, que um subagent *worktree* pode usar (roda dentro do próprio run do filho, sem precisar de wake).
+
+**Disparo.** `reminder({ in, note })` agenda um `setTimeout(delay)`. Ao disparar, o scheduler empurra no canal:
+
+```
+{ kind: 'reminder', note, scheduledAt }
+```
+
+A partir daí é idêntico ao `bg_done`: **idle → wake** (dispara um turn cujo input é a `note`, como linha de sistema `● [reminder] <note>` no scrollback, §3B.7); **turn em curso → semi-push** (drena no próximo boundary). Todas as guardas de §3B.4 valem sem adição — typing-gate, budget-gate, consecutive-wake cap, precedência do operador. O input do wake-turn persiste com `source: 'system'` (migration 075), não como input do operador.
+
+**Constraints normativas** (espelham `CONTRACTS.md §2.6.10`):
+
+| Constraint | Regra |
+|---|---|
+| **Escopo** | in-memory, session-scoped. Sem persistência cross-session (§0). Reminder com horizonte > vida da sessão não dispara — aceito. |
+| **Tempo** | só delay relativo (`in`); condicional é `wait_for` (retirado), não reintroduzir. |
+| **Cap de horizonte** | default 24h. Obrigatório: `setTimeout` > 2³¹ ms dispara imediatamente — o cap fica bem abaixo. |
+| **Cancel/list** | `reminder_cancel` faz `clearTimeout`+remove (idempotente); `reminder_list` snapshota os pendentes (recupera `reminder_id` perdido por compaction). |
+
+**Transição.** O wake de §3B.4 agora dispara por `bg_done ∨ reminder_fired` (`STATE_MACHINE.md §2.2`).
+
+**Eval acoplado:** `evals/reminders/` — agenda um reminder curto, fecha o turn, verifica (a) dispara no horizonte, (b) wake quando idle, (c) semi-push quando busy, (d) `reminder_cancel` desmarca antes do disparo, (e) `cleanup()` no exit não vaza timer pendente.
 
 ---
 
@@ -543,7 +712,7 @@ if critique.mode applicable to this step:
     Filter por threshold (default 0.7)
       ↓
     if issues filtered:
-        Show <CritiqueOverlay>
+        Emit `critique:ask` (modal pattern, UI.md §5.5)
         User: ignore | redo | abort
           ↓
         if ignore: persist buffer → context (registra `critique.warning_ignored`)
@@ -679,7 +848,7 @@ Tudo compete pelo budget remanescente.
 |---|---|
 | Hard cap (`max_cost_usd`) | step ativo recebe sinal de finalizar; novos spawns rejeitados; sessão eventualmente marca `exhausted` |
 | Soft warning (90%) | UI alerta; user pode `/budget extend $N` |
-| `max_steps` hit | sessão imediatamente `exhausted` no fim do step atual |
+| `max_steps` hit | **synthesis turn** final (1 provider call, SEM tools) produz o output com o que já foi coletado; então `exhausted` no fim do step. Pulado se o último turno já emitiu texto não-vazio, ou se `max_cost_usd` também estourou (sem budget pro call). Ver `STATE_MACHINE.md §2.2`. |
 | `max_wall_clock_ms` hit | `interrupt_signal` paralelo; cleanup |
 
 ### 8.3 Subagent vs pai

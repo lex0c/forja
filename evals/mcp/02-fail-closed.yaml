@@ -1,0 +1,23 @@
+name: mcp server fails closed headless (no auto-approve)
+# A server declared in mcp.toml but NOT auto-approved (no setup.mcp). A headless
+# run has no trust confirmer, so the server is denied pre-connect and its tools
+# never register — the model cannot call `echo`. Proves --auto-approve-mcp is
+# required for headless MCP trust (the command is never spawned; the deny is
+# pre-connect). `evaluates: harness` keeps it out of the model ranking (it pins a
+# harness property, not model competence) while CI still runs it.
+evaluates: harness
+prompt: |
+  If an "echo" tool is available, call it to echo 'hello'. If no such tool exists,
+  reply with exactly: NO_ECHO_TOOL
+setup:
+  files:
+    .forja/mcp.toml: |
+      [servers.fixture]
+      transport = "stdio"
+      command = ["mcp-eval", "fixture"]
+      surface = "base"
+expect:
+  - tool_not_called: mcp__fixture__echo
+  - status: done
+budget:
+  maxSteps: 4

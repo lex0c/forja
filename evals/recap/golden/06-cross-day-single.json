@@ -1,0 +1,76 @@
+{
+  "schemaVersion": "v1",
+  "generatedAt": 1777680000000,
+  "scope": {
+    "kind": "day",
+    "sessionIds": [
+      "a6000001-0000-0000-0000-000000000000",
+      "a6000002-0000-0000-0000-000000000000"
+    ],
+    "range": {
+      "start": 1777593600000,
+      "end": 1777680000000
+    }
+  },
+  "completeness": {
+    "incomplete": false,
+    "incompleteSessions": [],
+    "incompleteReason": ""
+  },
+  "goal": {
+    "text": "morning task: review changes",
+    "sourceStepId": "a6000100-0000-0000-0000-000000000000"
+  },
+  "goalStack": [],
+  "decisions": [],
+  "pinnedContext": [],
+  "actions": {
+    "filesRead": [],
+    "filesWritten": [],
+    "commandsRun": [],
+    "webFetches": [],
+    "subagentsSpawned": []
+  },
+  "outcomes": {
+    "testsRun": [],
+    "checkpoints": [],
+    "artifacts": []
+  },
+  "timeline": [
+    {
+      "ts": 1777626000000,
+      "event": "session_start",
+      "detail": "a6000001-0000-0000-0000-000000000000"
+    },
+    {
+      "ts": 1777626005000,
+      "event": "session_end",
+      "detail": "a6000001-0000-0000-0000-000000000000 (done)"
+    },
+    {
+      "ts": 1777647600000,
+      "event": "session_start",
+      "detail": "a6000002-0000-0000-0000-000000000000"
+    },
+    {
+      "ts": 1777647604000,
+      "event": "session_end",
+      "detail": "a6000002-0000-0000-0000-000000000000 (done)"
+    }
+  ],
+  "costs": {
+    "tokens": {
+      "in": 1500,
+      "out": 90,
+      "cached": 1100
+    },
+    "usd": 0.0031999999999999997,
+    "durationMs": 9000,
+    "model": "sonnet-4-6",
+    "cacheHitRatio": 0.4230769230769231
+  },
+  "errors": [],
+  "notDone": [],
+  "unresolvedQuestions": [],
+  "memoryProposed": []
+}

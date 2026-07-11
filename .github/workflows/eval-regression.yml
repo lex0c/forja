@@ -1,0 +1,98 @@
+# Eval — regression corpus
+#
+# Runs `evals/regression/` against a real provider. **Opt-in only**
+# (manual `workflow_dispatch` or PR labeled `run-eval`) — provider
+# calls cost real money and the corpus is dozens of cases; per-PR
+# auto-run is not justifiable today. The corpus exists to gate
+# system-prompt changes per `CONTEXT_TUNING §1.8.5` step 2; this
+# workflow is the CI hook.
+#
+# Default model is `anthropic/claude-haiku-4-5`. First-run baseline
+# comparison (BACKLOG entry on 2026-05-23) showed haiku and opus-4-7
+# reach the same headline pass rate (40/47, ~85%) but with a
+# DIFFERENT failure composition: opus parallelizes tool calls more
+# aggressively (breaks compaction cases that assume serial reads)
+# while haiku is weaker on multi-step reasoning (breaks cases 45/46/47
+# from slice B). Haiku is ~6× cheaper per run ($0.42 vs $2.42) and
+# ~25% faster (~4min vs ~5:41), which is the right default for an
+# opt-in gate that may run on many PRs. Operators wanting higher
+# fidelity can override via `workflow_dispatch` input — opus is the
+# closest match to the local interactive default pinned in
+# `.forja/config.toml`.
+#
+# The runner's own exit code is the gate: `src/evals/cli.ts`
+# returns 1 when any case fails, 0 when all pass — GitHub surfaces
+# the failure on the PR check.
+#
+# Baseline-comparison (slice C.2) and drift detection — "warn when
+# `prompt_versions` gained a new hash without a recent eval"
+# (slice C.3) — are not in this workflow yet. Today's gate is
+# binary: every case in the corpus must pass at HEAD's prompt.
+
+name: Eval — regression corpus
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'Provider/model to evaluate against (e.g. anthropic/claude-opus-4-7 for higher fidelity)'
+        required: false
+        default: 'anthropic/claude-haiku-4-5'
+  pull_request:
+    # Only fires when a PR receives the `run-eval` label — the
+    # `if` on the job filters everything else out.
+    types: [labeled]
+
+concurrency:
+  group: eval-regression-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    # Skip the labeled-PR branch unless the trigger label is
+    # `run-eval`; workflow_dispatch always runs.
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'run-eval'
+    name: regression corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Provider key, supplied as a repo / org secret. Absence is a
+      # hard fail — the runner cannot proceed without it, and CI
+      # silently passing while no provider was reached would defeat
+      # the gate.
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.3.13
+
+      - name: Install ripgrep
+        # The `grep` tool wraps `rg`; some eval cases depend on it.
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
+      - name: Install deps
+        run: bun install --frozen-lockfile
+
+      - name: Verify provider secret is present
+        # Fork PRs cannot read repo secrets (GH security model);
+        # absent / misconfigured secrets would otherwise surface as
+        # ~50 per-case 401s instead of an actionable "secret missing"
+        # diagnostic. Fail loudly at the workflow level instead.
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::ANTHROPIC_API_KEY is unavailable (fork PR? secret not configured on this repo?)"
+            exit 1
+          fi
+
+      - name: Run regression eval
+        # `MODEL` is assigned via `env:` so the value is read as a
+        # shell variable, not interpolated raw into the command line
+        # — defends against an operator (workflow_dispatch) supplying
+        # a model string with shell metacharacters. The fallback
+        # string handles the labeled-PR path (no `inputs`).
+        env:
+          MODEL: ${{ inputs.model || 'anthropic/claude-haiku-4-5' }}
+        run: bun run eval:regression -- --model "$MODEL"

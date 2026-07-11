@@ -25,20 +25,28 @@ Sem audit consolidado, "compliance" e "debug forense" viram intenção sem entre
 
 ## 1. Tables canônicas
 
-Lista canônica das **18 tabelas de audit**, com escopo, retention, sensitivity, e regra de redaction.
+Lista canônica das **28 tabelas de audit**, com escopo, retention, sensitivity, e regra de redaction.
 
 | Tabela | Escopo | Retention default | Sensitivity | Redaction |
 |---|---|---|---|---|
 | `sessions` | metadata de sessão | 90d | low | path → `~/...` |
 | `messages` | conversation history | 90d | **high** (PII potential) | full redaction (secrets, paths) |
 | `tool_calls` | invocações de tool | 90d | **high** (args + output) | full redaction |
-| `approvals` | decisões permission | 365d | medium | nenhuma (decision-level apenas) |
+| `approvals` | decisões permission (v1) | 365d | medium | nenhuma (decision-level apenas) |
+| `approvals_log` | ledger hash-chained de decisões (v2, §7.1; install-scoped) | 365d | medium | nenhuma (`args_hash` em vez de args; capabilities + reason_chain em JSON) |
 | `hook_runs` | execução de hooks | 90d | medium | redact stdout |
-| `failure_events` | falhas classificadas | 365d | medium | redact `details` |
+| `failure_events` | falhas classificadas (FAILURE_MODES §19; chain per-session §4.2) | 365d | medium | redact `payload_json` |
+| `outcome_signals` | sinais derivados (`tool_error`, `failure_event`, `checkpoint_reverted`, `session_aborted`) ligados a `approvals_log.seq` — input pra calibração §6.3.2 | per-kind (ver §1.2) | medium | redact `payload_json` |
+| `outcomes` | outcomes operacionais cross-substrato (tier 1-5, `action_signature`, `scope_kind`) — input pra loop frio de adaptação (FEEDBACK_ADAPTATION §3.1) | 90d default | medium | redact `evidence_json` |
+| `eviction_events` | transições de lifecycle (proposed/active/shadow/quarantined/invalidated/evicted/purged) cross-substrato (EVICTION §10.1) | 365d | medium | redact `evidence_json` |
+| `policies` | policies adaptadas commit-like (id, parent, scope, state) — produzidas pelo loop frio (FEEDBACK_ADAPTATION §3.2) | **forever** (no auto-cleanup) | low | nenhuma (conteúdo é a policy) |
+| `retrieval_trace` | trace per-query do pipeline `candidates → expansion → ranking → compression` (RETRIEVAL §10.1) | 90d | medium | redact attrs com path/conteúdo |
+| `context_pins` | pinned context per-sessão (constraint/workflow/invariant/reminder) — re-injetado em goal/compaction/auto-rehydrate (CONTEXT_TUNING §12.4.2) | 90d (cascade com sessions) | low | nenhuma (texto curto, ≤500 chars) |
 | `memory_events` | memory ops | 365d | low (action+name only; sem body) | nenhuma |
 | `recap_runs` | recap executions | 90d | low | nenhuma |
 | `checkpoints` | FS snapshots metadata | 30d | low | path → `~/...` |
 | `subagent_outputs` | subagent results | 90d | medium | full redaction em `payload` |
+| `subagent_processes` | subagent subprocess lifecycle (ver §1.7) | 90d (cascade com sessions) | low | nenhuma (só metadata OS) |
 | `pending_decisions` | modal state | 7d (transient) | low | nenhuma |
 | `recap_cache` | rendered recaps | 1h TTL | medium | nenhuma (output já passou por redaction) |
 | `background_processes` | bg processes metadata | 30d | low | redact `cmd` |
@@ -49,12 +57,30 @@ Lista canônica das **18 tabelas de audit**, com escopo, retention, sensitivity,
 | `feature_flags_active` | flags ativas per-sessão (ver §1.6) | 90d (cascade com sessions) | low | nenhuma |
 | `traces` (NDJSON) | OTEL spans | 90d | medium | redact attrs |
 | `redaction_events` | NEW — audit de redactions | 365d | low | nenhuma (sem o conteúdo redacted) |
+| `purge_events` | invocações de `agent purge --force` (`AGENTIC_CLI.md §2.1.2`); install-scoped, project-keyed | 365d | low | nenhuma (paths já fora do projeto purgado, apenas metadata de FS) |
 
 ### 1.1 Sensitivity levels
 
 - **low**: metadata operacional; sem PII esperada
 - **medium**: pode conter info sensível em payload; redaction parcial
 - **high**: alta probabilidade de PII/secrets; redaction obrigatória completa
+
+#### 1.1.1 `outcome_signals` × `outcomes` — coexistência declarada
+
+As duas tabelas registram **outcomes de ações**, mas vivem em níveis arquiteturais distintos. Coexistem por design; não unificar é decisão consciente.
+
+| | `outcome_signals` | `outcomes` |
+|---|---|---|
+| Owner | `PERMISSION_ENGINE.md §6.3.2` | `FEEDBACK_ADAPTATION.md §3.1` |
+| Escopo | calibração do permission engine | adaptação operacional cross-substrato |
+| Integridade | derived-audit (FK lógica via `approvals_log.seq`; sem chain própria — `§4.2.3`) | append-only convention `§4.1`; sem hash chain própria |
+| Schema | `signal_kind` enumerado (`tool_error`, `failure_event`, `checkpoint_reverted`, `session_aborted`) | `tier` (1-5) + `action_signature` (L1-L4) + `scope_kind` (session/repo/user/language/global) |
+| Granularidade | per-approval | per-action genérica |
+| Consumidor | composite harmful score (`PERMISSION_ENGINE §6.3.2`) | bayesian update no loop frio (`FEEDBACK_ADAPTATION §3.2`) |
+
+Caller que registra sinal de permission deve emitir **apenas** em `outcome_signals`. Caller que registra outcome operacional genérico (não-permission) emite **apenas** em `outcomes`. Não há dual-write — duplicaria estado sem ganho.
+
+Cross-ref: queries que precisam combinar dimensões (ex.: "policy adaptada degradou taxa de aprovação?") fazem JOIN explícito via `session_id` ou `tool_call_id`, não via reificação intermediária.
 
 ### 1.2 Retention configurável
 
@@ -64,15 +90,36 @@ Lista canônica das **18 tabelas de audit**, com escopo, retention, sensitivity,
 default_days = 90
 sessions = 90
 messages = 90
-approvals = 365         # compliance
+approvals = 365              # compliance
+approvals_log = 365           # v2 hash-chained ledger
 failure_events = 365
+outcome_signals = "per-kind"  # ver §1.2.1
+outcomes = 90                 # FEEDBACK_ADAPTATION §3.1 (default; override per-scope possível)
+eviction_events = 365         # EVICTION §10.1
+policies = "forever"          # FEEDBACK_ADAPTATION §3.2 (commit-like; nunca limpar)
+retrieval_trace = 90          # RETRIEVAL §10.1
+context_pins = 90             # CONTEXT_TUNING §12.4 (cascade com sessions)
 memory_events = 365
-recap_cache = "1h"      # TTL especial
+recap_cache = "1h"            # TTL especial
 pending_decisions = 7
 prompt_versions = "forever"   # nunca limpar; rastreabilidade load-bearing
+purge_events = 365            # AGENTIC_CLI §2.1.2 (par com approvals_log)
 ```
 
 Cleanup via cron user-side (`agent gc`) ou hook `Stop` (configurable).
+
+#### 1.2.1 Retention per-kind para `outcome_signals`
+
+`outcome_signals.ttl_expires_at` é per-row, não table-wide. Cada `signal_kind` carrega TTL próprio em `DEFAULT_SIGNAL_TTL_DAYS`:
+
+| `signal_kind` | TTL default | Rationale |
+|---|---|---|
+| `tool_error` | 365d | Sinal fraco (0.30); padrão §1.2. |
+| `failure_event` | 365d | Sinal médio (0.50); padrão §1.2. |
+| `checkpoint_reverted` | **730d** | Sinal forte (0.90) — operator `--undo` é o proxy mais valioso pra calibração §6.3.2. Janela maior permite regressões anuais comparando `baseline-v2.0` vs `v2.1` derivado. |
+| `session_aborted` | 365d | Sinal fraco (0.20); padrão §1.2. |
+
+`agent gc` filtra via `WHERE ttl_expires_at < now()` (não via tabela inteira). Override per-row possível via `EmitOutcomeSignalInput.ttl_days` quando calibration sweep precisa de janela alternativa.
 
 ### 1.3 Prompt versioning (`prompt_versions`)
 
@@ -285,7 +332,7 @@ A última query é o **gatilho de reconsideração** declarado em `CONTRACTS.md 
 
 #### 1.4.7 Limites
 
-- **Não captura "intent" do modelo, só o que ele declarou.** Plano implícito (sem checklist) fica invisível. Aceitável: mesma limitação de Claude Code com `todo_write` opcional.
+- **Não captura "intent" do modelo, só o que ele declarou.** Plano implícito (sem checklist) fica invisível. Aceitável: mesma limitação de qualquer agente com `todo_write` opcional.
 - **Parser confidence é heurística.** False positives (UI list markdown que não é todo) são possíveis; mitigado por contexto (parser só ativa em respostas pós-prompt do tipo "plan", "list steps", ou explicit slash command).
 - **Modelos locais podem ter alta `fail_rate`.** Se inviável em `LOCAL_MODELS.md`, profile `orchestrated` pode promover `todo_write` a tool **só nesse profile**. Decisão deferida pra v1.1.
 
@@ -295,11 +342,14 @@ Cobre o ponto cego de auditabilidade de MCP — antes deste schema, trust histor
 
 #### 1.5.1 Schema — `mcp_servers`
 
-Estado **atual** de cada server em config (1 row per `<name>`).
+Estado **atual** de cada server em config (1 row per `(scope, name)`).
+
+`scope` isola a linha **por projeto**. `sessions.db` é user-global, mas a config MCP de projeto é per-repo, então o mesmo `<name>` (`db`, `postgres`) definido em repos diferentes precisa de linhas distintas — senão aprovar o server de um repo sobrescreve a identidade + o cached-trust do outro (o `<name>` como chave global colide). `scope` = **project root** do repo (`project_shared` / `project_local`); `''` (sentinela global) pra servers `user`, que são compartilhados entre repos de propósito. `(scope, name)` é a identidade real.
 
 ```sql
 CREATE TABLE mcp_servers (
-  name TEXT PRIMARY KEY,                 -- ex: "postgres"
+  scope TEXT NOT NULL DEFAULT '',        -- project root (project servers) | '' (user, global)
+  name TEXT NOT NULL,                    -- ex: "postgres"
   transport TEXT NOT NULL CHECK (transport IN ('stdio','sse','http')),
   command TEXT,                          -- JSON array, stdio only; redacted env values
   url TEXT,                              -- SSE/HTTP only
@@ -315,13 +365,14 @@ CREATE TABLE mcp_servers (
   last_error TEXT,                       -- last failure reason, classed
   total_calls INTEGER NOT NULL DEFAULT 0,
   total_tokens_in INTEGER NOT NULL DEFAULT 0,
-  audit_schema_version INTEGER NOT NULL DEFAULT 1
+  audit_schema_version INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (scope, name)
 );
 ```
 
-Sensitivity: **low**. Redaction: env values em `command` substituídos por `${VAR_NAME}` antes de persistir; URL em `url` é literal (esperado público). Retention: enquanto server estiver em config; remoção de config → row removida no próximo `agent gc` (excepcional pra audit table; razão: estado, não history).
+Sensitivity: **low**. Redaction: env values em `command` substituídos por `${VAR_NAME}` antes de persistir; URL em `url` é literal (esperado público). `scope` é um path de projeto local (mesma classe que o `cwd` já embutido em `command`). Retention: enquanto server estiver em config; remoção de config → row removida no próximo `agent gc` (excepcional pra audit table; razão: estado, não history). O sweep é **scope-aware**: remove só órfãos cujo `scope` pertence à invocação atual (o repo corrente + o global `''`), nunca linhas de outro repo.
 
-UPDATE permitido em: `state`, `current_manifest_hash`, `last_connected_at`, `last_error`, contadores. **Imutável**: `name`, `transport`, `command`, `url`, `source`. Mudança de transport ou command = remove + insert.
+UPDATE permitido em: `state`, `current_manifest_hash`, `last_connected_at`, `last_error`, contadores. **Imutável**: `scope`, `name`, `transport`, `command`, `url`, `source`. Mudança de transport ou command = remove + insert.
 
 #### 1.5.2 Schema — `mcp_manifest_history`
 
@@ -330,9 +381,10 @@ History de manifests. **Append-only, forever retention** (igual a `prompt_versio
 ```sql
 CREATE TABLE mcp_manifest_history (
   id INTEGER PRIMARY KEY,
+  scope TEXT NOT NULL DEFAULT '',        -- mesmo scope de mcp_servers (per-repo | '' global)
   server_name TEXT NOT NULL,
   hash TEXT NOT NULL,
-  previous_hash TEXT,                    -- hash imediatamente anterior pra esse server
+  previous_hash TEXT,                    -- hash imediatamente anterior pra esse (scope, server)
   manifest_json TEXT NOT NULL,           -- conteúdo canonical
   protocol_version TEXT NOT NULL,
   server_version TEXT,
@@ -344,10 +396,10 @@ CREATE TABLE mcp_manifest_history (
 );
 
 CREATE UNIQUE INDEX idx_mcp_manifest_unique
-  ON mcp_manifest_history(server_name, hash);
+  ON mcp_manifest_history(scope, server_name, hash);
 
 CREATE INDEX idx_mcp_manifest_decided
-  ON mcp_manifest_history(server_name, decided_at DESC);
+  ON mcp_manifest_history(scope, server_name, decided_at DESC);
 ```
 
 Sensitivity: **low**. Redaction: nenhuma (manifest é spec, não dado de usuário; mesmo princípio de `prompt_versions`).
@@ -365,7 +417,7 @@ para cada server em config (mcp.toml):
    ▼ initialize + tools/list
    ▼ hash = SHA256(canonical(manifest))
    │
-   ▼ SELECT current_manifest_hash FROM mcp_servers WHERE name=?
+   ▼ SELECT current_manifest_hash FROM mcp_servers WHERE scope=? AND name=?
    │
    ├─── match: state ← 'trusted' (skip prompt)
    │
@@ -387,7 +439,8 @@ Trigger restritivo:
 
 ```sql
 CREATE TRIGGER mcp_servers_immutable_keys BEFORE UPDATE ON mcp_servers
-WHEN OLD.name != NEW.name
+WHEN OLD.scope != NEW.scope
+  OR OLD.name != NEW.name
   OR OLD.transport != NEW.transport
   OR (OLD.command IS NOT NULL AND OLD.command != NEW.command)
   OR (OLD.url IS NOT NULL AND OLD.url != NEW.url)
@@ -425,7 +478,9 @@ WHERE s.last_connected_at > unixepoch('now', '-30 days')
 ORDER BY s.total_calls DESC;
 
 -- "Manifest history de um server específico"
-SELECT decided_at, decision, hash, previous_hash, decided_by
+-- `scope` distingue o mesmo <name> entre repos; omita o filtro de scope pra ver
+-- o histórico cross-repo, ou fixe um scope pra um projeto específico.
+SELECT scope, decided_at, decision, hash, previous_hash, decided_by
 FROM mcp_manifest_history
 WHERE server_name = 'postgres'
 ORDER BY decided_at DESC;
@@ -477,7 +532,7 @@ Permite query: "quando esse server estava nesse manifest, quais tools foram cham
 
 - **Server-side audit não captura.** O que o server faz internamente (queries SQL, FS reads) é problema do server, não do harness. Audit cobre interface, não implementação.
 - **Hash de manifest, não de comportamento.** Server pode ter mesmo manifest mas comportamento diferente (mudou implementação interna). Trust é em manifest, não em binary; documented.
-- **`source` do server pode mudar entre sessões.** Mesmo `<name>` aparecendo em fontes diferentes (user → project → local) não é detectado como event; rastrear via git/config diff.
+- **`source` do server pode mudar entre sessões, dentro do mesmo `scope`.** Um `<name>` que troca de camada de config no MESMO projeto (`project_shared` ↔ `project_local`) reusa a linha (mesmo `scope`) e não é detectado como event; rastrear via git/config diff. O mesmo `<name>` em **repos diferentes** já é linha distinta (via `scope`), então não colide. Um `<name>` que migra entre `user` (`scope=''`) e um projeto (`scope=<repo>`) é linha distinta — a identidade é re-confirmada pelo trust gate.
 - **Sem audit de `prompts/get` ou `resources/read`.** v1 só consome `tools/*` (ver `MCP.md §11`).
 
 ### 1.6 Feature flags ativas (`feature_flags_active`)
@@ -603,6 +658,73 @@ ORDER BY days_old DESC;
 - **State flags imutáveis durante sessão** (`profile`, `mcp_servers.state`) — gravados em outras tabelas; `feature_flags_active` reflete só user-controlled toggles.
 - **Sem versionamento de registry.** Se `experimental` → `staged` muda mid-session, `feature_flags_active` não captura — `set_by` registra origem, não stage histórico.
 - **Cleanup cascateia com sessão.** Sessão deletada por retention (`§1.2`) leva flags junto. Para análise long-term, agregação periódica em tabela separada (`flag_metrics`) é v2.
+
+### 1.7 Subagent subprocess lifecycle (`subagent_processes`)
+
+End-to-end audit do **OS-level** subprocess de cada subagent. Complementa `subagent_outputs` (resultado estruturado que o filho publica) e `subagent_runs` (metadata da decisão de spawn): cobre o que aconteceu **com o processo** em si.
+
+#### 1.7.1 Motivação
+
+Sem essa tabela, "subagent X falhou" como query forense quica entre `stderr.log` no disco + especulação. Especificamente:
+
+- Filho que crasha **antes** do primeiro IPC (segfault no boot, ENOENT do binário, OOM antes do harness inicializar): `subagent_outputs` fica com `payload IS NULL`, sem cause label.
+- Filho killed por signal externo (OOM-killer, operador `kill -9`): exit code 137 (ou similar) sem distinção entre "OS matou" e "pai matou".
+- Operador que quer correlacionar com ferramentas externas (`ps`, `top`, profiler): pid não está em lugar nenhum no audit.
+
+#### 1.7.2 Schema
+
+Migração `029-subagent-processes`:
+
+```sql
+CREATE TABLE subagent_processes (
+  session_id        TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  parent_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+  pid               INTEGER NOT NULL,
+  argv_hash         TEXT NOT NULL,         -- SHA256(cmd.join('\0'))
+  spawned_at        INTEGER NOT NULL,
+  exited_at         INTEGER,               -- nullable enquanto vivo
+  exit_code         INTEGER,               -- nullable em signal-exit (POSIX)
+  exit_signal       TEXT,                  -- 'SIGTERM' | 'SIGSEGV' | ...
+  stderr_log_path   TEXT,                  -- nullable se bgLogDir undefined
+  ipc_handshake_ok  INTEGER NOT NULL DEFAULT 0,  -- 0|1
+  exit_reason       TEXT                   -- categórico (§1.7.4)
+);
+```
+
+`argv_hash` é fingerprint da **config efetiva**, não do invocation. Calculado em `runtime.ts:computeArgvHash` como SHA256 sobre o argv com pares `(--subagent-session-id, <id>)` e `(--subagent-bg-log-dir, <path>)` removidos — esses dois variam por spawn (UUID fresco a cada chamada; bg-log-dir embute o mesmo UUID no path) e sem o filtro o hash seria único por invocation, inutilizável como sinal de regressão cross-run. Os outros flags forwardados (`--subagent-depth`, `--subagent-temperature`, `--subagent-plan-mode`, `--subagent-cwd-trusted`, `--subagent-memory-cwd`, `--ipc=N`) ARE config e ficam no hash. Reproducibilidade ("este filho rodou com os mesmos flags do anterior?") via comparação de hashes; reconstrução literal não é objetivo (paths/tokens em argv não viram audit).
+
+#### 1.7.3 Lifecycle (two-phase write)
+
+| Fase | Caller | Tipo | Trigger |
+|---|---|---|---|
+| 1. INSERT | `runtime.ts:5a-bis` | `recordProcessSpawn` | logo após `Bun.spawn` retornar pid |
+| 1.5. UPDATE (idempotent) | `runtime.ts` IPC handshake | `markIpcHandshakeOk` | primeiro `session_start` válido sobre IPC |
+| 2. UPDATE | `runtime.ts` exit handler | `recordProcessExit` | `proc.exited` resolve |
+
+Spawn falha (ENOENT, EACCES, out-of-fds) **não** produz linha aqui — sem pid não há row. Esses casos seguem o caminho normal via `subagent_outputs` com `reason='subprocess_spawn_failed'`. A tabela é "processos que efetivamente rodaram".
+
+Tests que injetam fake `spawnChildProcess` (sem pid/cmd reais) skip o audit write — guard `if (handle.pid !== undefined && handle.cmd !== undefined)`. Documentado para que regressões que tentem stamp sem pid surfaçam como falha de teste.
+
+#### 1.7.4 Categorias de `exit_reason`
+
+Computed no exit handler, em ordem de precedência:
+
+| Reason | Condição | Significado |
+|---|---|---|
+| `parent_aborted` | `input.signal.aborted` (caller cancelou) | Operador deu Ctrl-C ou SDK chamou abort. Precedência sobre signal/code porque captura intenção, não mecanismo. |
+| `killed` | exit signal presente AND `parentInitiatedKill === true` | Pai chamou `handle.kill()` (wall-clock graceful, protocol mismatch, hard abort). |
+| `signal` | exit signal presente AND `parentInitiatedKill === false` | OS-killed sem ação do pai (SIGSEGV, OOM-killer, `kill -9` externo). |
+| `normal` | exit code 0, sem signal | Saída limpa. |
+| `crash` | exit code ≠ 0, sem signal | Filho saiu por conta própria com erro. |
+| `unknown` | reservado | Não emitido pelo classifier atual; reservado para shapes futuros. |
+
+`parentInitiatedKill` é tracked via shim em `handle.kill` no runtime — toda chamada (this-file + wait-loop) flipa o flag pelo reference compartilhado.
+
+#### 1.7.5 Best-effort writes
+
+Audit writes neste path são embrulhados em try/catch silencioso. Premissa: SQLite lock contention / schema mismatch / qualquer throw NÃO pode quebrar o spawn flow. O subagent run continua; o gap surge como linha ausente em query time. `agent worktree gc` futuro reapa órfãos via `listOrphanedProcesses`.
+
+Princípio §0.1 ("append-only por convenção") observado com a flexibilidade documentada em `subagent_outputs` (§1) — o row tem dois UPDATE points fixos (handshake + exit), refletindo lifecycle de duas-fases, não mutação livre.
 
 ---
 
@@ -823,12 +945,12 @@ Enforcement: lint custom em CI verifica que código não tem `UPDATE audit_table
 
 ### 4.2 Hash chain (tamper-evident)
 
-Cada row em audit tables tem coluna `chain_hash`:
+Cada row em audit tables **primárias** tem coluna `chain_hash`:
 
 ```sql
 ALTER TABLE approvals ADD COLUMN chain_hash TEXT;
 ALTER TABLE failure_events ADD COLUMN chain_hash TEXT;
--- (idem outras tabelas críticas)
+-- (idem outras tabelas primárias)
 ```
 
 Computed em INSERT:
@@ -840,6 +962,36 @@ chain_hash = SHA256(
 ```
 
 Primeira row da sessão: `prev = SHA256(session_id)`.
+
+#### 4.2.1 Construção de hash (convenção Forja)
+
+A spec define `chain_hash = SHA256(prev || canonical_json(row))` — concatenação binária do prev hash com a serialização canônica do resto da linha.
+
+Implementação Forja diverge em duas dimensões, ambas defensáveis e usadas consistentemente em `approvals_log` (slice 34) e `failure_events` (slice 130):
+
+1. **`prev_chain_hash` entra como COLUNA do payload canônico**, não como bytes pré-concatenados. `buildHashPayload` itera `HASH_INPUT_COLUMNS` (todas exceto `this_chain_hash`), gera `canonical_json(payload_completo)`, e produz `SHA256(...)`. Matematicamente equivalente à concatenação porque (a) `prev_chain_hash` é uma string única no input, (b) `canonicalize` ordena chaves lexicograficamente, e (c) `prev` aparece exatamente uma vez. A vantagem operacional é que o mesmo `canonicalize` + `sha256Hex` que atende a outras checagens da chain serve aqui sem branch especial.
+
+2. **A "este row menos chain_hash" da spec significa excluir `chain_hash` (singular) do canonical**. A implementação exclui especificamente o nome da coluna OUTPUT (`this_chain_hash` em failure_events, `this_hash` em approvals_log) — equivalente, mas literal aos nomes do schema.
+
+#### 4.2.2 Escopo da chain — `install`-scoped vs `session`-scoped
+
+A spec menciona "first row da sessão" implicando escopo per-session. A implementação usa:
+
+- **`approvals_log`** (slice 34) — **per-install** chain. Genesis = `SHA256(install_id || created_at_ms)`. Defende contra cross-install forgery (slice 128 R4 P0-Audit-1). Rotação de chain (slice 35) reseta o genesis mantendo install_id.
+- **`failure_events`** (slice 130) — **per-session** chain (segue spec). Genesis = `SHA256(session_id)`. Sessão isolada — corrupção em uma não cascateia em outras.
+
+Ambos escopos são válidos sob §4.2; o escopo apropriado depende do threat model (forge cross-install vs cross-session). Slices futuras adicionando audit tables devem documentar o escopo escolhido no header da migration.
+
+#### 4.2.3 Derived-audit tables (exceção declarada)
+
+`outcome_signals` (slice 131) é o caso paradigmático de **derived-audit table**: cada row deriva 100% de eventos já encadeados em tabelas-fonte (`approvals_log` + `failure_events`). Re-hashar aqui duplicaria garantia de integridade sem adicionar evidência. O regime alternativo:
+
+- Sem coluna `chain_hash`.
+- FK lógica via `approval_seq` validada at INSERT (sink probe `getApprovalsLogBySeq`) mas **não** enforçada por `ON DELETE CASCADE` (chain rotation deletaria signals sem aviso — slice 131 fixup #1).
+- `install_id` denormalizado pra preservar atribuição cross-table mesmo quando approval row é deletada (chain rotation).
+- Forensic reconstruction: "signal row → source table → chained row" — a integridade vem das tabelas-fonte; cada signal é uma referência verificável a uma row já protegida.
+
+Critério pra uma future tabela qualificar como derived-audit: (a) todo conteúdo derivável de queries sobre tabelas chained, (b) row never carries primary forensic evidence (apenas correlação), (c) header de migration declara explicitamente o regime.
 
 ### 4.3 Verification
 
@@ -979,7 +1131,7 @@ agent audit gc --apply                      # aplica retention cleanup
 
 ### 6.2 Output formats
 
-- Default: tabela compacta colorida (Ink)
+- Default: tabela compacta em texto (cor mínima — só `dim` em meta, sem highlight colorido)
 - `--json`: NDJSON pra scripting
 - `--csv`: pra Excel/sheets
 - `--markdown`: pra reports

@@ -1,0 +1,15 @@
+name: glob walks deeply nested directories
+prompt: |
+  Use the glob tool with the pattern `**/*.ts` to list every TypeScript file
+  under the working directory, regardless of how deep the nesting is. Reply
+  with the matched filenames, one per line.
+setup:
+  fixture: ../fixtures/nested-tree
+expect:
+  - tool_called: glob
+  - output_contains: alpha.ts
+  - output_contains: beta.ts
+  - output_contains: delta.ts
+  - status: done
+budget:
+  maxSteps: 5

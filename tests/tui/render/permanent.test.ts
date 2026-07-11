@@ -1,0 +1,1835 @@
+import { describe, expect, test } from 'bun:test';
+import { formatPermanent } from '../../../src/tui/render/permanent.ts';
+import { CSI, type Capabilities } from '../../../src/tui/term.ts';
+
+const ascii: Capabilities = {
+  isTTY: true,
+  cols: 80,
+  rows: 24,
+  color: 'none',
+  unicode: false,
+};
+const unicode: Capabilities = { ...ascii, unicode: true };
+const colored: Capabilities = { ...unicode, color: 'basic' };
+
+// Frame margin (UI.md §6.3): every permanent kind emits 2sp-padded
+// lines. Helper makes the expected strings readable without inlining
+// the prefix everywhere.
+const pad = (s: string): string => `  ${s}`;
+
+describe('formatPermanent', () => {
+  // session-header was removed (UI.md §3.2): emitting a UUID-bearing
+  // header per turn just clutters scrollback. The kind is gone from
+  // PermanentItem entirely; producer (state.ts session:start) emits
+  // an empty permanent array. No render coverage needed.
+
+  describe('session-footer (turn-end marker, UI.md §3.2)', () => {
+    // Spec change: session-footer renders as a blank line + verb +
+    // wall-clock duration (`Cogitated for 1m23s`, `Aborted after 12s`,
+    // etc). Both lines respect the §6.3 frame margin. When `durationMs`
+    // is absent (legacy / replay), falls back to short form.
+
+    test('done with duration → `Cogitated for X`', () => {
+      // 8.2s: 8200ms ≈ 8s rounded.
+      expect(
+        formatPermanent({ kind: 'session-footer', reason: 'done', durationMs: 8200 }, ascii),
+      ).toEqual([pad(''), pad('Cogitated for 8s')]);
+    });
+
+    test('done with sub-second duration → `Cogitated for Xms`', () => {
+      expect(
+        formatPermanent({ kind: 'session-footer', reason: 'done', durationMs: 450 }, ascii),
+      ).toEqual([pad(''), pad('Cogitated for 450ms')]);
+    });
+
+    test('done with multi-minute duration → `Cogitated for XmYs`', () => {
+      // 13m21s = 801000ms.
+      expect(
+        formatPermanent({ kind: 'session-footer', reason: 'done', durationMs: 801000 }, ascii),
+      ).toEqual([pad(''), pad('Cogitated for 13m21s')]);
+    });
+
+    test('done with exact-minute duration drops the seconds clause', () => {
+      // 2m exactly = 120000ms.
+      expect(
+        formatPermanent({ kind: 'session-footer', reason: 'done', durationMs: 120000 }, ascii),
+      ).toEqual([pad(''), pad('Cogitated for 2m')]);
+    });
+
+    test('done WITHOUT duration → short `Cogitated.` fallback', () => {
+      expect(formatPermanent({ kind: 'session-footer', reason: 'done' }, ascii)).toEqual([
+        pad(''),
+        pad('Cogitated.'),
+      ]);
+    });
+
+    test('aborted (soft) with duration → `Aborted (soft) after X`', () => {
+      expect(
+        formatPermanent(
+          { kind: 'session-footer', reason: 'aborted', abortCause: 'soft', durationMs: 12000 },
+          ascii,
+        ),
+      ).toEqual([pad(''), pad('Aborted (soft) after 12s')]);
+    });
+
+    test('aborted (hard) with duration → `Aborted (hard) after X`', () => {
+      expect(
+        formatPermanent(
+          { kind: 'session-footer', reason: 'aborted', abortCause: 'hard', durationMs: 12000 },
+          ascii,
+        ),
+      ).toEqual([pad(''), pad('Aborted (hard) after 12s')]);
+    });
+
+    test('aborted without cause WITH duration → `Aborted after X` (no parens)', () => {
+      expect(
+        formatPermanent({ kind: 'session-footer', reason: 'aborted', durationMs: 5000 }, ascii),
+      ).toEqual([pad(''), pad('Aborted after 5s')]);
+    });
+
+    test('aborted WITHOUT duration → short `Aborted.` fallback', () => {
+      expect(formatPermanent({ kind: 'session-footer', reason: 'aborted' }, ascii)).toEqual([
+        pad(''),
+        pad('Aborted.'),
+      ]);
+    });
+
+    test('error with duration → `Failed after X`', () => {
+      expect(
+        formatPermanent({ kind: 'session-footer', reason: 'error', durationMs: 8000 }, ascii),
+      ).toEqual([pad(''), pad('Failed after 8s')]);
+    });
+
+    test('maxSteps with duration → `Stopped (max steps) after X`', () => {
+      expect(
+        formatPermanent({ kind: 'session-footer', reason: 'maxSteps', durationMs: 60000 }, ascii),
+      ).toEqual([pad(''), pad('Stopped (max steps) after 1m')]);
+    });
+
+    test('maxCostUsd with duration → `Stopped (max cost) after X`', () => {
+      expect(
+        formatPermanent({ kind: 'session-footer', reason: 'maxCostUsd', durationMs: 60000 }, ascii),
+      ).toEqual([pad(''), pad('Stopped (max cost) after 1m')]);
+    });
+
+    test('abortCause on a non-abort reason is dropped (defensive)', () => {
+      // Producer guarantees abortCause is only set when
+      // reason==='aborted', but the renderer doesn't trust that —
+      // a stray cause on `done` shouldn't leak into the output.
+      expect(
+        formatPermanent(
+          { kind: 'session-footer', reason: 'done', abortCause: 'soft', durationMs: 1000 },
+          ascii,
+        ),
+      ).toEqual([pad(''), pad('Cogitated for 1s')]);
+    });
+
+    test('unknown reason capitalizes + duration (graceful unknown)', () => {
+      // If a future producer emits a reason this renderer doesn't
+      // know, capitalize and append duration. Without duration, fall
+      // back to `Capitalized.` so the marker stays grammatical.
+      expect(
+        formatPermanent(
+          { kind: 'session-footer', reason: 'somethingNew', durationMs: 3000 },
+          ascii,
+        ),
+      ).toEqual([pad(''), pad('SomethingNew after 3s')]);
+      expect(formatPermanent({ kind: 'session-footer', reason: 'somethingNew' }, ascii)).toEqual([
+        pad(''),
+        pad('SomethingNew.'),
+      ]);
+    });
+  });
+
+  describe('session-banner', () => {
+    const baseBanner = {
+      kind: 'session-banner' as const,
+      app: 'forja',
+      version: '0.1.0',
+      model: 'anthropic/claude-sonnet-4-6',
+      contextWindow: 200000,
+      maxOutputTokens: 4096,
+      cwd: '/home/lex/forja',
+      env: [
+        { kind: 'meta' as const, key: 'subagents', value: '2' },
+        { kind: 'flag' as const, name: 'checkpoints' },
+      ],
+    };
+
+    test('stacks title, model identity, and cwd — no env block', () => {
+      expect(formatPermanent(baseBanner, unicode)).toEqual([
+        pad('forja v0.1.0'),
+        pad('anthropic/claude-sonnet-4-6'),
+        pad('/home/lex/forja'),
+      ]);
+    });
+
+    test('appends effort to the identity line when set', () => {
+      const out = formatPermanent({ ...baseBanner, effort: 'high' }, unicode);
+      expect(out[1]).toBe(pad('anthropic/claude-sonnet-4-6 · effort high'));
+    });
+
+    test('shortens a long removable-drive cwd on the third line', () => {
+      const out = formatPermanent(
+        {
+          ...baseBanner,
+          cwd: '/run/media/lex/728c6e4f-56b6-4bf8-903c-838aeaaf2690/Workspaces/forja',
+          home: '/home/lex',
+        },
+        unicode,
+      );
+      expect(out[2]).toBe(pad('/run/media/…/Workspaces/forja'));
+    });
+
+    test('version already prefixed with v is not double-prefixed', () => {
+      const out = formatPermanent({ ...baseBanner, version: 'v2.3.4' }, unicode);
+      expect(out[0]).toBe(pad('forja v2.3.4'));
+    });
+
+    test('title paints app bold and version secondary (when color enabled)', () => {
+      const out = formatPermanent(baseBanner, colored);
+      // bold = SGR 1, secondary = SGR 90. Each segment carries its
+      // own wrap so the version reads as meta against the app name.
+      expect(out[0]).toContain('\x1b[1mforja\x1b[0m');
+      expect(out[0]).toContain('\x1b[90mv0.1.0\x1b[0m');
+    });
+
+    test('sandboxActive does NOT render the affirmative enforcement line', () => {
+      // The "✓ sandbox enforcement active" greenlight was dropped from the
+      // banner (boot noise the operator doesn't act on). The field still
+      // rides on the PermanentItem for NDJSON / audit, but must not surface.
+      const out = formatPermanent({ ...baseBanner, sandboxActive: 'bwrap' }, unicode);
+      expect(out).toHaveLength(3);
+      expect(out.join('\n')).not.toContain('sandbox enforcement active');
+    });
+
+    test('env contents do NOT leak into the rendered banner', () => {
+      // env still rides on the PermanentItem for NDJSON / audit,
+      // but the TUI renderer must not surface flag names or meta
+      // values regardless of how rich the env payload is.
+      const out = formatPermanent(
+        {
+          ...baseBanner,
+          env: [
+            { kind: 'meta' as const, key: 'policy', value: 'project (5 rules)' },
+            { kind: 'flag' as const, name: 'checkpoints' },
+            { kind: 'flag' as const, name: 'memory', count: 14 },
+          ],
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(3);
+      const joined = out.join('\n');
+      expect(joined).not.toContain('checkpoints');
+      expect(joined).not.toContain('memory');
+      expect(joined).not.toContain('policy');
+    });
+
+    test('emits no SGR when color disabled', () => {
+      const out = formatPermanent(baseBanner, unicode);
+      for (const line of out) expect(line).not.toContain(CSI);
+    });
+
+    test('appends an isolation-profile line when a profile is active', () => {
+      const out = formatPermanent({ ...baseBanner, profile: 'dev' }, unicode);
+      expect(out).toHaveLength(4);
+      expect(out[3]).toBe(pad('profile: dev (isolated namespace)'));
+    });
+
+    test('no profile line on the default namespace (null / absent)', () => {
+      expect(formatPermanent({ ...baseBanner, profile: null }, unicode)).toHaveLength(3);
+      expect(formatPermanent(baseBanner, unicode)).toHaveLength(3);
+    });
+  });
+
+  describe('user-submit (inverse bar, UI.md §4.10.8)', () => {
+    // SGR 7 (reverse) emits unconditionally — it's an attribute, not
+    // a color (works under NO_COLOR). Unlike the rest of the frame, the
+    // bar goes edge-to-edge from col 0: NO frame margin outside the SGR
+    // 7 wrap, and each line is padded internally to the full `cols` so
+    // the inverse spans the whole width (like the input box).
+    //
+    // Leading blank line per UI.md §6.3 — separates each turn from
+    // the previous one (Done. → blank → > prompt). out[0] is the
+    // blank (just the frame margin); out[1..] are the inverse bars.
+    const REVERSE_OPEN = '\x1b[7m';
+    const RESET = '\x1b[0m';
+    // Line shape: REVERSE_OPEN + content + RESET (no frame margin).
+    // Helper strips the wrap to inspect the inner padded content.
+    const innerOf = (line: string): string => line.slice(REVERSE_OPEN.length, -RESET.length);
+
+    test('emits leading blank + reversed full-width-padded content', () => {
+      const out = formatPermanent({ kind: 'user-submit', text: 'hi' }, ascii);
+      expect(out).toHaveLength(2);
+      expect(out[0]).toBe(pad(''));
+      const line = out[1] ?? '';
+      expect(line.startsWith(REVERSE_OPEN)).toBe(true);
+      expect(line.endsWith(RESET)).toBe(true);
+      expect(innerOf(line)).toBe('> hi'.padEnd(ascii.cols));
+    });
+
+    test('multi-line submit: blank + first line with `>`, continuations with `  `', () => {
+      const out = formatPermanent({ kind: 'user-submit', text: 'first\nsecond\nthird' }, ascii);
+      expect(out).toHaveLength(4);
+      expect(out[0]).toBe(pad(''));
+      const inners = out.slice(1).map(innerOf);
+      expect(inners).toEqual([
+        '> first'.padEnd(ascii.cols),
+        '  second'.padEnd(ascii.cols),
+        '  third'.padEnd(ascii.cols),
+      ]);
+      // Each bar line independently wrapped in SGR 7 + reset, edge-to-edge.
+      for (const l of out.slice(1)) {
+        expect(l.startsWith(REVERSE_OPEN)).toBe(true);
+        expect(l.endsWith(RESET)).toBe(true);
+      }
+    });
+
+    test('reverse is emitted even when caps.color is "none" (attribute, not color)', () => {
+      // ascii uses color: 'none'. Reverse must still emit per spec.
+      const out = formatPermanent({ kind: 'user-submit', text: 'x' }, ascii);
+      expect((out[1] ?? '').includes(REVERSE_OPEN)).toBe(true);
+    });
+
+    test('text wider than caps.cols is not padded (negative pad clamps to 0)', () => {
+      const narrow: Capabilities = { ...ascii, cols: 5 };
+      const out = formatPermanent({ kind: 'user-submit', text: 'a long input' }, narrow);
+      // Inner content keeps the original text without truncation;
+      // truncation is the renderer's job (truncateToWidth).
+      expect(innerOf(out[1] ?? '')).toBe('> a long input');
+    });
+  });
+
+  // Assistant kind emits just the AI prose, prepended with a blank
+  // line (UI.md §6.3). The legacy `· Generated N tokens in Xs` chip
+  // header was removed — duration lives in the turn-end marker
+  // (`Cogitated for Xs`) and tokens live in the footer's right
+  // column. The chip header was duplicating both signals.
+
+  test('assistant emits blank + text lines (single-line)', () => {
+    const out = formatPermanent(
+      { kind: 'assistant', text: 'hello', durationMs: 8200, outputTokens: 234 },
+      ascii,
+    );
+    // Blank + text. Chip header gone — durationMs / outputTokens
+    // come through but render path ignores them.
+    expect(out).toEqual([pad(''), pad('hello')]);
+  });
+
+  test('assistant emits blank + each text line (multi-line)', () => {
+    expect(
+      formatPermanent(
+        { kind: 'assistant', text: 'line1\nline2', durationMs: 1000, outputTokens: 50 },
+        ascii,
+      ),
+    ).toEqual([pad(''), pad('line1'), pad('line2')]);
+  });
+
+  test('assistant with empty text emits nothing (regardless of metadata)', () => {
+    // Tool-only turn: the model produced tool_use blocks but no
+    // prose. Cost is in the footer + tool-end chips already; no
+    // need for a permanent chip-only line in scrollback.
+    expect(
+      formatPermanent({ kind: 'assistant', text: '', durationMs: 8200, outputTokens: 234 }, ascii),
+    ).toEqual([]);
+    expect(
+      formatPermanent({ kind: 'assistant', text: '', durationMs: null, outputTokens: null }, ascii),
+    ).toEqual([]);
+  });
+
+  test('assistant: a trailing newline does not leave a spurious empty line', () => {
+    // The Markdown renderer normalizes a trailing `\n` — it is not a
+    // line. The pre-markdown `text.split('\n')` left an empty `''`
+    // here; this test pinned that, and now pins its absence.
+    expect(
+      formatPermanent(
+        { kind: 'assistant', text: 'foo\n', durationMs: null, outputTokens: null },
+        ascii,
+      ),
+    ).toEqual([pad(''), pad('foo')]);
+  });
+
+  test('assistant ignores durationMs/outputTokens (chip header removed)', () => {
+    // Before the spec change a turn with metadata produced a
+    // `· Generated N tokens in Xs` header above the text. Pin the
+    // contract that the header is gone — if a future refactor
+    // brings it back, this test catches it.
+    const out = formatPermanent(
+      { kind: 'assistant', text: 'hi', durationMs: 8200, outputTokens: 234 },
+      ascii,
+    );
+    expect(out.join('\n')).not.toContain('Generated');
+    expect(out.join('\n')).not.toContain('tokens');
+    expect(out.join('\n')).not.toContain('8.2s');
+  });
+
+  describe('tool-end (operation chip + sub-content, UI.md §4.10.5/§4.10.7)', () => {
+    // Tool-end prepends a leading blank (UI.md §6.3) — each tool
+    // finalization is its own "session" block. out[0] is the blank,
+    // out[1] is the chip head, out[2] (when present) is the
+    // sub-content connector. Sub-content stays tight under the
+    // chip — it's the chip's "subsession", not a sibling block.
+
+    test('done status: blank + chip head + sub-content', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'read_file',
+          verb: 'Read file',
+          subject: '/foo.ts',
+          status: 'done',
+          durationMs: 850,
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(3);
+      expect(out[0]).toBe(pad(''));
+      // Top-level chip head hangs in the gutter: the glyph sits at col 0,
+      // the `● ` prefix lands the verb at col 2. Sub-content keeps the margin.
+      expect(out[1]).toBe('  Read file  [850ms]');
+      expect(out[2]).toBe(pad('└─ /foo.ts'));
+    });
+
+    test('done status with a summary but no subject renders the summary on the connector', () => {
+      // clarify's result_detail rides in as `summary` on a done chip
+      // (clarify has no vocab subject) — it must surface on the `└─`
+      // connector, the same fallback the no-subject error path uses.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'clarify',
+          verb: 'Called clarify',
+          subject: null,
+          status: 'done',
+          durationMs: 850,
+          summary: 'which file? → src/checkout.ts',
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(3);
+      expect(out[1]).toBe('  Called clarify  [850ms]');
+      expect(out[2]).toBe(pad('└─ which file? → src/checkout.ts'));
+    });
+
+    test('done status with BOTH a subject and a summary combines them on the connector', () => {
+      // fetch_url carries a url subject AND a result_detail summary; the chip
+      // must show both as `url — detail` rather than dropping the detail
+      // (which carries the injection-suspect signal) because the subject won
+      // the connector line.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'fetch_url',
+          verb: 'Fetched',
+          subject: 'https://docs.example.com/guide',
+          status: 'done',
+          durationMs: 320,
+          summary: '200 · 1.2 KB · injection-suspect',
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(3);
+      expect(out[1]).toBe('  Fetched  [320ms]');
+      expect(out[2]).toBe(
+        pad('└─ https://docs.example.com/guide — 200 · 1.2 KB · injection-suspect'),
+      );
+    });
+
+    test('non-zero exitCode renders `exit N` on the head', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: 'npm test',
+          status: 'done',
+          durationMs: 30,
+          exitCode: 1,
+        },
+        unicode,
+      );
+      expect(out[1]).toBe('  Executed  exit 1  [30ms]');
+    });
+
+    test('nested (parentId set): no leading blank + |_ glyph + indented sub-content', () => {
+      // Slice 2: chips with parentId render under their owner
+      // (today: a subagent run). The leading blank that separates
+      // top-level chips drops — a burst of nested chips reads as
+      // one visual block under the parent rather than gap-
+      // separated siblings. The chip glyph swaps from `·` to `|_`
+      // and the sub-content connector indents to stay aligned
+      // with the nested chip head.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'read_file',
+          verb: 'Read file',
+          subject: '/foo.ts',
+          status: 'done',
+          durationMs: 200,
+          parentId: 'sub-abc',
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(2);
+      // Indent (2sp) between frame padding and the |_ glyph; subject
+      // line keeps the same indent so the connector lines up under
+      // the nested head.
+      expect(out[0]).toBe(pad('  |_ Read file  [200ms]'));
+      expect(out[1]).toBe(pad('  └─ /foo.ts'));
+    });
+
+    test('nested chip in ASCII mode also uses |_ (consistent in both unicode and ascii)', () => {
+      // The nest glyph is the same string in unicode and ascii —
+      // `|_` reads as "branch from above" regardless of capability.
+      // Pinned so a future "fancy unicode arrow" refactor doesn't
+      // diverge the two paths and break the ASCII fallback.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'echo',
+          verb: 'Executed',
+          subject: 'hi',
+          status: 'done',
+          durationMs: 5,
+          parentId: 'sub-x',
+        },
+        ascii,
+      );
+      expect(out[0]).toBe(pad('  |_ Executed  [5ms]'));
+    });
+
+    test('nested chip with no subject emits ONLY the head line (no orphan connector)', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'todo_create',
+          verb: 'Updated todos',
+          subject: null,
+          status: 'done',
+          durationMs: 5,
+          parentId: 'sub-y',
+        },
+        unicode,
+      );
+      expect(out).toEqual([pad('  |_ Updated todos  [5ms]')]);
+    });
+
+    test('nested error chip keeps the error palette + |_ glyph', () => {
+      // Status palette is independent of nesting — a nested tool
+      // that failed still reads as red.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: null,
+          status: 'error',
+          durationMs: 5,
+          parentId: 'sub-z',
+        },
+        colored,
+      );
+      // The glyph + verb carry the error palette; the `[Xms]` metric
+      // is split into `secondary` (meta, not status), so it is no
+      // longer contiguous with the verb.
+      expect(out[0]).toContain('|_ Failed');
+      expect(out[0]).toContain('[5ms]');
+      expect(out[0]).toContain('\x1b[31m'); // error palette on the head
+      expect(out[0]).toContain('\x1b[90m'); // secondary on the metric
+    });
+
+    test('done status with no subject emits blank + chip head only', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'todo_create',
+          verb: 'Updated todos',
+          subject: null,
+          status: 'done',
+          durationMs: 50,
+        },
+        unicode,
+      );
+      expect(out).toEqual([pad(''), '  Updated todos  [50ms]']);
+    });
+
+    test('error status overrides verb to "Failed" regardless of vocab', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: 'rm -rf /tmp/x',
+          status: 'error',
+          durationMs: 200,
+        },
+        unicode,
+      );
+      expect(out[0]).toBe(pad(''));
+      expect(out[1]).toContain('Failed  [200ms]');
+      expect(out[1]).not.toContain('Executed');
+      expect(out[2]).toBe(pad('└─ rm -rf /tmp/x'));
+    });
+
+    test('error with summary appends reason as `subject: summary`', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'read_file',
+          verb: 'Read file',
+          subject: '/proj/missing.txt',
+          status: 'error',
+          durationMs: 2,
+          summary: 'ENOENT: no such file or directory',
+        },
+        unicode,
+      );
+      expect(out[1]).toContain('Failed  [2ms]');
+      expect(out[2]).toBe(pad('└─ /proj/missing.txt: ENOENT: no such file or directory'));
+    });
+
+    test('error with summary but no subject falls back to summary alone', () => {
+      // todo_create has no vocab subject. An error there should still
+      // surface the cause on the connector instead of dropping it.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'todo_create',
+          verb: 'Updated todos',
+          subject: null,
+          status: 'error',
+          durationMs: 1,
+          summary: 'todo list serialization failed',
+        },
+        unicode,
+      );
+      expect(out[1]).toContain('Failed  [1ms]');
+      expect(out[2]).toBe(pad('└─ todo list serialization failed'));
+    });
+
+    test('denied status overrides verb to "Denied"', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: 'rm -rf /',
+          status: 'denied',
+          durationMs: 1,
+        },
+        unicode,
+      );
+      expect(out[1]).toContain('Denied  [1ms]');
+    });
+
+    test('denied status with summary surfaces the policy reason as sub-content', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: 'rm -rf /',
+          status: 'denied',
+          durationMs: 1,
+          summary: 'matches deny rule bash.rm.rf',
+        },
+        unicode,
+      );
+      // Summary takes precedence over subject for denied (the
+      // operator wants the reason, not the rejected command echo).
+      expect(out[2]).toBe(pad('└─ matches deny rule bash.rm.rf'));
+    });
+
+    test('summary fills in for sub-content when subject is null', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'todo_create',
+          verb: 'Updated todos',
+          subject: null,
+          status: 'done',
+          durationMs: 10,
+          summary: '3 items added',
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(3);
+      expect(out[2]).toBe(pad('└─ 3 items added'));
+    });
+
+    test('top-level tool chip leads with a blank gap (no dot), verb at col 2', () => {
+      const u = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'r',
+          verb: 'Read file',
+          subject: null,
+          status: 'done',
+          durationMs: 1,
+        },
+        unicode,
+      );
+      const a = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'r',
+          verb: 'Read file',
+          subject: null,
+          status: 'done',
+          durationMs: 1,
+        },
+        ascii,
+      );
+      // Top-level tool chip head hangs in the gutter but no longer carries a dot
+      // anchor: the head starts with a 2-col blank gap so the verb still lands at
+      // col 2 (out[1] — out[0] is the leading blank). Same under Unicode + ASCII.
+      expect(u[1]).toBe('  Read file  [1ms]');
+      expect(a[1]).toBe('  Read file  [1ms]');
+    });
+
+    test('connector is `└─ ` under Unicode, `\\- ` under ASCII', () => {
+      const u = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'r',
+          verb: 'Read file',
+          subject: '/x',
+          status: 'done',
+          durationMs: 1,
+        },
+        unicode,
+      );
+      const a = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'r',
+          verb: 'Read file',
+          subject: '/x',
+          status: 'done',
+          durationMs: 1,
+        },
+        ascii,
+      );
+      expect(u[2]).toBe(pad('└─ /x'));
+      expect(a[2]).toBe(pad('\\- /x'));
+    });
+
+    test('duration uses ms below 1s, s above', () => {
+      const fast = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'r',
+          verb: 'Read',
+          subject: null,
+          status: 'done',
+          durationMs: 850,
+        },
+        ascii,
+      );
+      const slow = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'r',
+          verb: 'Read',
+          subject: null,
+          status: 'done',
+          durationMs: 1234,
+        },
+        ascii,
+      );
+      expect(fast[1]).toContain('850ms');
+      expect(slow[1]).toContain('1.2s');
+    });
+
+    test('error status applies error palette SGR to chip head when color enabled', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: null,
+          status: 'error',
+          durationMs: 1,
+        },
+        colored,
+      );
+      expect(out[1]).toContain(`${CSI}31m`);
+    });
+
+    test('denied status applies error palette SGR to chip head when color enabled', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: null,
+          status: 'denied',
+          durationMs: 1,
+        },
+        colored,
+      );
+      expect(out[1]).toContain(`${CSI}31m`);
+    });
+
+    test('done status applies dim palette SGR to chip head when color enabled', () => {
+      const out = formatPermanent(
+        { kind: 'tool-end', name: 'r', verb: 'Read', subject: null, status: 'done', durationMs: 1 },
+        colored,
+      );
+      expect(out[1]).toContain(`${CSI}2m`);
+    });
+
+    test('outputTruncated appends a `… output truncated` hint under the card', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: 'cat big.log',
+          status: 'done',
+          durationMs: 50,
+          outputTruncated: true,
+        },
+        unicode,
+      );
+      // blank, head, `└─` subject, hint — the hint indents 3 cols so
+      // it sits under the connector's content.
+      expect(out).toHaveLength(4);
+      expect(out[3]).toBe(pad('   … output truncated'));
+    });
+
+    test('no hint line when outputTruncated is absent', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: 'ls',
+          status: 'done',
+          durationMs: 5,
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(3);
+      expect(out.join('\n')).not.toContain('truncated');
+    });
+
+    test('ASCII: the truncation hint uses the ... ellipsis fallback', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: 'ls',
+          status: 'done',
+          durationMs: 5,
+          outputTruncated: true,
+        },
+        ascii,
+      );
+      expect(out[out.length - 1]).toBe(pad('   ... output truncated'));
+    });
+  });
+
+  // error / warn / info also prepend a leading blank — each is a
+  // top-level "session" block deserving its own breathing space.
+
+  test('error and warn pass through as plain text when color disabled', () => {
+    expect(formatPermanent({ kind: 'error', message: 'down' }, ascii)).toEqual([
+      pad(''),
+      pad('error: down'),
+    ]);
+    expect(formatPermanent({ kind: 'warn', message: 'high' }, ascii)).toEqual([
+      pad(''),
+      pad('warn: high'),
+    ]);
+  });
+
+  describe('operator-bash (the `!cmd` shell escape card)', () => {
+    test('success: blank + `! command  [dur]` head + verbatim output, no exit marker', () => {
+      const out = formatPermanent(
+        {
+          kind: 'operator-bash',
+          command: 'git status',
+          output: 'On branch main\nnothing to commit\n',
+          exitCode: 0,
+          durationMs: 12,
+        },
+        unicode,
+      );
+      expect(out).toEqual([
+        pad(''),
+        pad('! git status  [12ms]'),
+        pad('On branch main'),
+        pad('nothing to commit'),
+      ]);
+    });
+
+    test('a multi-line command is flattened to a single head row', () => {
+      // The editor accepts `\`+Enter / Shift+Enter, so the command can
+      // carry newlines. The head must stay ONE row (flattened) — else a
+      // raw `\n` spills onto an unprefixed scrollback row and pushes the
+      // `[dur]` below the command text.
+      const out = formatPermanent(
+        {
+          kind: 'operator-bash',
+          command: 'for f in x; do\necho $f\ndone',
+          output: '',
+          exitCode: 0,
+          durationMs: 5,
+        },
+        unicode,
+      );
+      expect(out).toEqual([pad(''), pad('! for f in x; do echo $f done  [5ms]')]);
+      expect(out[1]).not.toContain('\n');
+    });
+
+    test('empty output → head only', () => {
+      const out = formatPermanent(
+        { kind: 'operator-bash', command: 'true', output: '', exitCode: 0, durationMs: 3 },
+        unicode,
+      );
+      expect(out).toEqual([pad(''), pad('! true  [3ms]')]);
+    });
+
+    test('non-zero exit shows a warn `exit N` marker (color enabled)', () => {
+      const out = formatPermanent(
+        { kind: 'operator-bash', command: 'false', output: '', exitCode: 1, durationMs: 2 },
+        colored,
+      );
+      // warn = SGR 33. Head carries `exit 1` in warn.
+      expect(out[1]).toContain(`${CSI}33m  exit 1${CSI}0m`);
+    });
+
+    test('output beyond the cap folds into a `+N more lines` tail', () => {
+      const lines = Array.from({ length: 250 }, (_, i) => `line ${i}`).join('\n');
+      const out = formatPermanent(
+        { kind: 'operator-bash', command: 'seq', output: lines, exitCode: 0, durationMs: 9 },
+        unicode,
+      );
+      // blank + head + 199 output rows + 1 "more" row = 202.
+      expect(out).toHaveLength(202);
+      expect(out[out.length - 1]).toContain('+51 more lines');
+    });
+  });
+
+  describe('tool-end-batch (coalesced card — UI.md §4.10.5/§4.10.7)', () => {
+    test('top-level batch: blank + card head with count + tree continuations', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 3 files',
+          count: 3,
+          totalDurationMs: 4500,
+          subjects: ['src/a.ts', 'src/b.ts', 'src/c.ts'],
+          status: 'done',
+        },
+        unicode,
+      );
+      // Layout: blank, head, then a 3-row subject tree (├─ ├─ └─).
+      // Duration crosses 1s → bracket metric `[4.5s]`. Connectors
+      // align at the head glyph column — no extra indent top-level.
+      expect(out).toEqual([
+        pad(''),
+        '  Read 3 files  [4.5s]',
+        pad('├─ src/a.ts'),
+        pad('├─ src/b.ts'),
+        pad('└─ src/c.ts'),
+      ]);
+    });
+
+    test('count is bold within the headline verb (when color enabled)', () => {
+      // The batch size is the one number that says how much the fold
+      // hides, so it gets weight (bold = SGR 1) while staying in the
+      // head tone (done → dim = SGR 2). paintMulti wraps tone+bold with
+      // a single reset; the surrounding verb text stays plain-dim.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'bash',
+          verb: 'Executed 6 commands',
+          count: 6,
+          totalDurationMs: 900,
+          subjects: ['a', 'b'],
+          status: 'done',
+        },
+        colored,
+      );
+      // Head row (out[1]; out[0] is the leading blank). The count `6`
+      // carries dim+bold; the words around it stay dim.
+      expect(out[1]).toContain('\x1b[2m\x1b[1m6\x1b[0m');
+      expect(out[1]).toContain('Executed');
+      expect(out[1]).toContain('commands');
+    });
+
+    test('count bolding leaves plain output untouched when color disabled', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'bash',
+          verb: 'Executed 6 commands',
+          count: 6,
+          totalDurationMs: 900,
+          subjects: ['a', 'b'],
+          status: 'done',
+        },
+        unicode,
+      );
+      expect(out[1]).toBe('  Executed 6 commands  [900ms]');
+    });
+
+    test('outputTruncated appends one hint line under the batch body', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 2 files',
+          count: 2,
+          totalDurationMs: 80,
+          subjects: ['a.ts', 'b.ts'],
+          status: 'done',
+          outputTruncated: true,
+        },
+        unicode,
+      );
+      // blank, head, ├─ a, └─ b, then a single hint for the group.
+      expect(out).toHaveLength(5);
+      expect(out[4]).toBe(pad('   … output truncated'));
+    });
+
+    test('single-subject batch closes the tree with └─ on the only row', () => {
+      // `count` can exceed the subject list when some children had
+      // null subjects (filtered upstream). The lone visible subject
+      // is still the last row → `└─`, never `├─`.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 2 files',
+          count: 2,
+          totalDurationMs: 80,
+          subjects: ['only.ts'],
+          status: 'done',
+        },
+        unicode,
+      );
+      expect(out).toEqual([pad(''), '  Read 2 files  [80ms]', pad('└─ only.ts')]);
+    });
+
+    test('nested batch: no leading blank + |_ head + single-indent tree', () => {
+      // When the batch is nested under a subagent (parentId set),
+      // the head uses `|_` and the subject tree indents one step so
+      // the hierarchy reads "subagent > batch summary > child". The
+      // tree connectors align under the `|_` head glyph.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 3 files',
+          count: 3,
+          totalDurationMs: 6000,
+          subjects: ['/sub/a.ts', '/sub/b.ts', '/sub/c.ts'],
+          status: 'done',
+          parentId: 'sub-abc',
+        },
+        unicode,
+      );
+      expect(out).toEqual([
+        pad('  |_ Read 3 files  [6.0s]'),
+        pad('  ├─ /sub/a.ts'),
+        pad('  ├─ /sub/b.ts'),
+        pad('  └─ /sub/c.ts'),
+      ]);
+    });
+
+    test('error status: head uses error palette + verb overridden to Failed', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 3 files',
+          count: 3,
+          totalDurationMs: 100,
+          subjects: ['a', 'b', 'c'],
+          status: 'error',
+        },
+        colored,
+      );
+      // Verb override mirrors the single-chip behavior: error
+      // statuses always read "Failed" regardless of the producer's
+      // headline. The `[Xms]` metric is split into `secondary` —
+      // meta, not status — so it is not contiguous with the verb.
+      expect(out[1]).toContain('Failed');
+      expect(out[1]).toContain('[100ms]');
+      expect(out[1]).toContain('\x1b[31m'); // error palette on the head
+      expect(out[1]).toContain('\x1b[90m'); // secondary on the metric
+    });
+
+    test('empty subjects array still emits the head (no orphan tree rows)', () => {
+      // Defensive: a tool with no vocab subject extractor (all
+      // children produced null subjects, all filtered upstream) can
+      // still surface as a batch card — count carries the signal.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'echo',
+          verb: 'Echoed ×3',
+          count: 3,
+          totalDurationMs: 30,
+          subjects: [],
+          status: 'done',
+        },
+        unicode,
+      );
+      expect(out).toEqual([pad(''), '  Echoed ×3  [30ms]']);
+    });
+
+    test('long subject list caps at MAX_BATCH_SUBJECTS with a +N more tail', () => {
+      // 9 subjects, cap 5 → body shows 4 then a `└─ … +5 more`
+      // fold. The body never exceeds 5 rows; the head count keeps
+      // the true total honest.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 9 files',
+          count: 9,
+          totalDurationMs: 90,
+          subjects: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i'],
+          status: 'done',
+        },
+        unicode,
+      );
+      expect(out).toEqual([
+        pad(''),
+        '  Read 9 files  [90ms]',
+        pad('├─ a'),
+        pad('├─ b'),
+        pad('├─ c'),
+        pad('├─ d'),
+        pad('└─ … +5 more'),
+      ]);
+    });
+
+    test('exactly MAX_BATCH_SUBJECTS subjects render in full (no fold)', () => {
+      // 5 subjects, cap 5 → `5 > 5` is false, all shown, last row
+      // closes with `└─`. Boundary pinned so an off-by-one in the
+      // overflow check doesn't silently drop a subject.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 5 files',
+          count: 5,
+          totalDurationMs: 50,
+          subjects: ['a', 'b', 'c', 'd', 'e'],
+          status: 'done',
+        },
+        unicode,
+      );
+      expect(out).toEqual([
+        pad(''),
+        '  Read 5 files  [50ms]',
+        pad('├─ a'),
+        pad('├─ b'),
+        pad('├─ c'),
+        pad('├─ d'),
+        pad('└─ e'),
+      ]);
+    });
+
+    test('MAX_BATCH_SUBJECTS + 1 subjects trips the fold (boundary)', () => {
+      // 6 is the first count that overflows: `6 > 5` → 4 subjects
+      // shown + a `+2 more` tail. Pairs with the exact-MAX case
+      // above to pin both sides of the overflow boundary.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 6 files',
+          count: 6,
+          totalDurationMs: 60,
+          subjects: ['a', 'b', 'c', 'd', 'e', 'f'],
+          status: 'done',
+        },
+        unicode,
+      );
+      expect(out).toEqual([
+        pad(''),
+        '  Read 6 files  [60ms]',
+        pad('├─ a'),
+        pad('├─ b'),
+        pad('├─ c'),
+        pad('├─ d'),
+        pad('└─ … +2 more'),
+      ]);
+    });
+
+    test('ASCII mode: tree continuations use +- / \\- without unicode', () => {
+      // The tree connectors fall back to `+- ` (mid) and `\\- `
+      // (last); the chip glyph falls back to `*`. The affordance
+      // survives the no-unicode path.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 2 files',
+          count: 2,
+          totalDurationMs: 200,
+          subjects: ['a.ts', 'b.ts'],
+          status: 'done',
+        },
+        ascii,
+      );
+      expect(out[1]).toBe('  Read 2 files  [200ms]');
+      expect(out[2]).toBe(pad('+- a.ts'));
+      expect(out[3]).toBe(pad('\\- b.ts'));
+    });
+
+    test('ASCII overflow tail uses ... ellipsis', () => {
+      // `…` falls back to `...` under no-unicode; the tail still
+      // closes the tree with the `\\- ` last-branch.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 8 files',
+          count: 8,
+          totalDurationMs: 80,
+          subjects: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'],
+          status: 'done',
+        },
+        ascii,
+      );
+      expect(out[out.length - 1]).toBe(pad('\\- ... +4 more'));
+    });
+  });
+
+  test('error and warn are wrapped in SGR escapes when color enabled', () => {
+    const errored = formatPermanent({ kind: 'error', message: 'down' }, colored);
+    expect(errored[0]).toBe(pad(''));
+    expect(errored[1]).toBe(pad(`${CSI}31merror: down${CSI}0m`));
+    const warned = formatPermanent({ kind: 'warn', message: 'high' }, colored);
+    expect(warned[0]).toBe(pad(''));
+    expect(warned[1]).toBe(pad(`${CSI}33mwarn: high${CSI}0m`));
+  });
+
+  test('recap-terse: bold "recap:" prefix + secondary across the line (RECAP §3.3)', () => {
+    // Color path: `recap:` is wrapped in `${CSI}90m${CSI}1m...${CSI}0m`
+    // (secondary + bold via paintMulti — single trailing reset).
+    // Body is wrapped in `${CSI}90m...${CSI}0m`. Two separate
+    // SGR runs with a single reset each, concatenated.
+    const out = formatPermanent({ kind: 'recap-terse', message: 'fix the bug.' }, colored);
+    expect(out[0]).toBe(pad(''));
+    expect(out[1]).toBe(pad(`${CSI}90m${CSI}1mrecap:${CSI}0m${CSI}90m fix the bug.${CSI}0m`));
+  });
+
+  test('recap-terse: plain text when color disabled', () => {
+    const out = formatPermanent({ kind: 'recap-terse', message: 'fix the bug.' }, ascii);
+    expect(out).toEqual([pad(''), pad('recap: fix the bug.')]);
+  });
+
+  describe('subagent_summary (S2 of subagent IPC)', () => {
+    test('subagent_group_header renders `● Subagents` flush-left (leading blank, col 0)', () => {
+      const out = formatPermanent({ kind: 'subagent_group_header', ts: 1 }, unicode);
+      expect(out).toEqual(['', '● Subagents']);
+      // col 0 — the `●` sits flush-left (the `● …` blocks below keep the
+      // 2-space margin and indent under this parent glyph).
+      expect(out[1]?.startsWith('●')).toBe(true);
+    });
+
+    test('done shape: name + verb + duration; the child summary is NOT echoed', () => {
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'explore',
+          status: 'done',
+          summary: 'README at /repo/README.md',
+          durationMs: 5_000,
+          costUsd: 0,
+          toolCounts: [],
+          toolTotal: 0,
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0]).toContain('● explore · Done');
+      expect(out[0]).toContain('5.0s');
+      // The verbose child summary is the parent's reply, not block noise.
+      expect(out[0]).not.toContain('README at /repo/README.md');
+    });
+
+    test('aggregated-by-type trail: header + one line per tool type', () => {
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'code-review',
+          status: 'done',
+          summary: '3 findings',
+          durationMs: 62_000,
+          costUsd: 0.019,
+          toolCounts: [
+            ['read_file', 38],
+            ['grep', 11],
+            ['git', 4],
+          ],
+          toolTotal: 53,
+        },
+        unicode,
+      );
+      // header + 3 trail lines
+      expect(out).toHaveLength(4);
+      expect(out[0]).toContain('53 tools');
+      expect(out[0]).toContain('$0.02');
+      // aggregated: short tool name + count + noun
+      expect(out[1]).toContain('read 38 files');
+      expect(out[2]).toContain('grep 11 searches');
+      expect(out[3]).toContain('git 4 reads');
+    });
+
+    test('error shape uses Error verb and red SGR when colored', () => {
+      // Renamed from "Failed" to "Error" — the verb mapping
+      // distinguishes status types (Done / Aborted / Exhausted /
+      // Error) so the operator can read the cause at a glance.
+      // "Failed" remains the last-resort fallback for unknown
+      // status combos.
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'audit',
+          status: 'error',
+          summary: 'crashed',
+          durationMs: 12,
+          costUsd: 0,
+          toolCounts: [],
+          toolTotal: 0,
+        },
+        colored,
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0]).toContain('Error');
+      // 31 = red SGR (paint(error, ...) goes through this code).
+      expect(out[0]).toContain(`${CSI}31m`);
+    });
+
+    test('exhausted + maxCostUsd renders cost cap label with $X', () => {
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'explain',
+          status: 'exhausted',
+          reason: 'maxCostUsd',
+          summary: 'budget exceeded',
+          durationMs: 96_000,
+          costUsd: 0.6,
+          toolCounts: [],
+          toolTotal: 0,
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0]).toContain('Exhausted (cost cap, $0.60)');
+    });
+
+    test('cost rendering rounds half-up at IEEE-754 edges (0.585 → $0.59)', () => {
+      // (0.585).toFixed(2) returns "0.58" in V8 / JavaScriptCore
+      // because 0.585 has an inexact IEEE-754 representation
+      // that rounds DOWN under toFixed's banker-style behavior.
+      // Anthropic pricing produces values right at this kind of
+      // edge — operator would see "$0.58 cost cap" when the run
+      // actually hit $0.59. Pin the half-up Math.round-based
+      // formatter so the displayed amount matches the cap that
+      // fired.
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'explain',
+          status: 'exhausted',
+          reason: 'maxCostUsd',
+          summary: '',
+          durationMs: 96_000,
+          costUsd: 0.585,
+          toolCounts: [],
+          toolTotal: 0,
+        },
+        unicode,
+      );
+      expect(out[0]).toContain('Exhausted (cost cap, $0.59)');
+      expect(out[0]).not.toContain('$0.58');
+    });
+
+    test('interrupted + aborted renders Aborted verb', () => {
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'explain',
+          status: 'interrupted',
+          reason: 'aborted',
+          summary: '',
+          durationMs: 1500,
+          costUsd: 0.02,
+          toolCounts: [],
+          toolTotal: 0,
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0]).toContain('Aborted');
+    });
+
+    test('exhausted + maxSteps renders step cap label', () => {
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'refactor',
+          status: 'exhausted',
+          reason: 'maxSteps',
+          summary: 'step cap reached',
+          durationMs: 5000,
+          costUsd: 0.42,
+          toolCounts: [],
+          toolTotal: 0,
+        },
+        unicode,
+      );
+      expect(out[0]).toContain('Exhausted (step cap)');
+    });
+
+    test('error + stepStalled renders "Error (no progress)"', () => {
+      // Step-stall watchdog fired — provider stream went silent
+      // for the full stallMs budget. Operator sees a specific
+      // cause label instead of a generic "Error" or worse,
+      // "Failed". Pin the verb so a regression that drops the
+      // stepStalled branch from the verb mapping shows up here.
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'explain',
+          status: 'error',
+          reason: 'stepStalled',
+          summary: 'step stalled (no provider events for 90000ms)',
+          durationMs: 90_000,
+          costUsd: 0.02,
+          toolCounts: [],
+          toolTotal: 0,
+        },
+        unicode,
+      );
+      expect(out[0]).toContain('Error (no progress)');
+    });
+
+    test('interrupted + maxWallClockMs renders Timed out', () => {
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'audit',
+          status: 'interrupted',
+          reason: 'maxWallClockMs',
+          summary: '',
+          durationMs: 600_000,
+          costUsd: 0,
+          toolCounts: [],
+          toolTotal: 0,
+        },
+        unicode,
+      );
+      expect(out[0]).toContain('Timed out');
+    });
+
+    test('uses ASCII glyph when caps.unicode is false', () => {
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'r',
+          status: 'done',
+          summary: 'ok',
+          durationMs: 100,
+          costUsd: 0,
+          toolCounts: [],
+          toolTotal: 0,
+        },
+        ascii,
+      );
+      // The padFrame helper prepends '  '; CHIP_FINAL_GLYPH ASCII
+      // is `*` so the line should begin with `  *`.
+      expect(out[0]?.startsWith('  *')).toBe(true);
+    });
+
+    test('a long child summary is dropped from the block (not echoed or truncated in)', () => {
+      const long = 'x'.repeat(200);
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'r',
+          status: 'done',
+          summary: long,
+          durationMs: 100,
+          costUsd: 0,
+          toolCounts: [],
+          toolTotal: 0,
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(1);
+      // None of the summary leaks into the block — not even truncated.
+      expect(out[0]).not.toContain('x');
+      expect(out[0]).toContain('Done');
+    });
+
+    test('empty summary: metric bracket follows the verb with the standard 2-space gap', () => {
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'r',
+          status: 'done',
+          summary: '',
+          durationMs: 100,
+          costUsd: 0,
+          toolCounts: [],
+          toolTotal: 0,
+        },
+        unicode,
+      );
+      // Empty summary → the duration follows the verb directly in the
+      // ` · ` chain (no summary segment, no brackets).
+      expect(out[0]).toContain('Done · 100ms');
+      expect(out[0]).not.toContain('[');
+    });
+  });
+
+  describe('info (UI.md §6.1 — plain by default, secondary tone opt-in)', () => {
+    test('default tone: message is plain (no SGR) even when colored', () => {
+      const out = formatPermanent({ kind: 'info', message: 'help text here' }, colored);
+      // [leading blank, message]. The message row carries no SGR —
+      // info isn't an alert; coloring it would collide with warn.
+      expect(out).toHaveLength(2);
+      expect(out[1]).toContain('help text here');
+      expect(out[1]).not.toContain(CSI);
+    });
+
+    test("tone 'plain' is identical to omitting tone", () => {
+      const plain = formatPermanent({ kind: 'info', message: 'x' }, colored);
+      const explicit = formatPermanent({ kind: 'info', message: 'x', tone: 'plain' }, colored);
+      expect(explicit).toEqual(plain);
+    });
+
+    test("tone 'secondary' paints the message in the grey meta channel (SGR 90)", () => {
+      const out = formatPermanent(
+        {
+          kind: 'info',
+          message: '— resumed 2 prior turns (history above; new turns below) —',
+          tone: 'secondary',
+        },
+        colored,
+      );
+      expect(out).toHaveLength(2);
+      expect(out[1]).toContain(`${CSI}90m`);
+      expect(out[1]).toContain('resumed 2 prior turns');
+    });
+
+    test("tone 'secondary' emits no SGR when color is disabled", () => {
+      const out = formatPermanent({ kind: 'info', message: 'anchor', tone: 'secondary' }, ascii);
+      // paint() no-ops under color: 'none' — the line is plain text.
+      expect(out[1]).toBe(pad('anchor'));
+    });
+  });
+});
+
+describe('formatPermanent — diff snippet (write/edit cards)', () => {
+  test('renders +N/-N counts on the file-path line (not the head) and a colored snippet', () => {
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'edit_file',
+        verb: 'Edited file',
+        subject: 'src/a.ts',
+        status: 'done',
+        durationMs: 10,
+        diff: {
+          added: 1,
+          removed: 1,
+          snippet: [
+            { type: 'ctx', text: 'a' },
+            { type: 'del', text: 'b' },
+            { type: 'add', text: 'B' },
+            { type: 'ctx', text: 'c' },
+          ],
+          hiddenChanges: 0,
+        },
+      },
+      ascii,
+    );
+    const head = out.find((l) => l.includes('Edited file'));
+    const pathLine = out.find((l) => l.includes('src/a.ts'));
+    // Counts moved off the head onto the path line.
+    expect(head?.includes('+1')).toBe(false);
+    expect(pathLine).toContain('+1');
+    expect(pathLine).toContain('-1');
+    expect(out.some((l) => l.includes('- b'))).toBe(true);
+    expect(out.some((l) => l.includes('+ B'))).toBe(true);
+  });
+
+  test('bolds the file path on a diff card (secondary + bold)', () => {
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'edit_file',
+        verb: 'Edited file',
+        subject: 'src/a.ts',
+        status: 'done',
+        durationMs: 10,
+        diff: {
+          added: 1,
+          removed: 0,
+          snippet: [{ type: 'add', text: 'x', newLine: 1 }],
+          hiddenChanges: 0,
+        },
+      },
+      colored,
+    );
+    const pathLine = out.find((l) => l.includes('src/a.ts'));
+    // secondary (90) + bold (1) wrap the path, single trailing reset.
+    expect(pathLine).toContain(`${CSI}90m${CSI}1msrc/a.ts${CSI}0m`);
+  });
+
+  test('a non-diff tool subject stays plain secondary (no bold)', () => {
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'bash',
+        verb: 'Executed',
+        subject: 'ls -la',
+        status: 'done',
+        durationMs: 5,
+      },
+      colored,
+    );
+    const subjectLine = out.find((l) => l.includes('ls -la'));
+    expect(subjectLine).toContain(`${CSI}90m`); // still secondary
+    expect(subjectLine?.includes(`${CSI}1m`)).toBe(false); // but not bold
+  });
+
+  test('summarizes changes beyond the snippet via the hidden-changes tail', () => {
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'write_file',
+        verb: 'Wrote file',
+        subject: 'src/b.ts',
+        status: 'done',
+        durationMs: 5,
+        diff: {
+          added: 10,
+          removed: 0,
+          snippet: [{ type: 'add', text: 'first' }],
+          hiddenChanges: 9,
+        },
+      },
+      ascii,
+    );
+    expect(out.join('\n')).toContain('+9 more changed lines');
+  });
+
+  test('sanitizes file-content lines (ANSI/control stripped) before render', () => {
+    const esc = String.fromCharCode(27); // build the raw ESC byte at runtime
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'edit_file',
+        verb: 'Edited file',
+        subject: 'src/c.ts',
+        status: 'done',
+        durationMs: 5,
+        diff: {
+          added: 1,
+          removed: 0,
+          snippet: [{ type: 'add', text: `${esc}[31mhack${esc}[0m` }],
+          hiddenChanges: 0,
+        },
+      },
+      ascii,
+    );
+    const joined = out.join('\n');
+    expect(joined).toContain('hack');
+    expect(joined.includes(esc)).toBe(false); // no escape sequence leaked through
+  });
+
+  test('renders a line-number gutter: new-file for ctx/add, old-file for del', () => {
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'edit_file',
+        verb: 'Edited file',
+        subject: 'src/a.ts',
+        status: 'done',
+        durationMs: 10,
+        diff: {
+          added: 1,
+          removed: 1,
+          snippet: [
+            { type: 'ctx', text: 'a', oldLine: 1, newLine: 1 },
+            { type: 'del', text: 'b', oldLine: 2 },
+            { type: 'add', text: 'B', newLine: 2 },
+            { type: 'ctx', text: 'c', oldLine: 3, newLine: 3 },
+          ],
+          hiddenChanges: 0,
+        },
+      },
+      ascii,
+    );
+    expect(out.some((l) => l.includes('2 | - b'))).toBe(true); // del shows old line 2
+    expect(out.some((l) => l.includes('2 | + B'))).toBe(true); // add shows new line 2
+    expect(out.some((l) => l.includes('1 |'))).toBe(true);
+    expect(out.some((l) => l.includes('3 |'))).toBe(true);
+  });
+
+  test('right-aligns the gutter to the widest line number', () => {
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'edit_file',
+        verb: 'Edited file',
+        subject: 'x',
+        status: 'done',
+        durationMs: 1,
+        diff: {
+          added: 1,
+          removed: 0,
+          snippet: [
+            { type: 'ctx', text: 'nine', oldLine: 9, newLine: 9 },
+            { type: 'add', text: 'ten', newLine: 10 },
+          ],
+          hiddenChanges: 0,
+        },
+      },
+      ascii,
+    );
+    // 9 padded to width 2 so the rail aligns under the 2-digit 10.
+    expect(out.some((l) => l.includes(' 9 | '))).toBe(true);
+    expect(out.some((l) => l.includes('10 | '))).toBe(true);
+  });
+
+  test('uses the │ rail under unicode caps', () => {
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'edit_file',
+        verb: 'Edited file',
+        subject: 'x',
+        status: 'done',
+        durationMs: 1,
+        diff: {
+          added: 1,
+          removed: 0,
+          snippet: [{ type: 'add', text: 'x', newLine: 1 }],
+          hiddenChanges: 0,
+        },
+      },
+      unicode,
+    );
+    expect(out.join('\n')).toContain('│');
+  });
+
+  test('paints the number in the line tone; the rail stays secondary', () => {
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'edit_file',
+        verb: 'Edited file',
+        subject: 'x',
+        status: 'done',
+        durationMs: 1,
+        diff: {
+          added: 1,
+          removed: 1,
+          snippet: [
+            { type: 'del', text: 'b', oldLine: 2 },
+            { type: 'add', text: 'B', newLine: 2 },
+          ],
+          hiddenChanges: 0,
+        },
+      },
+      colored,
+    );
+    const joined = out.join('\n');
+    expect(joined).toContain(`${CSI}31m2${CSI}0m`); // del number → error (red)
+    expect(joined).toContain(`${CSI}32m2${CSI}0m`); // add number → success (green)
+    expect(joined).toContain(`${CSI}90m │ ${CSI}0m`); // rail → secondary (grey)
+  });
+
+  test('no gutter when the snippet carries no line numbers (back-compat)', () => {
+    const out = formatPermanent(
+      {
+        kind: 'tool-end',
+        name: 'write_file',
+        verb: 'Wrote file',
+        subject: 'x',
+        status: 'done',
+        durationMs: 1,
+        diff: {
+          added: 1,
+          removed: 0,
+          snippet: [{ type: 'add', text: 'x' }],
+          hiddenChanges: 0,
+        },
+      },
+      ascii,
+    );
+    const addLine = out.find((l) => l.includes('+ x'));
+    expect(addLine?.trimStart().startsWith('+')).toBe(true); // no leading "N |"
+  });
+
+  describe('reasoning (extended-thinking block, UI.md)', () => {
+    test('renders a blank lead, a "reasoning:" header, then one body line per \\n', () => {
+      const out = formatPermanent({ kind: 'reasoning', text: 'line one\nline two' }, ascii);
+      expect(out).toEqual([pad(''), pad('reasoning:'), pad('line one'), pad('line two')]);
+    });
+
+    test('header is bold+secondary, body is secondary (colored caps)', () => {
+      const out = formatPermanent({ kind: 'reasoning', text: 'scratch' }, colored);
+      // header: bold then secondary, single trailing reset (paintMulti).
+      expect(out[1]).toBe(pad(`${CSI}1m${CSI}90mreasoning:${CSI}0m`));
+      // body: secondary only.
+      expect(out[2]).toBe(pad(`${CSI}90mscratch${CSI}0m`));
+    });
+
+    test('soft-wraps a long single line so no rendered row overflows cols', () => {
+      const long = 'word '.repeat(60).trim(); // ~299 chars, no embedded newline
+      const out = formatPermanent({ kind: 'reasoning', text: long }, { ...ascii, cols: 40 });
+      // header + at least two wrapped body rows.
+      expect(out.length).toBeGreaterThan(3);
+      for (const row of out) expect(row.length).toBeLessThanOrEqual(40);
+    });
+
+    test('preserves blank separator lines between summary parts', () => {
+      const out = formatPermanent({ kind: 'reasoning', text: 'part one\n\npart two' }, ascii);
+      expect(out).toEqual([pad(''), pad('reasoning:'), pad('part one'), pad(''), pad('part two')]);
+    });
+  });
+});

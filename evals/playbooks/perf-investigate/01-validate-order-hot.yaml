@@ -1,0 +1,15 @@
+name: 01-validate-order-hot
+playbook: perf-investigate
+prompt: |-
+  Latency p99 on `validateOrder` regressed from 40ms to 120ms
+  after the last release. Run a profile against
+  `bench/orders.js`, identify the hot path, hypothesize the
+  cause, and quantify the suggested intervention's expected
+  gain. Do NOT apply any fix.
+expect:
+  output_schema_valid: true
+  output_contains:
+    - baseline
+    - hot_path
+    - hypotheses
+    - suggestions

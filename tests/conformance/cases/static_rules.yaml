@@ -1,0 +1,447 @@
+# Conformance: static rule matching (PERMISSION_ENGINE.md §6.2)
+# Cover the rule precedence (deny > session > allow > confirm),
+# the search-tool root semantics, and the default-deny fallback.
+
+- name: "deny rule wins over allow"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["rm *"]
+          deny: ["rm -rf *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "rm -rf /tmp/x"
+  expect:
+    kind: "deny"
+    source_section: "bash"
+
+- name: "allow rule produces allow"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["git status"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "git status"
+  expect:
+    kind: "allow"
+    source_section: "bash"
+
+- name: "confirm rule produces confirm"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        bash:
+          confirm: ["git push *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "git push origin main"
+  expect:
+    kind: "confirm"
+    source_section: "bash"
+
+- name: "default-deny when no rule matches"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["git status"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "curl example.com"
+  expect:
+    kind: "deny"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group A — Hierarchy precedence (slice 64)
+#
+# §5 + hierarchy.ts merge semantics: each tools.<section> is replaced
+# WHOLLY by the highest-precedence layer that wrote it (order:
+# enterprise → user → project → session). Locks prevent overrides.
+# These cases pin the "last writer wins per section" rule across
+# distinct layers via the runner's enterprise_policy / user_policy /
+# session_policy seams.
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "user bash section replaces enterprise bash section entirely"
+  # Section-level replacement, not rule-merging. Enterprise's allow
+  # of `npm test` is dropped when user writes ANY bash section,
+  # even one with different rules.
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    enterprise_policy: |
+      tools:
+        bash:
+          allow: ["npm test"]
+    user_policy: |
+      tools:
+        bash:
+          deny: ["npm test"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "npm test"
+  expect:
+    kind: "deny"
+    source_section: "bash"
+
+- name: "enterprise + user write different sections — both apply"
+  # Enterprise sets bash; user sets read_file. The merged policy
+  # has BOTH sections — section-replacement is per-section, not
+  # per-policy.
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    enterprise_policy: |
+      tools:
+        bash:
+          allow: ["git status"]
+    user_policy: |
+      tools:
+        read_file:
+          allow_paths: ["src/**"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "git status"
+  expect:
+    kind: "allow"
+    source_section: "bash"
+
+- name: "session policy bash beats project bash (last writer wins)"
+  # Session is the highest-precedence layer; it overrides project's
+  # bash rules. Operator's `--policy-session` CLI flag flows here.
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        bash:
+          deny: ["git status"]
+    session_policy: |
+      tools:
+        bash:
+          allow: ["git status"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "git status"
+  expect:
+    kind: "allow"
+    source_section: "bash"
+
+- name: "session mode=bypass overrides project mode=strict (session highest-precedence)"
+  # defaults.mode field is replaced by the highest-precedence layer
+  # that wrote it. Merge order: enterprise → user → project → session
+  # with last-writer-wins, so session's mode=bypass beats project's
+  # mode=strict and bash returns allow under bypass.
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      defaults:
+        mode: strict
+    session_policy: |
+      defaults:
+        mode: bypass
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "ls"
+  expect:
+    kind: "allow"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group B — Locked sections (slice 64)
+#
+# A higher-precedence layer setting `locked: true` on a section
+# prevents lower-precedence layers from changing it. Re-asserting
+# the same value is silent; an actual change records a lockConflict
+# AND is discarded (the locked version stays authoritative). These
+# cases verify the engine sees the LOCKED layer's rules / fields,
+# not the overrider's.
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "enterprise locks bash → user override silently rejected"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    enterprise_policy: |
+      tools:
+        bash:
+          allow: ["git status"]
+          locked: true
+    user_policy: |
+      tools:
+        bash:
+          allow: ["rm -rf /work/proj/junk"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      # Slice 147: cwd-relative path so the resolver passes it to
+      # the policy stage (RM_REFUSE_ROOTS catches `rm -rf /` BEFORE
+      # policy is consulted; that's covered by the resolver suite).
+      # The lock semantics tested here are about policy override
+      # rejection, not catastrophic-rm refuse.
+      command: "rm -rf /work/proj/junk"
+  expect:
+    kind: "deny"
+    source_section: "bash"
+
+- name: "enterprise locks bash — locked rules still match for non-overridden allows"
+  # Enterprise's allow list survived the lock; queries matching it
+  # still produce allow.
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    enterprise_policy: |
+      tools:
+        bash:
+          allow: ["git status"]
+          locked: true
+    user_policy: |
+      tools:
+        bash:
+          deny: ["git status"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "git status"
+  expect:
+    kind: "allow"
+    source_section: "bash"
+
+- name: "enterprise locks defaults.mode=strict → user mode=bypass ignored"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    enterprise_policy: |
+      defaults:
+        mode: strict
+        locked: true
+    user_policy: |
+      defaults:
+        mode: bypass
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "ls"
+  expect:
+    # Strict mode + no matching bash rule = deny.
+    kind: "deny"
+
+- name: "user locks bash → project override rejected (lock applies down-precedence)"
+  # Locks work in either direction of precedence — the locking
+  # layer sticks; layers BELOW (or above, since order is strict)
+  # can't change it. Here user locks; project's later attempt is
+  # dropped.
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    user_policy: |
+      tools:
+        bash:
+          allow: ["pwd"]
+          locked: true
+    project_policy: |
+      tools:
+        bash:
+          allow: ["rm -rf /work/proj/junk"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      # Slice 147: cwd-relative path (same reason as above).
+      command: "rm -rf /work/proj/junk"
+  expect:
+    kind: "deny"
+    source_section: "bash"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group C — Pattern edge cases (slice 64)
+#
+# Within a single layer's rules, how do overlapping / multiple
+# entries resolve? Spec §6.2: deny > allow > confirm precedence,
+# evaluated against the input.
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "specific deny beats broad allow"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["git *"]
+          deny: ["git push --force *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "git push --force origin main"
+  expect:
+    kind: "deny"
+    source_section: "bash"
+
+- name: "multiple allow rules — any match wins"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        bash:
+          allow:
+            - "git status"
+            - "git log"
+            - "git diff *"
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "git diff HEAD~3"
+  expect:
+    kind: "allow"
+    source_section: "bash"
+
+- name: "confirm rule fires when no allow/deny matches"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["git status"]
+          confirm: ["git push *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "git push origin main"
+  expect:
+    kind: "confirm"
+    source_section: "bash"
+
+- name: "deny beats confirm when both match"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        bash:
+          confirm: ["git push *"]
+          deny: ["git push *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "git push origin main"
+  expect:
+    kind: "deny"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group D — Cross-tool rule shapes (slice 64)
+#
+# Static-rule matching applies to every gated tool, not just bash.
+# These cases pin the rule-engine's path/host matching for
+# non-bash tools.
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "read_file allow_paths matches relative pattern"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        read_file:
+          allow_paths: ["src/**"]
+  input:
+    tool: "read_file"
+    category: "fs.read"
+    args:
+      file_path: "src/lib/index.ts"
+  expect:
+    kind: "allow"
+    source_section: "read_file"
+
+- name: "write_file deny_paths blocks even when not in allow"
+  # deny_paths is always restrictive — overrides allow / default
+  # behavior.
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        write_file:
+          allow_paths: ["src/**"]
+          deny_paths: ["src/secrets/**"]
+  input:
+    tool: "write_file"
+    category: "fs.write"
+    args:
+      file_path: "src/secrets/api-key"
+      content: "x"
+  expect:
+    kind: "deny"
+    source_section: "write_file"
+
+- name: "fetch_url allow_hosts matches exact host"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        fetch_url:
+          allow_hosts: ["api.github.com"]
+  input:
+    tool: "fetch_url"
+    category: "web.fetch"
+    args:
+      url: "https://api.github.com/repos/foo/bar"
+  expect:
+    kind: "allow"
+    source_section: "fetch_url"
+
+- name: "fetch_url deny_hosts blocks even when host matches allow"
+  # deny precedence applies to host-based rules same as path-based.
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        fetch_url:
+          allow_hosts: ["*.example.com"]
+          deny_hosts: ["bad.example.com"]
+  input:
+    tool: "fetch_url"
+    category: "web.fetch"
+    args:
+      url: "https://bad.example.com/x"
+  expect:
+    kind: "deny"
+    source_section: "fetch_url"

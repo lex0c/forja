@@ -1,0 +1,35 @@
+name: working-state hypothesis survives compaction via panel re-injection
+evaluates: harness
+prompt: |
+  Before anything else, make ONE working_state_update call that sets your
+  focus to "identify the shared dependency" and adds a hypothesis whose text
+  is EXACTLY this line:
+
+  MARKER_WS_HYP all five modules import from forja-core
+
+  Then read every TypeScript file under src/ in alphabetical order
+  (a.ts, b.ts, c.ts, d.ts, e.ts), one at a time. The reads are extensive, so
+  compaction will fire and wipe the early conversation — including that first
+  tool call.
+
+  Your FINAL message MUST restate your single active hypothesis, copied
+  VERBATIM. After compaction the only surviving record of it is the
+  working-state panel, re-injected every turn from the panel store (NOT from
+  the conversation). If panel re-injection works, the token MARKER_WS_HYP
+  shows up in your final reply.
+setup:
+  fixture: ../fixtures/chunky-modules
+expect:
+  - tool_called: working_state_update
+  - compaction_triggered:
+      min_count: 1
+  - output_contains: MARKER_WS_HYP
+  - status: done
+budget:
+  maxSteps: 12
+  maxCostUsd: 0.15
+  # Force compaction on the small fixture (mirrors 24-compaction-preserves-goal):
+  # the first turn's working_state_update is pushed into the compacted middle,
+  # so a MARKER_WS_HYP in the final reply can only come from panel re-injection.
+  compactionThreshold: 0.02
+  compactionPreserveTail: 1

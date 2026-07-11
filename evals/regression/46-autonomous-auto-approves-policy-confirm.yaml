@@ -1,0 +1,27 @@
+name: autonomous posture auto-approves a routine policy confirm
+evaluates: harness
+# Operation-mode (AGENTIC_CLI §8.1). A plain `confirm` policy rule on a
+# low-risk write: under the autonomous posture the engine auto-approves
+# it (no modal), so the write actually lands. The companion case (47)
+# proves a risk-signal command is NOT auto-approved even in autonomous.
+prompt: |
+  Use the write_file tool exactly once to create `out.txt` with the
+  content `hi`. Do NOT use any other tool, and do NOT read anything
+  first. Report whatever the tool returns.
+setup:
+  approvalPosture: autonomous
+  files:
+    .forja/permissions.yaml: |
+      defaults:
+        mode: strict
+      tools:
+        write_file:
+          confirm_paths:
+            - "out.txt"
+expect:
+  - tool_called: write_file
+  - file_exists: out.txt
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

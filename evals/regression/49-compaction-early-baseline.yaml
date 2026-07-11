@@ -1,0 +1,35 @@
+name: compaction-early A/B baseline — high threshold, history grows un-compacted
+evaluates: harness
+# Controlled A/B for "compact/elide earlier" (the CONTEXT_TUNING §990 / BACKLOG
+# 404-416 follow-up). Same tool-heavy scenario as 23/48, with compactionRelevance
+# fixed ON in BOTH arms — the ONLY variable vs the treatment (case 50) is
+# compactionThreshold, removing the 23-vs-48 confound (which varied relevance AND
+# threshold). Here 0.5 is high enough that this scenario never crosses it, so the
+# history grows un-compacted and is re-read every turn — simulating the real
+# session where compaction ran 0x and cache-read dominated cost. Compare costUsd
+# against case 50 out of band; the quality assertions confirm the task succeeds.
+#
+# RESULT (jun/2026, haiku, --repeat 3): baseline avg $0.030 vs treatment (case 50)
+# $0.040 — compacting early cost +31% and was 2.5x slower; both 3/3 pass. The micro
+# scenario collapsed to 4 steps (parallel reads), so the long-session regime where
+# compacting saves cache-read was never reached. A micro-eval can't show the win
+# (compaction overhead is ~fixed and dominates at short scale; the read-saving only
+# amortizes over a long session) → default compaction_threshold 0.7 stays; the real
+# lever (cache-read in a long session) needs production instrumentation, not a fixture.
+prompt: |
+  Read every TypeScript file under src/ in alphabetical order
+  (a.ts, b.ts, c.ts, d.ts, e.ts), then read each one a SECOND time in the
+  same alphabetical order. After all ten reads, tell me the dependency name
+  every file imports from. Quote it verbatim.
+setup:
+  fixture: ../fixtures/chunky-modules
+expect:
+  - tool_called: read_file
+  - status: done
+  - output_contains: forja-core
+budget:
+  maxSteps: 16
+  maxCostUsd: 0.40
+  compactionThreshold: 0.5
+  compactionPreserveTail: 1
+  compactionRelevance: true

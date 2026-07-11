@@ -1,0 +1,23 @@
+name: parallel reads in a single turn
+prompt: |
+  Read the three files alpha.txt, beta.txt, and gamma.txt in this directory.
+  Emit ALL THREE read_file calls in a SINGLE assistant message — do NOT chain
+  them across turns. After reading, summarize what each file says with one
+  short sentence per file (3 sentences total).
+setup:
+  fixture: ../fixtures/parallel-reads
+expect:
+  - tool_called: read_file
+  - output_contains: agile
+  - output_contains: bright
+  - output_contains: graceful
+  - status: done
+budget:
+  # Tight: 2 turns is enough only when the model parallelizes
+  # the three reads in turn 1 and summarizes in turn 2. If the
+  # model serialized (one read per turn), it would need 4 turns
+  # and trip this cap. Combined with the three output_contains
+  # assertions on file content, this gives a pretty strong
+  # regression net for the parallel_safe wire from
+  # ORCHESTRATION.md §1.3 (BACKLOG eval #34).
+  maxSteps: 3

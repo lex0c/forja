@@ -1,0 +1,23 @@
+name: strict mode denies write outside allow_paths scope
+evaluates: harness
+prompt: |
+  Use the write_file tool to create `data.json` with the single line `{}`.
+  Report whatever the tool returns. Do NOT retry with a different path or
+  extension, do NOT switch tools.
+setup:
+  files:
+    .forja/permissions.yaml: |
+      defaults:
+        mode: strict
+      tools:
+        write_file:
+          allow_paths:
+            - '*.md'
+expect:
+  - tool_called: write_file
+  - tool_denied: write_file
+  - file_not_exists: data.json
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

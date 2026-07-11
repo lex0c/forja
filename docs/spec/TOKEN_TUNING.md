@@ -259,7 +259,7 @@ Reasoning tokens são **cobrados** mesmo se ocultos:
 - Anthropic: `reasoning.cost_usd` em traces
 - OpenAI: aparece em billing como tokens normais
 
-UI mostra `🧠 thinking... (Xs, $Y)` durante reasoning ativo (LOCAL_MODELS via UI.md `<ThinkingIndicator>`).
+UI mostra `thinking... (Xs, $Y)` na status line durante reasoning ativo (evento `thinking:delta`, UI.md §3.2).
 
 ### 4.4 Per playbook
 
@@ -436,6 +436,10 @@ Tabela canônica de tuning per workflow. Aplicada em playbook frontmatter.
 | `recap` (LLM render) | 0.2 | 0.95 | 4096 | off | yes |
 | Modo normal (sem playbook) | 0.2 | 0.95 | 4096 | conservative | no |
 
+**Nota — modelos que deprecaram `temperature`/`top_p`:** alguns frontier models (ex.: Anthropic Opus 4.7) rejeitam a passagem de `temperature` ou `top_p` no Messages API com HTTP 400. O adapter respeita uma flag opcional `capabilities.supports_sampling` (default `true`); quando declarada `false`, ambos os parâmetros são strippados antes do request. A tabela canonical acima continua valendo para todos os modelos restantes — o opt-out é por-modelo e observável via `ProviderCapabilities`, não uma exceção workflow-level. Determinismo nos modelos que opt-out fica reduzido (provider default), mas o cache de output (RECAP §8.3 / outros workflows com cache content-hashed) absorve a deriva entre runs idênticos.
+
+**Nota — `temperature` + `top_p` na mesma request:** distinto do caso acima — modelos Anthropic atuais (Haiku 4.5 e a família 4.x) **aceitam** sampling, mas rejeitam os **dois** parâmetros juntos numa request com HTTP 400 (`temperature and top_p cannot both be specified for this model`). Como **toda** linha da tabela fixa ambos, isso atinge todos os workflows, não só `recap`. O adapter Anthropic envia **apenas `temperature`** quando os dois vêm (knob primário; a própria Anthropic recomenda ajustar um OU outro), `top_p` sozinho quando `temperature` está ausente, e nada quando `supports_sampling=false`. A tradução é per-adapter (§10.1): a tabela mantém os dois valores como **intenção canônica**, e cada adapter resolve a restrição do seu provider — OpenAI/Google, que aceitam o par, continuam recebendo ambos. Sem isso, todo render constrained (recap inclusive) caía em HTTP 400 → fallback silencioso.
+
 ### 9.1 Justificativas
 
 - **`code-review` temp 0.1**: factual; queremos consistência; mesma lógica em re-runs
@@ -489,6 +493,7 @@ Provider adapter normaliza:
 - `repetition_penalty` em Anthropic/OpenAI: ignored com warning
 - `frequency_penalty` em Ollama/llama.cpp: aproximado via `repetition_penalty`
 - `top_k` em Anthropic/OpenAI: ignored
+- `temperature` + `top_p` juntos em Anthropic (modelos atuais): envia só `temperature` (§9, nota)
 
 Sem error em parâmetro não-suportado; warning em audit.
 
@@ -618,7 +623,7 @@ Hash do conteúdo final (template + frontmatter + sampling) é registrado em `pr
 
 ### 13.4 System prompt regression eval
 
-A fonte mais comum de regressão silenciosa não é mudança de modelo nem de sampling — é mudança de **system prompt** ou **playbook**. A Anthropic admitiu publicamente em 2026 que Claude Code regressou em qualidade após uma mudança de prompt que ninguém marcou como breaking. Sem eval dedicado, o erro deles é o erro padrão.
+A fonte mais comum de regressão silenciosa não é mudança de modelo nem de sampling — é mudança de **system prompt** ou **playbook**. Casos públicos de 2026 mostram agentes regredindo em qualidade após mudanças de prompt que ninguém marcou como breaking. Sem eval dedicado, o erro deles é o erro padrão.
 
 Princípio 4 ("Eval é load-bearing") fica vazio se o caminho mais quente de regressão não tem cobertura.
 

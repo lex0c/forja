@@ -1,0 +1,33 @@
+name: compaction-early A/B treatment — low threshold, elide early
+evaluates: harness
+# Treatment arm for "compact/elide earlier". Byte-identical to case 49 EXCEPT
+# compactionThreshold: 0.02 (fires early → the relevance pre-pass pointer-elides
+# low-goal-relevance tool_result bodies, keeping the history small). costUsd here
+# vs case 49 is the controlled measurement: same scenario, relevance fixed ON,
+# threshold the only variable.
+#   lower cost than 49  → compacting early pays off net (cache-read saved > the
+#                         cache-write / LLM-fold paid to compact)
+#   higher cost than 49 → at this scale the write/fold cost of compacting
+#                         dominates the read saved (the cache trade-off bites)
+# Quality assertions (same as 49) confirm elideing early does not break the task.
+#
+# RESULT (jun/2026, haiku, --repeat 3): avg $0.040 vs baseline (case 49) $0.030 —
+# compacting early cost +31%, 2.5x slower; 3/3 pass. See case 49 for the verdict
+# (a micro-eval can't show the win; default threshold 0.7 stays).
+prompt: |
+  Read every TypeScript file under src/ in alphabetical order
+  (a.ts, b.ts, c.ts, d.ts, e.ts), then read each one a SECOND time in the
+  same alphabetical order. After all ten reads, tell me the dependency name
+  every file imports from. Quote it verbatim.
+setup:
+  fixture: ../fixtures/chunky-modules
+expect:
+  - tool_called: read_file
+  - status: done
+  - output_contains: forja-core
+budget:
+  maxSteps: 16
+  maxCostUsd: 0.40
+  compactionThreshold: 0.02
+  compactionPreserveTail: 1
+  compactionRelevance: true

@@ -1,0 +1,28 @@
+name: PostToolUse hook fires after a successful write
+evaluates: harness
+prompt: |
+  Use the write_file tool to create `data.txt` with content `payload`.
+  Report what the tool returned.
+setup:
+  files:
+    .forja/permissions.yaml: |
+      defaults:
+        mode: bypass
+    .forja/hooks.toml: |
+      [[hooks]]
+      event = "PostToolUse"
+      command = "echo posthook-fired > posthook.marker"
+expect:
+  - tool_called: write_file
+  - file_exists: data.txt
+  # Marker proves PostToolUse dispatched AFTER the tool ran.
+  # Drain in finish() guarantees the chain settled before the
+  # eval's expect phase reads the workspace.
+  - file_exists: posthook.marker
+  - file_contains:
+      path: posthook.marker
+      pattern: posthook-fired
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

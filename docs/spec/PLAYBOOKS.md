@@ -31,6 +31,7 @@ Os 8 princípios abaixo são as derivações operacionais dessa diretriz:
 ---
 name: string                  # único, kebab-case
 description: string           # uma linha, aparece em /help
+model: string                 # opcional; id do catálogo. Default: herda o modelo da sessão (ver abaixo)
 tools: [string]               # whitelist (default: vazio = nenhuma)
 tool_restrictions:            # restrições por tool específica
   bash: [glob]                # comandos permitidos
@@ -42,6 +43,7 @@ budget:
 references: [path]            # docs lidos sob demanda
 output_schema: {...}          # schema YAML/JSON do output esperado
 slash: string                 # comando que invoca (sem /)
+when_to_use: string           # uma linha; sinaliza quando o agente principal deve auto-delegar (ver §1.4)
 sampling:                     # tuning de geração (ver TOKEN_TUNING.md)
   temperature: float          # 0.0 - 2.0
   top_p: float                # 0.0 - 1.0
@@ -56,7 +58,6 @@ context_recipe:               # shaping de contexto (ver CONTEXT_TUNING.md)
   fewshot_count: int
   memory_filter: [string]     # filtra memory index por type/tag
   step_reflection: enum [off, terse, full]   # default off; opt-in (CONTEXT_TUNING.md §13.10)
-  clarify_mode: enum [off, on_high_blast, pre_execution]   # default on_high_blast (STATE_MACHINE.md §12)
 prompt_version: int           # bump em mudança de prompt OR sampling
 context_recipe_version: int   # bump em mudança de recipe
 phases:                       # opt-in; auto-emite push/pop em goal_stack (STATE_MACHINE.md §2.3)
@@ -67,6 +68,8 @@ phases:                       # opt-in; auto-emite push/pop em goal_stack (STATE
 ```
 
 Sampling defaults canônicos por workflow em [`TOKEN_TUNING.md`](./TOKEN_TUNING.md) §9. Context recipes canônicos por workflow em [`CONTEXT_TUNING.md`](./CONTEXT_TUNING.md) §13. Override per playbook conforme acima. Goal stack lifecycle em [`STATE_MACHINE.md`](./STATE_MACHINE.md) §2.3 — playbooks com `phases` declaradas auto-empilham objetivos; sem `phases`, push/pop é manual.
+
+**Modelo de execução (`model`).** Opcional. Ausente (o caso padrão), o subagent roda no **mesmo modelo da sessão** que o invocou — o comportamento atual, inalterado para todo playbook existente. Presente, deve ser um id do catálogo de modelos (`anthropic/claude-opus-4-8`, `openai/gpt-4o`, `ollama/<modelo>`, …): o harness resolve o provider pelo catálogo no momento do spawn e grava esse id na sessão-filha, de modo que custo e auditoria refletem o modelo realmente usado, não o do pai (o `subagent-child` já reconstrói o provider a partir de `session.model` + do snapshot do catalog entry). A resolução é **fail-soft com preflight**: se o id não existe no catálogo ou o provider não pode ser instanciado (ex.: credencial ausente), o spawn é recusado com um envelope de erro claro **antes** de gastar um processo — o modelo principal recebe o erro e corrige, em vez de o run falhar opaco. É um **override estático por playbook**, não orquestração: sem seleção dinâmica de modelo, sem DAG, sem perfil hybrid/orchestrated — apenas a resolução de modelo por catálogo que o resto do sistema já faz via `--model`. A profundidade de aninhamento permanece governada por `MAX_SUBAGENT_DEPTH`; `model` não interage com ela.
 
 ### 1.2 Output schema sempre tem
 
@@ -95,6 +98,89 @@ Sem esses três campos, o playbook está incompleto.
 
 Sem "você é", sem "passo 1 / passo 2", sem motivação inspiracional.
 
+### 1.4 Discovery e roteamento
+
+Playbooks são consumidos por **dois caminhos**, mesma engine (`task_sync`/`task_async` em [`ORCHESTRATION.md`](./ORCHESTRATION.md) §6):
+
+| Caminho | Quem invoca | Trigger |
+|---|---|---|
+| Slash command | usuário | digita `/review`, `/challenge`, etc. no CLI |
+| Auto-delegação | agente principal | reconhece padrão e chama `task_sync("<playbook>", ...)` |
+
+**Discovery (como o agente principal vê o registry):**
+
+No startup, o harness varre `~/.config/agent/playbooks/*.md`, extrai `name + description + when_to_use` e injeta no system prompt do agente principal como tabela canônica. Limite: ≤ 12 linhas, ≤ 800 tokens — cabe em qualquer modelo sem comer contexto útil. Exemplo do que o modelo vê:
+
+```
+| playbook              | when_to_use                                                              |
+|-----------------------|--------------------------------------------------------------------------|
+| code-review           | diff pronto pra revisão; mudança que precisa de gate antes de merge      |
+| security-audit        | código que toca authz/crypto/input boundary; varredura por threat category|
+| ...                   | ...                                                                      |
+```
+
+`name` é o ID que vai em `task_sync(playbook=...)`. `slash:` não aparece — é detalhe de UX, não de roteamento.
+
+**Critério de auto-delegação (constraints negativas primeiro):**
+
+NÃO delegue quando:
+- Pergunta respondível com 1-2 reads sem schema de output (ex: "onde está definida a função X?")
+- Conversa exploratória ainda formando o problema — delegar prematuramente trava em schema antes da forma estar clara
+- Tarefa não casa com nenhum `when_to_use` — não force-fit
+- Usuário pediu resposta direta, não relatório estruturado
+
+Delegue quando:
+- Tarefa cabe num schema estruturado de algum playbook (`code-review`, `security-audit`, etc.) e o usuário se beneficia do output categorizado
+- Quer **isolation de contexto** — subagent não polui o turno principal com leituras intermediárias
+- Quer **tools restritas** — ex: red-team que NÃO deve poder editar código
+- Tarefa exige **viés explícito** que conflita com o tom default (ex.: paranoia em `security-audit`)
+
+**Anti-pattern: auto-delegar tudo.** Subagent custa context handoff + budget + latência. Usar `task_sync` pra "que horas são" é cargo cult. Default é responder direto; delegação é exceção que paga benefício específico (isolation, schema, viés, tool restriction).
+
+**Selection eval (PR-bloqueante):** `evals/playbooks/_routing/` com 30 prompts:
+- 15 que devem disparar delegação (cada um casando com 1 playbook específico)
+- 10 que NÃO devem disparar (perguntas simples, exploratórias, off-pattern)
+- 5 ambíguos (multi-playbook plausível) — esperado: agente escolhe um e justifica em uma linha, ou pede clarification
+
+Métricas:
+- `wrong_dispatch_rate` ≤ 0.10 (delegou pro playbook errado)
+- `false_dispatch_rate` ≤ 0.10 (delegou quando não devia)
+- `missed_dispatch_rate` ≤ 0.15 (não delegou quando devia — mais tolerante; falso negativo é menos custoso que falso positivo)
+
+A combinação de `when_to_use` declarado + eval de roteamento é o que mantém a §14 honesta: se o teto de 6 estoura confusão de seleção, a métrica detecta antes de o usuário sentir.
+
+### 1.5 Intenção vs literal
+
+O pedido do usuário é o **ponto de partida**, não o contrato fechado. Linguagem natural é lossy: o usuário comprime o que quer numa frase, e parte da intenção fica fora dela. Mas inferir intenção é faca de dois gumes — interpretar demais vira scope creep ("já que eu tava lá, refatorei junto"), interpretar de menos vira agente literal-burro que troca `methodName` pela string `"method_name"` em vez de procurar a função no código.
+
+A regra é **calibrar pelo blast radius e pela ambiguidade**, não escolher um extremo.
+
+#### NÃO faça
+- Executar literalmente quando o pedido é ambíguo, contraditório, ou claramente subespecificado. "Renomeie pra snake_case" sem alvo = procurar o referente, não devolver a string transformada.
+- Inferir intenção e agir em silêncio quando a inferência **diverge** do literal. Se você acha que o usuário "na verdade queria" outra coisa, pergunte — não decida por ele.
+- Expandir escopo via inferência ("ele pediu pra consertar X mas claramente Y também tá quebrado"). Y é tarefa nova, não corolário.
+- Inferir intenção em ações destrutivas ou de blast radius alto. Ambiguidade em `rm -rf`, `force push`, `drop table`, mensagem em canal compartilhado = pergunta, não chute.
+
+#### Faça
+- Tratar o pedido literal como **uma evidência** da intenção, não como a intenção inteira. Combine com: contexto da conversa, código que está aberto, histórico recente, CLAUDE.md.
+- Resolver subespecificação por inferência **dentro do escopo declarado** (achar o referente, escolher o lib óbvio do projeto, seguir convenção existente). Isso é cumprir o pedido, não expandi-lo.
+- Quando intenção inferida diverge do literal: **uma pergunta curta** com a divergência explícita. "Você quer que eu renomeie só `methodName` ou todos os métodos do arquivo?" — não dois parágrafos de hipóteses.
+- Declarar a inferência no output. Se assumiu algo não-óbvio, vai em `assumptions` (§1.2). Inferência silenciosa que dá errado é pior que inferência explícita que o usuário corrige.
+
+#### Heurística rápida
+
+| Sinal | Ação |
+|---|---|
+| Pedido literal é executável e não-ambíguo | Execute literal. |
+| Pedido subespecificado, intenção é inferível do contexto, blast radius baixo | Infira, declare em `assumptions`, execute. |
+| Intenção inferida **diverge** do literal | Pergunte antes. |
+| Blast radius alto (destrutivo, compartilhado, irreversível) + qualquer ambiguidade | Pergunte antes. |
+| Inferência implicaria expandir escopo | Não infira; entregue o pedido literal e levante o resto como observação. |
+
+#### Anti-pattern
+
+"Eu sei o que ele quis dizer" sem evidência no contexto = alucinação de intenção. Se a única evidência é seu próprio palpite, é palpite — pergunte.
+
 ---
 
 ## 2. Playbook: `code-review`
@@ -105,15 +191,10 @@ Slash command: `/review`. Subagent isolado. Não edita nada.
 ---
 name: code-review
 description: Revisa mudanças e reporta findings. Não conserta.
-tools: [read_file, grep, glob, bash]
-tool_restrictions:
-  bash:
-    - "git diff *"
-    - "git log *"
-    - "git show *"
-    - "git blame *"
-    - "rg *"
-    - "cat *"
+tools: [read_file, grep, glob, git]   # `git` (read-only) supersedes the old
+                                      # bash-restricted-to-git approach: same
+                                      # diff/log/show/blame, but writes:false →
+                                      # isolation:none, no worktree, no shell.
 budget:
   max_steps: 25
   max_cost_usd: 0.75
@@ -131,7 +212,10 @@ references:
   - IDEMPOTENCY.md                      # endpoints/jobs sem essa propriedade
   - IMMUTABLE.md                        # mutação compartilhada
   - PREMATURE_OPTIMIZATION.md           # complexidade sem motivo
+  # Eficiência operacional
+  - TOOL_ERGONOMICS.md                  # padrões de leitura/busca eficiente
 slash: review
+when_to_use: "diff/PR pronto pra revisão; mudança de código que precisa de gate de qualidade antes de merge"
 output_schema:
   summary: string                  # 1-3 linhas
   blockers:                        # devem ser corrigidos
@@ -176,6 +260,22 @@ Não escreve código. Não aplica fixes. Não aprova nem rejeita PR.
 
 `low` vai pra `nits`. `critical`/`high` vão pra `blockers`. `medium` é julgamento.
 
+## Heurísticas de busca rápida
+
+```bash
+# Uso similar no resto do código (consistency check)
+rg -nw 'similar_pattern'
+
+# Callers do símbolo mudado (raio de impacto)
+rg -nw 'changed_function|ChangedClass'
+
+# Tests cobrindo o diff
+git diff --name-only main...HEAD | rg -i 'test|spec'
+
+# Strings/literals novos (i18n drift, dup error messages)
+git diff main...HEAD | rg '^\+' | rg -nE '"[^"]{20,}"'
+```
+
 ## Exemplo de output mínimo
 
 ```yaml
@@ -212,14 +312,8 @@ Slash command: `/audit`. Mindset paranoico, output estruturado por categoria de 
 ---
 name: security-audit
 description: Audita PR/branch/diff em busca de problemas de segurança.
-tools: [read_file, grep, glob, bash]
-tool_restrictions:
-  bash:
-    - "git diff *"
-    - "git log *"
-    - "git show *"
-    - "rg *"
-    - "cat *"
+tools: [read_file, grep, glob, git]   # `git` (read-only) supersedes the old
+                                      # bash-restricted-to-git approach.
 budget:
   max_steps: 40
   max_cost_usd: 1.50
@@ -247,6 +341,7 @@ references:
   - FIREWALL.md
   - ANONYMITY_NETWORKS.md
 slash: audit
+when_to_use: "varredura de código por threat categories (auth, injection, supply-chain, secrets) sem alvo específico; pré-deploy ou pós-feature sensível"
 output_schema:
   summary: string
   threat_model:
@@ -336,644 +431,27 @@ Se não tem certeza, marque `suspicious` com `confidence`. Vale mais reportar um
 
 ---
 
-## 4. Playbook: `debug`
+## 4. Playbook: `debug` (removido)
 
-Slash command: `/debug`. Hipótese-driven. Tem permissão de executar (repro), mas só edita após confirmar hipótese.
-
-```yaml
----
-name: debug
-description: Investiga bug com hipóteses, repro, root cause, fix proposto.
-tools: [read_file, grep, glob, bash, bash_background, bash_output, bash_kill, todo_write]
-tool_restrictions:
-  bash:
-    - "*"                         # debug precisa rodar coisas
-    deny:
-      - "rm -rf *"
-      - "git push *"
-      - "git reset --hard *"
-budget:
-  max_steps: 35
-  max_cost_usd: 1.50
-references:
-  # Filosofia operacional (alinhamento direto com "NÃO chute fix")
-  - BRUTE_FORCE_VS_ROOT_CAUSE.md
-  - SCIENTIFIC_METHOD.md            # hipótese-driven é exatamente isso
-  - PROBLEM_SOLUTION.md
-  - PARADOX_ANALYSIS.md             # quando explicações conflitam
-  # Domínios específicos (sob demanda)
-  - PROD_PROBLEM.md                 # se bug é produção
-  - CONCURRENCY.md                  # se sintomas indicam race
-  - DISTRIBUTED_SYSTEMS.md          # se multi-serviço
-  - OBSERVABILITY.md                # se falta de sinal é o problema
-slash: debug
-context_recipe:
-  step_reflection: terse          # debug é hipótese-driven; trace de raciocínio paga (CONTEXT_TUNING.md §13.10)
-output_schema:
-  symptom: string                 # o bug como reportado
-  hypotheses:
-    - id: int
-      statement: string
-      verifies_with: string       # como testar
-      status: enum [pending, confirmed, rejected, inconclusive]
-      evidence: string
-  root_cause:
-    file: string
-    line: int
-    explanation: string
-    confidence: enum [confirmed, likely, speculation]
-  repro:
-    minimal_steps: [string]
-    expected: string
-    actual: string
-  fix_proposal:
-    diff_summary: string
-    side_effects: [string]
-    breaks_what: [string]         # testes/comportamentos que quebram
-    requires_migration: bool
-  not_investigated: [string]
-  assumptions: [string]
----
-```
-
-```markdown
-# Debug
-
-Você investiga um bug. Não chuta fix. Forma hipóteses, valida, e só depois propõe correção.
-
-## NÃO faça
-- NÃO escreva fix antes de confirmar root cause (`status: confirmed` em pelo menos 1 hipótese).
-- NÃO rode "tente isso" sem hipótese declarada.
-- NÃO mude código pra "ver o que acontece" — isso é shotgun debugging.
-- NÃO assuma que o bug está onde o sintoma aparece (geralmente não está).
-- NÃO termine sem `repro.minimal_steps` (se não consegue reproduzir, fale isso explicitamente).
-- NÃO proponha fix sem `side_effects` listados — todo fix tem; reconhecer é honestidade.
-
-## Faça
-- Comece definindo o **sintoma exato** com input mínimo que reproduz.
-- Forme **2-3 hipóteses** antes de investigar — evita tunnel vision.
-- Use `todo_write` pra trackear hipóteses (status visível ao usuário).
-- Cada hipótese tem `verifies_with` concreto (comando, leitura específica, teste).
-- Hipótese rejeitada vale tanto quanto confirmada — registre evidência.
-- Use `bash_background` pra logs de processo longo enquanto continua investigação.
-
-## Fluxo recomendado (não obrigatório)
-
-1. Reproduzir minimamente (sem isso, está debugando no escuro)
-2. Listar hipóteses (causa próxima ≠ causa raiz)
-3. Validar barata-primeiro (commando que confirma/rejeita rápido vence leitura de 500 linhas)
-4. Confirmar root cause (não para na primeira correlação)
-5. Propor fix mínimo + listar side effects + listar o que quebra
-
-## Anti-patterns que você vai sentir tentação de cometer
-
-- **Premature fix**: encontrou algo suspeito, troca, "talvez seja isso?". Pare. Confirme primeiro.
-- **Correlation = causation**: log mostra X antes do crash; X pode ser sintoma, não causa.
-- **Cargo cult fix**: "adicionei try/catch e parou de aparecer" não é fix, é mascaramento.
-- **Skip repro**: "deve ser isso, vamos só corrigir". Sem repro, não há validação.
-
-## Quando NÃO conseguir reproduzir
-
-Estado válido. Reporte:
-- O que tentou
-- Por que falhou
-- Hipóteses sobre **por que não reproduz** (env, timing, dado específico)
-- Marca `root_cause.confidence: speculation` e segue.
-
-## Output
-
-Schema completo, mesmo com hipóteses inconclusivas. Campo vazio é diferente de campo ausente — ausência viola schema, vazio é informação.
-
-`fix_proposal.diff_summary` é descrição em prosa do fix, não diff aplicado. Aplicação do fix é decisão do usuário (este playbook não escreve, só propõe — para escrever o fix, sair do `/debug` e usar modo normal).
-```
+> **Removido do catálogo canônico (2026-06-13).** Diagnóstico hipótese-driven volta ao modo normal. Número da seção preservado como tombstone para não renumerar §8–§14, referenciadas em código e em outros docs.
 
 ---
 
-## 5. Playbook: `refactor`
+## 5. Playbook: `refactor` (removido)
 
-Slash command: `/refactor`. Aplica mudanças preservando semântica. **Diferente** dos 3 anteriores: tem permissão de escrita. Compensa com escopo declarado, plan explícito, checkpoint entre etapas, e teste como gate.
-
-```yaml
----
-name: refactor
-description: Refatora código preservando semântica. Scope-bounded, test-gated, incremental.
-tools: [read_file, write_file, edit_file, glob, grep, bash, todo_write]
-tool_restrictions:
-  bash:
-    - "git status"
-    - "git diff *"
-    - "git log *"
-    - "git show *"
-    - "rg *"
-    - "cat *"
-    - "npm test*"
-    - "pnpm test*"
-    - "yarn test*"
-    - "go test*"
-    - "pytest*"
-    - "cargo test*"
-    - "make test*"
-    - "make check*"
-    - "tsc --noEmit*"
-    deny:
-      - "git push *"
-      - "git reset --hard *"
-      - "rm -rf *"
-budget:
-  max_steps: 50
-  max_cost_usd: 2.00
-references:
-  - REFACTORING.md
-  - COHESION_COUPLING.md
-  - DESIGN_SMELLS.md
-  - ANTI_PATTERNS_AND_CODE_ENTROPY.md
-  - CODE_COMMODITY.md
-  - CONCEPTUAL_INTEGRITY.md
-  - IDEMPOTENCY.md
-  - IMMUTABLE.md
-slash: refactor
-context_recipe:
-  clarify_mode: pre_execution      # blast radius alto; perguntar na fase exploratória paga (STATE_MACHINE.md §12)
-output_schema:
-  summary: string
-  scope:
-    files: [string]               # in-scope, paths concretos
-    not_in_scope: [string]        # explicitamente fora, com motivo
-    motivation: string            # por que refatorar; "está mais limpo" não é motivo
-  pre_flight:
-    has_tests: bool
-    test_command: string          # comando que valida o escopo
-    baseline_passing: bool        # rodou antes de tocar?
-  plan:
-    - id: int
-      description: string
-      files_affected: [string]
-      semantic_preserving: bool
-      requires_test_run: bool
-  applied:
-    - step_id: int
-      checkpoint: string          # checkpoint id antes da etapa
-      result: enum [done, skipped, reverted]
-      tests_passed: bool
-      notes: string
-  side_effects: [string]          # arquivos novos, formatadores, código morto removido
-  not_done:
-    - { area, reason }
-  assumptions: [string]
----
-```
-
-```markdown
-# Refactor
-
-Você refatora código preservando semântica. Saída é um relatório do plan
-executado etapa a etapa, com checkpoint entre cada uma e teste como gate.
-
-## NÃO faça
-- NÃO mude semântica observável. Para inputs cobertos por teste, output e side effects observáveis devem ser idênticos.
-- NÃO refatore sem motivo concreto declarado em `scope.motivation`. "Está mais limpo" / "mais idiomático" não é motivo.
-- NÃO comece sem testes existentes ou recém-adicionados. Sem teste, **PARE**: sugira `task(playbook: test-add)` antes, ou aborte com `pre_flight.has_tests: false`.
-- NÃO rode baseline `tests` que **falha** antes de começar. Se baseline já está vermelho, isso não é refactor — é fix. Aborte.
-- NÃO aplique todo o refactor de uma vez. **Uma etapa por vez**, checkpoint entre.
-- NÃO toque arquivo fora de `scope.files`. Mudança colateral = nova decisão; consulte usuário ou aborte.
-- NÃO ignore falha de teste. Se quebra, **reverta** a etapa via checkpoint, marca como `reverted`, segue ou aborta.
-- NÃO refatore além do plan quando o plan termina. Não busque mais oportunidades. Pare.
-- NÃO renomeie identificadores exportados sem listar callers. Use `grep` ou repo_map antes.
-- NÃO refatore e adicione feature no mesmo step. Se vê oportunidade de melhoria não-preservadora, registra em `not_done` e segue.
-
-## Faça
-- **Pre-flight obrigatório**: identificar test command, rodar baseline, registrar `pre_flight`.
-- **Scope explícito antes de plan**: arquivos in-scope + arquivos vizinhos que NÃO entram com motivo.
-- **Plan decomposto**: cada etapa com ID, descrição curta, arquivos afetados, flag `semantic_preserving`.
-- Use `todo_write` para tornar o plan visível ao usuário **antes** de executar.
-- Após cada etapa que muda código: rodar testes da área afetada (não suite inteira; eficiência).
-- Se teste falha: **reverter** via checkpoint, marca `reverted`, tenta etapa alternativa OU aborta plan.
-- Em `summary`, comece com veredicto: "all applied", "partial — N/M etapas", "aborted — motivo".
-
-## Critérios de "semantic preserving"
-
-Refactor preserva semântica se, para inputs cobertos pelos testes:
-- output é **idêntico** (não "equivalente"; idêntico bit-a-bit quando aplicável)
-- side effects observáveis são idênticos (logs, network calls, FS writes, exceptions)
-- performance não regride catastroficamente (>2× pior em path quente é red flag → marca como `not preserving` mesmo se output igual)
-
-Mudanças que **não** são refactor (use outro playbook ou modo normal):
-- Adicionar feature → modo normal
-- Corrigir bug → `/debug` ou modo normal
-- Mudar API pública → exige migration plan, não é puro refactor
-- Trocar dependência major → não é refactor; é migração
-
-## Heurísticas de scope
-
-- Comece pequeno: 1 função, 1 classe, 1 arquivo.
-- Multi-arquivo só se o plano é claro (rename simétrico, extract module, restructure conhecido).
-- Nunca > 10 arquivos em um plano sem cortar em sub-tasks.
-- Ao detectar que escopo é maior que 10 arquivos: aborta plan, propõe decomposição em N refactors menores.
-
-## Anti-patterns que você vai sentir tentação de cometer
-
-- **Scope creep**: "já que estou aqui, vou consertar X também". NÃO. Registra em `not_done`.
-- **Refactor preditivo**: "isso pode ser útil no futuro". NÃO refatore para hipótese.
-- **Big bang**: aplicar 8 etapas sem rodar teste entre. Quebra fica invisível até o fim.
-- **Test-then-refactor confusão**: adicionar teste e refatorar no mesmo plano sem isolar (etapa de teste deve ser `semantic_preserving: true` E rodar isolada antes do refactor).
-- **"Fix" silencioso**: encontrar bug durante refactor, consertar sem registrar. Reporta em `not_done` ou aborta refactor pra atacar bug separado.
-
-## Quando NÃO conseguir terminar
-
-Estado válido. Reporte:
-- Plan parcial: quais etapas foram aplicadas (`applied[].result`)
-- Por que parou: teste falhou, escopo maior que esperado, dependência inesperada, etc.
-- Estado consistente: garantir que último checkpoint deixa código em estado **funcional** (testes passando), mesmo se não-otimizado. Nunca deixar build quebrado.
-
-## Output
-
-Schema completo, mesmo se aborta cedo. `pre_flight` é obrigatório (mesmo que diga "sem testes, abortado"). `applied` lista todas etapas tentadas, mesmo as `reverted`. `not_done` é honestidade epistêmica.
-
-## Exemplo de output mínimo
-
-```yaml
-summary: "all applied — 4/4 etapas, testes passando"
-scope:
-  files: [src/queue.ts, src/queue.test.ts]
-  not_in_scope: [src/queue-consumer.ts]
-  motivation: "extrair lógica de retry pra função pura, testar isolado"
-pre_flight:
-  has_tests: true
-  test_command: "pnpm test src/queue"
-  baseline_passing: true
-plan:
-  - id: 1
-    description: "criar src/queue/backoff.ts com função pura computeBackoff"
-    files_affected: [src/queue/backoff.ts]
-    semantic_preserving: true
-    requires_test_run: false
-  - id: 2
-    description: "adicionar tests/queue/backoff.test.ts (5 casos)"
-    files_affected: [tests/queue/backoff.test.ts]
-    semantic_preserving: true
-    requires_test_run: true
-  - id: 3
-    description: "substituir lógica inline em queue.ts:142 por import"
-    files_affected: [src/queue.ts]
-    semantic_preserving: true
-    requires_test_run: true
-  - id: 4
-    description: "remover código morto computeBackoffOld"
-    files_affected: [src/queue.ts]
-    semantic_preserving: true
-    requires_test_run: true
-applied:
-  - step_id: 1
-    checkpoint: chkpt_abc
-    result: done
-    tests_passed: true
-    notes: "arquivo novo; sem teste roda na etapa 2"
-  - step_id: 2
-    checkpoint: chkpt_def
-    result: done
-    tests_passed: true
-    notes: "5 testes adicionados, todos verdes"
-  - step_id: 3
-    checkpoint: chkpt_ghi
-    result: done
-    tests_passed: true
-    notes: "diff de 1 linha trocando inline por import"
-  - step_id: 4
-    checkpoint: chkpt_jkl
-    result: done
-    tests_passed: true
-    notes: "11 linhas removidas; baseline confirmou que ninguém referenciava"
-side_effects:
-  - "novo arquivo src/queue/backoff.ts"
-  - "prettier rodou via hook PostToolUse"
-not_done:
-  - area: "src/queue-consumer.ts"
-    reason: "fora do escopo declarado; tem padrão similar mas precisa de plan próprio"
-assumptions:
-  - "tests/queue.test.ts cobre o path de retry (verificado por nome de teste, não por coverage real)"
-```
-```
+> **Removido do catálogo canônico (2026-06-13).** Refactor escopo-bounded volta ao modo normal (checkpoints do harness cobrem a reversibilidade). Número da seção preservado como tombstone para não renumerar §8–§14, referenciadas em código e em outros docs.
 
 ---
 
-## 6. Playbook: `explain`
+## 6. Playbook: `explain` (removido)
 
-Slash command: `/explain`. **Read-only**, educacional. Distinto de `/debug` (fix-oriented) e modo normal (open-ended). Mapeia código + memory + refs pra responder perguntas estruturadas sem risco de side effect.
-
-```yaml
----
-name: explain
-description: Explica código/sistema/decisão em estrutura fixa. Read-only.
-tools: [read_file, grep, glob, memory_read, memory_search, web_fetch]
-tool_restrictions:
-  web_fetch:
-    allow_hosts: []           # config do projeto pode adicionar docs hosts
-budget:
-  max_steps: 20
-  max_cost_usd: 0.30
-references:
-  - SOFTWARE_ARCHITECTURE.md
-  - CONCEPTUAL_INTEGRITY.md
-  - HOLISTIC_VIEW.md
-slash: explain
-context_recipe:
-  step_reflection: terse             # output IS o reasoning; trace explícito vale (CONTEXT_TUNING.md §13.10)
-output_schema:
-  topic: string                      # o que foi explicado (echo do prompt)
-  overview: string                   # 2-4 linhas, resumo executivo
-  files_touched:                     # arquivos lidos pra montar resposta
-    - { path: string, why: string }
-  dependencies:                      # módulos/sistemas relacionados
-    - { name: string, role: string, file?: string }
-  flow:                              # sequência (se aplicável; ex: request flow)
-    - { step: int, what: string, where: string }
-  gotchas:                           # armadilhas / não-óbvios
-    - { issue: string, evidence: string }
-  references:                        # ponteiros pra mais
-    - { kind: enum [memory, repo_file, external_doc], ref: string }
-  not_explained:                     # honestidade epistêmica
-    - { area: string, reason: string }
-  confidence: enum [high, medium, low, speculation]
----
-```
-
-```markdown
-# Explain
-
-Você explica algo sobre o código/sistema/decisão. **Não conserta. Não opina.
-Não modifica.** Sua saída é um relatório estruturado.
-
-## NÃO faça
-- NÃO sugira refactor, fix, ou melhoria. Se tem opinião, suprime.
-- NÃO fale sobre o que **deveria** existir. Apenas o que **existe**.
-- NÃO especule sobre intenção do autor sem evidência (`git blame`, comentário, etc).
-- NÃO termine sem `not_explained` populado se algum aspecto ficou fora.
-- NÃO use `web_fetch` salvo se docs externos estão configurados em `allow_hosts`.
-- NÃO assuma conhecimento prévio do leitor — explique acrônimos/conceitos não-óbvios uma vez.
-
-## Faça
-- Comece com `overview` em 2-4 linhas.
-- Cite `file:line` em `files_touched` e `flow`.
-- Distinga: **mecanismo** (como funciona), **propósito** (por que existe), **gotcha** (o que surpreende).
-- Em `confidence`, seja honesto: `speculation` se parte da explicação é inferida sem ler código direto.
-- Se a pergunta tem múltiplas interpretações válidas, liste em `not_explained` qual foi escolhida e por quê.
-
-## Tipos de pergunta cobertos
-
-| Pergunta | Foco do output |
-|---|---|
-| "Como funciona X?" | overview + flow + dependencies |
-| "Por que Y existe?" | overview + memória/git history + references |
-| "O que acontece quando Z?" | flow detalhado |
-| "Qual a relação entre A e B?" | dependencies + flow |
-| "Onde mora a lógica de C?" | files_touched + dependencies |
-
-## Quando NÃO conseguir explicar
-
-Estado válido:
-- Código ofuscado / minified → reporte; sugira inspecionar source original
-- Sistema externo (3rd party closed) → `confidence: speculation`; cite docs ou reverse engineering
-- Lógica gerada por código (build artifact) → diga claramente
-
-## Output
-
-Schema completo, mesmo se parcial. Vazio é informação válida; ausência viola schema.
-
-## Exemplo de output mínimo
-
-```yaml
-topic: "como funciona o retry em src/queue.ts"
-overview: |
-  src/queue.ts implementa fila de jobs com retry exponencial.
-  computeBackoff calcula intervalo (max 30s); JobQueue.dequeue
-  aplica backoff antes de re-fila.
-files_touched:
-  - { path: "src/queue.ts", why: "implementa JobQueue + computeBackoff" }
-  - { path: "src/queue.test.ts", why: "validar comportamento esperado" }
-dependencies:
-  - { name: "EventEmitter (node)", role: "emits 'job_failed' eventos", file: "src/queue.ts:88" }
-  - { name: "logger", role: "registra retries", file: "src/queue.ts:142" }
-flow:
-  - { step: 1, what: "job entra via JobQueue.enqueue", where: "src/queue.ts:45" }
-  - { step: 2, what: "se job falha, computeBackoff(retry_count)", where: "src/queue.ts:142" }
-  - { step: 3, what: "setTimeout reagenda; retry_count++", where: "src/queue.ts:158" }
-  - { step: 4, what: "após max_retries (5), emite 'permanently_failed'", where: "src/queue.ts:172" }
-gotchas:
-  - { issue: "max 30s é hardcoded", evidence: "src/queue.ts:148" }
-  - { issue: "retry_count zera se enqueue novamente — pode re-tentar infinito", evidence: "src/queue.ts:50 — não checa estado anterior" }
-references:
-  - { kind: memory, ref: "feedback_no_console_log" }
-  - { kind: repo_file, ref: "tests/queue/backoff.test.ts" }
-not_explained:
-  - { area: "queue-consumer.ts", reason: "fora do escopo da pergunta; consume é separado" }
-confidence: high
-```
-```
+> **Removido do catálogo canônico (2026-06-13).** Explicação read-only de código/sistema volta ao modo normal. Número da seção preservado como tombstone para não renumerar §8–§14, referenciadas em código e em outros docs.
 
 ---
 
-## 7. Playbook: `threat-model`
+## 7. Playbook: `threat-model` (removido)
 
-Slash command: `/threat-model`. Subagent isolado. **Proativo**: input é design/arquitetura/diff de feature antes de mergear; output é threat model estruturado. Distinto de `security-audit` (reativo: input é código já escrito).
-
-```yaml
----
-name: threat-model
-description: Threat model STRIDE-driven de design/arquitetura (proativo, antes de implementar)
-tools:
-  - read_file
-  - grep
-  - glob
-  - outline_file
-  - find_references
-  - code_graph
-  - read_symbol
-tool_restrictions:
-  read_file: { allow_paths: ['**/*.md', '**/*.toml', '**/*.yaml', '**/*.yml', 'src/**', 'docs/**'] }
-budget:
-  max_steps: 25
-  max_cost_usd: 1.5
-references:
-  - THREAT_MODELING.md
-  - ZERO_TRUST.md
-  - SECURITY_GUIDELINE.md
-  - AGENTS.md
-output_schema:
-  type: object
-  required: [summary, scope, trust_boundaries, threats, assumptions, not_checked]
-  properties:
-    summary: { type: string, maxLength: 500 }
-    scope:
-      type: object
-      properties:
-        in_scope: { type: array, items: string }
-        out_of_scope: { type: array, items: string }
-    trust_boundaries:
-      type: array
-      items:
-        type: object
-        required: [name, between, direction, controls]
-        properties:
-          name: string
-          between: { type: array, minItems: 2 }
-          direction: { enum: [unidirectional, bidirectional] }
-          controls: { type: array, items: string }
-    threats:
-      type: array
-      items:
-        type: object
-        required: [id, category, target, attack, severity, mitigation]
-        properties:
-          id: { pattern: '^T-\\d{3}$' }
-          category: { enum: [spoofing, tampering, repudiation, info_disclosure, dos, elevation] }
-          target: string
-          attack: string
-          severity: { enum: [critical, high, medium, low] }
-          mitigation:
-            type: object
-            required: [proposal, residual_risk]
-            properties:
-              proposal: string
-              residual_risk: string
-              owner_hint: string
-          confidence: { enum: [high, medium, speculation] }
-    assumptions:
-      type: array
-      items:
-        type: object
-        required: [item, why]
-    not_checked:
-      type: array
-      items:
-        type: object
-        required: [area, reason]
-slash: threat-model
-sampling:
-  temperature: 0.2
-  max_tokens: 4096
-  thinking_budget: 4096
-  seed_in_eval: true
-context_recipe:
-  include_repo_map: eager
-  include_diff: true
-  include_callers: false
-  goal_reinjection_every_n_steps: 4
-  fewshot_count: 1
-  memory_filter: ['security', 'architecture', 'reference']
-prompt_version: 1
-context_recipe_version: 1
----
-```
-
-# Threat Model
-
-Modela ameaças de design **antes** da implementação. Cobre as 6 categorias STRIDE de forma sistemática; produz threats com proposta de mitigação e risco residual declarado.
-
-Não escreve código. Não roda testes. Não toca FS além de leitura.
-
-## NÃO faça
-
-- Não invente trust boundaries que não estão no design ou código existente.
-- Não confunda **threat** (cenário) com **vulnerability** (instância concreta de bug). Vulnerabilidade é `security-audit`.
-- Não declare uma ameaça `critical` sem identificar o vetor concreto.
-- Não proponha mitigação que pressupõe stack que o projeto não usa.
-- Não trate categorias STRIDE como checklist a preencher por preencher; só registre quando a ameaça for plausível.
-- Não invente CVEs ou referências a CVE inexistentes.
-- Não revele PII de design (credenciais em config, etc.) na descrição da ameaça — substitua por placeholder.
-
-## Faça
-
-- Identifique trust boundaries primeiro; ameaças derivam delas.
-- Para cada boundary, walk-through de cada categoria STRIDE; registre só o que é plausível.
-- Toda mitigação tem `residual_risk` declarado — proposta perfeita não existe; honestidade epistêmica.
-- Severidade calibrada: `critical` = breach total + dado sensível + prob >= 0.5; `high` = breach parcial OU prob >= 0.3; medium/low caem dali.
-- Quando um threat depende de assumption (ex: "usuário não compartilha credenciais"), declarar em `assumptions[]`.
-
-## STRIDE — quando cada categoria importa
-
-| Categoria | Foco | Exemplo |
-|---|---|---|
-| **S**poofing | identidade falsificada | tokens previsíveis; sem auth em endpoint admin |
-| **T**ampering | dados alterados em trânsito/repouso | sem checksum em config; mutação de body de request |
-| **R**epudiation | usuário nega ter feito algo | sem audit log; logs sem chain |
-| **I**nfo disclosure | vazamento de info confidencial | error messages com stack trace; cache aberto |
-| **D**os | indisponibilidade | unbounded loops; sem rate limit; recursos ilimitados |
-| **E**levation | escalation de privilégio | path traversal; SSRF pra metadata; injection |
-
-Cobertura inteira não é obrigatória; **plausibilidade** é. Threat fabricado pra preencher categoria é ruído.
-
-## Heurísticas de hunting
-
-- Cada **input do usuário** vira threat candidate (tampering/elevation).
-- Cada **persistência** vira candidate (info_disclosure/tampering).
-- Cada **trust boundary cross-network** vira candidate (spoofing/info_disclosure).
-- Cada **componente externo** (API, MCP server, dependência) vira candidate (todas as 6 categorias).
-- Cada **operação async/background** vira candidate (race conditions → tampering/elevation).
-
-## Output
-
-Schema completo. Threats vazia é resultado válido **se** scope justificar (ex: refactor puro sem mudança de surface). Vazio sem justificativa em `not_checked` é violação.
-
-## Exemplo de output mínimo
-
-```yaml
-summary: |
-  Threat model do design de "fetch_url tool" (CONTRACTS.md §2.6.5b). Trust
-  boundary chave é input do modelo → URL allowlist; 6 ameaças identificadas,
-  4 críticas/altas com mitigação proposta.
-scope:
-  in_scope:
-    - "fetch_url tool input/output path"
-    - "URL allowlist resolution"
-    - "Body redaction pipeline"
-  out_of_scope:
-    - "TLS handshake (assumido correto)"
-    - "DNS rebinding mitigation (já em SECURITY_GUIDELINE.md §9.1.6)"
-trust_boundaries:
-  - name: "model → harness URL extraction"
-    between: ["LLM model output", "Permission engine"]
-    direction: unidirectional
-    controls: ["URL allowlist regex match against prompt+files", "fetch.policy_denied on miss"]
-  - name: "harness → external HTTP"
-    between: ["Permission engine", "Network"]
-    direction: bidirectional
-    controls: ["deny_hosts (RFC 1918, cloud metadata)", "TLS pinning?", "max_bytes cap"]
-threats:
-  - id: T-001
-    category: elevation
-    target: "URL allowlist (§9.1.1)"
-    attack: |
-      Modelo emite URL prefixada com URL legítima do user mas com path/query
-      modificado pra exfil (ex: user-url=docs.example.com; modelo emite
-      docs.example.com.attacker.tld).
-    severity: high
-    mitigation:
-      proposal: "Allowlist por host normalizado, não por prefix string match"
-      residual_risk: "Subdomínio attacker.docs.example.com ainda passa se hostname normalization for ingênua"
-      owner_hint: "Permission engine"
-    confidence: high
-  - id: T-002
-    category: info_disclosure
-    target: "Body redaction (§9.1.3)"
-    attack: |
-      Secret em base64 ou ofuscado dentro de body retornado bypassa regex
-      do redactor; secret chega ao modelo cru.
-    severity: medium
-    mitigation:
-      proposal: "Documentado como limit aceito; reforçar via warning [PII?] em flagged patterns"
-      residual_risk: "Aceito: redactor é heurístico, não cryptographic"
-    confidence: high
-assumptions:
-  - item: "TLS handshake é correto"
-    why: "Out of scope; coberto por kernel/openssl"
-  - item: "DNS resolver respeita /etc/hosts override do sandbox"
-    why: "Documentado em SECURITY_GUIDELINE.md §8.1"
-not_checked:
-  - area: "Hibernation v2 (deferred)"
-    reason: "Fora de escopo do design v1"
-  - area: "fetch_url + MCP combo (cross-tool injection)"
-    reason: "Plausible threat mas exige design hipotético; em backlog"
-```
+> **Removido do catálogo canônico (2026-06-13).** Threat modeling proativo volta ao modo normal; candidato a skill no futuro. Número da seção preservado como tombstone para não renumerar §8–§14, referenciadas em código e em outros docs.
 
 ---
 
@@ -1030,6 +508,7 @@ references:
   - PREMATURE_OPTIMIZATION.md
   - PERFORMANCE.md
   - AGENTS.md
+  - TOOL_ERGONOMICS.md
 output_schema:
   type: object
   required: [summary, baseline, hot_path, hypotheses, evidence, suggestions, assumptions, not_checked]
@@ -1082,6 +561,7 @@ output_schema:
     assumptions: { type: array }
     not_checked: { type: array }
 slash: perf
+when_to_use: "regressão de latência/throughput observada; sintoma de lentidão sem causa identificada e sem hipótese ainda formada"
 sampling:
   temperature: 0.1
   max_tokens: 4096
@@ -1197,336 +677,47 @@ not_checked:
 
 ---
 
-## 9. Playbook: `git-hygiene`
+## 9. Playbook: `git-hygiene` (removido)
 
-Slash command: `/git-hygiene`. Subagent isolado. Sugere ações de git (commit msg, branch naming, rebase strategy) **sem executar**. User aplica manualmente.
-
-```yaml
----
-name: git-hygiene
-description: Sugestões de commit msg, branch naming, rebase, e cleanup de history (read-only)
-tools:
-  - read_file
-  - grep
-  - glob
-  - bash
-tool_restrictions:
-  bash:
-    allow_patterns:
-      - 'git log *'
-      - 'git diff *'
-      - 'git diff --stat *'
-      - 'git status *'
-      - 'git branch *'
-      - 'git rev-parse *'
-      - 'git show *'
-      - 'git blame *'
-      - 'git ls-files *'
-      - 'git remote *'
-      - 'git tag --list *'
-      - 'git config --get *'
-      - 'wc *'
-budget:
-  max_steps: 12
-  max_cost_usd: 0.30
-references:
-  - COMMIT.md
-  - AGENTS.md
-output_schema:
-  type: object
-  required: [summary, suggestions, assumptions, not_checked]
-  properties:
-    summary: { type: string }
-    branch_assessment:
-      type: object
-      properties:
-        current_branch: string
-        naming_match: { type: boolean }
-        suggested_name: string
-        reason: string
-    suggestions:
-      type: array
-      items:
-        type: object
-        required: [kind, action, command, why]
-        properties:
-          kind: { enum: [commit_message, branch_rename, rebase, squash, split_commit, amend, cleanup_history] }
-          action: string                    # descrição curta do que fazer
-          command:                          # comando(s) literal(is) pro user rodar
-            type: array
-            items: string
-          why: string
-          risk: { enum: [low, medium, high] }
-          reversible: { type: boolean }
-    commit_drafts:
-      type: array
-      items:
-        type: object
-        required: [files, subject, body, follows_convention]
-        properties:
-          files: { type: array, items: string }
-          subject: { type: string, maxLength: 72 }
-          body: string
-          follows_convention: string         # "Title Case verb (repo style)" / "conventional-commits" / etc
-    assumptions: { type: array }
-    not_checked: { type: array }
-slash: git-hygiene
-sampling:
-  temperature: 0.1
-  max_tokens: 2048
-context_recipe:
-  include_repo_map: lazy
-  include_diff: true
-  include_callers: false
-  goal_reinjection_every_n_steps: 6
-  fewshot_count: 1
-  memory_filter: ['feedback', 'reference']  # captura convenção do repo (ex: feedback_commit_style)
-prompt_version: 1
-context_recipe_version: 1
----
-```
-
-# Git Hygiene
-
-Sugere ações de git que melhoram **legibilidade do history** e aderência a convenções do projeto. **Não executa**. Output é shopping list de comandos pro user copiar.
-
-Não cria commit. Não faz push. Não rebase. Não força nada.
-
-## NÃO faça
-
-- Não execute `git commit`, `git push`, `git rebase`, `git reset`, `git restore`, `git tag`, `git checkout` (qualquer comando que muda state). Tool restriction enforça.
-- Não invente convenção; **leia AGENTS.md / CONTRIBUTING.md / git log recente** pra inferir o padrão do projeto.
-- Não sugira "Conventional Commits" se o projeto não usa. Olhe o histórico.
-- Não sugira squash/rebase em commits já push'd a `main` ou branch protegida.
-- Não recomende `--force` push em branches compartilhadas.
-- Não invente issue numbers ou PR refs ("Closes #123") sem evidência.
-- Não declare commit message "perfect" sem ler o diff completo.
-- Não revele credenciais ou secrets que apareçam em git log/diff (raro, mas redactor falhou se aparece).
-
-## Faça
-
-- Inferir convenção do projeto via `git log --oneline -50` antes de sugerir.
-- Convenções comuns conhecidas: Title Case verb (`Create X.md, Update Y.md`), Conventional Commits (`feat:`, `fix:`), Gitmoji, ALL CAPS de 3 chars (`ADD`/`FIX`). Identifique qual e siga.
-- Commit message: subject ≤ 72 chars, imperative mood, sem ponto final (a menos que convenção diga).
-- Body só se mudança não-óbvia; explique **por quê**, não **o quê** (diff já mostra o quê).
-- Branch naming: feature/X, fix/Y, ou padrão do projeto detectado.
-- Rebase só sugerido para commits **locais** (não em remoto compartilhado).
-- Squash apropriado quando há "WIP" / "fix typo" entre commits relacionados.
-
-## Convenções comuns (reconheça-as)
-
-| Padrão | Exemplo | Sinais |
-|---|---|---|
-| Title Case verb | `Create AGENTS.md, Update CONTEXT_TUNING.md` | git log mostra "Create"/"Update" prefix consistente |
-| Conventional Commits | `feat(auth): add password reset` | `feat:`/`fix:`/`chore:` em ≥ 70% dos commits recentes |
-| Gitmoji | `:sparkles: add feature` | emojis em ≥ 50% |
-| Ticket-prefixed | `JIRA-123: fix bug` | matching `[A-Z]+-\\d+:` em ≥ 70% |
-| ALL CAPS verb | `ADD support for X` | `[A-Z]{3,}\\s` prefix consistente |
-| Free-form | sem padrão | inconsistência > 50%; sugira mas não force |
-
-## Heurísticas de detecção de issues
-
-- **Commit msg vago** ("update", "fix bug", "wip"): propor refraseamento.
-- **Commit gigante** (>20 arquivos, lotes não-relacionados): propor split.
-- **Commits encadeados de "fix"**: propor squash.
-- **Branch name genérico** ("test", "tmp", "branch1"): propor rename.
-- **Histórico com WIP/typo no meio**: propor rebase interativo (commits locais apenas).
-- **Body com info que devia estar em PR description**: propor mover.
-
-## Quando NÃO conseguir terminar
-
-Output com suggestions vazia + `not_checked` justificando ("convenção do projeto não detectável; precisa de input humano"). Não invente convenção pra preencher.
-
-## Output
-
-Schema completo. Suggestions vazia é resultado válido (history limpo, convenção seguida — nada a mexer).
-
-`commit_drafts[].follows_convention` cita explicitamente qual convenção foi seguida; vincula ao memory de `feedback_commit_style` quando aplicável.
-
-## Exemplo de output mínimo
-
-```yaml
-summary: |
-  Branch atual segue convenção (feature/*). 3 commits locais não-pushed têm
-  msgs vagas ("wip", "fix typo"); sugiro squash em commit único com msg clara
-  seguindo o padrão "Title Case verb" detectado em git log -50.
-branch_assessment:
-  current_branch: feature/auth-refactor
-  naming_match: true
-  reason: "Padrão feature/<topic> seguido em ≥ 80% das branches recentes"
-suggestions:
-  - kind: squash
-    action: "Squash 3 commits locais ('wip', 'fix typo', 'cleanup') em um único"
-    command:
-      - "git rebase -i HEAD~3"
-      - "# marcar commits 2 e 3 como 'fixup'"
-      - "git commit --amend -m 'Update src/auth.ts, src/auth.test.ts'"
-    why: |
-      Commits intermediários não agregam ao history; squash deixa diff revisável
-      em 1 commit limpo. Seguro pois commits são locais (git rev-parse @{u}
-      mostra que upstream tem só HEAD~3).
-    risk: low
-    reversible: true   # git reflog cobre se errar
-commit_drafts:
-  - files: ["src/auth.ts", "src/auth.test.ts"]
-    subject: "Update src/auth.ts, src/auth.test.ts"
-    body: |
-      Extract validateToken to pure function; preserva semântica observable.
-      8/8 testes passando; nenhum caller afetado (ver code_graph dependents).
-    follows_convention: "Title Case verb (repo style — feedback_commit_style)"
-assumptions:
-  - item: "git rev-parse @{u} confirmou upstream = HEAD~3"
-    why: "Verificou que squash não afeta commits push'd"
-not_checked:
-  - area: "Conventional Commits format"
-    reason: "Repo não usa esse padrão (git log -50 mostra Title Case verb)"
-  - area: "PR description"
-    reason: "Out of scope; gh CLI não está em allow_patterns"
-```
+> **Removido do catálogo canônico (2026-06-13).** Sugerir commit message,
+> branch naming e estratégia de rebase é workflow read-only, em forma de
+> procedimento — encaixa melhor no modelo de **skill** que num subagent com
+> contexto isolado (não há budget/isolation por chamada que justifique o
+> overhead; os demais workflows de git já vivem como skills). O número da seção
+> é preservado como tombstone para não renumerar §10–§16, referenciadas em
+> código e em outros docs.
 
 ---
 
-## 10. Playbook: `gap-audit`
+## 10. Playbook: `gap-audit` (removido)
 
-Slash command: `/gapaudit`. Subagent isolado com viés cético. Audita um artefato (spec, plano, PR description, decision log, threat model) contra evidência verificável. Não corrige; reporta lacunas.
-
-Distinto de `code-review` (revisa **mudanças** de código contra correctness) e `security-audit` (varre **código** por threat categories). `gap-audit` opera sobre **artefatos textuais** verificando *claim vs evidence*.
-
-```yaml
----
-name: gap-audit
-description: Audita artefato (spec/plano/PR/threat model) procurando gaps, contradições e claims sem evidência. Não conserta.
-tools: [read_file, grep, glob]
-budget:
-  max_steps: 30
-  max_cost_usd: 0.50
-references:
-  - CRITICAL_THINKING.md
-slash: gapaudit
-sampling:
-  temperature: 0.2                 # baixo; queremos consistência cética, não criatividade
-  max_tokens: 4096
-  thinking_budget: 4000            # vale pensar antes de declarar gap
-output_schema:
-  summary: string                  # 1-3 linhas: "audit verdict + headline gaps"
-  gaps:                            # algo que devia existir e não existe
-    - { artifact_ref, claim_or_section, what_is_missing, severity, why_it_matters }
-  contradictions:                  # X afirma Y; A afirma ¬Y
-    - { artifact_ref_a, artifact_ref_b, conflict, severity }
-  unverifiable:                    # claim feito sem evidência checável
-    - { artifact_ref, claim, why_unverifiable, suggested_evidence }
-  confirmed_ok:                    # claims que foram verificados contra evidência
-    - { artifact_ref, claim, evidence_ref }
-  not_checked:                     # honestidade epistêmica — escopo não auditado
-    - { area, reason }
-  assumptions: [string]
----
-```
-
-```markdown
-# Gap Audit
-
-Você audita artefatos (spec, plano, PR description, decision log) com viés cético.
-Sua única saída é um relatório no schema acima.
-Não escreve código. Não aplica fixes. Não reescreve o artefato.
-
-## NÃO faça
-
-- NÃO coloque nada em `confirmed_ok` sem ter verificado contra evidência específica (`file:line`, comando rodado, output observado).
-- NÃO use linguagem que confirma sem evidência ("parece OK", "provavelmente correto", "looks good"). Se não verificou, vai pra `unverifiable` ou `not_checked`.
-- NÃO marque gap baseado em ausência ambígua. Se "X não está mencionado" pode ser intencional, vai pra `unverifiable` com `suggested_evidence`, não pra `gaps`.
-- NÃO sugira como consertar. Esse é trabalho do autor; você só aponta.
-- NÃO trate o artefato como autoritativo. Se ele afirma que `tabela_X` existe, você grep pra confirmar — não assuma.
-- NÃO termine sem preencher `not_checked` honestamente. "Auditei tudo" é red flag.
-- NÃO produza output que parece thorough mas não cita evidência. Cada item tem `artifact_ref` (`file:line` ou `file §N`).
-
-## Faça
-
-- Cite `artifact_ref` (formato `file:line` ou `file §N.N`) em **todo** item.
-- Para `gaps`: explique **por que importa** — gap sem consequence é nit, não gap.
-- Para `contradictions`: cite **ambos** os lados com refs.
-- Para `unverifiable`: sugira que evidência fecharia (`suggested_evidence`), assim autor sabe o que produzir.
-- Para `confirmed_ok`: cite `evidence_ref` que verifica (pode ser outro `file:line`, comando, ou test fixture).
-- Em `summary`, comece com veredicto: "solid", "needs work", ou "structural issues".
-
-## Critérios de severidade (gaps e contradictions)
-
-| Severidade | Definição |
-|---|---|
-| `critical` | Gap/contradição que torna o artefato inaplicável (spec impossível de implementar, plano internamente inconsistente) |
-| `high` | Gap que vai surpreender quem implementar; contradição entre seções principais |
-| `medium` | Gap em edge case; claim importante sem evidência mas consertável |
-| `low` | Detalhe ausente, melhoria de clareza |
-
-`low` quase nunca vai em `gaps` — vira `unverifiable` ou `not_checked`. Auditor que reporta 30 itens `low` está fazendo nitpick, não audit.
-
-## Heurísticas (o que procurar)
-
-- **Conceito introduzido sem schema/contrato.** "Tabela X é usada" sem schema declarado.
-- **Cross-ref que não resolve.** `§N` ou `FOO.md §M` apontando pra inexistente.
-- **Symbol mencionado sem definição.** Tool/comando/estado citado sem aparecer em outro lugar canônico.
-- **Invariante declarada sem verificação.** "Sempre X" sem mecanismo que garanta X.
-- **Trade-off omitido.** Decisão sem custo declarado é decisão sem ponderação.
-- **Claim de "isso é seguro/correto/idempotente" sem evidência.** Vai pra `unverifiable`.
-- **Numeração inconsistente após renumeração.** Comum em spec longa editada incrementalmente.
-
-## Anti-pattern do próprio auditor (sycophancy)
-
-Modelo default tende a confirmar. Sintomas:
-
-- `confirmed_ok` longo com itens não-verificados
-- Ratio `confirmed_ok / (gaps + contradictions + unverifiable)` > 3:1 sem evidência forte
-- Nenhuma `unverifiable` em audit de artefato com 1000+ linhas (improvável que tudo seja checável)
-
-Se o output parece "tudo OK", **revise** — provavelmente faltou cético.
-
-## Quando NÃO conseguir auditar
-
-- Artefato é prosa narrativa sem claims verificáveis (ensaio, design rationale puro): retorna `summary` reconhecendo isso + `not_checked` com motivo.
-- Faltam refs externas pra verificar (artefato cita `INTERNAL_DOC.md` que você não pode acessar): vai em `unverifiable`, não em `gaps`.
-
-## Exemplo de output mínimo
-
-\`\`\`yaml
-summary: "needs work — 2 contradictions estruturais entre STATE_MACHINE §2.3 e RECAP §3, 4 gaps de schema. Resto está sólido onde verificado."
-gaps:
-  - artifact_ref: "STATE_MACHINE.md §11"
-    claim_or_section: "drift detector emite drift_event(...)"
-    what_is_missing: "schema da tabela drift_events não declarado"
-    severity: high
-    why_it_matters: "consumidores (eval, /recap forensics) não sabem colunas"
-contradictions:
-  - artifact_ref_a: "RECAP.md §3 (linha 107)"
-    artifact_ref_b: "STATE_MACHINE.md §2.3.1 (schema)"
-    conflict: "RECAP define goal_stack com 6 campos; schema SQL canônico tem 9"
-    severity: medium
-unverifiable:
-  - artifact_ref: "ORCHESTRATION.md §4.6"
-    claim: "fallback estático tem latência < 50ms"
-    why_unverifiable: "sem benchmark referenciado"
-    suggested_evidence: "link pra evals/compaction/static_fallback/latency.json"
-confirmed_ok:
-  - artifact_ref: "STATE_MACHINE.md §9"
-    claim: "todos eventos novos (drift_*, regrounding_*) estão na tabela"
-    evidence_ref: "verificado via grep ^| em §9; 4 entries presentes"
-not_checked:
-  - area: "ORCHESTRATION.md §6 (self-critique)"
-    reason: "fora do escopo do patch auditado"
-assumptions:
-  - "spec é source of truth; não verifiquei contra implementação real (não existe ainda)"
-\`\`\`
-```
-
-**Eval acoplado:** `evals/playbooks/gap-audit/` com 10 fixtures:
-- 4 artefatos com gaps semeados deliberadamente (esperado: `gap_recall ≥ 0.8`)
-- 3 artefatos limpos (esperado: `false_positive_rate ≤ 0.05`, ou seja, `gaps[]` quase vazio)
-- 3 artefatos com contradições internas semeadas (esperado: detector recall ≥ 0.7)
-
-Métrica anti-sycophancy: **`false_confirmation_rate`** = items em `confirmed_ok` que não têm `evidence_ref` válido (resolvível) / total `confirmed_ok`. Threshold: ≤ 0.05. PR-bloqueante.
+> **Removido do catálogo canônico (2026-06-13).** Meta-playbook anti-sycophancy (auditava artefato textual: claim vs evidência). Removido junto com `challenge-assumptions` ao enxugar o catálogo para o conjunto de isolamento/compressão (`code-review`, `security-audit`, `perf-investigate`). Número da seção preservado como tombstone para não renumerar §12–§14.
 
 ---
 
-## 11. Como adicionar um playbook novo
+## 11. Playbook: `challenge-assumptions` (removido)
+
+> **Removido do catálogo canônico (2026-06-13).** Meta-playbook anti-frame-trap (auditava cadeia de raciocínio: premissa load-bearing, framing estreito, falácia conjuntiva). Removido junto com `gap-audit` — ver §10. Número da seção preservado como tombstone.
+
+---
+
+## 12. Distribuição inicial via `agent init`
+
+Os 4 playbooks canônicos da lista `CANONICAL_PLAYBOOKS` (`code-review` §2, `security-audit` §3, `perf-investigate` §8 e `general-purpose` — a instância empacotada do subagent genérico, §15) ficam empacotados no binário e são distribuídos via `agent init` (`AGENTIC_CLI.md §2.1`). As seções §4–§7 e §9–§11 são **tombstones** (playbooks removidos) e NÃO são copiadas. Em `init` numa árvore sem `.agent/agents/`, cada playbook é copiado pra lá em formato `.md` — o mesmo formato que o loader de subagents lê depois. O scaffold é **idempotente por arquivo**: passos seguintes pulam playbooks já existentes (operador pode ter editado um), e `--force` (ou `--force=playbooks`) sobrescreve cada `.md` mesmo que tenha mudado.
+
+Granularidade:
+
+- `agent init` — scaffolda os 4 artefatos do bootstrap (`permissions.yaml`, `.gitignore`, `config.toml`, playbooks) numa só invocação.
+- `agent init --only=playbooks` — re-copia só os playbooks (ex: após `git pull` que trouxe versão nova do binário, ou após apagar `.agent/agents/` manualmente).
+- `agent init --force=playbooks` — sobrescreve os 4 mesmo que o operador tenha editado. Use quando quer descartar customizações e voltar ao baseline canônico.
+
+**Customizações continuam disjuntas do scaffold.** Playbooks per-developer ficam em `~/.config/agent/playbooks/`; playbooks per-projeto customizados ficam em `.agent/agents/` mas com nomes que não colidem com os 4 canônicos (o scaffold só toca arquivos cujo `filename` aparece em `src/cli/init-playbooks/index.ts`). Se o operador renomear um canônico (`code-review.md` → `code-review-strict.md`) o original re-aparece no próximo `init` — sintoma esperado; o scaffold não rastreia renames.
+
+**Distribuição vs. discovery.** A discovery de playbook (system prompt injetado, listagem via `/`) lê de `~/.config/agent/playbooks/` + `.agent/agents/` independente de quem escreveu — `agent init` é só o mecanismo que coloca os 4 canônicos no diretório certo na primeira vez. Operador que prefere bootstrap manual pode pular o `--only=playbooks` e copiar à mão.
+
+---
+
+## 13. Como adicionar um playbook novo
 
 1. Criar `~/.config/agent/playbooks/<name>.md` com frontmatter completo.
 2. Definir output schema com `summary` + `assumptions` + `not_checked` (mínimo).
@@ -1540,7 +731,7 @@ Sem (5)-(6), o playbook regride silenciosamente quando o prompt do system mudar.
 
 ---
 
-## 12. Anti-patterns comuns (não cometa)
+## 14. Anti-patterns comuns (não cometa)
 
 | Anti-pattern | Por que é ruim |
 |---|---|
@@ -1556,27 +747,27 @@ Sem (5)-(6), o playbook regride silenciosamente quando o prompt do system mudar.
 
 ---
 
-## 13. Playbooks futuros (candidatos)
+## 15. Playbooks futuros (candidatos)
 
-Ordem de retorno esperado. Teto recomendado: **6 playbooks total**. Mais que isso o modelo confunde a seleção. **Atual: 9** — acima do teto. Decisão deliberada; gatilho de revisão: eval de slash command selection mostra confusão > 5% em sessões recentes → revisitar (deprecar `pair-coding`/`architect` é trivial — não existem; deprecar um dos 9 ativos exige PR de remoção).
+Ordem de retorno esperado. Teto recomendado: **6 playbooks total**. Mais que isso o modelo confunde a seleção. **Atual: 4** — dentro do teto. Gatilho de revisão: eval de slash command selection mostra confusão > 5% em sessões recentes → revisitar. Deprecar um playbook ativo exige PR de remoção (já foram `git-hygiene`, `debug`, `refactor`, `explain`, `threat-model`, `gap-audit`, `challenge-assumptions`).
 
-Atual (9): `code-review`, `security-audit`, `debug`, `refactor`, `explain`, `threat-model`, `perf-investigate`, `git-hygiene`, `gap-audit`.
+Atual (4): `code-review`, `security-audit`, `perf-investigate` — todos read-only, produzindo relatório estruturado; o ganho é **isolamento/compressão de contexto** (exploração cara → resumo destilado). Os meta-playbooks `gap-audit` e `challenge-assumptions` foram removidos em 2026-06-13 ao enxugar o catálogo para esse conjunto; o viés anti-sycophancy que eles ofereciam volta a ser responsabilidade do modo normal (ver tombstones §4–§7, §9, §10–§11).
 
-`gap-audit` é meta — opera sobre artefatos, não código. Distinto dos outros 8 por escopo de input (texto/spec) e ausência de domain heuristics. Trade-off aceito: mais um playbook em troca de primitiva canônica anti-sycophancy reusável (audit de spec, plano, PR description, threat model com mesmo schema).
+O quarto é `general-purpose` — a **instância empacotada do subagent genérico** (AGENTIC_CLI §11), não um playbook de domínio. Read-only (`read_file`, `grep`, `glob`, `retrieve_context`, `memory_read`; sem `bash`/escrita → `isolation: none`), `slash: explore`. O caller escopa a tarefa (explorar subsistema, pesquisar como algo funciona, localizar call sites, cross-read de docs) e recebe a resposta destilada, não as leituras intermediárias. Por ser de domínio aberto, **não tem schema fixo de relatório**: só o contrato mínimo de honestidade (`summary` + `confidence` + `assumptions` + `not_checked`, com `findings`/`sources` opcionais para tarefas de localizar/mapear). É a contrapartida read-only do mesmo princípio que justifica os outros três (custo de exploração >> custo do resumo); o que ele *não* faz é editar, executar ou spawnar — aí o trabalho volta pro modo normal.
 
 | Candidato | Quando fazer | Por quê |
 |---|---|---|
-| `incident-response` | quando útil em on-call | Estabiliza → diagnostica → comunica. Mindset distinto de `debug`. Ref: `INCIDENT_RESPONSE.md`, `PROD_PROBLEM.md`, `OBSERVABILITY.md`. |
+| `incident-response` | quando útil em on-call | Estabiliza → diagnostica → comunica. Mindset distinto de debugging ad-hoc. Ref: `INCIDENT_RESPONSE.md`, `PROD_PROBLEM.md`, `OBSERVABILITY.md`. |
 | `test-add` | se cobertura é prioridade | Adiciona testes pra função/módulo. Ref: `TESTS.md`. |
 | `api-design` | se workflow é design de API | Endpoint design com constraints. Ref: `API_DESIGN.md`, `DESIGN_CONTRACT.md`. |
 | `architect` | provavelmente nunca | Vira filosofia; modelo já é bom em design quando contexto é bom |
 | `pair-coding` | nunca | Modo default já é isso |
 
-Princípio: cada playbook novo só entra se **eval mostra que modo normal falha** no workflow. Sem evidência empírica, fica em backlog. Promoção dos 3 mais recentes (`threat-model`, `perf-investigate`, `git-hygiene`) é decisão de design; eval-driven validation segue.
+Princípio: cada playbook novo só entra se **eval mostra que modo normal falha** no workflow. Sem evidência empírica, fica em backlog. O catálogo atual é deliberadamente o conjunto onde **custo de exploração >> custo do resumo** — workflows de edição/coordenação e tarefas pequenas ficam no modo normal.
 
 ---
 
-## 14. Insight final
+## 16. Insight final
 
 Playbook bem feito não ensina o modelo a pensar — **restringe** o que ele pode fazer e **estrutura** o que ele deve devolver. O resto é o modelo já fazendo o trabalho dele.
 

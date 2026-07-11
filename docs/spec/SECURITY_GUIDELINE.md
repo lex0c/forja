@@ -20,6 +20,7 @@ Premissa raiz aplicada: *meça duas vezes, corte uma*. Em segurança vira: **ass
 8. **Princípio do menor privilégio.** Tool com mínimo necessário; subagent com escopo mínimo; provider com permissão mínima.
 9. **Reversibilidade onde possível.** Side effect persistente = checkpoint + audit. Ataque parcial é recuperável.
 10. **Update + signing first-class.** Binário não-assinado é vetor; release sem hash é cargo cult.
+11. **Postura de request-handling.** O agente assiste trabalho de segurança autorizado, defensivo e educacional; recusa técnica destrutiva, DoS, alvejamento em massa, comprometimento de supply-chain e evasão para causar dano. Ferramental dual-use (exploit, teste de credencial, C2) exige contexto de autorização declarado — engajamento nomeado, competição, ou propósito defensivo. Distinto do playbook `security-audit` (`PLAYBOOKS.md`), que ataca código de terceiro sob playbook: este é a postura do agente diante de qualquer pedido.
 
 ---
 
@@ -72,7 +73,7 @@ Análise sistemática por categoria, com mitigação primária.
 | Ameaça | Mitigação |
 |---|---|
 | Loop infinito do modelo (tool call repetido) | `maxSteps` budget + `maxToolErrors` consecutive |
-| Cost runaway por loop degenerado | `maxCostUsd` budget hard cap; sem opt-out |
+| Cost runaway por loop degenerado | `maxCostUsd` budget hard cap; sem opt-out programático (modelo/loop não pode burlar) — opt-out só via ação explícita do operador (`/budget cost off`), registrada em audit |
 | Hook trava harness | Timeout 5s; SIGKILL após grace |
 | Tool com side effect pesado (rm -rf) | Permission deny por padrão; sandbox `bwrap` opcional/obrigatório |
 | Memory bloat (índice cresce sem fim) | Hard cap 200 linhas; expires default 90d em project |
@@ -235,7 +236,7 @@ Propriedades que devem **sempre** valer. Violação = bug crítico, não gracefu
 5. **Diretório não-confiável bloqueia inferred memory writes** automaticamente.
 6. **Locked rules em enterprise nunca são overridable** por user/project/session.
 7. **Hook timeout não bloqueia harness por mais que `max_hook_chain_ms`** (15s default).
-8. **`maxCostUsd` é respeitado**; sem opt-out runtime.
+8. **`maxCostUsd` é respeitado**; sem opt-out programático — nem modelo nem tool nem hook pode escrever em `baseConfig.budget` pra burlar o cap. A única forma de opt-out é ação explícita do operador via `/budget cost off`, que escreve `maxCostUsd: undefined` em `baseConfig.budget` e fica registrada em audit. Threat model: loop adversarial e adversário (repo malicioso induzindo loops) não têm acesso a essa superfície; operador deliberado tem.
 9. **MCP tools de servidor não-confiável são invisíveis** ao modelo.
 10. **Schema violation em tool args bloqueia invocação**, não tenta "best effort".
 11. **Path traversal em qualquer tool é fatal** (não warning).
@@ -328,11 +329,20 @@ Se scanner detecta secret **após** já ter sido persistido (eval offline pega):
 | macOS | `sandbox-exec` | opt-in | default |
 | Windows | (TBD — `AppContainer`?) | sem suporte | feature flag |
 
-Profile mínimo:
-- Mount: `cwd` read-write; `~/.config/agent` read; `/tmp` read-write isolado; resto read-only
+Profile base:
+- Mount: `cwd` read-write; `~/.config/agent` read; `/tmp` read-write isolado (**por sessão por default** — ver persistência abaixo; `shared_tmp = false` volta ao tmpfs fresco por spawn); resto read-only
 - Network: DENY por default (modo strict); ALLOW lista limitada (modo normal)
 - /etc, /root: read-only
 - /proc, /sys: minimal
+
+**Persistência (default ON, opt-out via `[sandbox]`).** Por decisão do operador o reuso é o baseline: sem `[sandbox]` config, os dois carve-outs abaixo já vêm **LIGADOS**, trocando efemeridade por reuso **sem nunca tocar o filesystem real do host** além do `cwd`. Cada um desliga explicitamente com `= false` (volta ao isolamento efêmero):
+
+- `cache_persistence` — cache de build/deps compartilhado por-usuário num diretório **dedicado ao Forja**, `~/.cache/forja/cache/<lang>/` (honra `$XDG_CACHE_HOME`), montado read-write persistente. O redirect é **em grande parte agnóstico a linguagem**, em duas camadas: (1) `XDG_CACHE_HOME` como catch-all — a maioria dos tools modernos (pip, uv, Go build cache, composer, yarn, e qualquer tool XDG-compliant, inclusive os que não mapeamos) lê o próprio cache de `$XDG_CACHE_HOME`, então uma var redireciona todos; (2) env vars dedicadas só pros teimosos que ignoram XDG (`npm_config_cache`, `GOMODCACHE`, `NUGET_PACKAGES`, `MAVEN_ARGS=-Dmaven.repo.local=…`, `GRADLE_USER_HOME`, `BUN_INSTALL_CACHE_DIR`, pnpm store). Injetadas pelo **wrap** (`--setenv` no bwrap / `env -i` no sandbox-exec — nunca pelo modelo, que o resolver de bash recusa `VAR=val cmd`). NUNCA se binda `~/.cache`, `~/go/pkg/mod`, `~/.npm` reais do host: o cache do Forja é separado, então um build comprometido dentro do sandbox não envenena builds que o operador roda fora dele. O cache real do host segue mascarado (tmpfs) como no default. Credenciais de package managers (`~/.npmrc`, `~/.nuget/NuGet/NuGet.Config`, `~/.config/composer/auth.json`, …) seguem mascaradas dentro do sandbox — só os subdirs de cache são expostos, nunca config/auth.
+- `shared_tmp` — `/tmp` persistente **por sessão**: `~/.cache/forja/tmp/sessions/<sessionId>` montado em `/tmp`, criado no boot e removido no exit. Reuso de arquivos temporários entre tool-calls da mesma sessão; isolado entre sessões e do `/tmp` real do host.
+
+**Rede grossa (`[sandbox] network`, off|on, default off).** Egress no sandbox é uma **postura do operador**, não inferência por binário. Default `off`: chamadas de binário não-modelado (`exec:arbitrary`) rodam em `cwd-rw` (sem rede) — builds offline funcionam, mas `go mod download`/`dotnet restore`/`composer install` etc. falham (esperado). `[sandbox] network = on` eleva essas chamadas a `cwd-rw-net`, de forma agnóstica a linguagem (qualquer toolchain baixa deps, sem código por-tool), **gateado por trust do diretório, de forma UNIFORME**: o egress de build só vale se o dir (raiz do repo, `projectConfigCwd`) estiver TRUSTED, **independente de qual camada de config ligou `network`** — um clone hostil não auto-habilita egress (o `network = on` do config de projeto não basta; trust é exact-path, confiar num subdir não destrava a raiz), e **mesmo um `network = on` do config de usuário** (`~/.config/forja`, a máquina do operador) NÃO concede egress num dir não-confiável (egress de build exige confiar no dir, não só ligar a feature). Dep-managers modelados (`npm`/`pip`/`cargo` + `go`/`dotnet`/…) emitem `net-egress` por conta própria — sem precisar da postura — mas sob o **mesmo** trust-gate; rede explícita (curl/ssh, marcada `explicitEgress`) não é gateada, exceto quando misturada com exec local arbitrário no mesmo shell (fail-closed). Caveat: egress concedido = rede inteira herdada do pai (`cwd-rw-net` omite `unshare-net`); não há filtro por-host no kernel hoje — o allowlist das caps serve pro confirm/score/auditoria; filtro real (proxy/nftables) é futuro. Mecanismo + floor `exec:arbitrary→cwd-rw` em `PERMISSION_ENGINE.md §6.5`.
+
+Ordem de montagem (bwrap aplica em ordem, last-wins): tmpfs do cache-do-host → bind do cache-do-Forja → bind do `cwd` → overlays de credencial. Um cache (envenenado ou não) **nunca** pode desmascarar uma credencial. Trade-off aceito: o cache compartilhado por-usuário persiste cross-session (superfície intra-Forja). Crescimento: vários package managers fazem GC/TTL no próprio cache (Go build trim, Gradle 30d, Composer cache-ttl) — que opera normalmente no dir redirecionado — e o operador recupera o cache de deps com `agent cache clear` (limpa só o subtree `cache/`, preservando o `/tmp` de sessões ativas em `tmp/sessions/` — apagar um bind source ao vivo quebraria a sessão). macOS: `sandbox-exec` não tem bind — a persistência de cache vira `(allow file-write* (subpath …))` + as mesmas env vars; o `/tmp` por sessão usa o mecanismo de tmpdir-subpath restrito.
 
 ### 8.2 Process isolation
 
@@ -383,7 +393,37 @@ id_ecdsa*
 **/secrets.yml
 **/secrets.yaml
 .git-credentials
+# Slice 180 — tool-specific credential files
+.terraformrc              # Terraform CLI credentials blocks
+.dockercfg                # Legacy Docker auth (pre-config.json)
+.pgpass                   # Postgres password file (netrc-shaped)
+.my.cnf                   # MySQL client [client] password=
+.mongorc.js               # Mongo shell init com conn strings
+**/.htpasswd              # Apache basic-auth
+# k8s / docker registry
+.kube/config              # kubeconfig: cluster tokens / client certs/keys
+kubeconfig                # standalone kubeconfig
+.docker/config.json       # Docker registry auth (moderno; .dockercfg é legado)
+# service-account keys (além de *credentials*.json)
+*service-account*.json    # GCP/Firebase service-account keys
+*-firebase-adminsdk-*.json
+# mobile signing + secret config
+*.jks                     # Android signing keystore (chave privada)
+*.keystore                # Android/Java keystore
+keystore.properties       # senhas de signing-store/key (Android)
+local.properties          # Android; storePassword/keyPassword (gitignored por convenção)
+*.p8                      # Apple APNs / sign-in key (PKCS#8 privada)
+*.mobileprovision         # iOS provisioning profile (signing identity)
+google-services.json      # Firebase config Android (API keys)
+GoogleService-Info.plist  # Firebase config iOS (API keys)
+# bearer tokens / VPN
+*.jwt                     # JWT bearer token
+*.ovpn                    # OpenVPN config (chaves/certs inline)
 ```
+
+Encodings de **cert público** (`*.crt`/`*.cer`/`*.der`) são deliberadamente **fora** da lista: não carregam chave privada (essa vive nos `*.pem`/`*.key`/`*.p12`/`*.pfx` já listados), e como este é um piso **duro e não-overridável**, bloqueá-los só quebraria leituras legítimas sem ganho de exposição de segredo.
+
+**Matching é case-insensitive.** O piso §8.4 precisa valer em **toda** plataforma que o binário suporta, e macOS (APFS) e Windows (NTFS) são case-insensitive por default — lá `write_file('.ENV')` atinge o mesmo inode que `.env`. Um matcher case-sensitive deixaria essa chamada passar como "não-sensível" sob policy permissiva (`allow_paths: ['**']`), abrindo bypass do engine-floor. A canonicalização de case via `realpath` só ocorre quando o alvo **já existe**; em write-creates-new-file o matcher vê o input cru, então o matcher em si tem que ser case-insensitive. A normalização lowerca **os dois lados** — input E pattern — porque nem todo pattern é lowercase (`GoogleService-Info.plist` é mixed-case): lowercar só o input mataria o match desses, reabrindo o bypass na direção oposta. O custo é over-match de nomes tipo `MyFile.PEM`, que é a direção segura pra uma deny de credencial.
 
 Match → tool retorna erro `path.deny_listed` com texto:
 
@@ -469,6 +509,80 @@ Continue? [y/N]
 - `--ephemeral --traces=file`. Defeats o ponto. Eval em CI cobre que combinação é rejected com erro claro.
 - Memory writes "esquecidos" em ephemeral. Modelo propõe memory write; harness retorna erro estruturado; modelo deve registrar em `assumptions[]` que houve preferência não persistida.
 - Ephemeral em compliance regulado. Falta audit trail — pode violar requirement. Documenta-se como **incompatível com auditoria forense** (`§10`).
+
+### 8.6 Git subprocess hardening (slice 178 M3 + C2)
+
+> **Razão:** todo `Bun.spawn({ cmd: ['git', ...] })` resolve git por PATH no momento do exec. Um shim de `~/bin/git` plantado mid-sessão (tool comprometido, dotfile malicioso, install hook bugado) é escolhido transparentemente — e roda com privilégios do agent, com o env herdado. Checkpoints rodam a cada step, então a janela de exploração é larga.
+
+**Defesa em duas camadas:**
+
+1. **Pin do binário no startup (two-stage resolution).** `getGitBinary()` (async) e `getGitBinarySync()` (sync) procuram git UMA vez por processo **in-process** (walk dos entries do PATH via `fs.access(.., X_OK)` — sem spawn de `which`, que está ausente em imagens minimalistas como busybox/distroless/scratch+static):
+   - **Stage 1 — canônico:** lookup contra SAFE_PATH (`/opt/homebrew/{s,}bin:/opt/local/{s,}bin:/usr/local/{s,}bin:/usr/{s,}bin:/{s,}bin`). Cobre macOS Homebrew/MacPorts + POSIX Linux. Quando resolve, `safeGitEnv().PATH` permanece canônica — defesa completa contra `~/bin/git` mid-session.
+   - **Stage 2 — fallback:** quando canônico não resolve, retry contra `process.env.PATH` do boot. Cobre NixOS (`/run/current-system/sw/bin`, `~/.nix-profile/bin`), asdf shims, `/run/wrappers/bin`, layouts ad-hoc (`/opt/custom/bin`). Quando o fallback resolve, **`safeGitEnv().PATH` vira `${CANONICAL_SAFE_PATH}:${operator_boot_PATH}`** — canônico FIRST (defesa contra shadowing de tools que TAMBÉM existem no canônico), dirs do operador APPEND (subprocess de git como hooks/credential helpers/ssh resolvem). Stderr logga uma linha avisando que a defesa de PATH ficou parcial (operador's boot PATH é parte do trust boundary, mesmo posture do `§2.1`).
+   - **Stage 3 — sem git em lugar nenhum:** cacheia null, retorna a string literal `'git'`. Spawn vai falhar com ENOENT visível.
+
+   Resolução é zero-dependência externa (não spawn `which`, `command`, ou shell builtin) — funciona em qualquer image que tenha git instalado e exposto em alguma entry do PATH, mesmo as que omitem utilitários POSIX (distroless, scratch + static-linked binaries).
+
+   Spawns subsequentes usam o path absoluto resolvido, não a string `'git'` — shadowing pós-startup não tem efeito (não há PATH lookup quando `cmd[0]` é absoluto).
+
+2. **Env controlado no spawn.** `safeGitEnv()` retorna apenas:
+   - `LC_ALL=C` (output parseável)
+   - `GIT_TERMINAL_PROMPT=0` (credentials prompt nunca bloqueia)
+   - `PATH` = `canônica:operator_boot_PATH` (canônica primeiro, operator boot PATH apêndice) em todos os branches de resolução bem-sucedida. O apêndice é necessário pra que subprocess de git (hooks `post-checkout` em `git worktree add`, `pre-commit`, credential helpers, ssh wrapper) encontrem ferramentas user-level (nvm, asdf, poetry, `~/bin` utilities). Sem o apêndice, hooks que dependem dessas ferramentas falhariam com "command not found" e operações de git inteiras (worktree add, commit) abortariam — regressão funcional vs o spawn inline pre-hardening. O prefixo canônico mantém a defesa: PATH lookup left-to-right, então um `~/bin/git` shim em operator PATH NÃO ganha sobre `/usr/bin/git` canônico.
+   - `HOME` herdado (git precisa pra `~/.gitconfig` — committer identity, ssh wrapper)
+   - **NÃO** `GIT_LITERAL_PATHSPECS` — `git check-ignore` rejeita com exit 128, fail global silencioso quebraria a detecção de colisão no `restore`. Sites que precisam do literal-pathspec guarantee (skip-worktree em worktrees de subagent, worktree-gc) mergem `GIT_LITERAL_PATHSPECS=1` localmente.
+
+**Sites obrigados a usar o par:**
+
+| Subsistema | Por quê |
+|---|---|
+| `src/checkpoints/git.ts` | Roda a cada step — primary git surface, maior janela de exploração |
+| `src/subagents/worktree.ts` + `worktree-gc.ts` | Manipula worktrees fora do cwd principal; PATH escape escala pra fora da árvore visível |
+| `src/cli/git-context.ts` | Probe síncrono no boot do system prompt (branch, ahead/behind) |
+| `src/memory/paths.ts` | `resolveRepoRoot()` síncrono no bootstrap; sem ele o registry de memória pode escopar errado |
+
+**Não obrigados (escopo de trust diferente):**
+- Tools que o modelo executa via `bash` — já passam pelo permission engine (sandbox plan + capability check). Aplicar PATH-pin lá seria redundante e quebraria `git` em paths legítimos não-canônicos do operador.
+- Test fixtures — usam `git` direto via shell helpers do test runner; não recebem input do modelo.
+
+**Limites declarados:**
+- Operador com PATH já comprometido na partida → fora de escopo (trust boundary). Subprocess de git (hooks) sempre rodam com operator PATH apêndice — o canônico-first ordering garante que git em si nunca resolve via shim, mas tools que git fork-execs (credential helpers, hooks customizados) podem.
+- Sistemas onde git não está em SAFE_PATH NEM em `process.env.PATH` (instalação manual em `/usr/games` sem PATH augment) → in-process walk retorna null em ambos stages, fallback final é a string `'git'`, exec falha com "command not found" — visível imediatamente, não silencioso.
+
+### 8.7 Regex shape guard (slice 178 A2)
+
+> **Razão:** JS não tem timeout per-match em RegExp. Um pattern catastrófico como `(a+)+b` contra input não-matching trava o event loop por segundos a minutos. Tools que recebem pattern do modelo (`wait_for`, `monitor`) precisam rejeitar shapes patológicos **no compile**.
+
+**Detector heurístico (`src/sanitize/regex.ts`):**
+
+Conservador por design — falso positivo (rejeita pattern benigno) é recuperável; o modelo pode retry com shape mais simples. Falso negativo (admite exponencial) trava o harness.
+
+Rejeita:
+- **Pattern over 1024 bytes** (limite arbitrário; cobre backreference attack inflada).
+- **Nested unbounded quantifier**, um e dois níveis: `(a+)+`, `((a+))+`, `((a)*)+`, `(x(a+)y)+`. Três níveis caem no length cap.
+- **Alternation em repeated group**: `(a|ab)+`, `(a|a)*` — branches sobrepostas causam backtracking exponencial.
+- **Large bounded repeat on quantified body**: `(a+){50,}` é tão ruim quanto `(a+)+`.
+
+**Aplicado em:** `process_output.pattern` em `wait_for`, `process_output_pattern.pattern` em `monitor`, somente quando `is_regex=true`. Modo literal (`is_regex=false`) bypassa porque `escapeRegexLiteral` neutraliza todo meta primeiro.
+
+**Limites declarados:**
+- Backreferences com quantifier (`(\w+)\1+`) não são detectados explicitamente — cobertura via length cap apenas.
+- Pattern com quantifier exato `(a+){5}` é incorretamente rejeitado como `large_bounded_repeat_on_group` (`upperRaw=undefined` colapsa pra Infinity). Fix de uma linha pendente; rejeição é safe-but-noisy.
+
+### 8.8 Database durability on shutdown (slice 178 A3)
+
+> **Razão:** `PRAGMA synchronous=NORMAL` (default em `openDb`) mantém o hot path rápido — páginas principais do DB sincam, mas frames do WAL podem ficar no page cache do kernel após COMMIT. Crash do host (kernel panic, power loss) entre o último commit e o próximo checkpoint perde todas as rows de audit escritas desde o último checkpoint, e o chain-verifier não consegue distinguir rows perdidas de rows nunca escritas.
+
+**`closeDb(db)` (`src/storage/db.ts`):** wrapper único pra encerrar handles SQLite, usado por todos os entry points do CLI + `evals/executor.ts`:
+
+1. `PRAGMA wal_checkpoint(PASSIVE)` — checkpoint best-effort: copia frames pro main DB sem esperar readers, sync do main file. Frames com active reader ficam no WAL (recovered automaticamente no próximo open).
+2. `db.close()` libera o handle. Em close limpo sem readers, SQLite remove `-wal`/`-shm` siblings automaticamente.
+
+Ambos os passos em try/catch separados que logam-e-suprimem stderr — finally chains do tipo `try { migrate(db); } catch (e) { closeDb(db); throw e; }` preservam o erro original.
+
+**Por que PASSIVE, não TRUNCATE/FULL:** TRUNCATE espera todos readers darem snapshot fresh do main DB (busy-handler invocado, controlled pelo `busy_timeout=5000` do `openDb`). Em deployments com parent + subagent + readonly inspector overlap (canonical Forja parallelism shape), cada `closeDb` poderia bloquear 5 SEGUNDOS — UX inaceitável pra finally blocks que rodam em todos entry points do CLI. PASSIVE retorna em ms; o trade-off é que pages com active reader ficam no WAL, recovered no próximo open. Window de risco genuíno: graceful shutdown + host crash + WAL file perdido (tmpfs, etc) antes do próximo open — narrower que a promessa v0 mas o balance certo contra latência de close.
+
+**Casos no-op (não throw, não warn):** DBs `:memory:`, handles readonly, DBs abertos antes de `journal_mode=WAL` rodar — `wal_checkpoint` é no-op nativo nesses casos.
 
 ---
 

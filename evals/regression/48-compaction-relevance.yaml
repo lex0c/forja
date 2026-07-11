@@ -1,0 +1,30 @@
+name: relevance compaction preserves the task on a tool-heavy history
+evaluates: harness
+# Flag-ON twin of 23-multi-compaction-rounds: the SAME tool-heavy scenario
+# (read 5 files twice → big, mostly-redundant tool_result bodies that trip
+# compaction), but with budget.compactionRelevance enabled. The relevance
+# pre-pass pointer-elides low-goal-relevance / redundant tool_result bodies
+# (the duplicate reads) WITHOUT an LLM call when that alone drops back under
+# the trigger, falling through to the LLM summary only if it doesn't. The
+# answer (the shared import) survives: it stays verbatim in the kept reads,
+# and elided bodies remain in the audit log / retrievable. Assertions are
+# strategy-agnostic on purpose (relevance may skip or fall through to the
+# LLM depending on sizes) — the point is task success is preserved with
+# relevance ON; cost is compared against case 23 (flag-off) out of band.
+prompt: |
+  Read every TypeScript file under src/ in alphabetical order
+  (a.ts, b.ts, c.ts, d.ts, e.ts), then read each one a SECOND time in the
+  same alphabetical order. After all ten reads, tell me the dependency name
+  every file imports from. Quote it verbatim.
+setup:
+  fixture: ../fixtures/chunky-modules
+expect:
+  - tool_called: read_file
+  - status: done
+  - output_contains: forja-core
+budget:
+  maxSteps: 14
+  maxCostUsd: 0.15
+  compactionThreshold: 0.02
+  compactionPreserveTail: 1
+  compactionRelevance: true

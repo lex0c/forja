@@ -1,0 +1,261 @@
+name: release
+
+# Triggers on `vX.Y.Z` tags. Manual `workflow_dispatch` is wired so a
+# release can be re-attempted without retagging — the tag form is the
+# canonical path; manual is for breakage recovery. The manual path
+# REQUIRES the tag to already exist; we check out at that ref so the
+# binaries match the tag, not whichever branch dispatched the workflow.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release (e.g. v0.1.0). Required for manual dispatch.'
+        required: true
+
+permissions:
+  contents: write       # uploading release assets
+  id-token: write       # OIDC token for Sigstore-backed build provenance
+  attestations: write   # writing SLSA provenance to the GitHub attestation store
+
+concurrency:
+  # Key by the resolved tag, NOT by `github.ref_name`. On a manual
+  # `workflow_dispatch`, `github.ref_name` is the branch the run was
+  # dispatched FROM (typically `main`), not the tag in `inputs.tag`.
+  # Two manual releases for the same tag dispatched from different
+  # branches would otherwise hash to different groups and race in
+  # `publish` (both invoking `gh release upload --clobber`). Putting
+  # `inputs.tag` first means: tag push → empty inputs.tag → falls
+  # through to `github.ref_name` (= the tag); manual dispatch →
+  # uses the operator-supplied tag directly. Same key in both paths
+  # for the same release.
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+# Single source of truth for the ref every job builds and publishes
+# against. On a tag push it's `github.ref` (= refs/tags/vX.Y.Z); on a
+# manual dispatch it's the operator-supplied tag name. Both forms
+# resolve to a tag, never a branch HEAD — so a manual rerun while
+# main has moved on still ships the exact commit at the tag.
+env:
+  RELEASE_REF: ${{ inputs.tag || github.ref }}
+
+jobs:
+  # Single-runner build of every target via Bun's cross-compile. We
+  # consciously do NOT use a runner matrix because Bun's --target
+  # produces the right binary from any host (PERFORMANCE.md §18.5
+  # line 626 lists targets, not runners). One runner == one cache
+  # warmup, one SBOM, one reproducibility check; an ARM/macOS runner
+  # per target buys nothing FOR THE BUILD. Runtime execution is a
+  # separate question — that's validated on native runners in the
+  # exec-check job below.
+  build:
+    name: build · sbom · size gate · checksums
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+          fetch-depth: 0
+
+      - name: Verify ref resolves to a tag
+        # Defense in depth: a manual dispatch with `inputs.tag`
+        # pointing at a branch name would be checked out by the step
+        # above and pass; this verifies we're actually on a tag.
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${{ env.RELEASE_REF }}"
+          # `refs/tags/<name>` form (tag-push trigger) or bare tag
+          # name (workflow_dispatch). Strip the prefix if present.
+          tag="${ref#refs/tags/}"
+          git rev-parse --verify "refs/tags/$tag" >/dev/null
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.3.13
+
+      - name: Install deps
+        run: bun install --frozen-lockfile
+
+      - name: Build all targets
+        run: bun run build:release
+
+      - name: Size gate (PERFORMANCE.md §18.2)
+        run: bun run build:size
+
+      - name: SBOM (CycloneDX)
+        run: bun run build:sbom
+
+      - name: SHA256SUMS
+        run: bun run build:checksums
+
+      - name: Verify checksums (round-trip sanity)
+        run: bun run build:verify
+
+      - name: Attest build provenance (SLSA)
+        # Signs a provenance attestation for every artifact listed in
+        # SHA256SUMS (the binaries + the SBOM) via Sigstore-backed GitHub
+        # attestations. Driven off the SUMS — not a dist/forja-* glob —
+        # so it attests exactly what ships and never the unpublished
+        # sourcemaps. Verify a downloaded binary with:
+        #   gh attestation verify <binary> --repo <owner>/<repo>
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be  # v2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: release-assets
+          path: |
+            dist/forja-*
+            dist/sbom.cdx.json
+            dist/SHA256SUMS
+          # Keep retention modest; assets land in GitHub Releases
+          # below as the durable copy. The artifact is a transport
+          # between jobs.
+          retention-days: 7
+          if-no-files-found: error
+
+  # Reproducible-build verification runs in its own job so a failure
+  # surfaces independently in the workflow timeline. Slow (double
+  # build) and not load-bearing for the upload step, so it parallels
+  # the build job rather than gating it.
+  reproducibility:
+    name: reproducible build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.3.13
+
+      - name: Install deps
+        run: bun install --frozen-lockfile
+
+      - name: Reproducibility check
+        run: bun run build:repro
+
+  # Runtime smoke on each target's NATIVE OS/arch. The build job's
+  # post-build smoke can only exec the one target matching its host
+  # (ubuntu-x64); the other four are cross-compiled and never actually
+  # run until a user installs them. This matrix downloads the
+  # already-built binaries and EXECUTES each on a matching runner —
+  # catching a binary that links but won't boot on its target platform
+  # (syscall/runtime/path regressions a cross-compile can't surface).
+  # Build stays single-runner (Bun cross-compile); only EXECUTION fans
+  # out, so the cost is seconds per runner, not a per-OS rebuild.
+  # Gates publish: a binary that won't run must not ship.
+  exec-check:
+    name: exec smoke · ${{ matrix.target }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux-x64, os: ubuntu-latest }
+          - { target: linux-arm64, os: ubuntu-24.04-arm }
+          - { target: darwin-x64, os: macos-13 }
+          - { target: darwin-arm64, os: macos-14 }
+          - { target: windows-x64, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - name: Download built binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Exec smoke (--version + broker echo)
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='${{ matrix.target }}'
+          # Locate this target's binary in the downloaded artifact.
+          # Asset name is forja-<version>-<target>[.exe]; the version
+          # segment is opaque here, so glob it. Sourcemaps (.map) and
+          # other targets don't match the -<target> suffix.
+          if [ "$target" = "windows-x64" ]; then
+            bin=$(ls dist/forja-*-"$target".exe)
+          else
+            bin=$(ls dist/forja-*-"$target")
+            chmod +x "$bin"
+          fi
+          echo "binary: $bin"
+
+          # 1) Loads and runs on this OS/arch at all.
+          ver=$("$bin" --version)
+          echo "version: $ver"
+          [ -n "$ver" ] || { echo "::error::--version produced no output on $target"; exit 1; }
+
+          # 2) Broker-worker dispatch works in the compiled binary —
+          #    same check as the post-build smoke, but on the NATIVE
+          #    OS/arch this time.
+          req='{"toolName":"__echo__","args":{"smoke":true},"capabilities":[],"sandboxProfile":null}'
+          out=$(printf '%s' "$req" | FORJA_BROKER_WORKER=1 "$bin")
+          echo "broker: $out"
+          printf '%s' "$out" | grep -q '"ok":true' || { echo "::error::broker echo not ok on $target"; exit 1; }
+          printf '%s' "$out" | grep -q '__echo__' || { echo "::error::broker echo payload mismatch on $target"; exit 1; }
+          echo "exec smoke ok: $target"
+
+  publish:
+    name: publish GitHub Release
+    needs: [build, reproducibility, exec-check]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - name: Download artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${{ env.RELEASE_REF }}"
+          tag="${ref#refs/tags/}"
+          echo "name=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Create / update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Publish binaries only — exclude sourcemaps. The dist/forja-*
+          # glob also matches the .map files, which checksums.ts keeps
+          # OUT of SHA256SUMS by design; publishing them would ship an
+          # unverifiable release asset. The .map stay in the CI artifact
+          # (7-day retention) for debugging instead. Word-splitting on
+          # $bins is intentional (multiple file args); release filenames
+          # are controlled and contain no spaces.
+          bins=$(find dist -maxdepth 1 -type f -name 'forja-*' ! -name '*.map' | sort)
+          [ -n "$bins" ] || { echo "no release binaries found in dist/" >&2; exit 1; }
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber $bins dist/sbom.cdx.json dist/SHA256SUMS
+          else
+            gh release create "$TAG" \
+              --target "$TAG" \
+              --title "$TAG" \
+              --generate-notes \
+              $bins dist/sbom.cdx.json dist/SHA256SUMS
+          fi

@@ -1,0 +1,225 @@
+import type { CompactionStrategy, ExitReason, HarnessResult } from '../harness/index.ts';
+import type { ApprovalPosture } from '../permissions/index.ts';
+import type { UsageInfo } from '../providers/index.ts';
+
+// One declarative expectation evaluated against a finished run.
+// Each shape carries exactly the data needed for its assertion;
+// the executor switches on the `kind` discriminant.
+export type EvalExpectation =
+  | { kind: 'tool_called'; tool: string }
+  | { kind: 'tool_not_called'; tool: string }
+  // Asserts the tool was invoked AND the harness/permission engine
+  // returned a deny decision for it. Critical for proving guards
+  // fire under load: `file_not_exists` confirms the sandbox held,
+  // but a model that never even attempted the call would satisfy
+  // it vacuously. Pairing with `tool_denied` proves the gate
+  // actually executed and refused — not that nothing happened.
+  // Catches regressions where a future refactor makes a guard
+  // silently allow what it was meant to block.
+  | { kind: 'tool_denied'; tool: string }
+  | { kind: 'file_exists'; path: string }
+  | { kind: 'file_not_exists'; path: string }
+  | { kind: 'file_contains'; path: string; pattern: string }
+  // The negation: assert an edit REMOVED text (the old content is gone), not just
+  // that new content is present. The file must exist (fails if missing), like
+  // file_contains — so a rename/refactor case can prove no stale name lingers.
+  | { kind: 'file_not_contains'; path: string; pattern: string }
+  | { kind: 'status'; status: HarnessResult['status'] }
+  | { kind: 'exit_reason'; reason: ExitReason }
+  | { kind: 'output_contains'; pattern: string }
+  // Asserts the run took at least `count` steps. Pairs with a
+  // forced dependency-chain prompt to prove the agent actually ran
+  // a LONG trajectory — a model that shortcuts the chain in a few
+  // steps fails even if it happens to land the answer. Critical for
+  // long-horizon evals where the property under test (e.g. reasoning
+  // continuity) only manifests across many tool round-trips; without
+  // it a 3-step lucky pass would mask the regime we mean to measure.
+  | { kind: 'min_steps'; count: number }
+  // Compaction observability: assert that at least `minCount`
+  // `compaction_finished` events fired during the run, optionally
+  // restricted to a specific `strategy` ('llm' / 'fallback' /
+  // 'skipped'). Without `strategy`, every emission counts.
+  // Critical to observe explicitly because the harness emits a
+  // `compaction_finished` event with `strategy: 'fallback'` when
+  // the LLM call fails — silently masking adapter bugs unless
+  // we assert against the strategy directly.
+  | { kind: 'compaction_triggered'; minCount: number; strategy?: CompactionStrategy }
+  // Runs an author-specified command in the eval cwd AFTER the agent finishes and asserts it
+  // exits 0. The OUTCOME oracle for capability evals (self-SWE-bench): the gold test is the
+  // spec, and "the bug is fixed" = the test command passes — independent of HOW the model
+  // acted (tool / format). Runs in the same workspace the agent edited, with its file changes
+  // in place. `timeoutMs` bounds a hung command (default DEFAULT_COMMAND_TIMEOUT_MS).
+  // `sandboxed` wraps the command in the `cwd-rw` sandbox profile (ro outside cwd, network
+  // off) — load-bearing for self-SWE-bench, where the command runs `bun test` over files the
+  // model wrote: without it a model under eval can plant code the verifier executes with the
+  // runner's full privileges. Defaults off (hermetic author-authored commands are trusted).
+  | { kind: 'command_succeeds'; command: string; timeoutMs?: number; sandboxed?: boolean };
+
+// Optional setup applied before the run: copy a fixture directory
+// into the eval's temp cwd, then overwrite/create files declared
+// inline. Inline files take precedence over fixture files at the
+// same path.
+export interface EvalSetup {
+  // Path (relative to the eval YAML file) to a directory whose
+  // contents are copied into the eval cwd as starting state.
+  fixture?: string;
+  // Inline files: { 'src/x.ts': 'export const x = 1\n' }. Useful
+  // for cases too small to deserve a fixture dir.
+  files?: Record<string, string>;
+  // Initialize the eval cwd as a git work-tree (`git init`) before the run.
+  // Needed for tools that require a repo (git_apply_patch) — the eval cache dir
+  // is not otherwise a git repo, so without this they'd dead-end on
+  // git.not_a_repo. cwd == worktree root, so patch paths resolve cleanly.
+  gitInit?: boolean;
+  // Initial approval posture (operation-mode, AGENTIC_CLI §8.1).
+  // Default 'supervised'. Evals run headless (no confirm bridge), so
+  // under 'supervised' a `confirm` verdict dead-ends as a deny; under
+  // 'autonomous' a routine `policy` confirm auto-approves while risk
+  // confirms still deny — the security invariant a posture eval pins.
+  approvalPosture?: ApprovalPosture;
+  // Hermetic HTTP stub for network tools (fetch_url). Maps an exact
+  // request URL to a canned response. The executor injects this into a
+  // stubbed fetch_url (`buildFetchStubRegistry`) — a `lookup` that returns a
+  // public test IP plus a `fetch` that maps the pinned request back to the
+  // original URL via the Host header — and swaps that tool into the registry.
+  // `globalThis.fetch` is NOT touched, so the provider's own API calls hit the
+  // real network; an unmatched fetch_url URL is rejected ('no canned
+  // response'). Lets a model-in-the-loop eval exercise fetch_url
+  // deterministically — the live-network alternative is both flaky and blocked
+  // by the SSRF gate for local stub servers.
+  httpStub?: Record<string, EvalHttpResponse>;
+  // Hermetic MCP servers for a model-in-the-loop eval. Each entry declares a
+  // fake stdio server (name → tools + a canned tools/call result); the executor
+  // writes a `.forja/mcp.toml` declaring them, auto-approves them (so the headless
+  // run trusts them without a confirmer), and injects a stubbed `McpClient` that
+  // serves the declared manifest — NO real subprocess (that path is covered by
+  // tests/mcp/real-subprocess.test.ts + evals/smoke-mcp.sh). Lets an eval measure
+  // whether the model discovers + calls an MCP tool and uses its result.
+  // The executor pins a hermetic "sandbox available" verdict for these, so the fake
+  // server resolves to the non-egress `mcp` category (default-allow) — a headless
+  // run can call it without a confirmer. (Egress is deliberately NOT auto-approved
+  // under `autonomous`, which is why the fake server must be non-egress.)
+  mcp?: Record<string, EvalMcpServer>;
+}
+
+// One hermetic MCP server for `EvalSetup.mcp`.
+export interface EvalMcpServer {
+  // The tools the fake server advertises via `tools/list`.
+  tools: { name: string; description: string; writes?: boolean }[];
+  // Canned text every `tools/call` returns (default 'ok'). A distinctive marker
+  // here lets `output_contains` verify the result round-tripped to the model.
+  result?: string;
+  // Model surface for the tools — 'base' (on the wire) or 'deferred' (via
+  // tool_search). Default 'base' so the model can call directly.
+  surface?: 'base' | 'deferred';
+}
+
+// One canned HTTP response for `EvalSetup.httpStub`.
+export interface EvalHttpResponse {
+  // Response body — for fetch_url, typically an HTML or text page.
+  body: string;
+  // HTTP status. Default 200.
+  status?: number;
+  // Content-Type header. Default 'text/html; charset=utf-8'.
+  contentType?: string;
+}
+
+export interface EvalBudget {
+  maxSteps?: number;
+  maxCostUsd?: number;
+  // Override the harness compaction trigger ratio for this case.
+  // Useful for forcing compaction with small fixtures: setting
+  // 0.01 means a ~2k-token prompt against a 200k-window provider
+  // will trip compaction, instead of needing the default 70%
+  // (~140k tokens).
+  compactionThreshold?: number;
+  // Override how many trailing turns compaction preserves
+  // literally. Lower values let compaction fire more
+  // aggressively in narrow tests.
+  compactionPreserveTail?: number;
+  // Enable the relevance compaction pre-pass for this case (default ON,
+  // mirroring DEFAULT_BUDGET). Lets the eval measure relevance ON vs OFF on
+  // the same scenario by pinning `false`.
+  compactionRelevance?: boolean;
+  // Override the compaction summary's max_tokens. A small value (e.g. 48) forces
+  // the structured summary to truncate, exercising the truncation path
+  // deterministically; the run must still succeed (goal re-injection + the
+  // GOAL/PENDING-first section order keep the thread).
+  compactionMaxTokens?: number;
+  // Enable the experimental #3 trigger refine (default-OFF in DEFAULT_BUDGET). Set
+  // true in a case to exercise the real-tokenizer skip path on a native-counter
+  // provider (Anthropic/Google) — the only place it acts — so its benefit + window
+  // edges get end-to-end coverage before it could be considered for the default.
+  compactionTriggerRefine?: boolean;
+}
+
+export interface EvalCase {
+  name: string;
+  // Resolved absolute path the case was loaded from. Used to
+  // resolve `setup.fixture` relative paths.
+  sourcePath: string;
+  prompt: string;
+  setup?: EvalSetup;
+  expect: EvalExpectation[];
+  budget?: EvalBudget;
+  // What the case discriminates: 'model' competence (tool use, editing, multi-step
+  // flows, judgment) vs a 'harness' mechanism (permissions, hooks, compaction,
+  // postures) whose outcome is the same regardless of model. The model ranking runs
+  // only 'model' cases; CI runs everything. Default 'model' (untagged counts toward
+  // the ranking) — tag the exceptions, not the norm.
+  evaluates?: 'model' | 'harness';
+}
+
+export interface ExpectationOutcome {
+  expectation: EvalExpectation;
+  passed: boolean;
+  // Human-readable detail when failed. Empty on pass.
+  detail?: string;
+}
+
+export interface EvalCaseResult {
+  name: string;
+  sourcePath: string;
+  // True iff every expectation passed AND the run finished without
+  // an internal/provider error AND cost stayed within budget.
+  passed: boolean;
+  durationMs: number;
+  // Pulled from the harness result; falsy when the run errored
+  // before producing one (e.g., setup failure).
+  status?: HarnessResult['status'];
+  exitReason?: ExitReason;
+  costUsd: number;
+  steps: number;
+  // True iff the run reported `usage` for every assistant turn.
+  // When false, costUsd is a lower bound — surfaced so summary
+  // stats can flag inflight underreporting.
+  usageComplete: boolean;
+  // Aggregated token usage from the harness result (input / output / cache_read /
+  // cache_creation). Undefined when the run produced no result (setup failure).
+  // Lets the ranking derive a cache-hit rate when the provider caches.
+  usage?: UsageInfo;
+  // The selected provider is unmetered (cost not tracked per-token, e.g. Ollama
+  // Cloud) — lets the ranking blank cost_usd instead of reading $0 as "free".
+  unmetered?: boolean;
+  expectations: ExpectationOutcome[];
+  // Top-level failure reason when the case never reached the
+  // expect phase (fixture missing, runAgent threw, budget cap).
+  failure?: string;
+  // Pass-through of `HarnessResult.detail` — the provider error
+  // message, the tool that exhausted the error budget, etc.
+  // Surfacing it on the eval line keeps debugging a `tail | jq`
+  // away instead of requiring a re-run with extra logging.
+  detail?: string;
+}
+
+export interface EvalSummary {
+  total: number;
+  passed: number;
+  failed: number;
+  passRate: number; // [0, 1]
+  // p50 cost across cases that produced a cost number (passed or
+  // failed equally). Undefined when no case produced cost.
+  p50CostUsd?: number;
+  totalCostUsd: number;
+  totalDurationMs: number;
+}

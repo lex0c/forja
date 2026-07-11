@@ -1,0 +1,36 @@
+name: three-step chain — glob then read then write derived summary
+prompt: |
+  Step 1: use the glob tool with the pattern `**/*.ts` to find every
+  TypeScript file in the working directory.
+
+  Step 2: read each matched file using read_file.
+
+  Step 3: use write_file to create `summary.txt` whose content lists the
+  number returned by each function, one per line, in alphabetical order
+  by filename. The file should look like:
+
+      1
+      2
+      4
+
+  (alpha returns 1, beta returns 2, delta returns 4 — alphabetical by
+  filename means alpha, beta, delta in that order).
+setup:
+  fixture: ../fixtures/nested-tree
+expect:
+  - tool_called: glob
+  - tool_called: read_file
+  - tool_called: write_file
+  - file_exists: summary.txt
+  - file_contains:
+      path: summary.txt
+      pattern: "1"
+  - file_contains:
+      path: summary.txt
+      pattern: "2"
+  - file_contains:
+      path: summary.txt
+      pattern: "4"
+  - status: done
+budget:
+  maxSteps: 10

@@ -1,0 +1,158 @@
+# Conformance: §10.1 subagent capability intersection (PERMISSION_ENGINE.md §10).
+#
+# These cases bypass the engine pipeline entirely and exercise the
+# `intersectCapabilities(parent, declared)` primitive directly — the
+# function that returns `{ effective, excess }` for a subagent spawn.
+# `effective` is what the child inherits; `excess` is what the
+# parent never had the authority to delegate (any non-empty `excess`
+# triggers `subagent_escalation` at the harness layer per §10.1).
+#
+# Case shape: `setup.parent_capabilities` and `setup.declared_capabilities`
+# are arrays of capability strings (formatted form, parsed via
+# `parseCapability`). `expect.effective` and `expect.excess` are the
+# expected outputs in DECLARED ORDER — the primitive preserves order in
+# both arrays, and the harness audit assumes that ordering, so the
+# tests assert it.
+#
+# Coverage groups (counts per §16.2 minimum of 6):
+#   A. Identity / subset / superset                (3)
+#   B. Empty boundary signals                      (1)
+#   C. Exec hierarchy (arbitrary umbrella)         (1)
+#   D. Path prefix glob coverage                   (1)
+#
+# Symmetric with `capabilities-intersection.test.ts` unit suite, but
+# pins the contracts at the conformance layer so the suite holds
+# them load-bearing for §16 GA.
+
+# ─────────────────────────────────────────────────────────────────────
+# Group A — Identity / subset / superset
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "subagent intersection: declared ⊆ parent (subset) — all effective, no excess"
+  setup:
+    parent_capabilities:
+      - "read-fs:**"
+      - "exec:arbitrary"
+      - "env-mutate"
+    declared_capabilities:
+      - "read-fs:src/index.ts"
+      - "exec:python"
+      - "env-mutate"
+  expect:
+    # `read-fs:**` covers any read-fs scope; `exec:arbitrary` is the
+    # umbrella over every exec class; scope-less `env-mutate` matches
+    # itself. All declared caps survive intersection.
+    effective:
+      - "read-fs:src/index.ts"
+      - "exec:python"
+      - "env-mutate"
+    excess: []
+
+- name: "subagent intersection: declared ⊃ parent (superset) — split into effective + excess"
+  setup:
+    parent_capabilities:
+      - "read-fs:src/**"
+    declared_capabilities:
+      - "read-fs:src/foo.ts"
+      - "write-fs:src/foo.ts"
+      - "exec:shell"
+  expect:
+    # `read-fs:src/**` covers `read-fs:src/foo.ts` (prefix-glob path)
+    # → effective. `write-fs:*` and `exec:*` have no parent coverage
+    # at all → both excess. Order preserved.
+    effective:
+      - "read-fs:src/foo.ts"
+    excess:
+      - "write-fs:src/foo.ts"
+      - "exec:shell"
+
+- name: "subagent intersection: cross-kind never covers — different kinds entirely in excess"
+  setup:
+    parent_capabilities:
+      - "read-fs:**"
+      - "net-egress:**"
+    declared_capabilities:
+      - "write-fs:src/x"
+      - "delete-fs:tmp"
+      - "git-write:/work/proj"
+  expect:
+    # The parent has read-fs and net-egress, but the declared caps
+    # are write-fs / delete-fs / git-write. Capability kind matching
+    # is the first gate in `capabilityCovers` — no cross-kind
+    # delegation. All declared caps land in excess (which forces
+    # `subagent_escalation` at the harness layer).
+    effective: []
+    excess:
+      - "write-fs:src/x"
+      - "delete-fs:tmp"
+      - "git-write:/work/proj"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group B — Empty boundary signals
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "subagent intersection: empty declared → empty effective + empty excess (pure-LLM signal)"
+  setup:
+    # Parent has rich capabilities, but the child declared NONE. Per
+    # §10.1, this maps to "subagent receives no capability" — a
+    # pure-LLM child that can't touch the filesystem or execute. The
+    # primitive returns empty arrays, which the harness treats as the
+    # pure-LLM signal (not a missing-cap escalation).
+    parent_capabilities:
+      - "read-fs:**"
+      - "exec:arbitrary"
+    declared_capabilities: []
+  expect:
+    effective: []
+    excess: []
+
+# ─────────────────────────────────────────────────────────────────────
+# Group C — Exec hierarchy (arbitrary umbrella covers concrete classes)
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "subagent intersection: exec:arbitrary parent covers shell + python + node"
+  setup:
+    # `exec` is a class hierarchy: `arbitrary` is the umbrella that
+    # covers every concrete class (shell, python, node). A parent
+    # holding `exec:arbitrary` can delegate any narrower exec class
+    # without escalation. Pins capabilityCovers's exec-branch logic.
+    parent_capabilities:
+      - "exec:arbitrary"
+    declared_capabilities:
+      - "exec:shell"
+      - "exec:python"
+      - "exec:node"
+      - "exec:arbitrary"
+  expect:
+    effective:
+      - "exec:shell"
+      - "exec:python"
+      - "exec:node"
+      - "exec:arbitrary"
+    excess: []
+
+# ─────────────────────────────────────────────────────────────────────
+# Group D — Path prefix glob coverage
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "subagent intersection: parent prefix-glob covers literal under prefix, NOT siblings outside"
+  setup:
+    parent_capabilities:
+      - "read-fs:src/**"
+    declared_capabilities:
+      - "read-fs:src/index.ts"
+      - "read-fs:src/deep/nested/x.ts"
+      - "read-fs:tests/x.ts"
+      - "read-fs:srcfoo/x"
+  expect:
+    # `<prefix>/**` semantics: covers `<prefix>` exactly and
+    # `<prefix>/...` descendants. Sibling directories that share a
+    # textual prefix but cross the `/` boundary (`srcfoo`) do NOT
+    # match — capabilityCovers uses startsWith on `${prefix}/`, not
+    # bare startsWith.
+    effective:
+      - "read-fs:src/index.ts"
+      - "read-fs:src/deep/nested/x.ts"
+    excess:
+      - "read-fs:tests/x.ts"
+      - "read-fs:srcfoo/x"

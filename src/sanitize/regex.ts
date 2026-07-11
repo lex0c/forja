@@ -1,0 +1,142 @@
+// Heuristic rejection of regex shapes prone to catastrophic
+// backtracking. JS has no per-match timeout; a pattern like
+// `(a+)+b` against a non-matching input freezes the event loop
+// for seconds or longer. Defense is shape rejection at compile
+// time. The heuristic is intentionally conservative — false
+// positives (rejecting a benign pattern) are recoverable because
+// the caller can surface the rejection and the model can retry
+// with a tamer shape; false negatives (admitting an exponential
+// pattern) freeze the harness.
+//
+// Detected shapes:
+//   - Nested unbounded quantifier: `(a+)+`, `(a*)*`, `(.+)*`, `(\d+)+`.
+//   - Large bounded outer quantifier on a repeated body: `(a+){10,}`.
+//   - Alternation inside a repeated group: `(a|a)*`, `(a|ab)+`.
+//
+// Not detected (caller responsibility / accepted risk):
+//   - Deeply nested groups beyond two levels (the inner-group
+//     scanner is single-level by design to keep the heuristic
+//     readable and fast).
+//   - Backreferences with quantifiers (`(\w+)\1+`) — rare in
+//     model-emitted patterns, separately guarded by total-length
+//     cap.
+
+const MAX_PATTERN_BYTES = 1024;
+const MAX_BOUNDED_REPEAT = 32;
+
+const NESTED_UNBOUNDED = /\([^()]*[+*][^()]*\)[+*]/;
+// Two-level variant: an outer (...)+/* whose body contains an
+// inner (...) group that itself has an unbounded quantifier
+// (either inside the inner body, or on the inner group itself).
+// Catches `((a+))+`, `(x(a+)y)+`, `((a)+)+`, `((a)*)+` — shapes
+// the single-level NESTED_UNBOUNDED misses because its `[^()]*`
+// segments cannot bridge inner parens. Three levels deep is
+// rare enough that the `pattern_too_long` cap (1024 bytes) is
+// the practical defense.
+const NESTED_UNBOUNDED_TWO_LEVEL =
+  /\([^()]*\([^()]*[+*][^()]*\)[^()]*\)[+*]|\([^()]*\([^()]*\)[+*][^()]*\)[+*]/;
+const ALT_IN_REPEATED_GROUP = /\([^()]*\|[^()]*\)[+*]/;
+// Alternation group with a BRACE quantifier (vs `[+*]`). Same
+// catastrophic-backtracking shape as ALT_IN_REPEATED_GROUP when
+// the count is large or unbounded: `(a|aa){30,}b` against a
+// non-matching input hangs for seconds. Walked with matchAll so a
+// benign-prefix bypass (`(x|y){1,2}(a|aa){100,}`) doesn't slip
+// past the first match. Threshold reused from BOUNDED_REPEAT_ON_GROUP.
+const ALT_IN_BOUNDED_GROUP = /\([^()]*\|[^()]*\)\{(\d+)(?:,(\d*))?\}/g;
+// `g` flag is load-bearing: `detectRedosShape` iterates EVERY match
+// via `matchAll`. Without the global flag, only the first quantified
+// group is inspected — an attacker could prepend a benign group
+// (`(a+){1,2}(b+){100,100}`) and slip the catastrophic shape past
+// the guard. Tests pin the multi-match case.
+const BOUNDED_REPEAT_ON_GROUP = /\([^()]*[+*][^()]*\)\{(\d+)(?:,(\d*))?\}/g;
+
+export interface RegexShapeRejection {
+  readonly code:
+    | 'pattern_too_long'
+    | 'nested_unbounded_quantifier'
+    | 'alternation_in_repeated_group'
+    | 'large_bounded_repeat_on_group';
+  readonly message: string;
+}
+
+export const detectRedosShape = (pattern: string): RegexShapeRejection | null => {
+  if (pattern.length > MAX_PATTERN_BYTES) {
+    return {
+      code: 'pattern_too_long',
+      message: `pattern exceeds ${MAX_PATTERN_BYTES} bytes (got ${pattern.length})`,
+    };
+  }
+
+  if (NESTED_UNBOUNDED.test(pattern) || NESTED_UNBOUNDED_TWO_LEVEL.test(pattern)) {
+    return {
+      code: 'nested_unbounded_quantifier',
+      message:
+        'pattern contains a repeated group whose body is itself unbounded (shapes like `(a+)+` or `((a+))+`); JS regex has no timeout, so this is rejected at compile time to avoid event-loop stalls',
+    };
+  }
+
+  if (ALT_IN_REPEATED_GROUP.test(pattern)) {
+    return {
+      code: 'alternation_in_repeated_group',
+      message:
+        'pattern contains alternation inside a repeated group (shapes like `(a|ab)+`); overlapping branches cause exponential backtracking',
+    };
+  }
+
+  // Same threat as ALT_IN_REPEATED_GROUP, but with brace quantifiers
+  // — `(a|aa){30,}b` hangs identically to `(a|aa)+b`. Iterate every
+  // match so a benign-prefix bypass doesn't slip past. Same shape
+  // logic as BOUNDED_REPEAT_ON_GROUP below: `{n}` is exact (upper =
+  // lower), `{n,}` is unbounded (upper = Infinity), `{n,m}` is
+  // bounded; reject when either bound exceeds MAX_BOUNDED_REPEAT.
+  for (const altBoundedMatch of pattern.matchAll(ALT_IN_BOUNDED_GROUP)) {
+    const lower = Number.parseInt(altBoundedMatch[1] ?? '0', 10);
+    const upperRaw = altBoundedMatch[2];
+    const upper =
+      upperRaw === undefined
+        ? lower
+        : upperRaw === ''
+          ? Number.POSITIVE_INFINITY
+          : Number.parseInt(upperRaw, 10);
+    if (lower > MAX_BOUNDED_REPEAT || upper > MAX_BOUNDED_REPEAT) {
+      return {
+        code: 'alternation_in_repeated_group',
+        message:
+          'pattern contains alternation inside a brace-quantified group with a large or unbounded count (shapes like `(a|aa){30,}`); same exponential backtracking as `(a|aa)+`',
+      };
+    }
+  }
+
+  // Iterate EVERY bounded-repeat match — a single bad group anywhere
+  // in the pattern is enough to trigger exponential backtracking at
+  // runtime. Pre-fix this used `pattern.match(...)` which returns
+  // only the FIRST match; a pattern like `(a+){1,2}(b+){100,100}`
+  // would accept (first group is small) while the second was the
+  // exact catastrophic shape the guard exists to block.
+  for (const boundedMatch of pattern.matchAll(BOUNDED_REPEAT_ON_GROUP)) {
+    const lower = Number.parseInt(boundedMatch[1] ?? '0', 10);
+    const upperRaw = boundedMatch[2];
+    // Three shapes the regex's optional second capture distinguishes:
+    //   `{n}`     → upperRaw === undefined (exact count; upper = lower)
+    //   `{n,}`    → upperRaw === ''        (unbounded;   upper = Infinity)
+    //   `{n,m}`   → upperRaw === 'm'       (bounded;     upper = parseInt(m))
+    // Pre-fix this branch collapsed undefined and '' to Infinity,
+    // wrongly rejecting `(a+){5}` (bounded to 5 outer reps, NOT
+    // exponential) as large_bounded_repeat_on_group. The fix only
+    // treats the `{n,}` shape as unbounded.
+    const upper =
+      upperRaw === undefined
+        ? lower
+        : upperRaw === ''
+          ? Number.POSITIVE_INFINITY
+          : Number.parseInt(upperRaw, 10);
+    if (lower > MAX_BOUNDED_REPEAT || upper > MAX_BOUNDED_REPEAT) {
+      return {
+        code: 'large_bounded_repeat_on_group',
+        message: `pattern repeats a quantified group more than ${MAX_BOUNDED_REPEAT} times; large bounded repeats on '(a+){n,}'-shaped bodies are exponential the same way unbounded repeats are`,
+      };
+    }
+  }
+
+  return null;
+};

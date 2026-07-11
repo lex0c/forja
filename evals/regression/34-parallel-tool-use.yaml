@@ -1,0 +1,22 @@
+name: parallel tool use — three reads dispatched in one assistant turn
+prompt: |
+  Read all three files `one.txt`, `two.txt`, and `three.txt` in PARALLEL —
+  emit all three read_file calls in a SINGLE assistant turn rather than
+  one at a time. Then in your final reply, list the contents of each file
+  on its own line, in the order one/two/three.
+setup:
+  files:
+    one.txt: |
+      RED
+    two.txt: |
+      GREEN
+    three.txt: |
+      BLUE
+expect:
+  - tool_called: read_file
+  - output_contains: RED
+  - output_contains: GREEN
+  - output_contains: BLUE
+  - status: done
+budget:
+  maxSteps: 5

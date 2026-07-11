@@ -1,0 +1,16 @@
+name: tool_search keyword discovery of a deferred tool
+prompt: |
+  First add a todo "ship the release". Then remove ALL todos from your list so
+  it's empty again. The tool that empties the todo list may not be in your
+  default toolset; if you don't see one, search for it first, then use it. Reply
+  "done" when the list is empty.
+expect:
+  # The deferred tool (todo_clear) must be discovered via tool_search by keyword...
+  - tool_called: tool_search
+  # ...then actually used.
+  - tool_called: todo_clear
+  - status: done
+budget:
+  # One extra step for the tool_search round-trip vs calling a visible tool.
+  maxSteps: 8
+  maxCostUsd: 0.30

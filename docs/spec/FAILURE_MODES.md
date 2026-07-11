@@ -219,6 +219,51 @@ Cada falha tem **código** no formato `<classe>.<subtipo>.<detalhe>`, ex: `provi
 2. Step retentado uma vez
 3. Falha persistente: erro fatal
 
+### 4.5 `storage.resume_truncated` — log persistido excedeu MAX_RESUME_MESSAGES (slice 178 M1)
+
+**Detecção:** `messagesToProviderMessages` retorna `droppedFromHead > 0`, indicando que o slice carregado no contexto do modelo é estritamente menor que o log persistido. Emitido apenas no `--resume` path (path preassigned, que sempre injeta exatamente um seed, não conta como truncation legítima).
+
+**Classe:** `storage` · **Recovery action:** `degraded` · **`user_visible: true``
+
+**Payload:**
+```json
+{
+  "kept": 500,
+  "dropped": 137,
+  "dropped_beyond_fetch": 80,
+  "dropped_by_alignment": 57,
+  "max_resume_messages": 500
+}
+```
+
+**Por que existe (vs. só o evento live):** o `resume_truncated` HarnessEvent já reachs TUI / NDJSON renderer; mas uma auditoria post-hoc de uma sessão resumida (queries em `failure_events`, forensics bundle) não tinha evidência DB-side de que o modelo trabalhou com subset do log — o gap aparecia só como "o modelo não lembrou disso" sem trail. A row em `failure_events` torna a truncation queryable junto com tudo mais.
+
+**Recovery:** nenhum — informativo. O harness não tenta carregar o tail dropado; o desenho do MAX_RESUME_MESSAGES é justamente OOM-prevention.
+
+### 4.6 `storage.persist_failed` (subsystem `outcome_signal_dual_write`) — compensação de dual-write (slice 178 M2)
+
+**Detecção:** `failureSink.emit({ code, classe, payload: { approval_seq } })` dispara o dual-write em `outcome_signals`; o INSERT em `outcome_signals` lança throw (sink offline, schema mismatch, disk-full, etc.). A throw é capturada pelo try/catch interno do sink — a row em `failure_events` já foi commitada e essa parte é load-bearing — mas a falha em si vira invisível pra queries que só inspecionam `failure_events`.
+
+**Compensação:** o emit é capturado em closure dentro da transação outer (`pendingCompensation` variável) e drenado **sincronicamente** depois de `withImmediateTransaction` retornar (writer lock liberado, recursive `emit()` pode tomar seu próprio BEGIN IMMEDIATE sem contention/deadlock) mas **antes** de o emit outer retornar pro caller — mesma call stack. Garante que um caller que faz `closeDb()` na próxima linha já vê a compensação row persisted.
+
+**Payload (compensação):**
+```json
+{
+  "subsystem": "outcome_signal_dual_write",
+  "original_failure_id": "01JD...",
+  "original_approval_seq": 42,
+  "reason": "<scrubbed error message>"
+}
+```
+
+**IMPORTANTE — `original_approval_seq` ≠ `approval_seq`:** o campo é renomeado deliberadamente. O dual-write extractor lê `payload.approval_seq` literal; reusar esse nome faria o emit recursivo disparar OUTRO dual-write em outcome_signals (que ainda está broken) — loop infinito sincrônico. Tests pinam que o campo está renomeado.
+
+**Limite declarado:** se o INSERT da própria compensação row falhar (sink triply-broken: outcome falhou, e o segundo `appendFailureEvent` também falha — disco cheio mid-operação, schema corrupto, etc.), o catch fall-back para stderr é o último recurso. Operador vê:
+```
+forja failure_events: dual-write compensation also failed (<reason>); audit gap is permanent for failure_id=<id>
+```
+Esse caso é fundamentalmente irrecuperável (o próprio audit sink quebrou); o gap em `failure_events` é o sinal honesto de que algo grave aconteceu com o storage.
+
 ---
 
 ## 5. Hook failures
@@ -616,7 +661,7 @@ Tente: /mcp reconnect {name}
 
 ### 15.5 `mcp.output.invalid`
 
-**Detecção:** server retornou output que **não valida** contra `outputSchema` (se declarado). Se schema ausente: heurística mínima — não-string em campo `text`, content array vazio, etc.
+**Detecção:** server retornou output que **não valida** contra `outputSchema` (se declarado). Se schema ausente (caso v1 — o manifest não captura `outputSchema`): heurística **conservadora**, só violações claras de protocolo — `content` **não-array**, ou um text-block com `text` **não-string**. Um array vazio ou content só-de-imagem **NÃO** é flagado: ambos podem ser legítimos (ação void, tool de imagem), e degradar um server saudável por falso-positivo é pior que perder um caso. Um result `isError` explícito é erro válido, não malformado.
 
 **Recovery:**
 1. Harness loga; devolve ao modelo `{ error: "mcp.output.invalid", hint, raw_output_truncated }` (raw com truncate em 1KB).
@@ -1050,23 +1095,58 @@ Templates ficam em `~/.config/agent/messages/<lang>/<code>.md`. Versionados, tra
 
 ## 19. Audit trail (o que **sempre** é registrado)
 
-Tabela `failure_events`:
+Tabela `failure_events` — schema canônico v2 (slice 130; atualiza pseudo-código de v1):
 
 ```sql
-failure_events(
-  id TEXT PRIMARY KEY,
-  session_id TEXT,
-  step_id TEXT,
-  code TEXT NOT NULL,           -- e.g. "provider.timeout.streaming"
-  classe TEXT NOT NULL,          -- e.g. "external"
-  recovery_action TEXT NOT NULL, -- e.g. "retried_3x", "fallback_to_model_X", "fatal"
-  user_visible BOOLEAN NOT NULL,
-  payload JSONB,                 -- detalhes específicos
-  created_at INTEGER NOT NULL
+CREATE TABLE failure_events (
+  id              TEXT PRIMARY KEY,           -- ULID (sortable, src/permissions/ulid.ts)
+  session_id      TEXT NOT NULL,              -- sentinel 'bootstrap' para pre-session events
+  step_id         TEXT,                       -- nullable
+  code            TEXT NOT NULL,              -- "<classe>.<subtipo>.<detalhe>"
+  classe          TEXT NOT NULL
+                    CHECK (classe IN (
+                      'provider','tool','sandbox','permission','subagent',
+                      'parse','mcp','storage','bootstrap','compliance'
+                    )),
+  recovery_action TEXT NOT NULL,              -- ver vocabulário abaixo
+  user_visible    INTEGER NOT NULL CHECK (user_visible IN (0, 1)),
+  payload_json    TEXT,                       -- canonical JSON, scrubbed; 8 KiB cap
+  created_at      INTEGER NOT NULL,
+  prev_chain_hash TEXT NOT NULL,              -- §4.2 per-session chain
+  this_chain_hash TEXT NOT NULL UNIQUE
 );
+CREATE INDEX idx_failure_events_code    ON failure_events(code, created_at DESC);
+CREATE INDEX idx_failure_events_session ON failure_events(session_id, created_at DESC);
 ```
 
 Toda falha **classificada** vai pra `failure_events`. Sem exceção. Auditoria mensal escaneia trends.
+
+### 19.1 Notas de implementação vs pseudo-código original
+
+- **`payload` → `payload_json`** — bun:sqlite não tem `JSONB` nativo; convenção Forja é sufixar colunas TEXT-de-JSON com `_json` (mesmo padrão de `capabilities_json`, `reason_chain_json`, `score_components_json` em `approvals_log`). `json_extract(...)` SQL funciona em ambos.
+- **`session_id NOT NULL` com sentinel `'bootstrap'`** — diverge do pseudo-código que tinha `session_id TEXT` (nullable). A spec §4.2 define chain genesis = `SHA256(session_id)` — NULL orfanaria a row do chain walk. Sentinel literal `'bootstrap'` é reservado para eventos pre-session (boot-time sandbox availability, etc.) e dá genesis determinístico. `src/failures/codes.ts:BOOTSTRAP_SESSION_ID` pina a constante.
+- **`classe` é enum CHECK-constrained** — 10 valores top-level cobrindo cada subsistema (`provider/tool/sandbox/permission/subagent/parse/mcp/storage/bootstrap/compliance`). Substitui o exemplo `"external"` do pseudo-código (que era um agrupamento de §2.1, não um valor `classe`). Adicionar nova classe = ALTER TABLE + PR explícito; impede typo silencioso.
+- **`user_visible` é INTEGER 0/1 com CHECK** — bun:sqlite serializa booleans como integers; o CHECK pina a semântica.
+- **Chain columns `prev_chain_hash` + `this_chain_hash`** — §4.2.1 implementação (canonical row payload, `prev` como coluna). Per-session genesis = `SHA256(session_id)`.
+
+### 19.2 Vocabulário de `recovery_action`
+
+Pseudo-código original lista `"retried_3x"`, `"fallback_to_model_X"`, `"fatal"`. Implementação valida no writer (src/failures/codes.ts) contra:
+
+| Forma | Aceito | Origem |
+|---|---|---|
+| `fatal` | ✓ | spec original |
+| `ignored` | ✓ | slice 130 (best-effort site swallowed but logged) |
+| `degraded` | ✓ | slice 130 (subsystem fallback path) |
+| `pending_repair` | ✓ | reservado pra estados que precisam intervenção operator |
+| `retried_<N>x` | ✓ regex `/^retried_\d+x$/` | spec original |
+| `fallback_to_<name>` | ✓ regex `/^fallback_to_[a-z0-9_-]+$/` | spec original |
+
+Operadores de calibração / dashboard filtram por `recovery_action` — typos silenciosos quebrariam o sinal. CHECK no DB seria custoso (lista explode com cada novo `retried_Nx`); validação fica no writer.
+
+### 19.3 Code vocabulary
+
+`code` segue `<classe>.<subtipo>[.<detalhe>[.<sub>]]` (1–4 segmentos, regex `^[a-z_]+(\.[a-z_]+){1,3}$`). Sites emissores se registram em `CODE_VOCABULARY` em `src/failures/codes.ts`; emit com code não-registrado **falha loud** no writer (evita drift entre sites). Slice 130 ships 4 codes (`sandbox.tool_unavailable`, `sandbox.mid_session_loss`, `storage.lock_contention`, `storage.persist_failed`); os 17+ codes restantes do catálogo §3-§17 entram quando seus subsistemas-dono receberem refactor slice.
 
 ---
 

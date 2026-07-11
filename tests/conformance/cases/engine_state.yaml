@@ -1,0 +1,130 @@
+# Conformance: engine state machine (PERMISSION_ENGINE.md §2)
+# init/loading-policy/validating-chain/refusing reject every check
+# with `source.section='engine-state'`. degraded upgrades allow to
+# confirm. ready is the default and runs the pipeline unchanged.
+
+- name: "state=init denies every check"
+  setup:
+    initialState: "init"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["ls *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "ls -la"
+  expect:
+    kind: "deny"
+    source_section: "engine-state"
+    reason_substring: "engine not ready"
+
+- name: "state=loading-policy denies every check"
+  setup:
+    initialState: "loading-policy"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["ls *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "ls -la"
+  expect:
+    kind: "deny"
+    source_section: "engine-state"
+
+- name: "state=validating-chain denies every check"
+  setup:
+    initialState: "validating-chain"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["ls *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "ls -la"
+  expect:
+    kind: "deny"
+    source_section: "engine-state"
+
+- name: "state=refusing denies every check (terminal)"
+  setup:
+    initialState: "refusing"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["ls *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "ls -la"
+  expect:
+    kind: "deny"
+    source_section: "engine-state"
+
+- name: "state=degraded upgrades allow to confirm"
+  setup:
+    initialState: "degraded"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["ls *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "ls -la"
+  expect:
+    kind: "confirm"
+    reason_substring: "degraded state forced confirm"
+
+- name: "state=degraded preserves deny (deny not downgraded)"
+  setup:
+    initialState: "degraded"
+    project_policy: |
+      tools:
+        bash:
+          deny: ["rm -rf *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "rm -rf /tmp/x"
+  expect:
+    kind: "deny"
+
+- name: "state=degraded preserves confirm (confirm unchanged)"
+  setup:
+    initialState: "degraded"
+    project_policy: |
+      tools:
+        bash:
+          confirm: ["git push *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "git push origin main"
+  expect:
+    kind: "confirm"
+
+- name: "state=ready behaves normally"
+  setup:
+    initialState: "ready"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["ls *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "ls -la"
+  expect:
+    kind: "allow"

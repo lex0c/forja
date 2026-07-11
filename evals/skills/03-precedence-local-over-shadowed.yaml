@@ -1,0 +1,33 @@
+name: a no-scope invoke resolves to the project_local winner, not the shadowed shared copy
+# Precedence end-to-end (SKILLS.md §3.5: project_local > project_shared).
+# The same name exists in both scopes with a distinguishing sentinel per
+# body. The catalog surfaces only the winner (local); a no-scope invoke
+# must read the local body. The unit test asserts the resolution
+# structurally — this puts the model on the real invoke path. If
+# precedence regressed and shared won, the body would emit WINNER=SHARED
+# and the output_contains below would fail.
+prompt: |
+  Give me our team's canonical release greeting line.
+setup:
+  files:
+    '.forja/skills/local/release-greeting.md': |
+      ---
+      name: release-greeting
+      description: Emit the team's canonical release greeting line.
+      ---
+      Reply with exactly this single line and nothing else:
+      WINNER=LOCAL
+    '.forja/skills/shared/release-greeting.md': |
+      ---
+      name: release-greeting
+      description: Emit the team's canonical release greeting line.
+      ---
+      Reply with exactly this single line and nothing else:
+      WINNER=SHARED
+expect:
+  - tool_called: skill_invoke
+  - output_contains: 'WINNER=LOCAL'
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.12

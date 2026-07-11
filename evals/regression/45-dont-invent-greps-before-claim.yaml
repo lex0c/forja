@@ -1,0 +1,35 @@
+# Exercises CONTEXT_TUNING §1.6 #1 ("don't invent files/functions
+# without read/grep"). Without the constraint, the model is free to
+# fabricate a path like "it's defined in `src/utils/auth.ts`" that
+# doesn't exist. With the constraint, the model must search first and
+# cite the actual location. The dedicated `grep` tool is deferred at
+# every window (§2.2 — `bash` covers `rg`/`grep`), so the load-bearing
+# proof that it searched-before-claiming is `tool_called: bash`;
+# output_contains pins that the search result was actually used.
+name: don't invent — model searches before referencing an unknown symbol
+setup:
+  files:
+    src/auth.ts: |
+      export function validate(token: string): boolean {
+        return token.length > 0;
+      }
+    src/api.ts: |
+      import { validate } from './auth.ts';
+      export function authenticate(t: string): boolean {
+        return validate(t);
+      }
+prompt: |
+  Where is `validate` defined in this repo? Reply with ONLY the
+  full path from repo root (for example, `path/to/file.ts`).
+  Nothing else. Do NOT guess — search first (e.g. `grep`/`rg` via bash).
+expect:
+  - tool_called: bash
+  - output_contains: src/auth.ts
+  - status: done
+budget:
+  # Enforces BEHAVIOR (grep before claiming the path), not cost economy. The cost cap was
+  # dropped in the model-case cost-gate sweep — the ranking reports cost as a SEPARATE axis,
+  # so a reasoning model overthinking must not "fail" for spend. maxSteps is 8 (not the
+  # usual 5): the model legitimately needs grep + read + compose-the-literal-path steps; an
+  # earlier maxSteps=5 exhausted before it could cite the path. maxSteps still bounds runaway.
+  maxSteps: 8

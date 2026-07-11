@@ -1,0 +1,23 @@
+name: multi-tool flow — read input, transform, write derived output
+prompt: |
+  The file `input.json` contains a JSON array of integers. Read it, then
+  write a NEW file named `output.json` whose only content is the SUM of
+  those integers as a JSON number (e.g. `42`). Use read_file then
+  write_file. Do not modify input.json.
+setup:
+  files:
+    input.json: |
+      [10, 20, 30, 40]
+expect:
+  - tool_called: read_file
+  - tool_called: write_file
+  - file_exists: output.json
+  - file_contains:
+      path: output.json
+      pattern: "100"
+  - file_contains:
+      path: input.json
+      pattern: "[10, 20, 30, 40]"
+  - status: done
+budget:
+  maxSteps: 6

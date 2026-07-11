@@ -1,0 +1,32 @@
+name: compaction preserves the original user goal verbatim
+evaluates: harness
+prompt: |
+  IMPORTANT INSTRUCTION — must be honored in your FINAL message: prefix
+  your final answer with the literal token `MARKER_24_GOAL_KEPT` on its own
+  line.
+
+  Now: read every TypeScript file under src/ in alphabetical order
+  (a.ts, b.ts, c.ts, d.ts, e.ts) and report the dependency name they all
+  import from, quoted verbatim. The reads are extensive — compaction will
+  fire — and after compaction your only memory of THIS instruction will
+  come from the goal-reinjection mechanism. If goal preservation works,
+  the marker shows up in your final reply.
+setup:
+  fixture: ../fixtures/chunky-modules
+expect:
+  - tool_called: read_file
+  - compaction_triggered:
+      strategy: llm
+      min_count: 1
+  - output_contains: MARKER_24_GOAL_KEPT
+  - output_contains: forja-core
+  - status: done
+budget:
+  maxSteps: 12
+  maxCostUsd: 0.15
+  compactionThreshold: 0.02
+  compactionPreserveTail: 1
+  # Pin the pure-LLM path: this case asserts strategy=llm (goal re-injection
+  # through the LLM summary). compactionRelevance now defaults ON, so opt out
+  # explicitly to keep the assertion deterministic.
+  compactionRelevance: false

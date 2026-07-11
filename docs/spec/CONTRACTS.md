@@ -76,7 +76,7 @@ Direção: A → B (A invoca tool)
   - `write_file`/`edit_file`: declara `writes: true` em metadata → harness cria checkpoint **antes**
   - `bash`: declara `writes: true` (pessimista) salvo `bash:read_only` flag
   - `web_fetch`: network access; respeita `deny_hosts`
-- **Display hint opcional** em metadata: `display: 'table' | 'list' | 'diff' | 'raw' | 'auto'` (default `auto`). Override do auto-detect do `<ToolCallCard>` (`UI.md §3.1`/§3.2). Tools com output `Array<object>` homogêneo se beneficiam de `display: 'table'` explícito; outputs de `bash` usam `display: 'raw'` para preservar formatação de terminal.
+- **Display hint opcional** em metadata: `display: 'table' | 'list' | 'diff' | 'raw' | 'auto'` (default `auto`). Override do auto-detect do tool card (`UI.md §4.1`). Tools com output `Array<object>` homogêneo se beneficiam de `display: 'table'` explícito; outputs de `bash` usam `display: 'raw'` para preservar formatação de terminal.
 - Erros são **estruturados** seguindo schema canônico (não exception bare):
   ```ts
   interface ToolError {
@@ -142,6 +142,9 @@ Conjunto fechado para v1. Adições requerem PR contra este doc + eval de regres
 | `read_file` | `{ path, offset?, limit? }` | `{ content, total_lines, truncated }` | nenhum | sim | ~5ms; até `limit` linhas |
 | `glob` | `{ pattern, cwd? }` | `{ matches: string[], truncated }` | nenhum | sim | ~10-50ms; cap 1000 matches |
 | `grep` | `{ pattern, path?, type?, -A?, -B? }` | `{ matches: { file, line, text }[], truncated }` | nenhum | sim | ~50-500ms; cap 200 matches |
+| `git` | `{ mode, path?, ref?, max_count?, staged?, follow? }` | `{ mode, command, output, truncated, exit_code }` | nenhum | sim | ~60ms; cap 64 KiB |
+
+`git` é read-only por construção: o modelo escolhe `mode` (`log`/`show`/`diff`/`blame`/`status`/`ls_files`) e parâmetros tipados — nunca flags cruas. A tool constrói o argv já endurecido (`-c core.fsmonitor=`, `-c core.hooksPath=/dev/null`, `--no-ext-diff`/`--no-textconv`, sem passthrough), então as rotas de execução de comando do git em modo "leitura" (`core.pager`, `--ext-diff` + `.gitattributes`, aliases) são inalcançáveis. `diff`/`status` refletem a **working tree viva** (uncommitted incluído), diferente de um worktree em HEAD — por isso é a forma de dar git a um subagent `isolation: none` sem `bash`.
 
 ### 2.6.2 Filesystem (write)
 
@@ -168,6 +171,38 @@ Conjunto fechado para v1. Adições requerem PR contra este doc + eval de regres
 | `task_async` | `{ playbook, prompt, budget? }` | `{ handle }` | spawna processo filho | não | ~50ms (spawn) |
 | `task_await` | `{ handle, timeout_ms? }` | `SubagentOutput` | nenhum (block) | sim | varia |
 | `task_cancel` | `{ handle }` | `{ cancelled: bool }` | mata subprocess | sim (idempotente em handle morto) | ~10ms |
+
+#### 2.6.4.1 SubagentOutput.reason — valores válidos
+
+Qualquer caller que mapeia `SubagentOutput` para tool error deve reconhecer este enum. Strings desconhecidas devem ser tratadas como `error`/`run_failed` genérico (forward-compatibility).
+
+| `reason` | `status` | Origem | Semântica |
+|---|---|---|---|
+| `done` | `done` | child harness | run terminou normalmente |
+| `cancelled` | `interrupted` | per-handle cancel mid-run | operador disparou `task_cancel` ou parent abortou |
+| `cancelled_before_dispatch` | `interrupted` | handle store | cancel chegou ANTES do slot do semáforo liberar; child nunca rodou (sessionId vazio) |
+| `resumed_session` | `interrupted` | handle store rehydration | parent crashou enquanto este handle estava `running`; resume converte |
+| `spawn_failed` | `error` | handle store | `spawnFn` lançou exceção fora do envelope normal (programmer bug ou DB unhealthy); detalhes em `auditFailure` |
+| `corrupt_envelope` | `error` | handle store rehydration | `settled_payload` JSON tinha shape desconhecida (storage rot ou version skew) |
+| `unknown_subagent` | `error` | spawn dispatch | nome do subagent não está registrado no run; rehidratado via discriminated parser |
+| `depth_exceeded` | `error` | spawn dispatch | recursão `task → task → task` excedeu `MAX_SUBAGENT_DEPTH`; rehidratado via discriminated parser |
+| `maxSteps`/`maxWallClockMs`/`maxToolErrors`/etc. | `exhausted`/`error`/etc. | child harness `ExitReason` | espelha o exit reason do harness do filho |
+
+Os reasons originados no handle store (`cancelled_before_dispatch`, `resumed_session`, `spawn_failed`, `corrupt_envelope`) são **session-scoped** — só aparecem em runs com `task_async` family ativa. Os demais valem para `task_sync` também.
+
+#### 2.6.4.2 `subagent.budget_exhausted` — error details
+
+Tool error emitido por `task_sync`/`task_async`/`task_await` quando o cap compartilhado seria cruzado (spec `ORCHESTRATION.md §3.5`). `details` carrega:
+
+| Campo | Tipo | Semântica |
+|---|---|---|
+| `subagent` | string | Nome do subagent que seria spawnado |
+| `spent` | number | Cost cumulativo já incorrido: parent self + children settled + reservas in-flight (USD) |
+| `estimate` | number | Worst-case do spawn em pauta, lido de `definition.budget.maxCostUsd` (USD) |
+| `projected` | number | `spent + estimate` (USD); valor que cruzou `cap` |
+| `cap` | number | `RunBudget.maxCostUsd` (USD) |
+
+Modelos podem ler esses campos para decidir entre (a) aguardar in-flight settlar (libera reservas) ou (b) finalizar sem novo subagent. `retryable: false` — chamar de novo com mesmos args é garantido falhar (a menos que outro evento libere espaço).
 
 ### 2.6.5 Memory
 
@@ -204,11 +239,32 @@ Família para processos de longa duração e coordenação não-blocking. Tools 
 
 | Tool | Input | Output | Side effects | Idempotente | Custo típico |
 |---|---|---|---|---|---|
-| `bash_background` | `{ cmd, label }` | `{ process_id, started_at }` | `writes: true`, `exec: true`, spawna processo | não | ~10ms (spawn) |
-| `bash_output` | `{ process_id, since? }` | `{ stdout, stderr, cursor, exit_code? }` | nenhum (leitura) | sim (cursor avança) | ~5ms |
+| `bash_background` | `{ cmd, label }` | `{ process_id, started_at }` | `writes: true`, `exec: true`, spawna processo que **sobrevive ao turn** e **notifica na conclusão** (`ORCHESTRATION.md §3B`) | não | ~10ms (spawn) |
+| `bash_output` | `{ process_id, since? }` | `{ stdout, stderr, cursor, exit_code? }` | nenhum (leitura); lê de processo `running`/`exited`/`killed` | sim (cursor avança) | ~5ms |
 | `bash_kill` | `{ process_id, signal? }` | `{ killed: bool, exit_code }` | mata subprocess | sim (idempotente em pid morto) | ~10ms graceful, +5s SIGKILL |
+| `bash_list` | `{ status? }` | `{ processes: [{ process_id, command, label, status, exit_code, spawned_at }], running, total }` | nenhum (snapshot) | sim | ~5ms |
 | `wait_for` | `{ condition, timeout_ms, poll_interval_ms? }` | `{ matched, condition_met, elapsed_ms, payload? }` | bloqueia loop (sem LLM call); cancellable | sim | varia; bound por `timeout_ms` |
 | `monitor` | `{ condition, duration_ms?, max_events? }` | `{ events[], reason: 'duration'|'max_events'|'cancelled' }` | streama eventos durante duração | sim | varia; bound por args |
+
+#### 2.6.5d.1 Lifecycle persistente e o envelope `bg_done`
+
+`bash_background` roda o processo **genuinamente em background** (`ORCHESTRATION.md §3B`): sobrevive ao fim do turn, vive até término natural / `bash_kill` / exit da sessão (cross-turn, **não** cross-process), e **notifica** o modelo na conclusão em vez de exigir poll. Na conclusão, o REPL empurra um item no **canal de notifications** in-memory — distinto do inbox, genérico e discriminado por `kind` (`ORCHESTRATION.md §3B.3`; a família `reminder` adiciona o `kind: 'reminder'` — §2.6.5f / §2.6.10):
+
+```ts
+interface BgDoneNotification {
+  kind: 'bg_done';
+  processId: string;
+  command: string;
+  status: 'exited' | 'killed' | 'failed';
+  exitCode: number | null;
+}
+```
+
+O output completo fica recuperável via `bash_output(processId)`; inline de um head-tail na notificação é refinamento, não normativo.
+
+- Output é durável (logs em disco + row em `background_processes`); `bash_output` o recupera **mesmo após o término**, cross-turn e pós-compaction, enquanto o modelo tiver o `process_id`.
+- `bash_list` recupera o `process_id` perdido (turns depois, compaction) — snapshot read-only dos bg da sessão; análogo de `task_list`.
+- O wake-when-idle que pode disparar um turn a partir do `bg_done` é timing puro: `ORCHESTRATION.md §3B.4` + `STATE_MACHINE.md §2.2`/§9.
 
 **Razão da família:**
 
@@ -242,33 +298,41 @@ Família para processos de longa duração e coordenação não-blocking. Tools 
 - `wait.cancelled` — Ctrl+C/Esc Esc cascateando AbortSignal
 - `monitor.cancelled` — mesmo
 
-UI integration: `<BackgroundProcessTray>` mostra `bash_*` ativos; `<WaitIndicator>` substitui `<LoopStatusLine>` durante `wait_for`; `<MonitorStream>` durante `monitor` (todos em `UI.md §3.2`).
+UI integration: status line mostra tray de `bash_*` ativos (`bg N`); status line substitui por `wait` indicator durante `wait_for`; eventos de `monitor` são streamados como linhas vivas conforme chegam. Ver `UI.md §4.4`.
 
 **Hibernation:** `wait_for` bloqueia o agente process. Daemon-based hibernation (agente sai durante wait, daemon dispara hook em wakeup) é **deferred v2** (`AGENTIC_CLI.md §7.3.1`).
 
 ### 2.6.5e Interaction (anti-presumption)
 
-> **Cross-refs:** mecânica completa em `STATE_MACHINE.md §12`; estado `[clarifying]` em `STATE_MACHINE.md §2.2`; per-playbook config em `PLAYBOOKS.md §1.1` (`clarify_mode`).
+> **Cross-refs:** mecânica completa em `STATE_MACHINE.md §12`; estado `[clarifying]` em `STATE_MACHINE.md §2.2`.
 
 | Tool | Input | Output | Side effects | Idempotente | Custo típico |
 |---|---|---|---|---|---|
-| `clarify` | `{ question, options[≥2], why_it_matters?, blast_radius: low\|medium\|high }` | `{ outcome: resolved\|skipped\|escalated\|auto_low, chosen_option_id?, user_text? }` | nenhum (consulta humana) | sim (mesma question + options ⇒ mesmo modal recriado) | `low`: ~5ms (auto-resolve); `medium`/`high`: bound por timeout 60s |
+| `clarify` | `{ question, options[≥2], why_it_matters? }` | `{ outcome: resolved\|skipped\|escalated, chosen_option_id?, user_text? }` | nenhum (consulta humana) | sim (mesma question + options ⇒ mesmo modal recriado) | bound por timeout 60s (wall-clock do operador) |
 
-**Semantics distintos por `blast_radius`:**
-
-- `low` — auto-resolvido sem modal; output `outcome: auto_low`, `chosen_option_id: options[0].id`. Registra em `assumptions[]` do output do playbook.
-- `medium` — bufferizado; agrupado com outros `medium` pendentes; modal único antes do próximo write.
-- `high` — modal imediato (transição `running → clarifying`). Outras tools bloqueadas até resolver.
+**Comportamento:** toda chamada abre o modal imediatamente (transição `running → clarifying`); outras tool calls ficam bloqueadas até resolver. **Não há `blast_radius`** — nenhuma classificação de severidade que o modelo possa errar (auto-assumindo quando deveria perguntar). O modelo decide apenas *chamar ou não*: para uma escolha de baixo impacto, ele não chama `clarify` (escolhe um default e registra a suposição).
 
 **Failure semantics:**
 - `clarify.options.invalid` — < 2 options, ou IDs duplicados
-- `clarify.disabled_by_playbook` — `clarify_mode: off` no frontmatter; modelo recebe erro estruturado e re-tenta com `assumptions[]` em vez
-- `clarify.budget_exceeded` — sessão emitiu mais de `clarification.max_per_session` (default 5); fallback para `auto_low` automático
+- `clarify.budget_exceeded` — sessão emitiu mais de `clarification.max_per_session` (default 5); retorna erro estruturado e o modelo segue com a suposição
 
-**Disponibilidade ao modelo:** controlada por `clarify_mode` do playbook ativo:
-- `pre_execution`: tool exposta; `medium`/`high` permitidos só em fase exploratória (drift detector flagga uso tardio)
-- `on_high_blast`: tool exposta; `low` auto-resolve, `medium` bufferiza, `high` interrompe
-- `off`: tool **não exposta** ao modelo; tudo vira `assumptions[]` retrospectivo
+**Disponibilidade ao modelo:** `clarify` é tool **core, sempre exposta** — disponível em toda sessão ao lado de `read`/`write`/`edit`, sem gate de playbook e sem modo por playbook.
+
+### 2.6.5f Timing (reminders)
+
+> **Cross-refs:** ADR completo + reconciliação com o princípio guia em `§2.6.10`; produtor #2 do canal de notifications em `ORCHESTRATION.md §3B.9`; wake-when-idle em `§3B.4`.
+
+Família que observa o **relógio** e empurra no canal de notifications (`kind: 'reminder'`) — o análogo temporal de `bash_background` (que observa **exits**). In-memory, session-scoped (morre no exit, como o bg). Só delay relativo.
+
+| Tool | Input | Output | Side effects | Idempotente | Custo típico |
+|---|---|---|---|---|---|
+| `reminder` | `{ in, note }` | `{ reminder_id, fire_at }` | agenda `setTimeout` session-scoped; no disparo enfileira `ReminderNotification` (§3B.9) | não | ~1ms |
+| `reminder_list` | `{}` | `{ reminders: [{ reminder_id, note, scheduled_at, fire_at }], total }` | nenhum (snapshot) | sim | ~1ms |
+| `reminder_cancel` | `{ reminder_id }` | `{ cancelled }` | `clearTimeout` + remove | sim (`false` em id desconhecido / já disparado) | ~1ms |
+
+`in` é delay relativo com sufixo `s`/`m`/`h` (`"30s"`, `"10m"`, `"2h"`), validado positivo e ≤ cap de horizonte (default 24h). O disparo acorda a sessão se `idle` (wake-when-idle, §3B.4) ou aguarda o próximo boundary se `busy` (semi-push) — mesmas guardas do `bg_done`.
+
+**Disponibilidade — só REPL interativo** (`ORCHESTRATION.md §3B.9`). Sem scheduler (one-shot `run.ts`, subagent), as três tools são **escondidas do surface** do modelo (`buildToolDefs` filtra `requiresReminderScheduler`), e um whitelist de subagent que as liste falha no `validate` — um subagent *run-to-completion* não tem estado idle para acordar.
 
 ### 2.6.6 Justificativa do teto (22 vs 10)
 
@@ -299,14 +363,14 @@ Tools que **estouraria o teto** se promovidas (mantidas em domínios separados):
 - `memory_write` exige confirmação humana — slash command, não tool.
 - `format_file` / `lint_file` / `test` são gates do `CODE_GENERATION.md` pipeline, rodados em `PostToolUse`, não decididos pelo modelo.
 
-Cargo-cult check: nenhuma tool do catálogo foi adicionada porque "Claude Code tem". Cada uma resolve uma falha enumerada em `FAILURE_MODES.md` ou um caso de uso documentado em §2.6.8 / §2.6.9 / §7.3 do `AGENTIC_CLI.md`.
+Cargo-cult check: nenhuma tool do catálogo foi adicionada porque "outro agente tem". Cada uma resolve uma falha enumerada em `FAILURE_MODES.md` ou um caso de uso documentado em §2.6.8 / §2.6.9 / §7.3 do `AGENTIC_CLI.md`.
 
 Adicionar `todo_write`, `checkpoint_*`, ou `recap_*` como tools expostas ao modelo **estouraria** o teto — por isso ficam em domínios separados:
 - `todo_write` é UI affordance (ver `UI.md`), não tool de modelo (escreve via stream parsing). Audit gap endereçado por tabela `todos` em vez de promoção a tool — ver §2.6.8 decisão B.
 - `checkpoint` é operação do harness, exposta via slash command.
 - `recap` é projeção SQL, exposto via CLI.
 
-Cargo-cult check: nenhuma das tools acima foi adicionada porque "Claude Code tem". Cada uma resolve uma falha enumerada em `FAILURE_MODES.md` ou um caso de uso documentado em §2.6.8 / §2.6.9.
+Cargo-cult check: nenhuma das tools acima foi adicionada porque "outro agente tem". Cada uma resolve uma falha enumerada em `FAILURE_MODES.md` ou um caso de uso documentado em §2.6.8 / §2.6.9.
 
 ### 2.6.7 Tools deliberadamente ausentes
 
@@ -328,7 +392,7 @@ O leak da Anthropic em 2026 expôs as categorias de tools que outras CLIs agenti
 
 **Princípio guia:** *meta-cognição não é tool*. Modelo decide ações **no mundo** (FS, shell, subagent, memory_search, fetch). Decisões **sobre o modelo** (planejar, lembrar, comprimir contexto, gerenciar atenção) são responsabilidade do harness, não do catálogo. Sem essa fronteira, o tool budget é consumido por ferramentas que não mexem em nada — e auditabilidade não compensa o bloat.
 
-Esta posição é uma **inversão deliberada** vs Claude Code, onde o modelo invoca `todo_write`, planeja explicitamente, e é responsável por sumarizar a própria história. As três decisões abaixo aplicam o princípio.
+Esta posição é uma **inversão deliberada** vs agentes que delegam planejamento ao modelo (onde o modelo invoca `todo_write`, planeja explicitamente, e é responsável por sumarizar a própria história). As três decisões abaixo aplicam o princípio.
 
 | # | Tool proposta | Decisão | Tool count após |
 |---|---|---|---|
@@ -689,6 +753,80 @@ Estas 4 tools só viram visíveis ao modelo quando:
 
 Sem (1)-(4): tool **registrada** mas com `visible_to_model: false` em todos os schemas. Decisão simétrica à de MCP servers não-confiáveis (`MCP.md §1.5`). Modelo nem sabe que existe a tool até pré-requisitos serem cumpridos.
 
+### 2.6.10 Timing tools (notification-channel-driven review)
+
+`ORCHESTRATION.md §3B` introduziu o **canal de notifications** genérico (discriminado por `kind`) + wake-when-idle. `bg_done` é o produtor #1 (observa **exits** de processo). Esta sub-seção formaliza o produtor #2: uma família `reminder` que observa o **relógio**.
+
+**Tensão com o princípio guia (§2.6.8).** "Meta-cognição não é tool; *lembrar* é do harness" rejeitou `todo_write`. O reminder parece colidir — a reconciliação **é** o ADR:
+
+- O "lembrar" rejeitado em §2.6.8 é **recall de fato** / gestão de plano: decisão *sobre o modelo*, harness-side (memory subsystem; todos via stream-parse). Continua não sendo tool.
+- `reminder` agenda um **evento temporal no mundo**. Análogo a `at(1)`/`cron`: dispara um trigger por relógio, exatamente como `bash_background` dispara por exit. O harness **não pode** decidir o "quando" — só o modelo sabe que "isto leva ~5 min" relativo à tarefa em curso. Delegar o quando via tool é a mesma lógica de `bash_background` ("rode isto e me avise"), não cognição.
+- **Fronteira:** o reminder não carrega estado cognitivo persistente (não é "nota pro futuro-self" — isso seria `pin_context`/memory). Carrega uma string de contexto (`note`) que vira o input do wake-turn; o efeito é puramente temporal.
+
+| # | Tool proposta | Decisão | Tool count após |
+|---|---|---|---|
+| H | `reminder` | **accepted** | 17 |
+| I | `reminder_list` | **accepted** | 18 |
+| J | `reminder_cancel` | **accepted** | 19 |
+
+Total: 16 → 19, **peso conceitual ~1 slot** — a família é uma *palette* (set → list → cancel), como `bash_background`/`bash_list`/`bash_kill` (§2.6.5d) e `task_async`/`task_list`/`task_cancel` (§2.6.5b). `_list`/`_cancel` são add-ons baratos da mesma razão de existência do `bash_list`: o modelo perde o `reminder_id` após compaction e precisa recuperá-lo/desmarcá-lo.
+
+**Schema:**
+
+```yaml
+name: reminder
+input:
+  in: string         # delay relativo: "30s" | "10m" | "2h" (sufixos s/m/h)
+  note: string       # contexto que vira o input do wake-turn no disparo
+output:
+  reminder_id: string
+  fire_at: number    # epoch ms agendado
+---
+name: reminder_list
+input: {}            # sem args — snapshot dos pendentes desta sessão
+output:
+  reminders: { reminder_id, note, scheduled_at, fire_at }[]
+  total: number
+---
+name: reminder_cancel
+input:  { reminder_id: string }
+output: { cancelled: boolean }   # false se id desconhecido / já disparou
+```
+
+No disparo, o scheduler empurra no canal de notifications (mesmo envelope-por-`kind` do `bg_done`):
+
+```ts
+interface ReminderNotification {
+  kind: 'reminder';
+  note: string;
+  scheduledAt: number;   // quando foi agendado (epoch ms)
+}
+```
+
+**Por que accepted:**
+- **Caso de uso não coberto:** delay temporal antes de re-engajar quando **não há processo** — reset de rate-limit, propagação de DNS, dar tempo a um deploy/humano externo. `bash_background` cobre "espere um processo"; `reminder` cobre "espere o relógio".
+- **Infra near-zero:** reusa o canal + wake-when-idle + as 5 guardas de §3B.4. O produtor é um `setTimeout` session-scoped. Sem o reminder, o modelo recai no anti-pattern `bash_background('sleep 600')` — desperdiça um processo + log file para obter um timer.
+- **Simetria de catálogo:** a palette set/list/cancel é o mesmo mental model das outras famílias.
+
+**Constraints (normativas — `ORCHESTRATION.md §3B.9`):**
+- **In-memory, session-scoped:** morre no exit da sessão, como `bash_background` (§3B.1) e o inbox. Sem persistência cross-session — preserva `AGENTIC_CLI.md §0`. Um reminder cujo horizonte excede a vida da sessão simplesmente não dispara (aceito; o caso comum no REPL interativo é delay curto).
+- **Só delay relativo** (`in`); horário absoluto o modelo converte para delta. Condicional (`when port_open`) é `wait_for` (retirado da superfície — §3B); não reintroduzir.
+- **Cap de horizonte** (default 24h): limite de sanidade **e** obrigatório tecnicamente — `setTimeout` com delay > 2³¹ ms dispara imediatamente.
+
+**Gatilho de reconsideração:**
+- Eval mostra reminders com horizonte > vida-média-de-sessão sendo comuns (o modelo quer cross-session) → reabrir a decisão de persistência durável (migration + re-hidratação no boot), aceitando a tensão com §0.
+- O modelo nunca usa `reminder_list`/`reminder_cancel` em N sessões medidas → colapsar para só `reminder` (anti-bloat).
+
+#### 2.6.10.x Resumo
+
+| Tool | Status | Próximo passo concreto |
+|---|---|---|
+| `reminder` | accepted | `ReminderScheduler` in-memory (`src/reminders/`); envelope em `ORCHESTRATION.md §3B.9`; eval `evals/reminders/` |
+| `reminder_list` | accepted | snapshot dos pendentes da sessão; análogo de `bash_list`/`task_list` |
+| `reminder_cancel` | accepted | `clearTimeout` + remove; idempotente em id desconhecido |
+
+Catalog count: **16 → 19** (peso conceitual ~1, família-palette).
+
 ---
 
 ## 3. Hook ↔ Harness
@@ -805,10 +943,10 @@ Step 3: Buffer (pra UI batching)
   - tool_use_delta acumulado até tool_use_stop
   - Outros: emit imediato
   ↓
-Step 4: Emit pra UI (streaming visible)
-  - <StreamingMessage> recebe text_delta batched
-  - <ToolCallCard> recebe tool_use_start
-  - thinking_delta → <ThinkingIndicator>
+Step 4: Emit pra UI bus (streaming visible) — eventos canônicos em UI.md §3
+  - text_delta batched → emit `assistant:delta`
+  - tool_use_start → emit `tool:start`
+  - thinking_delta → emit `thinking:delta`
   ↓
 Step 5: Em tool_use_stop OU stop event:
   - Validate args estruturado (JSON parse + schema)
@@ -1120,9 +1258,9 @@ MCP é o **único caminho declarado** para extensão do tool catalog (`§2.6.7`)
 
 ### Namespacing:
 
-- Tools MCP aparecem no registry como `mcp:<server-name>:<tool-name>` (ex: `mcp:postgres:query`)
+- Tools MCP aparecem no registry como `mcp__<server-name>__<tool-name>` (ex: `mcp__postgres__query`)
 - Colisão com tool canônica do `§2.6` → tool MCP **rejeitada** ao registrar (server não pode shadow `read_file`, `bash`, etc); registro falha com `mcp.namespace.shadow_canonical`
-- Colisão entre dois servers → segundo registro vira `mcp:<server-name-2>:<tool-name>`; resolução por `server-name`, sem fallback ambíguo
+- Colisão entre dois servers → segundo registro vira `mcp__<server-name-2>__<tool-name>`; resolução por `server-name`, sem fallback ambíguo
 
 ### Versão: **v1**
 
@@ -1190,7 +1328,7 @@ Coisas que ficam de fora dos contratos por design:
 
 - **Conteúdo dos prompts** — pode mudar a qualquer momento; eval cobre
 - **Tool descriptions** — texto que o modelo lê; mudanças não quebram contrato (só métricas)
-- **UI rendering** — Ink components são internos; mudam livremente
+- **UI rendering** — funções de render do TUI são internas; mudam livremente. Apenas o catálogo de eventos do bus (UI.md §3) é contrato.
 - **Schema interno do SQLite além das tabelas declaradas** — índices, triggers, vacuum strategy
 - **Latência em microbenchmarks** — coberto em `PERFORMANCE.md`, não aqui
 - **Heurísticas** (detection de injection, capability detection) — best-effort, sem garantia formal

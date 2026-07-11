@@ -1,0 +1,487 @@
+// Live region composition. Combines the per-element render functions
+// (status line, input box, tool cards) into the array of lines the
+// renderer writes. Spec: UI.md §2, §4, §4.10.
+//
+// Layout (top → bottom of live region):
+//   1. TodoList (1 + N lines — only when state.todos is non-empty).
+//   2. Subagent rows (one per concurrent child run).
+//   3. Live tool-end batch preview — the accumulating, grouped
+//      finalizations of consecutive same-name tools, rendered with the
+//      same formatter as scrollback so they stay visible (and grouped)
+//      until the batch settles into scrollback.
+//   4. Active tool cards (running form, with preview).
+//   5. Pinned turn-phase chip — the single live "what is the turn
+//      doing now" indicator (thinking / generating / tool-phase /
+//      awaiting), pinned at the bottom of the live region just above
+//      the input, with the tool stack (3–4) growing above it.
+//   6. Bottom anchor block:
+//      - rule above input
+//      - input box (1+ lines)
+//      - rule below input
+//      - footer (1 line)
+//      OR modal (when up), which owns the bottom slot entirely
+//      and carries its own structure.
+//
+// Order: history above (scrollback), then the accumulating tool batch,
+// live tool cards, the subagent group, todos (pinned just above), the
+// pinned phase chip, then the bottom anchor (rule/input/rule/footer).
+
+import type { ComposeLive } from '../renderer-types.ts';
+import { type LiveState, flushPendingToolEndBatch } from '../state.ts';
+import { type Capabilities, paint } from '../term.ts';
+import { renderAssistantChip } from './assistant-chip.ts';
+import { renderAwaitingChip } from './awaiting-chip.ts';
+import { hasFooterPathRow, renderFooter, renderFooterPath } from './footer.ts';
+import { padFrame } from './frame.ts';
+import { renderQueued } from './inbox.ts';
+import { renderInput } from './input.ts';
+import { renderModal } from './modal.ts';
+import { isBashMode } from './mode.ts';
+import { formatPermanent } from './permanent.ts';
+import { renderReverseSearch } from './reverse-search.ts';
+import { renderSlashPopover, slashPopoverLineCount } from './slash-popover.ts';
+import { renderSubagentRows } from './subagent-row.ts';
+import { renderThinkingChip } from './thinking-chip.ts';
+import { renderTimedChip } from './timed-chip.ts';
+import { renderTodoList } from './todo-list.ts';
+import { renderToolCardLive } from './tool-card.ts';
+import { renderToolPhaseChip } from './tool-phase-chip.ts';
+import { visualWidth } from './width.ts';
+import { wrapInputLine } from './wrap.ts';
+
+// Horizontal rules around the input go edge-to-edge (UI.md §6.3
+// "bloco do input" exception). Together with the input line they
+// form a 3-row unit that visually breaks away from the indented
+// content above and the indented footer below — operator's eye reads
+// the block as "this is where you type" without the rules pretending
+// to belong to the padded frame.
+// `bash` paints the rule `warn` (yellow) instead of `dim` — in bash
+// mode (`!cmd`) the whole input block, rules included, goes yellow so
+// the mode reads as one unmistakable unit.
+const horizontalRule = (caps: Capabilities, bash = false): string =>
+  paint(caps, bash ? 'warn' : 'dim', (caps.unicode ? '─' : '-').repeat(caps.cols));
+
+// Number of lines between the input's last row and the bottom of the
+// live region in the BASE case (rule below input + the footer line).
+// composeCursor subtracts this so the cursor lands inside the input,
+// not on the footer. Only matters in the no-modal path — when a modal
+// is up, composeCursor returns null and the constant goes unused.
+// Grow alongside any future expansion of the bottom block (multi-line
+// footer, secondary tray under it, etc.).
+//
+// The slash popover renders BETWEEN the rule-below-input and the
+// footer (UI.md §5.3 — popover sits adjacent to the typing zone, no
+// frame margin, no blank separator). When `state.slash !== null`,
+// `trailingBelowInput` adds the popover's line count to this base —
+// composeCursor uses that combined offset to keep the cursor on the
+// input row regardless of how many suggestions are open.
+//
+// Exported so a regression test can guard against drift between the
+// constant and what composeLive actually emits below the input.
+// BASE case only: the rule below the input + the single footer info line.
+// The footer's optional second row (the cwd path — present once the banner
+// has seeded `status.cwd`) is NOT counted here; `trailingBelowInput` adds it
+// dynamically so the constant stays truthful for the pre-banner / bash-mode
+// case the guard test exercises.
+export const FOOTER_BLOCK_LINES = 2;
+
+// How many live-region rows sit BELOW the last input row, accounting for the
+// optional slash popover AND the footer's optional cwd path row. Single source
+// of truth shared by the composer (writes that block) and composeCursor
+// (subtracts it to find the input row). If a future element joins the trailing
+// stack, extend here and in composeLive in lockstep.
+const trailingBelowInput = (state: LiveState): number => {
+  const popover = state.slash !== null ? slashPopoverLineCount(state.slash) : 0;
+  const pathRow = hasFooterPathRow(state) ? 1 : 0;
+  return FOOTER_BLOCK_LINES + pathRow + popover;
+};
+
+// Position the cursor wants to land inside the live region, so the
+// renderer can issue cursor-back escapes after writing. Coordinates
+// are 0-based from the top-left of the live region. Returns null when
+// no input is rendered (modal is up — modal owns the bottom slot).
+//
+// `lineCount` is the size of `composeLive`'s output for the same
+// state. We pass it instead of recomputing because the renderer
+// already has it.
+//
+// Layout assumption: when no modal, the bottom anchor is
+// `[..., rule, input, rule, footer]` — input ends `FOOTER_BLOCK_LINES`
+// rows above the last live line. composeLive and composeCursor must
+// stay in lockstep on this constant.
+//
+// Visual columns assume single-width text (ASCII). CJK/emoji would
+// under-count by 1 col per double-width glyph; producers don't emit
+// multi-col text in the input today.
+export interface CursorPos {
+  row: number;
+  col: number;
+}
+export const composeCursor = (
+  state: LiveState,
+  caps: Capabilities,
+  lineCount: number,
+): CursorPos | null => {
+  if (state.modal !== null) return null;
+  // Bash mode (`render/input.ts`): an idle buffer starting with `!`
+  // renders the leading `!` as the prompt glyph, not content — so the
+  // drawn command is `value.slice(1)` and the caret is one column left
+  // of the raw offset. Mirror that here so the cursor lands on the right
+  // column; both sides consume the SAME `isBashMode` predicate
+  // (render/mode.ts) so they can't desync.
+  const bang = isBashMode(state);
+  const value = bang ? state.input.value.slice(1) : state.input.value;
+  const cursorAbs = bang ? Math.max(0, state.input.cursor - 1) : state.input.cursor;
+  // Both '> ' (first line) and '  ' (continuation) are 2 chars wide;
+  // soft-wrap chunks each `\n`-separated buffer line into chunks of
+  // up to `caps.cols - prefixWidth` code units, with surrogate-pair
+  // boundaries kept intact (see render/wrap.ts). composeCursor must
+  // walk the SAME chunk list renderInput produced — uniform-width
+  // arithmetic (`offsetInLine % innerWidth`) breaks when chunks are
+  // shrunk by one to avoid splitting a non-BMP codepoint.
+  const prefixWidth = 2;
+  const innerWidth = Math.max(1, caps.cols - prefixWidth);
+
+  // Per-buffer-line chunk list. Empty buffer lines wrap to a single
+  // empty sub-row (the prefix-only `> ` / `  ` line that renderInput
+  // emits) — the chunk list is `[]` in that case and the
+  // sub-row/col math below special-cases it.
+  const lines = value === '' ? [''] : value.split('\n');
+  const lineChunks = lines.map((l) => wrapInputLine(l, innerWidth));
+  const rowsForChunks = (n: number): number => (n === 0 ? 1 : n);
+  const inputLineCount = lineChunks.reduce((acc, cs) => acc + rowsForChunks(cs.length), 0);
+
+  // Find which buffer line + offset within it contains the cursor.
+  let charsBefore = 0;
+  let bufferLineIdx = 0;
+  let offsetInLine = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const lineLen = (lines[i] ?? '').length;
+    if (cursorAbs <= charsBefore + lineLen) {
+      bufferLineIdx = i;
+      offsetInLine = cursorAbs - charsBefore;
+      break;
+    }
+    charsBefore += lineLen + 1; // +1 for the '\n' separator
+  }
+
+  // Visual rows occupied by buffer lines BEFORE the cursor's line.
+  let visualRowsBefore = 0;
+  for (let i = 0; i < bufferLineIdx; i++) {
+    visualRowsBefore += rowsForChunks((lineChunks[i] ?? []).length);
+  }
+  const cursorChunks = lineChunks[bufferLineIdx] ?? [];
+  const cursorLine = lines[bufferLineIdx] ?? '';
+  const numSubRows = rowsForChunks(cursorChunks.length);
+  // Column within a sub-row = the VISUAL width of the text from the
+  // chunk's start to the cursor (not its code-unit count), so a wide
+  // glyph (CJK / emoji = 2 cols) before the cursor advances the column
+  // by 2 — matching where the terminal actually puts the caret. Wraps
+  // are already wcwidth-aware (wrapInputLine), so this stays within the
+  // sub-row.
+  const colInChunk = (chunkStart: number): number =>
+    prefixWidth + visualWidth(cursorLine.slice(chunkStart, offsetInLine));
+  // Locate the chunk whose code-unit range covers `offsetInLine`.
+  // Linear walk is fine: typical input has < 30 chunks per line.
+  // Cursor at the exact end of a chunk lands on that chunk's last
+  // column (the next chunk's start === this chunk's end), which the
+  // boundary clamp below resolves; same shape as the old
+  // exact-wrap-boundary case where cursor was at offset = N*innerWidth.
+  let subRowInLine = 0;
+  let col = prefixWidth + offsetInLine;
+  for (let c = 0; c < cursorChunks.length; c++) {
+    const chunk = cursorChunks[c];
+    if (chunk === undefined) continue;
+    if (offsetInLine < chunk.end) {
+      subRowInLine = c;
+      col = colInChunk(chunk.start);
+      break;
+    }
+    // Past the last chunk's end — fall through; the clamp below
+    // pins to the right edge of the last sub-row.
+    if (c === cursorChunks.length - 1) {
+      subRowInLine = c;
+      col = colInChunk(chunk.start);
+    }
+  }
+
+  // Exact-wrap-boundary clamp: cursor at offset = chunk.end of a
+  // non-final chunk wants to land on the next sub-row, but
+  // renderInput only emits `chunks.length` sub-rows so a cursor
+  // past the last would visually overlap the rule below the input.
+  // Clamp to the right edge of the last existing sub-row instead —
+  // typical editor behavior. As soon as the operator types one
+  // more char, a new chunk allocates and the cursor moves naturally
+  // to col 2 of the new row.
+  if (subRowInLine >= numSubRows) {
+    subRowInLine = numSubRows - 1;
+    col = caps.cols - 1;
+  }
+
+  // Last input row sits `trailingBelowInput` rows above the bottom of
+  // the live region; subtract input's own (wrapped) height to get the
+  // first row. `trailingBelowInput` covers the base rule+footer plus
+  // the slash popover when it's open.
+  const inputStartRow = lineCount - trailingBelowInput(state) - inputLineCount;
+  return {
+    row: inputStartRow + visualRowsBefore + subRowInLine,
+    col: Math.min(col, Math.max(0, caps.cols - 1)),
+  };
+};
+
+export const composeLive: ComposeLive = (
+  state: LiveState,
+  caps: Capabilities,
+  now: number,
+): string[] => {
+  const lines: string[] = [];
+
+  // Frame margin (UI.md §6.3): every line in the live region gets 2sp
+  // left padding EXCEPT the input row. The composer applies `padFrame`
+  // to each renderer's output here; the renderers themselves emit
+  // unpadded content, which keeps them composable with anything else
+  // (tests, headless replay) that wants the raw content. The two
+  // width-aware paths — `horizontalRule` (computed locally) and
+  // `renderFooter` (anchor math) — already produce padded output.
+
+  // Live region "session" blocks (UI.md §6.3): each top-level element
+  // (TodoList, assistant chip, each tool card) gets a blank line above
+  // it for scannability. Sub-content within an element (todo rows
+  // under "Tasks", `└─` connector under a tool chip) stays tight —
+  // it's the parent block's "subsession". Helper ALWAYS prepends a
+  // blank: combined with the forced blank above the input rule,
+  // every top-level block ends up bounded by blanks on both sides
+  // — so the operator's eye scans live content as discrete units
+  // (e.g., "Generating..." chip with breathing space top + bottom)
+  // without the bottom edge fusing with the rule above the input.
+  const appendBlock = (block: string[]): void => {
+    if (block.length === 0) return;
+    lines.push(padFrame(''));
+    lines.push(...block.map(padFrame));
+  };
+
+  // 1. Live preview of the accumulating tool-end batch. Consecutive
+  // same-name tools (read/read/read, or a run of bash) buffer into
+  // `pendingToolEndBatch` and only settle into scrollback when the
+  // group ends (a different-name tool, assistant text, or session
+  // end). Rendering that buffer here keeps the completed tools VISIBLE
+  // and GROUPED while they accumulate — without it a fast tool would
+  // flash, leave `activeTools`, and vanish into the invisible buffer
+  // until some later flush trigger (the "aparece mas some" report).
+  //
+  // We render exactly what the batch WILL flush as, by formatting the
+  // would-be PermanentItem(s) with the same `formatPermanent` the
+  // scrollback path uses — so when the batch settles, the block simply
+  // moves from the live region into scrollback with no visual jump
+  // (single tool below the coalesce threshold → one `tool-end` line;
+  // at/above it → the coalesced `● Executed N commands` summary).
+  // `flushPendingToolEndBatch` is pure: we read its `.permanent` and
+  // discard the cleared state. `formatPermanent` already bakes the
+  // frame margin + leading blank, so these lines are pushed directly
+  // (not via `appendBlock`, which would double the margin).
+  for (const item of flushPendingToolEndBatch(state).permanent) {
+    lines.push(...formatPermanent(item, caps));
+  }
+
+  // 2. Active tool cards (running). Map insertion order is preserved, so
+  // the visual order matches the order tools were started. The cards STACK
+  // above the TodoList + phase chip below — read, write, bash… pile upward
+  // as the harness fires them.
+  for (const tool of state.activeTools.values()) {
+    // Only the card head hangs in the gutter (glyph at col 0, verb at col 2),
+    // matching the settled `tool-end` chip (permanent.ts) so the card doesn't
+    // shift when it moves live → scrollback. Sub-content (subject / preview)
+    // keeps the frame margin. The leading blank separator (appendBlock's
+    // contract) is kept for the same vertical rhythm as every other block.
+    const block = renderToolCardLive(tool, caps, now);
+    if (block.length === 0) continue;
+    lines.push(padFrame(''));
+    lines.push(block[0] as string);
+    for (let i = 1; i < block.length; i++) lines.push(padFrame(block[i] as string));
+  }
+
+  // 3. Active subagents (UI.md §4.2), grouped directly ABOVE Tasks near the
+  // typing zone. One 2-line row per concurrent child (spinner · name ·
+  // elapsed · cost, then the in-flight tool); section disappears when empty.
+  // Queued backlog comes from parallel:status (count only). The child's
+  // tools no longer stream as live cards — they collapse into the grouped
+  // summary block on end — so this sits cleanly above Tasks.
+  appendBlock(
+    renderSubagentRows(state.subagents, caps, now, state.parallelStatus?.subagentsQueued ?? 0),
+  );
+
+  // 4. Live TodoList, pinned at the BOTTOM of the volatile stack — just
+  // above the phase chip, near the typing zone. The WHOLE tool zone (the
+  // settling batch §1 and the running cards §2) plus the subagent group §3
+  // render ABOVE it, so a completing tool moves card→batch entirely above
+  // the list instead of crossing it (the "tool flashes below Tasks"
+  // report). Because the live region is anchored to the input, the list
+  // stays put while that stack grows/shrinks overhead. renderTodoList
+  // returns [] when empty — the section drops. Diverges from spec §4.10.6
+  // ("Todo list acima dos chips") — folds into the pending todolist spec
+  // follow-up.
+  appendBlock(renderTodoList(state.todos, caps, now, !state.ended));
+
+  // 5. Pinned turn-phase chip. The single live indicator for what the
+  // turn is doing right now — it sits at the BOTTOM of the live region
+  // (directly above the input block), with the TodoList (section 4), the
+  // tool cards (section 3), and the accumulating batch (section 2)
+  // stacking above it. This is the inverse of the older
+  // "chip as parent above its tool calls" layout: the operator's eye
+  // rests at the bottom near the typing zone, so the always-present
+  // status lands there and the volatile tool stack grows upward out
+  // of the way.
+  //
+  // One chip at a time, picked by a strict priority over four
+  // mutually-exclusive states so the slot never shows two verbs:
+  //
+  //   thinking      → Thinking chip (cognitive verb). More specific
+  //                   than "Generating…"; explains the 5-30s extended-
+  //                   thinking gap that has no token counter.
+  //   pendingAssistant → Generating chip (output verb). Text streaming.
+  //   activeTools   → tool-phase chip (orchestration verb). Model has
+  //                   gone idle; the harness is running the calls it
+  //                   emitted. Ranked below assistant (text can stream
+  //                   while a tool runs) and above awaitingProvider (an
+  //                   active tool means we're past that round-trip —
+  //                   in practice awaitingProvider is null here).
+  //   awaitingProvider → Awaiting chip. Request handed to the provider,
+  //                   nothing streaming yet. Cleared by assistant:start
+  //                   / thinking:start, so it only shows in the gap
+  //                   before the first provider event.
+  //
+  // Across a live turn at least one of these holds, so the chip stays
+  // visible the whole interaction; between turns all four are null and
+  // the slot collapses. `compacting` is LAST: a compaction runs only
+  // between steps (auto) or with no turn at all (/compact), so the turn
+  // chips are already null when it should show — and if a stray end event
+  // ever left it set mid-turn, a real turn chip correctly takes the slot
+  // instead of a stale "Compacting context…" masking the live work. No special
+  // priority, no need to clear it on chip transitions.
+  if (state.thinking !== null) {
+    appendBlock(renderThinkingChip(state.thinking, caps, now));
+  } else if (state.pendingAssistant !== null) {
+    appendBlock(renderAssistantChip(state.pendingAssistant, caps, now));
+  } else if (state.activeTools.size > 0) {
+    appendBlock(renderToolPhaseChip(state.currentTurnId, caps, now));
+  } else if (state.awaitingProvider !== null) {
+    appendBlock(renderAwaitingChip(state.awaitingProvider, caps, now));
+  } else if (state.compacting !== null) {
+    appendBlock(renderTimedChip('Compacting context…', state.compacting.startedAt, caps, now));
+  }
+
+  // (Status line — removed: UI.md §4.4 absorbed into the §4.10.6
+  // footer. Same info `model · [plan] · steps/max · cost · [bg N]`
+  // appears in the footer's right column, so a separate line above
+  // the input would just duplicate it. No section number — it renders
+  // nothing; noted here so the removal stays discoverable.)
+
+  // 6. Modal OR bottom anchor — never both. Bottom anchor is rule +
+  // input + rule + footer (4-block stack); modal substitutes the
+  // whole anchor and carries its own structure. Status line + tool
+  // cards stay visible above so the user keeps context.
+  //
+  // Modal lines are NOT run through padFrame: renderModal already
+  // bakes the §6.3 frame margin into content rows (each block
+  // emits `'  ' + text`) AND its rule rows are intentionally
+  // edge-to-edge at caps.cols (matching the input block's full-
+  // width rule convention §6.3). Adding another 2sp prefix would
+  // double-indent content AND push rules past caps.cols, which
+  // truncateToWidth then clips on the right edge — visible as the
+  // box losing its last 2 columns on every row of every modal.
+  if (state.modal !== null) {
+    lines.push(...renderModal(state.modal, caps));
+    return lines;
+  }
+  // Reverse-search overlay (HISTORY.md §2.2) sits above the input
+  // rule, in the same upper-slot the live chips use. Slash popover
+  // moved below the input (further down in this function); the two
+  // were mutually exclusive at the producer level (REPL refuses to
+  // open Ctrl+R while slash is active), so swapping slash to the
+  // lower slot doesn't create any overlap with reverse-search.
+  // Reverse-search stays above because the operator typed Ctrl+R to
+  // *search* prior submits — visual proximity to scrollback above
+  // matters more than proximity to the input draft below.
+  if (state.reverseSearch !== null) {
+    appendBlock(renderReverseSearch(state.reverseSearch, caps));
+  }
+  // Queued inbox messages (INBOX §6 — in-memory). Input committed while a
+  // turn/playbook is in flight stacks here, just above the typing zone,
+  // in the same inverse-bar style as a submitted message; the next turn
+  // boundary drains the queue. The message being edited (editingId) is
+  // hidden — it's shown in the input instead. Empty → renderQueued
+  // returns [] and the section collapses. Sits in the upper slot (above
+  // the input rule), so it does NOT enter `trailingBelowInput` /
+  // composeCursor math.
+  const visibleQueued =
+    state.editingId === null ? state.queued : state.queued.filter((q) => q.id !== state.editingId);
+  appendBlock(renderQueued(visibleQueued, caps));
+  // 1 blank line above the input block (rule + input + rule) to keep the
+  // typing zone from fusing with whatever permanent content sits in scrollback
+  // right above it. EXCEPT when queued inbox bars sit directly above: those
+  // should HUG the input box (read as "pending, attached to where I type")
+  // rather than float a line above it — and they already carry their own
+  // leading blank (appendBlock) separating them from scrollback. So drop the
+  // gap when the queue is non-empty. Cursor math is unaffected: composeCursor
+  // anchors the input row from the BOTTOM (lineCount − trailingBelowInput −
+  // inputLineCount), so a blank removed ABOVE the input shifts nothing.
+  // Bash mode (idle `!cmd`): the input box — both rules + the line itself —
+  // renders yellow. Single `isBashMode` predicate (render/mode.ts) shared with
+  // renderInput / composeCursor / footer so the whole block agrees.
+  const bashMode = isBashMode(state);
+  if (visibleQueued.length === 0) {
+    lines.push(padFrame(''));
+  }
+  lines.push(horizontalRule(caps, bashMode));
+  // Input is the single OUTDENTED element (UI.md §6.3 frame margin
+  // exception). No padFrame here — the prompt `> ` lives at col 0
+  // and the cursor lands at col 2, naturally anchored to the rest
+  // of the indented content's left edge. When the reverse-search
+  // overlay is up, the input rows render dim (HISTORY.md §2.2) so
+  // the operator's draft is visibly preserved-but-secondary.
+  lines.push(
+    ...renderInput(state.input, caps, {
+      dimmed: state.reverseSearch !== null,
+      // Bash mode (idle `!cmd`) — flips the prompt to `! ` and paints
+      // the row yellow. Computed here (needs the full state for the
+      // idle gate) and passed in, so renderInput stays a pure function
+      // of InputState + flags rather than re-deriving the predicate.
+      bash: bashMode,
+      // INBOX §6.1: hint the ↑-to-edit affordance while messages are
+      // queued. renderInput shows it only on an empty buffer, so it
+      // never hides a draft and vanishes the moment the operator types.
+      ...(visibleQueued.length > 0 ? { placeholder: 'Press up to edit queued messages' } : {}),
+      // Inline arg-hint ghost for a fully-typed slash command (computed
+      // in the REPL alongside the popover). renderInput draws it dim
+      // after the typed text only when the cursor is at the line end.
+      ...(state.slash?.ghost !== undefined ? { commandGhost: state.slash.ghost } : {}),
+    }),
+  );
+  lines.push(horizontalRule(caps, bashMode));
+  // Slash autocomplete popover: rendered DIRECTLY below the input's
+  // bottom rule, no `padFrame` (rows live at col 0 like the input
+  // block above), no blank separator (slash reads as an extension of
+  // the typing zone, not a standalone live-region block). When closed
+  // (`state.slash === null`) the slot collapses entirely and the
+  // footer abuts the rule as before — keeps `FOOTER_BLOCK_LINES`
+  // truthful for the base case. `trailingBelowInput` mirrors this
+  // structure so composeCursor lands the cursor on the right row.
+  if (state.slash !== null) {
+    lines.push(...renderSlashPopover(state.slash, caps));
+  }
+  // renderFooter only returns null on modal (handled above); the
+  // non-null assert keeps the contract explicit — if a future
+  // renderFooter loosens it, composeCursor's row math would silently
+  // drift. Fail loudly here instead.
+  const footer = renderFooter(state, caps);
+  if (footer === null) throw new Error('composeLive: renderFooter returned null in non-modal path');
+  lines.push(footer);
+  // Footer's second row: the repo/cwd path, directly below the info line
+  // (UI.md §4.10.6). Null before the banner seeds `status.cwd`, and in bash
+  // mode — `trailingBelowInput` mirrors that via `hasFooterPathRow` so the
+  // cursor row math stays exact whether or not the row is present.
+  const footerPath = renderFooterPath(state, caps);
+  if (footerPath !== null) lines.push(footerPath);
+
+  return lines;
+};

@@ -1,0 +1,26 @@
+name: PreToolUse block_message stdout reaches the model context
+evaluates: harness
+prompt: |
+  Use the write_file tool to create `out.txt`. Report verbatim
+  whatever the tool returns, including any error message text.
+setup:
+  files:
+    .forja/permissions.yaml: |
+      defaults:
+        mode: bypass
+    .forja/hooks.toml: |
+      [[hooks]]
+      event = "PreToolUse"
+      command = "echo blocked-by-policy-X; exit 2"
+expect:
+  - tool_called: write_file
+  - tool_denied: write_file
+  - file_not_exists: out.txt
+  # The block_message stdout MUST land in the model's tool_result
+  # block (not just the audit row); this proves operators can
+  # surface meaningful guidance to the model on a hook block.
+  - output_contains: blocked-by-policy-X
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

@@ -1,0 +1,5 @@
+name: 04-no-dispatch-direct-answer
+prompt: |-
+  In one sentence — should I prefer a worktree or in-place
+  isolation for a subagent that only reads files?
+expect_dispatch: none

@@ -1,0 +1,13 @@
+name: tool_search select-by-name fetch of a deferred tool
+prompt: |
+  Add a todo "draft notes", then use the `todo_clear` tool to empty the whole
+  todo list. `todo_clear` is a deferred tool — if it isn't already available,
+  reveal it with tool_search (you can fetch it directly by name), then call it.
+  Reply "done" when the list is empty.
+expect:
+  - tool_called: tool_search
+  - tool_called: todo_clear
+  - status: done
+budget:
+  maxSteps: 8
+  maxCostUsd: 0.30

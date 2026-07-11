@@ -1,0 +1,24 @@
+name: PreToolUse hook allow lets the tool through
+evaluates: harness
+prompt: |
+  Use the write_file tool to create `out.txt` with content `ok`.
+  Report what the tool returned.
+setup:
+  files:
+    .forja/permissions.yaml: |
+      defaults:
+        mode: bypass
+    .forja/hooks.toml: |
+      [[hooks]]
+      event = "PreToolUse"
+      command = "true"
+expect:
+  - tool_called: write_file
+  - file_exists: out.txt
+  - file_contains:
+      path: out.txt
+      pattern: ok
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

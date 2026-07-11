@@ -1,0 +1,70 @@
+{
+  "schemaVersion": "v1",
+  "generatedAt": 400000,
+  "scope": {
+    "kind": "session_specific",
+    "sessionIds": [
+      "a5000001-0000-0000-0000-000000000000"
+    ],
+    "range": {
+      "start": 0,
+      "end": 0
+    }
+  },
+  "completeness": {
+    "incomplete": true,
+    "incompleteSessions": [
+      "a5000001-0000-0000-0000-000000000000"
+    ],
+    "incompleteReason": "1 session(s) in non-terminal state"
+  },
+  "goal": {
+    "text": "apply the database migration but check with me before touching prod",
+    "sourceStepId": "a5000100-0000-0000-0000-000000000000"
+  },
+  "goalStack": [],
+  "decisions": [],
+  "pinnedContext": [],
+  "actions": {
+    "filesRead": [],
+    "filesWritten": [],
+    "commandsRun": [
+      {
+        "command": "bun run migrate:dry-run",
+        "exitCode": 0,
+        "durationMs": 220
+      }
+    ],
+    "webFetches": [],
+    "subagentsSpawned": []
+  },
+  "outcomes": {
+    "testsRun": [],
+    "checkpoints": [],
+    "artifacts": []
+  },
+  "timeline": [
+    {
+      "ts": 380000,
+      "event": "session_start",
+      "detail": "a5000001-0000-0000-0000-000000000000"
+    }
+  ],
+  "costs": {
+    "tokens": {
+      "in": 3400,
+      "out": 180,
+      "cached": 2700
+    },
+    "usd": 0.012,
+    "durationMs": 20000,
+    "model": "sonnet-4-6",
+    "cacheHitRatio": 0.4426229508196721
+  },
+  "errors": [],
+  "notDone": [],
+  "unresolvedQuestions": [
+    "Should we proceed with the production rollout now, or wait for the change-window?"
+  ],
+  "memoryProposed": []
+}

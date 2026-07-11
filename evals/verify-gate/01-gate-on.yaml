@@ -1,0 +1,37 @@
+name: verify-gate ON — edit then (nudged) run the declared verify command
+prompt: |
+  The file `src/add.ts` has a bug: `add` SUBTRACTS instead of adding, so
+  `add(2, 3)` returns -1 instead of 5. Fix it with edit_file. Reply "done"
+  when the edit is applied.
+setup:
+  gitInit: true
+  files:
+    src/add.ts: |
+      export const add = (a: number, b: number): number => a - b;
+    src/add.test.ts: |
+      import { expect, test } from 'bun:test';
+      import { add } from './add.ts';
+      test('adds', () => {
+        expect(add(2, 3)).toBe(5);
+      });
+    # Opt-in verify gate (STATE_MACHINE §3.2.1): after editing a file the model
+    # must have run `bun test` (exit 0) before a final answer is accepted.
+    .forja/config.toml: |
+      [verify]
+      commands = ["bun test"]
+expect:
+  - tool_called: edit_file
+  # The prompt never asks for tests, so bash runs ONLY because the gate nudged
+  # (the OFF arm never runs bash). The nudge tells the model to run the command
+  # DIRECTLY — no pipe/redirect — so a capable model runs a clean `bun test` the
+  # matcher credits, not a masked `bun test | tail` (whose exit is the pipe's, not
+  # the test's). Across repeated opus runs this credits cleanly in 5 steps with no
+  # exhaustion trace. The eval has no "exhaustion did not fire" signal to assert,
+  # so this expectation pins the bash attempt; clean crediting is confirmed by re-run.
+  - tool_called: bash
+  - file_contains:
+      path: src/add.ts
+      pattern: a + b
+  - status: done
+budget:
+  maxSteps: 12

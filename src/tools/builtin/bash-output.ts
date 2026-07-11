@@ -1,0 +1,218 @@
+import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
+
+export interface BashOutputInput {
+  process_id: string;
+  // Override the stored stdout cursor. When omitted, reads from the
+  // byte offset advanced by the prior call (or 0 on first read).
+  since_stdout?: number;
+  // Override the stored stderr cursor. Independent — see manager
+  // dual-cursor model.
+  since_stderr?: number;
+  // Cap on bytes returned per stream. Defaults to 64 KB to keep a
+  // single tool result inside the model's context budget.
+  max_bytes?: number;
+  // GREP MODE. When set, scan the WHOLE log (both streams) and return
+  // only lines containing this literal substring — instead of the cursor
+  // window. The cheap way to pull the failures out of a huge output
+  // without paging. Does NOT advance the cursor.
+  grep?: string;
+  // Case-insensitive grep match. Default false. Only meaningful with `grep`.
+  grep_ignore_case?: boolean;
+}
+
+export interface BashOutputOutput {
+  process_id: string;
+  status: 'running' | 'exited' | 'killed' | 'failed';
+  exit_code: number | null;
+  // In grep mode, stdout/stderr hold the MATCHING lines (joined by \n),
+  // not the cursor window; cursors/pending are 0 (grep doesn't advance).
+  stdout: string;
+  stderr: string;
+  // Byte offsets for the NEXT call. Persisted server-side; mirrored
+  // here so the model can pin a specific window in retries.
+  stdout_cursor: number;
+  stderr_cursor: number;
+  // Bytes still unread on each stream beyond the returned slice.
+  // Zero means caught up; >0 means truncated by max_bytes — the
+  // model should call again to fetch the remainder.
+  stdout_pending: number;
+  stderr_pending: number;
+  // Present only in grep mode: number of matching lines returned across
+  // both streams, and whether the per-stream match cap was hit (more
+  // matches exist than returned).
+  grep_matches?: number;
+  grep_truncated?: boolean;
+}
+
+export const bashOutputTool: Tool<BashOutputInput, BashOutputOutput> = {
+  name: 'bash_output',
+  description:
+    'Read stdout/stderr from a background process (bash_background). Default mode reads the incremental window since a server-side cursor (inspect a running process; you are notified separately when one finishes, so polling for completion is unnecessary). Pass `grep` to instead scan the WHOLE log and return only matching lines — the cheap way to pull failures out of a huge output without paging the cursor.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      process_id: {
+        type: 'string',
+        description: 'The process_id returned by bash_background.',
+      },
+      since_stdout: {
+        type: 'integer',
+        minimum: 0,
+        description:
+          'Optional explicit byte offset for stdout. Overrides the server-side cursor for replay/skip-ahead reads.',
+      },
+      since_stderr: {
+        type: 'integer',
+        minimum: 0,
+        description:
+          'Optional explicit byte offset for stderr. Independent of stdout — see dual-cursor model.',
+      },
+      max_bytes: {
+        type: 'integer',
+        minimum: 1,
+        description: 'Cap on bytes returned per stream. Defaults to 65536 (64 KB).',
+      },
+      grep: {
+        type: 'string',
+        description:
+          'Grep mode: return only lines of the full log containing this literal substring (not a regex). Ignores cursor/max_bytes; does not advance the cursor.',
+      },
+      grep_ignore_case: {
+        type: 'boolean',
+        description: 'Case-insensitive grep match. Only meaningful with `grep`.',
+      },
+    },
+    required: ['process_id'],
+  },
+  metadata: {
+    // Category 'misc', not 'bash'. Reasoning: checkBash requires
+    // `args.command` and denies when missing — bash_output only
+    // carries `process_id`, so 'bash' would default-deny under any
+    // strict/acceptEdits policy. The spawn-time call to
+    // bash_background already passed the bash policy gate, and
+    // reading output from a previously-approved process opens no
+    // new attack surface. Operators who want to deny output reads
+    // for already-spawned processes don't have a clean policy
+    // surface today; that's a known gap. The right defense is
+    // denying spawn at policy time.
+    category: 'misc',
+    writes: false,
+    // Hard dependency on `ToolContext.bgManager`. Pulled forward
+    // for the subagent validator the same way bash_background
+    // and bash_kill are.
+    requiresBgManager: true,
+    // Reading a fixed `since` window is idempotent. Reading without
+    // `since` advances the cursor and is therefore not.
+    idempotent: false,
+    display: 'raw',
+    cost: { latency_ms_typical: 5 },
+  },
+  async execute(args, ctx): Promise<ToolResult<BashOutputOutput>> {
+    if (ctx.signal.aborted) {
+      return toolError(ERROR_CODES.aborted, 'tool aborted before read', { retryable: true });
+    }
+    if (ctx.bgManager === undefined) {
+      return toolError(
+        'bg.manager_unavailable',
+        'bash_output requires a session-bound bg manager but none was provided',
+      );
+    }
+    if (typeof args.process_id !== 'string' || args.process_id.length === 0) {
+      return toolError(ERROR_CODES.invalidArg, 'process_id must be a non-empty string');
+    }
+    // Schema declares `since_*` as `minimum: 0` and `max_bytes` as
+    // `minimum: 1`, but providers don't enforce schema constraints —
+    // model JSON arrives unvalidated. Without these checks:
+    //   - since_*: -1 makes the manager's cursor math go backwards
+    //     relative to bytes read, returning chunks that overlap the
+    //     model's previous read window;
+    //   - max_bytes <= 0 returns empty chunks with nonzero pending
+    //     forever, trapping a polling loop in busy-wait;
+    //   - non-integer values land in slice/substr arithmetic and
+    //     produce off-by-fractional reads.
+    // Reject runtime-side with the same boundaries the schema declares.
+    const validateNonNegativeInt = (v: unknown, label: string): string | null => {
+      if (typeof v !== 'number' || !Number.isFinite(v) || !Number.isInteger(v) || v < 0) {
+        return `${label} must be a non-negative integer`;
+      }
+      return null;
+    };
+    if (args.since_stdout !== undefined) {
+      const err = validateNonNegativeInt(args.since_stdout, 'since_stdout');
+      if (err !== null) return toolError(ERROR_CODES.invalidArg, err);
+    }
+    if (args.since_stderr !== undefined) {
+      const err = validateNonNegativeInt(args.since_stderr, 'since_stderr');
+      if (err !== null) return toolError(ERROR_CODES.invalidArg, err);
+    }
+    if (args.max_bytes !== undefined) {
+      if (
+        typeof args.max_bytes !== 'number' ||
+        !Number.isFinite(args.max_bytes) ||
+        !Number.isInteger(args.max_bytes) ||
+        args.max_bytes < 1
+      ) {
+        return toolError(ERROR_CODES.invalidArg, 'max_bytes must be a positive integer (>=1)');
+      }
+    }
+    if (args.grep !== undefined && typeof args.grep !== 'string') {
+      return toolError(
+        ERROR_CODES.invalidArg,
+        'grep must be a string (omit it to read the cursor window instead of filtering)',
+      );
+    }
+    // `grep: ""` means "no filter" to some models — treat empty as omitted
+    // and fall through to the normal cursor read rather than barring the
+    // whole call over an optional field (empty-is-omitted, as git/grep do).
+    const grepPattern =
+      typeof args.grep === 'string' && args.grep.length > 0 ? args.grep : undefined;
+    try {
+      // Grep mode: scan the whole log, return only matching lines. No
+      // cursor window, no advance — the cheap path for huge outputs.
+      if (grepPattern !== undefined) {
+        const g = await ctx.bgManager.grepOutput(args.process_id, {
+          pattern: grepPattern,
+          ...(args.grep_ignore_case === true ? { ignoreCase: true } : {}),
+        });
+        return {
+          process_id: args.process_id,
+          status: g.status,
+          exit_code: g.exitCode,
+          stdout: g.stdoutMatches.join('\n'),
+          stderr: g.stderrMatches.join('\n'),
+          stdout_cursor: 0,
+          stderr_cursor: 0,
+          stdout_pending: 0,
+          stderr_pending: 0,
+          grep_matches: g.stdoutMatches.length + g.stderrMatches.length,
+          grep_truncated: g.truncated,
+        };
+      }
+      const opts: { sinceStdout?: number; sinceStderr?: number; maxBytes?: number } = {};
+      if (args.since_stdout !== undefined) opts.sinceStdout = args.since_stdout;
+      if (args.since_stderr !== undefined) opts.sinceStderr = args.since_stderr;
+      if (args.max_bytes !== undefined) opts.maxBytes = args.max_bytes;
+      const r = await ctx.bgManager.readOutput(args.process_id, opts);
+      return {
+        process_id: args.process_id,
+        status: r.status,
+        exit_code: r.exitCode,
+        stdout: r.stdout,
+        stderr: r.stderr,
+        stdout_cursor: r.stdoutCursor,
+        stderr_cursor: r.stderrCursor,
+        stdout_pending: r.stdoutPending,
+        stderr_pending: r.stderrPending,
+      };
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      // The manager throws with /not found/ or /not in this session/
+      // — both are clean tool-error surface, not retryable.
+      const isNotFound = /not found|not in this session/i.test(message);
+      return toolError(
+        isNotFound ? 'bg.process_not_found' : 'bg.output_failed',
+        `bash_output failed: ${message}`,
+      );
+    }
+  },
+};

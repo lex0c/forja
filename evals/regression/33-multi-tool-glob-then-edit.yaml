@@ -1,0 +1,24 @@
+name: multi-tool flow — glob to discover files then edit a specific one
+prompt: |
+  Use the glob tool with the pattern `**/*.ts` to find every TypeScript
+  file under the working directory. Then use edit_file on the file whose
+  name contains the substring `alpha` to change `return 1;` into
+  `return 100;`. Leave every other file unchanged.
+setup:
+  fixture: ../fixtures/nested-tree
+expect:
+  - tool_called: glob
+  - tool_called: edit_file
+  - tool_not_called: write_file
+  - file_contains:
+      path: src/alpha.ts
+      pattern: return 100;
+  - file_contains:
+      path: src/beta/beta.ts
+      pattern: return 2;
+  - file_contains:
+      path: src/gamma/delta/delta.ts
+      pattern: return 4;
+  - status: done
+budget:
+  maxSteps: 8
