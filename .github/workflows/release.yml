@@ -304,12 +304,18 @@ jobs:
   # SAME binaries as the GitHub Release — pulled from the shared
   # `release-assets` artifact and RE-VERIFIED against SHA256SUMS at pack
   # time (fail-closed) — as a launcher package (@lex0c/forja) plus five
-  # os/cpu-gated per-platform packages (@lex0c/forja-<target_id>). Gated
-  # behind the same jobs as the GitHub Release, so a binary that won't
-  # build, reproduce, or run natively never reaches npm.
+  # os/cpu-gated per-platform packages (@lex0c/forja-<target_id>).
+  #
+  # Depends on `publish` (not just the build gates) so npm goes LAST: npm
+  # versions are immutable (no --clobber) and the packages point users back
+  # to the GitHub Release (README install + the launcher's missing-binary
+  # error). Running in parallel with `publish` risks shipping irreversible
+  # npm packages whose primary verified fallback failed or only partially
+  # uploaded. `publish` does not depend on npm, so a broken npm side still
+  # never wedges the GitHub Release.
   publish-npm:
     name: publish npm packages
-    needs: [build, reproducibility, exec-check]
+    needs: [build, reproducibility, exec-check, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
