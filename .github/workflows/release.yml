@@ -283,8 +283,16 @@ jobs:
           # are controlled and contain no spaces.
           bins=$(find dist -maxdepth 1 -type f -name 'forja-*' ! -name '*.map' | sort)
           [ -n "$bins" ] || { echo "no release binaries found in dist/" >&2; exit 1; }
+          # Mark RC/beta tags (v1.2.3-rc.1) as prereleases so GitHub's
+          # /releases/latest — which install.sh follows — skips them and
+          # keeps pointing at the last stable release. Mirrors distTag in
+          # npm-publish.ts: the prerelease is the `-` segment; build
+          # metadata (after `+`) is not. Empty for a stable tag.
+          prerelease_flag=""
+          case "${TAG%%+*}" in *-*) prerelease_flag="--prerelease" ;; esac
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" --clobber $bins dist/sbom.cdx.json dist/SHA256SUMS
+            if [ -n "$prerelease_flag" ]; then gh release edit "$TAG" --prerelease; fi
           else
             # No --target: this workflow only ever runs on a tag that
             # already exists (tag-push trigger, or a manual dispatch
@@ -297,6 +305,7 @@ jobs:
             gh release create "$TAG" \
               --title "$TAG" \
               --generate-notes \
+              $prerelease_flag \
               $bins dist/sbom.cdx.json dist/SHA256SUMS
           fi
 

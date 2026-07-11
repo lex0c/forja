@@ -676,9 +676,10 @@ Canal **adicional** ao GitHub Release. O `install.sh` (§ acima + `SECURITY_GUID
 **Proveniência dos binários.** O job npm baixa o **mesmo** artefato `release-assets` que vira GitHub Release (byte-idêntico, já atestado por SLSA) e re-verifica cada binário contra `SHA256SUMS` antes de empacotar (fail-closed, igual ao `install.sh`).
 
 **Pipeline** (`.github/workflows/release.yml`, job `publish-npm`):
-- Gate: `needs: [build, reproducibility, exec-check]` — mesmo portão do GitHub Release; binário que não roda nativo não é publicado.
+- Gate: `needs: [build, reproducibility, exec-check, publish]` — publica **depois** do GitHub Release (`publish`), não em paralelo: versões npm são imutáveis (sem `--clobber`) e os pacotes apontam o usuário de volta pro GitHub Release, então npm só é exposto com o canal primário já confirmado bom. `publish` não depende de npm, então npm quebrado não trava o release.
 - Ordem: os 5 nativos **primeiro**, launcher **por último** (senão os `optionalDependencies` do launcher não resolvem na janela entre os publishes).
 - Idempotência: npm **não** tem `--clobber`; cada publish checa `npm view <pkg>@<versão>` e pula o já publicado → re-dispatch da mesma tag é seguro.
+- Prerelease: tag `vX.Y.Z-rc.N` (aceita pelo trigger `v*`) vai pro dist-tag **`next`**, nunca `latest` — `npm i -g @lex0c/forja` (que puxa `latest`) não pega RC. Simetricamente, o GitHub Release da RC é marcado `--prerelease`, então o `/releases/latest` que o `install.sh` segue fica no último estável. SemVer: prerelease é o segmento após `-`; build metadata após `+` não conta.
 - Auth: **Trusted Publishing (OIDC)** reusando o `id-token: write` já presente no workflow; `--provenance` (mesma cadeia OIDC do SLSA, selo "Built and signed" no npm). `NPM_TOKEN` (automation granular) é o fallback documentado. O **1º publish** de cada pacote exige bootstrap manual (registrar o nome antes de ligar o OIDC por-pacote) — passo único.
 
 ---
