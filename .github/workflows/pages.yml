@@ -34,7 +34,7 @@ jobs:
           install -m 0755 gitcortex-linux-amd64 gitcortex
 
       - name: Extract
-        run: ./gitcortex extract --branch main --output forja.jsonl --ignore "bun.lock" --include-commit-messages
+        run: ./gitcortex extract --branch main --output forja.jsonl --ignore "bun.lock" --ignore "docs/BACKLOG.md" --ignore "docs/TODO.md" --include-commit-messages
 
       - name: Generate report
         run: |
