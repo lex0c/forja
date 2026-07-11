@@ -24,6 +24,14 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege for GITHUB_TOKEN: every job here only READS the repo
+# (checkout, install, build, test, dependency audit) — none comments,
+# uploads artifacts, publishes, or pushes. Pinning read-only at the root
+# applies it to all jobs and keeps it that way even if the repo/org default
+# is read-write (actions/missing-workflow-permissions).
+permissions:
+  contents: read
+
 jobs:
   check:
     name: typecheck · lint · test

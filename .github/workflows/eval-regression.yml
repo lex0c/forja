@@ -47,6 +47,12 @@ concurrency:
   group: eval-regression-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege for GITHUB_TOKEN: the single job only READS the repo
+# (checkout, install, run the eval). The provider key rides a secret, not
+# the token; nothing here comments, uploads, publishes, or pushes.
+permissions:
+  contents: read
+
 jobs:
   regression:
     # Skip the labeled-PR branch unless the trigger label is
