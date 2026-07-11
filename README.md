@@ -287,6 +287,9 @@ The English operator and reference docs live under `docs/`. (The authored
 architectural spec is separate — `docs/spec/`, in PT-BR; when a doc and the
 spec diverge, the spec wins.)
 
+Contributing to Forja itself? Start with [`docs/DEV.md`](docs/DEV.md) — the
+setup, dev loop, and quality gates for working on the codebase.
+
 ### Operator guides
 
 | Doc | What it covers |
