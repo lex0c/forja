@@ -19,10 +19,10 @@ not per-provider: judge each model against the tier matching its class in
 
 ## Run
 
-    bun run eval:smoke:openrouter      # smoke suite against deepseek/deepseek-v3.2
+    bun run eval:smoke:openrouter      # smoke suite against deepseek/deepseek-v4-flash
     # other suites / models:
-    bun run src/evals/cli.ts evals/smoke      --model openrouter/x-ai/grok-4.3
-    bun run src/evals/cli.ts evals/regression --model openrouter/deepseek/deepseek-v3.2
+    bun run src/evals/cli.ts evals/smoke      --model openrouter/x-ai/grok-4.5
+    bun run src/evals/cli.ts evals/regression --model openrouter/deepseek/deepseek-v4-flash
 
 Note the **two-slash** id (`openrouter/<vendor>/<model>`) — the OpenRouter model id is
 itself `<vendor>/<model>`. Resolution keys off the whole id.
@@ -38,8 +38,8 @@ Pick the tier that matches the model's capability class:
 | Local | ≥60% | ≥45% | ≥50% |
 
 Suggested mapping for the seeded catalog (confirm with results, don't assume):
-- **Frontier/high-Mid class**: `deepseek/deepseek-r1`, `x-ai/grok-4.3`, `moonshotai/kimi-k2-thinking`.
-- **Mid class**: `deepseek/deepseek-v3.2`, `qwen/qwen3-coder-plus`, `z-ai/glm-4.6`, `meta-llama/llama-3.3-70b-instruct`.
+- **Frontier/high-Mid class**: `deepseek/deepseek-v4-flash`, `deepseek/deepseek-v4-pro`, `z-ai/glm-5.2`, `x-ai/grok-4.5`, `moonshotai/kimi-k2.6`, `minimax/minimax-m3`.
+- **Mid class**: `qwen/qwen3.6-plus`, `tencent/hy3:free` (free tier — heavily rate-limited; expect the compaction/summary cases to degrade under throttling).
 
 A model below its tier threshold is marked `recommended: false` in the catalog rather than
 removed (the matrix stays honest).
@@ -54,7 +54,7 @@ suites:
       bun test tests/providers/openrouter-integration.test.ts
 
 Override the model with `FORJA_OPENROUTER_INTEGRATION_MODEL` (default
-`deepseek/deepseek-v3.2`). Hermetic CI skips it (the env var / key are unset there).
+`deepseek/deepseek-v4-flash`). Hermetic CI skips it (the env var / key are unset there).
 
 ## Publishing results
 
