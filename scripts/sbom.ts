@@ -74,7 +74,7 @@ const PKG_SPEC_RE = /^(.+?)@([^@]+)$/;
 // as `pkg:npm/%40scope/name@1.2.3`. Most consumers tolerate either,
 // but the encoded form is what the spec mandates.
 const toPurl = (name: string, version: string): string => {
-  const encoded = name.startsWith('@') ? `%40${name.slice(1).replace('/', '/')}` : name;
+  const encoded = name.startsWith('@') ? `%40${name.slice(1)}` : name;
   return `pkg:npm/${encoded}@${version}`;
 };
 
