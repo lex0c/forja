@@ -82,6 +82,19 @@ jobs:
       - name: Install deps
         run: bun install --frozen-lockfile
 
+      # Stamp the tag into src/cli/version.ts BEFORE building, so binaries
+      # are named forja-<version>-<id> and `forja --version` reports the
+      # real version instead of the committed 0.0.0 placeholder
+      # (PERFORMANCE.md §18.6). Deterministic (same tag → same bytes), so
+      # it does not perturb the reproducibility job, which stamps
+      # identically.
+      - name: Stamp version from tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${{ env.RELEASE_REF }}"
+          bun run scripts/stamp-version.ts "${ref#refs/tags/}"
+
       - name: Build all targets
         run: bun run build:release
 
@@ -142,6 +155,16 @@ jobs:
 
       - name: Install deps
         run: bun install --frozen-lockfile
+
+      # Stamp identically to the build job so this verifies the SHIPPED
+      # (stamped) binary is reproducible, not a 0.0.0 variant that never
+      # ships (PERFORMANCE.md §18.6).
+      - name: Stamp version from tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${{ env.RELEASE_REF }}"
+          bun run scripts/stamp-version.ts "${ref#refs/tags/}"
 
       - name: Reproducibility check
         run: bun run build:repro
@@ -260,8 +283,16 @@ jobs:
           # are controlled and contain no spaces.
           bins=$(find dist -maxdepth 1 -type f -name 'forja-*' ! -name '*.map' | sort)
           [ -n "$bins" ] || { echo "no release binaries found in dist/" >&2; exit 1; }
+          # Mark RC/beta tags (v1.2.3-rc.1) as prereleases so GitHub's
+          # /releases/latest — which install.sh follows — skips them and
+          # keeps pointing at the last stable release. Mirrors distTag in
+          # npm-publish.ts: the prerelease is the `-` segment; build
+          # metadata (after `+`) is not. Empty for a stable tag.
+          prerelease_flag=""
+          case "${TAG%%+*}" in *-*) prerelease_flag="--prerelease" ;; esac
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" --clobber $bins dist/sbom.cdx.json dist/SHA256SUMS
+            if [ -n "$prerelease_flag" ]; then gh release edit "$TAG" --prerelease; fi
           else
             # No --target: this workflow only ever runs on a tag that
             # already exists (tag-push trigger, or a manual dispatch
@@ -274,5 +305,97 @@ jobs:
             gh release create "$TAG" \
               --title "$TAG" \
               --generate-notes \
+              $prerelease_flag \
               $bins dist/sbom.cdx.json dist/SHA256SUMS
           fi
+
+  # Additional distribution channel: npm (PERFORMANCE.md §18.6). Ships the
+  # SAME binaries as the GitHub Release — pulled from the shared
+  # `release-assets` artifact and RE-VERIFIED against SHA256SUMS at pack
+  # time (fail-closed) — as a launcher package (@lex0c/forja) plus five
+  # os/cpu-gated per-platform packages (@lex0c/forja-<target_id>).
+  #
+  # Depends on `publish` (not just the build gates) so npm goes LAST: npm
+  # versions are immutable (no --clobber) and the packages point users back
+  # to the GitHub Release (README install + the launcher's missing-binary
+  # error). Running in parallel with `publish` risks shipping irreversible
+  # npm packages whose primary verified fallback failed or only partially
+  # uploaded. `publish` does not depend on npm, so a broken npm side still
+  # never wedges the GitHub Release.
+  publish-npm:
+    name: publish npm packages
+    needs: [build, reproducibility, exec-check, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write   # OIDC: npm Trusted Publishing + --provenance
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.3.13
+
+      - name: Install deps
+        run: bun install --frozen-lockfile
+
+      - name: Download built binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${{ env.RELEASE_REF }}"
+          tag="${ref#refs/tags/}"
+          echo "value=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      # No version stamp here: npm-pack locates binaries by target suffix
+      # and takes the package version from --version below — it never reads
+      # src/cli/version.ts or assetName. The build job's stamp handles the
+      # binary's own --version. (Do not re-add a stamp step; it is a no-op.)
+
+      # npm Trusted Publishing + provenance require npm >= 11.5.1; the
+      # runner's bundled npm may be older.
+      - name: Upgrade npm (Trusted Publishing + provenance)
+        run: npm install -g npm@latest
+
+      - name: Assemble npm packages
+        run: bun run scripts/npm-pack.ts --version="${{ steps.ver.outputs.value }}"
+
+      # TEMPORARY bootstrap auth — REMOVE once Trusted Publishing is set up.
+      # Trusted Publishing (OIDC) can only be configured on a package that
+      # already exists, so the first release seeds the 6 names with a token.
+      # `npm publish --provenance` still attaches provenance (id-token:write
+      # is granted above); only auth comes from the token. After the first
+      # release: enable Trusted Publishing per package on npmjs.com, then
+      # delete this step AND the NPM_TOKEN secret so publishing is tokenless.
+      - name: Bootstrap npm auth (TEMPORARY — remove after Trusted Publishing)
+        run: echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" >> ~/.npmrc
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Publishes platform packages FIRST, launcher LAST; skips any version
+      # already on the registry (npm has no --clobber, so re-dispatching the
+      # same tag is safe). Auth is OIDC Trusted Publishing — no stored token
+      # — using the id-token above; --provenance attaches the build
+      # attestation (same OIDC chain as the SLSA step).
+      #
+      # ONE-TIME BOOTSTRAP: Trusted Publishing is configured per package on
+      # npmjs.com, which needs the package name to exist first. For the
+      # first release, publish the 6 packages once with a granular
+      # automation token, then enable Trusted Publishing on each and drop
+      # the token. Token fallback instead of OIDC: add actions/setup-node
+      # with registry-url + node-version, and set
+      #   env:
+      #     NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish to npm
+        run: bun run scripts/npm-publish.ts --out=dist-npm

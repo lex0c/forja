@@ -1,0 +1,40 @@
+{
+  "name": "@lex0c/forja",
+  "version": "0.0.0",
+  "description": "Agentic CLI — terminal-first, multi-provider, self-hostable",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/lex0c/forja",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lex0c/forja.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lex0c/forja/issues"
+  },
+  "keywords": [
+    "cli",
+    "agent",
+    "agentic",
+    "ai",
+    "llm",
+    "terminal",
+    "coding-agent"
+  ],
+  "bin": {
+    "forja": "bin/forja"
+  },
+  "files": [
+    "bin/forja",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@lex0c/forja-linux-x64": "0.0.0",
+    "@lex0c/forja-linux-arm64": "0.0.0",
+    "@lex0c/forja-darwin-x64": "0.0.0",
+    "@lex0c/forja-darwin-arm64": "0.0.0",
+    "@lex0c/forja-windows-x64": "0.0.0"
+  }
+}

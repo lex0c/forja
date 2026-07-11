@@ -652,6 +652,36 @@ Cada release:
 - Cosign signature *(deferred — `id-token: write` reservado no workflow)*
 - Reproducible build (mesmo source = mesmo binary; verificado com `SOURCE_DATE_EPOCH` fixo)
 
+### 18.6 npm distribution
+
+Canal **adicional** ao GitHub Release. O `install.sh` (§ acima + `SECURITY_GUIDELINE`) continua o canal verificado primário; o npm é conveniência (`npm i -g …`, atualização via gerenciador) sobre **os mesmos binários** — nunca uma segunda compilação.
+
+**Modelo: launcher + optionalDependencies por-plataforma.** Um pacote raiz com um `bin` shim declara `optionalDependencies` em N pacotes nativos, cada um marcado com `os`/`cpu`; o gerenciador resolve e baixa **só** o que casa com a máquina. É o padrão de facto pra binário pré-compilado no npm — o próprio Bun (`@oven/bun-*`), o Biome (`@biomejs/cli-*`, já dependência de dev deste projeto) e o esbuild (`@esbuild/*`) distribuem assim. Descartado o modelo `postinstall`-que-baixa: roda código no install, quebra com `--ignore-scripts`, não é offline-cacheável.
+
+**Nomes.** O nome desescopado `forja` está retido pela npm (pacote depreciado desde 2017), então a distribuição é **escopada**:
+
+| Pacote | `os`/`cpu` | `bin` | Conteúdo |
+|---|---|---|---|
+| `@lex0c/forja` (launcher) | — | `forja` → `bin/forja` (shim) | shim + README; `optionalDependencies` nos 5 nativos |
+| `@lex0c/forja-<target_id>` (×5) | sim | — | 1 binário (`bin/forja[.exe]`) |
+
+`<target_id>` é o mesmo de `scripts/targets.ts` (`linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64`, `windows-x64`). Publicado com `--access public` (escopado nasce privado). O comando instalado é sempre `forja` (vem do `bin`, independe do nome do pacote).
+
+**Contrato do launcher (`bin/forja`, CJS).** Roda sob o Node do usuário; mapeia `process.platform`/`process.arch` → `<target_id>`, resolve o binário via `require.resolve('@lex0c/forja-<target_id>/bin/forja[.exe]')` (respeita hoisting; sem caminho hard-coded) e faz handoff com `spawn` + `stdio: 'inherit'` (o binário Bun recebe os fds reais do TTY → TUI raw funciona), repassando argv, exit code e sinais (`SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT`). Plataforma não suportada ou pacote nativo ausente (`--omit=optional`): erro claro apontando pra `install.sh`/Releases — nunca um crash opaco.
+
+**Contrato do pacote de plataforma.** `os`+`cpu` setados; `files` = só o binário; **sem `bin`** (senão colide com o `forja` do launcher) e **sem `exports`** (senão bloqueia o `require.resolve` do arquivo). Pins do launcher são **exatos** (`1.2.3`, não `^`): nunca existe par launcher↔binário desencontrado.
+
+**Versão: fonte única = a tag.** A tag `vX.Y.Z` (sem `v`) é carimbada em `src/cli/version.ts` (`VERSION`) e nos 6 `package.json`. Isso elimina a deriva pré-existente (`VERSION` fixo `0.0.0`, assets `forja-0.0.0-*`, `forja --version` mentindo) — o npm força o acerto porque a identidade publicada **é** a versão.
+
+**Proveniência dos binários.** O job npm baixa o **mesmo** artefato `release-assets` que vira GitHub Release (byte-idêntico, já atestado por SLSA) e re-verifica cada binário contra `SHA256SUMS` antes de empacotar (fail-closed, igual ao `install.sh`).
+
+**Pipeline** (`.github/workflows/release.yml`, job `publish-npm`):
+- Gate: `needs: [build, reproducibility, exec-check, publish]` — publica **depois** do GitHub Release (`publish`), não em paralelo: versões npm são imutáveis (sem `--clobber`) e os pacotes apontam o usuário de volta pro GitHub Release, então npm só é exposto com o canal primário já confirmado bom. `publish` não depende de npm, então npm quebrado não trava o release.
+- Ordem: os 5 nativos **primeiro**, launcher **por último** (senão os `optionalDependencies` do launcher não resolvem na janela entre os publishes).
+- Idempotência: npm **não** tem `--clobber`; cada publish checa `npm view <pkg>@<versão>` e pula o já publicado → re-dispatch da mesma tag é seguro.
+- Prerelease: tag `vX.Y.Z-rc.N` (aceita pelo trigger `v*`) vai pro dist-tag **`next`**, nunca `latest` — `npm i -g @lex0c/forja` (que puxa `latest`) não pega RC. Simetricamente, o GitHub Release da RC é marcado `--prerelease`, então o `/releases/latest` que o `install.sh` segue fica no último estável. SemVer: prerelease é o segmento após `-`; build metadata após `+` não conta.
+- Auth: **Trusted Publishing (OIDC)** reusando o `id-token: write` já presente no workflow; `--provenance` (mesma cadeia OIDC do SLSA, selo "Built and signed" no npm). `NPM_TOKEN` (automation granular) é o fallback documentado. O **1º publish** de cada pacote exige bootstrap manual (registrar o nome antes de ligar o OIDC por-pacote) — passo único.
+
 ---
 
 ## 19. UI responsiveness
