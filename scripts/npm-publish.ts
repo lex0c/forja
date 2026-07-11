@@ -91,6 +91,21 @@ export const publishState = (
   return `${r.stdout}\n${r.stderr}`.includes('E404') ? 'absent' : 'unknown';
 };
 
+// npm tags a publish `latest` unless --tag is given, so an unqualified
+// publish of a prerelease (e.g. 1.2.3-rc.1 — which the `v*` tag trigger
+// and normalizeVersion both accept) would move `latest` onto the RC, and
+// `npm i -g @lex0c/forja` would hand every user a prerelease. Route
+// prereleases to a separate tag so `latest` only ever points at a stable
+// release. SemVer: the prerelease is the segment after `-`; build metadata
+// (after `+`, which may itself contain `-`) is NOT a prerelease, so it is
+// stripped before the check.
+export const PRERELEASE_DIST_TAG = 'next';
+
+export const distTag = (version: string, prereleaseTag: string = PRERELEASE_DIST_TAG): string => {
+  const core = version.split('+', 1)[0] ?? version;
+  return core.includes('-') ? prereleaseTag : 'latest';
+};
+
 export interface PublishOptions {
   outDir: string;
   dryRun: boolean;
@@ -100,6 +115,7 @@ export interface PublishOptions {
 export interface PublishOutcome {
   name: string;
   version: string;
+  tag: string;
   action: 'published' | 'skipped' | 'dry-run';
 }
 
@@ -108,9 +124,10 @@ export const publishAll = (opts: PublishOptions): PublishOutcome[] => {
   const ordered = publishOrder(discoverPackages(opts.outDir));
   const outcomes: PublishOutcome[] = [];
   for (const p of ordered) {
+    const tag = distTag(p.version);
     const state = publishState(p.name, p.version, run);
     if (state === 'published') {
-      outcomes.push({ name: p.name, version: p.version, action: 'skipped' });
+      outcomes.push({ name: p.name, version: p.version, tag, action: 'skipped' });
       continue;
     }
     if (state === 'unknown') {
@@ -122,10 +139,12 @@ export const publishAll = (opts: PublishOptions): PublishOutcome[] => {
       );
     }
     if (opts.dryRun) {
-      outcomes.push({ name: p.name, version: p.version, action: 'dry-run' });
+      outcomes.push({ name: p.name, version: p.version, tag, action: 'dry-run' });
       continue;
     }
-    const r = run('npm', ['publish', p.dir, '--access', 'public', '--provenance']);
+    // --tag routes prereleases off `latest` (see distTag). Explicit even
+    // for `latest` so the dist-tag is never left to npm's default.
+    const r = run('npm', ['publish', p.dir, '--access', 'public', '--provenance', '--tag', tag]);
     if (r.status !== 0) {
       // Abort before the launcher if a platform package failed — never
       // ship a launcher whose binaries aren't on the registry.
@@ -135,7 +154,7 @@ export const publishAll = (opts: PublishOptions): PublishOutcome[] => {
         }`,
       );
     }
-    outcomes.push({ name: p.name, version: p.version, action: 'published' });
+    outcomes.push({ name: p.name, version: p.version, tag, action: 'published' });
   }
   return outcomes;
 };
@@ -154,7 +173,9 @@ const main = (): void => {
   }
   try {
     const outcomes = publishAll({ outDir, dryRun });
-    for (const o of outcomes) process.stdout.write(`${o.action}: ${o.name}@${o.version}\n`);
+    for (const o of outcomes) {
+      process.stdout.write(`${o.action}: ${o.name}@${o.version} [${o.tag}]\n`);
+    }
   } catch (e) {
     process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`);
     process.exit(1);

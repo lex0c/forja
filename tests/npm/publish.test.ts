@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   discoverPackages,
+  distTag,
   publishAll,
   publishOrder,
   publishState,
@@ -92,6 +93,23 @@ describe('publishState', () => {
   });
 });
 
+describe('distTag', () => {
+  test('stable versions publish under latest', () => {
+    expect(distTag('1.2.3')).toBe('latest');
+    expect(distTag('10.0.0')).toBe('latest');
+  });
+
+  test('prereleases publish under next, keeping latest stable', () => {
+    expect(distTag('1.2.3-rc.1')).toBe('next');
+    expect(distTag('2.0.0-beta.2')).toBe('next');
+  });
+
+  test('build metadata (which may contain a hyphen) is not a prerelease', () => {
+    expect(distTag('1.2.3+exp-sha.5')).toBe('latest');
+    expect(distTag('1.2.3-rc.1+build')).toBe('next');
+  });
+});
+
 describe('publishAll', () => {
   // A genuine E404 from `npm view` → publishState 'absent' → publish proceeds.
   const absent: RunResult = { status: 1, stdout: '', stderr: 'npm error code E404' };
@@ -145,5 +163,25 @@ describe('publishAll', () => {
     expect(() => publishAll({ outDir: tree, dryRun: false, run })).toThrow(/publish failed/);
     // Only one publish was attempted; the launcher was never reached.
     expect(published).toHaveLength(1);
+  });
+
+  test('routes a prerelease to the next dist-tag, a stable to latest', () => {
+    const capture = (version: string): string => {
+      let tag = '';
+      const run: Runner = (_cmd, args) => {
+        if (args[0] === 'view') return absent;
+        const i = args.indexOf('--tag');
+        if (i >= 0) tag = args[i + 1] as string;
+        return ok;
+      };
+      publishAll({
+        outDir: makeTree([{ name: '@lex0c/forja-linux-x64', version }]),
+        dryRun: false,
+        run,
+      });
+      return tag;
+    };
+    expect(capture('2.0.0')).toBe('latest');
+    expect(capture('2.0.0-rc.1')).toBe('next');
   });
 });
