@@ -263,8 +263,15 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" --clobber $bins dist/sbom.cdx.json dist/SHA256SUMS
           else
+            # No --target: this workflow only ever runs on a tag that
+            # already exists (tag-push trigger, or a manual dispatch
+            # gated by the "Verify ref resolves to a tag" step), so gh
+            # creates the release straight from that existing tag.
+            # Passing `--target "$TAG"` fed the TAG NAME as
+            # target_commitish, which the API accepts only as a branch or
+            # commit SHA — it 422'd with "Release.target_commitish is
+            # invalid". Do not re-add it.
             gh release create "$TAG" \
-              --target "$TAG" \
               --title "$TAG" \
               --generate-notes \
               $bins dist/sbom.cdx.json dist/SHA256SUMS
