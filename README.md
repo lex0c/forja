@@ -8,19 +8,36 @@ What sets Forja apart is the structure surrounding the model. Every action with 
 
 ## Get started
 
-...
+Install the latest release — the script detects your OS/arch, downloads the
+matching binary from GitHub Releases, verifies it against the published
+`SHA256SUMS`, and installs into `$HOME/.local/bin`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lex0c/forja/main/install.sh | sh
+```
+
+Pin a version or change where it lands:
+
+```bash
+# a specific release
+curl -fsSL https://raw.githubusercontent.com/lex0c/forja/main/install.sh | sh -s -- v1.0.1
+
+# custom install dir (default: $HOME/.local/bin)
+curl -fsSL https://raw.githubusercontent.com/lex0c/forja/main/install.sh | sh -s -- --prefix "$HOME/bin"
+```
+
+The installer is fail-closed: if the binary's hash doesn't match the
+`SHA256SUMS` shipped with the release, nothing is written to disk. Prefer to
+do it by hand? Every release also carries the binaries, `SHA256SUMS`, a
+CycloneDX SBOM, and SLSA build provenance on the
+[Releases](https://github.com/lex0c/forja/releases) page — download the
+binary, verify its hash against `SHA256SUMS`, and drop it on your `PATH`.
 
 Verify the install:
 
 ```bash
 forja --version
 forja doctor               # platform, sandbox tools, config + data dirs, git
-```
-
-For a guided first-boot walkthrough (doctor + sandbox setup + next steps):
-
-```bash
-forja welcome
 ```
 
 ---
@@ -68,25 +85,6 @@ Run it as a headless tool (emits NDJSON events to stdout):
 ```bash
 forja --json "what changed in the last commit?" > events.ndjson
 ```
-
----
-
-## What's in the box
-
-| Subsystem | What it does | Surfaces |
-|---|---|---|
-| **Harness loop** | The agent runtime: step budget, max-cost cap, compaction at 70% context, retries with classified failure modes | `forja <prompt>` |
-| **Permissions** | Layered allow/deny policy with glob + prefix matching (no regex). Sandbox profiles per tool category. Per-session approval posture (supervised / autonomous) | `forja --explain-permissions`, `--autonomous`, Shift+Tab, `.forja/permissions.yaml` |
-| **Memory** | Cross-session knowledge with three scopes (user / project_shared / project_local), explicit trust, lifecycle states (active / quarantined / invalidated), provenance tracking | `forja --memory list`, `forja --memory show <name>`, `/memory` slash |
-| **Skills** | Eager-loaded catalog of operator-authored procedures, body lazy | Skills auto-surface in system prompt; `/skill` slash |
-| **Subagents** | Worktree-isolated child runs (`task`), async handles (`task_async`), parallel dispatch with caps | `.forja/playbooks/*.md` |
-| **Mesh (relay)** | Local Forja instances (same user, different repos) exchange plain-text messages to coordinate a cross-repo change. A peer's message is untrusted *intent, never authority* — every effect stays gated by the local operator's own posture | `/relay on`, `mesh_peers` / `mesh_send`, `[mesh]` in `.forja/config.toml` |
-| **Checkpoints** | Auto-snapshot of the working tree before any write tool. `--undo` restores | `forja --undo <session>`, `forja --checkpoints list <session>` |
-| **Audit** | Append-only event log across messages, tool calls, approvals, hooks, failures, memory events, checkpoints. Optional hash chain (tamper-evident) | `audit_timeline` view, `.local/share/forja/audit.db` |
-| **Hooks** | Operator-provided shell hooks at lifecycle events (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, etc.) with `additionalContext` injection | `.forja/hooks/` |
-| **Recap** | Session-end terse summary; structured PR / Slack / mini formats via the recap pipeline | `/recap`, session-end output |
-| **Resume** | Continue a prior session by id (or `last`) — replays scrollback and rebuilds context with auto-rehydrate | `forja --resume <id> "follow-up prompt"` |
-| **Token efficiency** | Cache breakpoints split across stable / memory segments; per-tool output summarization (bash / grep / glob) | `[forja:output_summarized ...]` markers |
 
 ---
 
