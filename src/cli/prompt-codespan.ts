@@ -89,9 +89,12 @@ export const sanitizeForPromptLine = (raw: string): string => {
   return v;
 };
 
-// Markdown-table-cell variant: also escapes `|` so a crafted value can't inject
-// an extra column or break the row. Used by the playbook discovery table, whose
+// Markdown-table-cell variant: also escapes the backslash AND `|` — in one pass
+// over `[\\|]` so the backslash is handled first — so a crafted value can't
+// inject an extra column or break the row. Escaping only `|` would turn an input
+// `\|` into `\\|`, which GFM renders as a literal backslash plus an UNescaped
+// pipe, reopening the column break. Used by the playbook discovery table, whose
 // cells (`name`, `when_to_use`) come from subagent frontmatter — operator- or
 // project-authored, i.e. attacker-influenceable in a shared/cloned repo.
 export const sanitizeForTableCell = (raw: string): string =>
-  sanitizeForPromptLine(raw).replace(/\|/g, '\\|');
+  sanitizeForPromptLine(raw).replace(/[\\|]/g, '\\$&');

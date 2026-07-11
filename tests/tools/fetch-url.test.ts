@@ -36,6 +36,14 @@ const confirm = (reason: string): Decision => ({
   reason,
 });
 
+// The redirect re-gate hands permissionCheck the target's fully-serialized
+// URL; a host-scoped stub must match on the parsed hostname, not a substring
+// of the whole URL. `String(url).includes('other.com')` is bypassable — a
+// hostile host can carry the allowed name in its path or query — which is why
+// CodeQL flags it (js/incomplete-url-substring-sanitization). Parsing the host
+// mirrors the tool's own re-gate (fetch-url.ts keys on `hopUrl.hostname`).
+const hostOf = (url: unknown): string => new URL(String(url)).hostname;
+
 // Default DNS stub: every host resolves to one public IP (passes the SSRF
 // blocklist). Tests exercising the rebinding refusal override lookupImpl.
 const okLookup = async (): Promise<{ address: string; family: number }[]> => [
@@ -140,7 +148,7 @@ describe('fetch_url', () => {
     });
     const ctx = makeCtx({
       permissionCheck: (_t, _c, args): Decision =>
-        String(args.url).includes('other.com') ? confirm('unknown host') : allow(),
+        hostOf(args.url) === 'other.com' ? confirm('unknown host') : allow(),
     });
     const r = await tool.execute({ url: 'https://start.com/p' }, ctx);
     expect(isToolError(r) && r.error_code).toBe('fetch.policy_denied');
@@ -164,7 +172,7 @@ describe('fetch_url', () => {
     });
     const ctx = makeCtx({
       permissionCheck: (_t, _c, args): Decision =>
-        String(args.url).includes('169.254') ? deny('SSRF blocklist') : allow(),
+        hostOf(args.url) === '169.254.169.254' ? deny('SSRF blocklist') : allow(),
     });
     const r = await tool.execute({ url: 'https://start.com/p' }, ctx);
     expect(isToolError(r) && r.error_code).toBe('fetch.policy_denied');

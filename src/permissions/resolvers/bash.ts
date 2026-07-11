@@ -1195,7 +1195,13 @@ const sedScriptReadOnly = (script: string): boolean => {
     return /^[gpiImM0-9]*$/.test(s.slice(i));
   }
   // Plain command (address + p/P/d/D/q/l/n/N/=), or /regex/ + print/delete.
-  return /^[0-9,$ ]*[pPdDqlnN=]$/.test(s) || /^\/(?:\\.|[^/\n])*\/[pPdD=]?$/.test(s);
+  // The `/regex/` arm's negated class excludes the backslash (`[^/\n\\]`, not
+  // `[^/\n]`) so a `\` is matched ONLY by the `\\.` escape arm. With `\` in both
+  // arms it was ambiguous, and a long run of `\x` pairs with no closing
+  // delimiter drove exponential backtracking (js/redos, CWE-1333). Excluding it
+  // makes the automaton deterministic — and is also more correct, treating `\/`
+  // as an escaped delimiter instead of a real close.
+  return /^[0-9,$ ]*[pPdDqlnN=]$/.test(s) || /^\/(?:\\.|[^/\n\\])*\/[pPdD=]?$/.test(s);
 };
 
 // Locate the sed in-place flag (`-i`) in ANY spelling and report its form:

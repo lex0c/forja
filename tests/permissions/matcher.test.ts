@@ -9,6 +9,7 @@ import {
   matchHost,
   matchPath,
 } from '../../src/permissions/matcher.ts';
+import { DEFAULT_TRUSTED_HOSTS } from '../../src/permissions/risk-score.ts';
 
 const CWD = '/proj';
 
@@ -256,6 +257,23 @@ describe('matchHost', () => {
   test('glob pattern for subdomains', () => {
     expect(matchHost('*.internal', 'api.internal')).toBe(true);
     expect(matchHost('*.internal', 'api.public.com')).toBe(false);
+  });
+
+  test('a hostname dot is matched literally, never as a regex wildcard', () => {
+    // Regression guard for js/incomplete-hostname-regexp: a trusted-host
+    // allowlist whose `.` compiled to "any char" would let
+    // `registry.yarnpkg.com` match `registryXyarnpkgYcom`. compileGlobToRegex
+    // escapes regex metacharacters, so every default matches ONLY itself —
+    // this fails loudly if `.` is ever dropped from REGEX_META.
+    for (const host of DEFAULT_TRUSTED_HOSTS) {
+      expect(matchHost(host, host)).toBe(true); // the exact host matches
+      expect(matchHost(host, host.replace(/\./g, 'X'))).toBe(false); // dots aren't wildcards
+    }
+    // Anchored at both ends — no prefix/suffix bypass.
+    expect(matchHost('github.com', 'notgithub.com')).toBe(false);
+    expect(matchHost('pypi.org', 'pypi.org.evil.com')).toBe(false);
+    // The literal-dot rule holds inside a wildcard pattern too.
+    expect(matchHost('*.corp.internal', 'fooXcorpYinternal')).toBe(false);
   });
 });
 

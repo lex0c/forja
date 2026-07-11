@@ -120,4 +120,13 @@ describe('sanitizeForTableCell', () => {
     expect(sanitizeForTableCell('gate diff before merge')).toBe('gate diff before merge');
     expect(sanitizeForTableCell('use `code-review`')).toBe('use `code-review`');
   });
+
+  test('escapes the backslash too, so `\\|` cannot smuggle an unescaped column', () => {
+    const BS = '\\'; // one literal backslash — avoids counting source escapes
+    // A lone backslash is doubled.
+    expect(sanitizeForTableCell(`a${BS}b`)).toBe(`a${BS}${BS}b`);
+    // Backslash-before-pipe → `\\` then `\|` (a literal backslash then a literal
+    // pipe), never `\` + an unescaped `|` that would open a fresh column.
+    expect(sanitizeForTableCell(`a${BS}|b`)).toBe(`a${BS}${BS}${BS}|b`);
+  });
 });

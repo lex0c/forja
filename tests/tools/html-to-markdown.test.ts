@@ -31,10 +31,35 @@ describe('htmlToMarkdown', () => {
     expect(md).toContain('[here](https://x.com/a?b=1&c=2)');
   });
 
-  test('javascript: links are not linkified', async () => {
-    const md = await htmlToMarkdown('<a href="javascript:alert(1)">click</a>');
-    expect(md).toContain('click');
-    expect(md).not.toContain('](javascript:');
+  test('unsafe-scheme links (javascript:/data:/vbscript:) are not linkified', async () => {
+    for (const href of [
+      'javascript:alert(1)',
+      'data:text/html,<script>alert(1)</script>',
+      'vbscript:msgbox(1)',
+      // Bypasses a browser would still execute — mixed case, a leading space,
+      // and an embedded tab — must be neutralized by the same normalization.
+      'JavaScript:alert(1)',
+      '  data:text/html,x',
+      'java\tscript:alert(1)',
+    ]) {
+      const md = await htmlToMarkdown(`<a href="${href}">click</a>`);
+      expect(md).toContain('click'); // the label text survives
+      expect(md).not.toContain(']('); // …but it is never emitted as a link
+    }
+  });
+
+  test('images render as markdown; an unsafe/data src falls back to alt text', async () => {
+    // A normal image round-trips to markdown.
+    expect(await htmlToMarkdown('<img src="https://x.com/a.png" alt="pic">')).toContain(
+      '![pic](https://x.com/a.png)',
+    );
+    // javascript:/data: srcs never reach the output as an image target; the
+    // alt text is kept instead.
+    for (const src of ['javascript:alert(1)', 'data:text/html,<script>x</script>']) {
+      const md = await htmlToMarkdown(`<img src="${src}" alt="safe label">`);
+      expect(md).toContain('safe label');
+      expect(md).not.toContain('](');
+    }
   });
 
   test('nested unordered + ordered lists are tight', async () => {
@@ -65,6 +90,18 @@ describe('htmlToMarkdown', () => {
     expect(md).toContain('| A | B |');
     expect(md).toContain('| --- | --- |');
     expect(md).toContain('| 1 | 2 |');
+  });
+
+  test('table cells escape both pipe and backslash so a row cannot break (GFM)', async () => {
+    const BS = '\\'; // a single literal backslash — avoids counting source escapes
+    const md = await htmlToMarkdown(
+      `<table><tr><th>a|b</th></tr><tr><td>x${BS}|y</td></tr></table>`,
+    );
+    // The pipe is escaped so it is not read as a column delimiter…
+    expect(md).toContain(`a${BS}|b`);
+    // …and a literal backslash-before-pipe is FULLY escaped (\\ then \|), not
+    // left as `\` + an unescaped `|` that would split the row into two columns.
+    expect(md).toContain(`x${BS}${BS}${BS}|y`);
   });
 
   test('script/style content is dropped, never leaked', async () => {
