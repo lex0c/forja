@@ -150,7 +150,8 @@ jobs:
   # post-build smoke can only exec the one target matching its host
   # (ubuntu-x64); the other four are cross-compiled and never actually
   # run until a user installs them. This matrix downloads the
-  # already-built binaries and EXECUTES each on a matching runner —
+  # already-built binaries and EXECUTES each on a matching runner
+  # (except darwin-x64 — see the matrix note below) —
   # catching a binary that links but won't boot on its target platform
   # (syscall/runtime/path regressions a cross-compile can't surface).
   # Build stays single-runner (Bun cross-compile); only EXECUTION fans
@@ -165,7 +166,16 @@ jobs:
         include:
           - { target: linux-x64, os: ubuntu-latest }
           - { target: linux-arm64, os: ubuntu-24.04-arm }
-          - { target: darwin-x64, os: macos-13 }
+          # darwin-x64 is deliberately NOT exec-checked: GitHub retired
+          # the macos-13 (Intel) hosted runner and macos-latest is Apple
+          # Silicon, so there is no native x64 macOS runner to boot it on
+          # (a macos-13 request now queues forever, wedging publish). The
+          # binary still builds, is size-gated, attested, and shipped — it
+          # is simply not exec-verified on native hardware here. Declared
+          # measurement gap: the darwin-arm64 leg below covers the macOS
+          # runtime path, and x64 users get the same compiled artifact.
+          # Re-add a leg (native, or under Rosetta on macos-14) if a
+          # native x64 macOS runner returns.
           - { target: darwin-arm64, os: macos-14 }
           - { target: windows-x64, os: windows-latest }
     runs-on: ${{ matrix.os }}
