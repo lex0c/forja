@@ -11,9 +11,9 @@ import type { GenerateRequest, ProviderMessage, StreamEvent } from '../../src/pr
 //     bun test tests/providers/openrouter-integration.test.ts
 //
 // Override the model with FORJA_OPENROUTER_INTEGRATION_MODEL (default
-// deepseek/deepseek-v3.2 — cheap, native tools, reasoning-capable).
+// deepseek/deepseek-v4-flash — cheap, native tools, reasoning-capable).
 const KEY = process.env.OPENROUTER_API_KEY;
-const MODEL = process.env.FORJA_OPENROUTER_INTEGRATION_MODEL ?? 'deepseek/deepseek-v3.2';
+const MODEL = process.env.FORJA_OPENROUTER_INTEGRATION_MODEL ?? 'deepseek/deepseek-v4-flash';
 // Both the opt-in flag AND a key are required — skip (not fail) when either is
 // absent, so a flag set without a key doesn't throw at factory time.
 const RUN = process.env.FORJA_OPENROUTER_INTEGRATION === '1' && KEY !== undefined && KEY.length > 0;

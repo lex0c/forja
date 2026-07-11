@@ -89,7 +89,7 @@ seeded models:
 | **google** | `gemini-3.5-flash`, `gemini-3.1-pro-preview`, `gemini-3.1-flash-lite`, `gemini-3-flash-preview`, `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite` |
 | **ollama** (local) | `qwen2.5-coder:7b/14b`, `qwen3:8b/14b`, `llama3.1:8b`, `mistral-nemo:12b`, `gpt-oss:20b` — all native tool calling, `$0` |
 | **ollama** (cloud) | `glm-5.2`, `qwen3-coder:480b`, `qwen3-coder-next`, `devstral-2:123b` — hosted on `ollama.com`, seeded with `base_url` + `api_key_env`; need `OLLAMA_API_KEY` (see § Ollama — cloud) |
-| **openrouter** (gateway) | `deepseek/deepseek-v3.2`, `deepseek/deepseek-r1`, `qwen/qwen3-coder-plus`, `x-ai/grok-4.3`, `z-ai/glm-4.6`, `moonshotai/kimi-k2-thinking`, `meta-llama/llama-3.3-70b-instruct` — models not reachable as a first-class family; ids are `openrouter/<vendor>/<model>` (two slashes) |
+| **openrouter** (gateway) | `deepseek/deepseek-v4-flash`, `deepseek/deepseek-v4-pro`, `minimax/minimax-m3`, `z-ai/glm-5.2`, `moonshotai/kimi-k2.6`, `qwen/qwen3.6-plus`, `x-ai/grok-4.5`, `tencent/hy3:free` — models not reachable as a first-class family; ids are `openrouter/<vendor>/<model>` (two slashes) |
 
 To add, remove, or adjust a model, edit the file (§2.1) — no recompile. The
 registry test (`tests/providers/registry.test.ts`) asserts every seeded model
@@ -126,7 +126,7 @@ Each entry:
   (`anthropic`, `openai`, `ollama`, `google`, `openrouter`); the file registers
   *models*, not new adapters (those are a code change — §8). For `openrouter` the
   `model_name` itself is `<vendor>/<model>`, so the id carries two slashes
-  (`openrouter/deepseek/deepseek-v3.2`).
+  (`openrouter/deepseek/deepseek-v4-flash`).
 - **`model_name`** — what the underlying SDK / HTTP API sees.
 - **`api_key_env`** — the env var that holds the API key (never the key itself).
   It is **authoritative**: the cloud adapters have no env fallback of their own,
@@ -231,12 +231,12 @@ provider.
 #### OpenRouter — one key, many models
 
 A gateway: a single `OPENROUTER_API_KEY` reaches models Forja does not ship
-first-class (DeepSeek, Qwen-Coder, Grok, GLM, Kimi, Llama). Set the key and select
-a seeded model — the id carries the vendor, so it has **two slashes**:
+first-class (DeepSeek V4, MiniMax, GLM, Kimi, Qwen, Grok, Tencent). Set the key
+and select a seeded model — the id carries the vendor, so it has **two slashes**:
 
 ```sh
 export OPENROUTER_API_KEY=sk-or-...
-forja --model openrouter/deepseek/deepseek-v3.2
+forja --model openrouter/deepseek/deepseek-v4-flash
 ```
 
 Any other OpenRouter model works via a catalog entry (§2.1) with

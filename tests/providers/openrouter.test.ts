@@ -7,6 +7,7 @@ import type { RawORChunk } from '../../src/providers/openrouter/stream.ts';
 import type {
   ConstrainedRequest,
   GenerateRequest,
+  ProviderCapabilities,
   ProviderMessage,
   StreamEvent,
 } from '../../src/providers/types.ts';
@@ -45,14 +46,14 @@ const collect = async (it: AsyncIterable<StreamEvent>): Promise<StreamEvent[]> =
 };
 
 const reqGen = (over: Partial<GenerateRequest>): GenerateRequest => ({
-  model: 'deepseek/deepseek-v3.2',
+  model: 'deepseek/deepseek-v4-flash',
   messages: [],
   max_tokens: 512,
   ...over,
 });
 
 const reqCon = (over: Partial<ConstrainedRequest>): ConstrainedRequest => ({
-  model: 'deepseek/deepseek-v3.2',
+  model: 'deepseek/deepseek-v4-flash',
   messages: [],
   max_tokens: 512,
   output_schema: { type: 'object' },
@@ -76,34 +77,36 @@ describe('createOpenRouterProvider', () => {
   });
 
   test('throws without an api key or client', () => {
-    expect(() => createOpenRouterProvider('deepseek/deepseek-v3.2')).toThrow(/API key required/);
+    expect(() => createOpenRouterProvider('deepseek/deepseek-v4-flash')).toThrow(
+      /API key required/,
+    );
   });
 
   test('id carries two slashes; family + native tools', () => {
-    const p = createOpenRouterProvider('deepseek/deepseek-v3.2', { client: makeClient({}) });
-    expect(p.id).toBe('openrouter/deepseek/deepseek-v3.2');
+    const p = createOpenRouterProvider('deepseek/deepseek-v4-flash', { client: makeClient({}) });
+    expect(p.id).toBe('openrouter/deepseek/deepseek-v4-flash');
     expect(p.family).toBe('openrouter');
     expect(p.capabilities.tools).toBe('native');
   });
 
   test('costs are per-million tokens (guards the $/1k → $/1M unit)', () => {
-    const caps = OPENROUTER_CAPS['deepseek/deepseek-v3.2'];
+    const caps = OPENROUTER_CAPS['deepseek/deepseek-v4-flash'];
     expect(caps).toBeDefined();
     if (caps === undefined) return;
-    // 1M input tokens should cost the headline input rate ($0.2288), not 1000× less.
+    // 1M input tokens should cost the headline input rate ($0.077), not 1000× less.
     const cost = computeCost(caps, {
       input: 1_000_000,
       output: 0,
       cache_read: 0,
       cache_creation: 0,
     });
-    expect(cost).toBeCloseTo(0.2288, 4);
+    expect(cost).toBeCloseTo(0.077, 4);
   });
 
   test('generate body: stream + max_tokens + transforms:[] + reasoning + usage:{include}, no stream_options', async () => {
     let body: Body = {};
-    // grok-4.3 is the effort-capable model, so reasoning.effort is emitted.
-    const p = createOpenRouterProvider('x-ai/grok-4.3', {
+    // grok-4.5 is an effort-capable model, so reasoning.effort is emitted.
+    const p = createOpenRouterProvider('x-ai/grok-4.5', {
       client: makeClient({
         chunks: textChunks,
         onBody: (b) => {
@@ -115,7 +118,7 @@ describe('createOpenRouterProvider', () => {
       p.generate(reqGen({ effort: 'high', messages: [{ role: 'user', content: 'hi' }] })),
     );
     expect(ev.map((e) => e.kind)).toEqual(['start', 'text_delta', 'usage', 'stop']);
-    expect(body.model).toBe('x-ai/grok-4.3');
+    expect(body.model).toBe('x-ai/grok-4.5');
     expect(body.stream).toBe(true);
     expect(body.max_tokens).toBe(512);
     expect(body.transforms).toEqual([]);
@@ -127,7 +130,7 @@ describe('createOpenRouterProvider', () => {
 
   test('reasoning-only assistant turn is dropped (invalid OpenAI-shape message)', async () => {
     let body: Body = {};
-    const p = createOpenRouterProvider('deepseek/deepseek-v3.2', {
+    const p = createOpenRouterProvider('deepseek/deepseek-v4-flash', {
       client: makeClient({
         chunks: textChunks,
         onBody: (b) => {
@@ -152,7 +155,23 @@ describe('createOpenRouterProvider', () => {
 
   test('reasoning omitted on a non-reasoning model even with effort', async () => {
     let body: Body = {};
-    const p = createOpenRouterProvider('meta-llama/llama-3.3-70b-instruct', {
+    // No shipped OpenRouter model lacks reasoning now, so assert the adapter's
+    // gating with an explicit non-reasoning capability override (no
+    // supports_reasoning / supports_reasoning_effort ⇒ buildReasoningParam omits it).
+    const nonReasoning: ProviderCapabilities = {
+      tools: 'native',
+      cache: false,
+      vision: false,
+      streaming: true,
+      constrained: 'tools',
+      context_window: 131_072,
+      output_max_tokens: 16_384,
+      cost_per_1k_input: 0.1,
+      cost_per_1k_output: 0.3,
+      notes: ['synthetic non-reasoning model for the reasoning-gating test'],
+    };
+    const p = createOpenRouterProvider('some-vendor/non-reasoning-model', {
+      capabilities: nonReasoning,
       client: makeClient({
         chunks: textChunks,
         onBody: (b) => {
@@ -168,7 +187,7 @@ describe('createOpenRouterProvider', () => {
 
   test('forwards tools (OpenAI-shape)', async () => {
     let body: Body = {};
-    const p = createOpenRouterProvider('deepseek/deepseek-v3.2', {
+    const p = createOpenRouterProvider('deepseek/deepseek-v4-flash', {
       client: makeClient({
         chunks: textChunks,
         onBody: (b) => {
@@ -193,7 +212,7 @@ describe('createOpenRouterProvider', () => {
 
   test('explicit-cache model (qwen) sends system as blocks with cache_control on breakpoints', async () => {
     let body: Body = {};
-    const p = createOpenRouterProvider('qwen/qwen3-coder-plus', {
+    const p = createOpenRouterProvider('qwen/qwen3.6-plus', {
       client: makeClient({
         chunks: textChunks,
         onBody: (b) => {
@@ -230,7 +249,7 @@ describe('createOpenRouterProvider', () => {
 
   test('non-explicit-cache model keeps a flat string system (no cache_control)', async () => {
     let body: Body = {};
-    const p = createOpenRouterProvider('deepseek/deepseek-v3.2', {
+    const p = createOpenRouterProvider('deepseek/deepseek-v4-flash', {
       client: makeClient({
         chunks: textChunks,
         onBody: (b) => {
@@ -252,7 +271,7 @@ describe('createOpenRouterProvider', () => {
 
   test('grok (effort-capable): thinking_budget 0 disables reasoning via effort:none', async () => {
     let body: Body = {};
-    const p = createOpenRouterProvider('x-ai/grok-4.3', {
+    const p = createOpenRouterProvider('x-ai/grok-4.5', {
       client: makeClient({
         chunks: textChunks,
         onBody: (b) => {
@@ -266,10 +285,10 @@ describe('createOpenRouterProvider', () => {
     expect(body.reasoning).toEqual({ effort: 'none' });
   });
 
-  test('reasoning model without effort levels (deepseek-v3.2) toggles via reasoning.enabled', async () => {
+  test('reasoning model without effort levels (minimax-m3) toggles via reasoning.enabled', async () => {
     const run = async (over: Partial<GenerateRequest>): Promise<Body> => {
       let body: Body = {};
-      const p = createOpenRouterProvider('deepseek/deepseek-v3.2', {
+      const p = createOpenRouterProvider('minimax/minimax-m3', {
         client: makeClient({
           chunks: textChunks,
           onBody: (b) => {
@@ -287,7 +306,7 @@ describe('createOpenRouterProvider', () => {
 
   test('reasoning_details replay: round-trips the captured block onto the assistant message', async () => {
     let body: Body = {};
-    const p = createOpenRouterProvider('deepseek/deepseek-v3.2', {
+    const p = createOpenRouterProvider('deepseek/deepseek-v4-flash', {
       client: makeClient({
         chunks: textChunks,
         onBody: (b) => {
@@ -315,7 +334,7 @@ describe('createOpenRouterProvider', () => {
 
   test('plaintext reasoning replay: round-trips via the assistant `reasoning` field', async () => {
     let body: Body = {};
-    const p = createOpenRouterProvider('deepseek/deepseek-v3.2', {
+    const p = createOpenRouterProvider('deepseek/deepseek-v4-flash', {
       client: makeClient({
         chunks: textChunks,
         onBody: (b) => {
@@ -345,7 +364,7 @@ describe('createOpenRouterProvider', () => {
     process.env.FORJA_OPENROUTER_REASONING_REPLAY = '0';
     try {
       let body: Body = {};
-      const p = createOpenRouterProvider('deepseek/deepseek-v3.2', {
+      const p = createOpenRouterProvider('deepseek/deepseek-v4-flash', {
         client: makeClient({
           chunks: textChunks,
           onBody: (b) => {
@@ -380,7 +399,7 @@ describe('createOpenRouterProvider', () => {
 
   test('generateConstrained forces a schema tool and returns output + usage', async () => {
     let body: Body = {};
-    const p = createOpenRouterProvider('deepseek/deepseek-v3.2', {
+    const p = createOpenRouterProvider('deepseek/deepseek-v4-flash', {
       client: makeClient({
         onBody: (b) => {
           body = b;
@@ -405,7 +424,7 @@ describe('createOpenRouterProvider', () => {
   });
 
   test('generateConstrained rejects caller tools', async () => {
-    const p = createOpenRouterProvider('deepseek/deepseek-v3.2', { client: makeClient({}) });
+    const p = createOpenRouterProvider('deepseek/deepseek-v4-flash', { client: makeClient({}) });
     await expect(
       p.generateConstrained(
         reqCon({ tools: [{ name: 't', description: 'd', input_schema: { type: 'object' } }] }),
@@ -414,7 +433,7 @@ describe('createOpenRouterProvider', () => {
   });
 
   test('countTokens returns a positive estimate', async () => {
-    const p = createOpenRouterProvider('deepseek/deepseek-v3.2', { client: makeClient({}) });
+    const p = createOpenRouterProvider('deepseek/deepseek-v4-flash', { client: makeClient({}) });
     const n = await p.countTokens([{ role: 'user', content: 'hello world this is a test' }]);
     expect(n).toBeGreaterThan(0);
   });

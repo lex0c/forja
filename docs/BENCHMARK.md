@@ -181,7 +181,7 @@ reader.
 bun run scripts/swe-bench-run.ts --models ollama/devstral-2:123b --tier 1 --limit 1
 
 # The full corpus against one or more models
-bun run scripts/swe-bench-run.ts --models ollama/devstral-2:123b,openrouter/deepseek/deepseek-r1
+bun run scripts/swe-bench-run.ts --models ollama/devstral-2:123b,openrouter/deepseek/deepseek-v4-flash
 
 # Filters: --tier N · --limit N · --id <sha> · --max-steps N · --timeout MS · --no-build
 ```
