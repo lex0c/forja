@@ -230,6 +230,18 @@ const INLINE_TAGS = new Set([
 
 const collapseWs = (s: string): string => s.replace(/\s+/g, ' ');
 
+// URL schemes that can smuggle executable code into a rendered link or image
+// — `javascript:`, `data:`, `vbscript:` (CWE-184). Before testing the scheme
+// we normalize the way a URL parser would: strip control chars + whitespace
+// (so `java\tscript:`, ` data:`, or a decoded `&#1;javascript:` can't slip
+// past a naive prefix match) and lowercase. Matching only `javascript:` — the
+// prior check — left `data:text/html,<script>…` and `vbscript:` open.
+const UNSAFE_URL_SCHEMES = ['javascript:', 'data:', 'vbscript:'] as const;
+const hasUnsafeScheme = (url: string): boolean => {
+  const normalized = url.replace(/[\p{Cc}\s]/gu, '').toLowerCase();
+  return UNSAFE_URL_SCHEMES.some((scheme) => normalized.startsWith(scheme));
+};
+
 // Wrap an inline frame's buffer per its tag once it closes.
 const wrapInline = (frame: Frame): string => {
   const text = frame.buf;
@@ -238,7 +250,7 @@ const wrapInline = (frame: Frame): string => {
     case 'a': {
       const href = frame.attrs.href ?? '';
       const label = empty ? href : text;
-      if (href.length === 0 || href.startsWith('javascript:')) return text;
+      if (href.length === 0 || hasUnsafeScheme(href)) return text;
       return `[${label}](${href})`;
     }
     case 'strong':
@@ -402,8 +414,11 @@ const walk = (tokens: Token[], title: string): string => {
       if (tag === 'img') {
         const src = t.attrs.src ?? '';
         const alt = t.attrs.alt ?? '';
-        if (src.length > 0) top().buf += `![${alt}](${src})`;
-        else if (alt.length > 0) top().buf += alt; // keep alt text when src is absent
+        // Drop an unsafe-scheme src (javascript:/data:/vbscript:) the same way
+        // links do — a `data:` blob is also pure token noise for the model, so
+        // falling back to alt text is doubly correct.
+        if (src.length > 0 && !hasUnsafeScheme(src)) top().buf += `![${alt}](${src})`;
+        else if (alt.length > 0) top().buf += alt; // keep alt text when src is absent/unsafe
         continue;
       }
       if (HEADINGS.has(tag)) {
