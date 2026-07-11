@@ -288,6 +288,22 @@ const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 // live-region redraw being observable in `rendererWrite` captures.
 const flushFrame = (): Promise<void> => new Promise((r) => setTimeout(r, 50));
 
+// Poll until `predicate()` holds, or fail after `timeoutMs`. Use instead of a
+// fixed `flushFrame` wait when the asserted end-state is a frame-scheduler
+// redraw (~33ms): under full-suite CPU load the frame timer and a fixed wait
+// both slip, so a frame-gated change (e.g. the footer's owed-reply chip
+// clearing) can land AFTER the window and flake. Polling waits exactly as long
+// as the redraw needs — normally ~one frame, capped well below any hang.
+const waitUntil = async (predicate: () => boolean, timeoutMs = 2000): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) {
+      throw new Error(`waitUntil: condition not met within ${timeoutMs}ms`);
+    }
+    await new Promise((r) => setTimeout(r, 5));
+  }
+};
+
 // A mesh manager stub for REPL wiring tests — every method/prop the REPL touches
 // (onMessage/setStatus/isServing/shutdown) is a no-op by default; a test
 // overrides just the hooks it asserts on. Keeping them all here means adding a
@@ -2109,18 +2125,35 @@ describe('repl — boot + smoke', () => {
     await tick();
     (fire as unknown as PeerCb)({ peerAlias: 'gateway', text: 'inspect' });
     await tick();
-    await flushFrame();
+    // The "awaiting reply" chip is a frame-scheduler redraw — poll for it rather
+    // than racing a fixed wait against the scheduler under load.
+    await waitUntil(
+      () =>
+        ra.captured.length === 2 &&
+        statuses.includes('working') &&
+        writes.join('').includes('awaiting reply'),
+    );
     expect(ra.captured).toHaveLength(2);
     expect(statuses).toContain('working');
     expect(writes.join('')).toContain('awaiting reply'); // owed while the turn ran
     // The peer turn rejects before emitting session_finished (provider crash).
     writes.length = 0;
     ra.reject(1, new Error('provider exploded'));
-    await flushFrame();
     // No mesh hang: the crashed turn's peer message was spliced + never committed (it
     // is lost, not recoverable), so the instance republishes idle (no conversation to
     // fail) AND settles the owed-reply debt — there is nothing left to reply to, so the
     // footer chip must clear rather than stick on a lost message.
+    //
+    // Both effects are frame-gated (the idle republish is synchronous, but the footer
+    // redraw that drops the chip rides the scheduler), so poll for the full end-state.
+    await waitUntil(() => {
+      const frames = writes.filter((w) => w.includes('mode on'));
+      return (
+        statuses[statuses.length - 1] === 'idle' &&
+        frames.length > 0 &&
+        !(frames[frames.length - 1] ?? '').includes('awaiting reply')
+      );
+    });
     expect(statuses[statuses.length - 1]).toBe('idle');
     const footerFrames = writes.filter((w) => w.includes('mode on'));
     expect(footerFrames.length).toBeGreaterThan(0);
