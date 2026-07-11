@@ -1,9 +1,24 @@
 name: CI
 
+# Docs-only changes skip the whole pipeline: nothing here
+# (typecheck / lint / test / dependency audit / cross-platform build)
+# inspects Markdown, so a `**.md`-only diff has no signal to gate.
+# `paths-ignore` skips the run only when EVERY changed file matches —
+# any non-`.md` file present still triggers the full pipeline.
+#
+# CAVEAT: if these jobs are configured as *required* status checks in
+# branch protection, a skipped workflow never reports a status and a
+# docs-only PR stays stuck "pending". If that bites, switch to a
+# job-level `if:` on a changed-files detection job (a skipped required
+# job counts as passing, a non-running workflow does not).
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md'
   pull_request:
+    paths-ignore:
+      - '**.md'
 
 concurrency:
   group: ci-${{ github.ref }}
