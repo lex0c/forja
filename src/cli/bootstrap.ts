@@ -19,6 +19,7 @@ import {
   loadProvidersConfig,
   loadRecapConfig,
   loadSandboxConfig,
+  loadUpdateConfig,
   loadVerifyConfig,
 } from '../config/loaders.ts';
 import { persistModelPin } from '../config/writer.ts';
@@ -156,6 +157,9 @@ export interface BootstrapInput {
   // `--no-recap` global flag: forces `recapEnabled=false` regardless
   // of `[recap].enabled` config.
   noRecap?: boolean;
+  // `--no-update-check` global flag: forces the passive update-available
+  // notice (§11.4) off regardless of `[update].check`.
+  noUpdateCheck?: boolean;
   cwd?: string;
   budget?: Partial<RunBudget>;
   signal?: AbortSignal;
@@ -608,6 +612,11 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // + `enabled` master switch. CLI `--no-recap` overrides config to
   // off; otherwise project [recap] wins over user, then default-on.
   const recapLoaded = loadRecapConfig({ cwd: projectConfigCwd, registry });
+
+  // [update] config — passive update-available notice (§11.4): `check`
+  // (opt-in, default off) + `interval` (throttle). CLI `--no-update-check`
+  // overrides to off.
+  const updateLoaded = loadUpdateConfig({ cwd: projectConfigCwd });
 
   // Slice Q — invert S11/S13 LLM-judge default to ON. The loader
   // walks the same `.forja/config.toml` + `~/.config/forja/config.toml`
@@ -1880,6 +1889,16 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
         : {}),
     ...(recapLoaded.config.renderModel !== undefined
       ? { recapRenderModel: recapLoaded.config.renderModel }
+      : {}),
+    // [update] — `--no-update-check` forces off; else config `check`; else
+    // absent (the boot path treats undefined as off — opt-in default, §11.4).
+    ...(input.noUpdateCheck === true
+      ? { updateCheckEnabled: false }
+      : updateLoaded.config.check !== undefined
+        ? { updateCheckEnabled: updateLoaded.config.check }
+        : {}),
+    ...(updateLoaded.config.intervalMs !== undefined
+      ? { updateIntervalMs: updateLoaded.config.intervalMs }
       : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     // Slice Q — resolved state (always boolean, never undefined).

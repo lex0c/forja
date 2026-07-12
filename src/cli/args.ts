@@ -27,6 +27,9 @@ export interface ParsedArgs {
   // (suppresses session-end/Alt+R auto-display, resume
   // auto-rehydrate, and forces deterministic `/recap` render).
   noRecap?: boolean;
+  // `--no-update-check`: disable the passive update-available notice
+  // for this run (SECURITY_GUIDELINE §11.4).
+  noUpdateCheck?: boolean;
   // List-sessions mode (AGENTIC_CLI §2.1): print known sessions
   // (newest first) and exit. Honors --json for headless consumers.
   listSessions: boolean;
@@ -721,6 +724,13 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
       // Leaving it in `recapArgs` would surface it as an unknown
       // flag in the slash-side parser.
       noRecap = true;
+      i += 1;
+      continue;
+    }
+    if (token === '--no-update-check') {
+      // Parity with --no-recap: consume it here so the slash-side parser
+      // doesn't surface it as an unknown flag. `forja recap` is headless and
+      // never shows the passive notice, so this is a no-op beyond consumption.
       i += 1;
       continue;
     }
@@ -1677,6 +1687,10 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         args.noRecap = true;
         i += 1;
         break;
+      case '--no-update-check':
+        args.noUpdateCheck = true;
+        i += 1;
+        break;
       case '--list-sessions':
         args.listSessions = true;
         i += 1;
@@ -2320,6 +2334,7 @@ export const usage = (): string =>
     '                         so a dev build never migrates or pollutes your real Forja state. Also via FORJA_PROFILE env. Name: [a-z0-9][a-z0-9-]*',
     '  --autonomous           Start in Autonomous mode: auto-approve routine confirms (Shift+Tab toggles)',
     '  --no-recap             Disable recap for this run: no session-end/Alt+R auto-display, no resume rehydrate, deterministic /recap render',
+    '  --no-update-check      Disable the passive "update available" notice for this run (SECURITY_GUIDELINE §11.4)',
     '  --list-sessions        Print known sessions (newest first) and exit',
     '  --include-subagents    With --list-sessions, fan parents into their subagent children (requires --list-sessions)',
     '  --limit <n>            With --list-sessions, cap rows returned (default 20; requires --list-sessions)',

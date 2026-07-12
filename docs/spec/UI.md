@@ -151,7 +151,7 @@ Implementação: `EventEmitter` nativo do Node/Bun. Não usar `mitt` ou similar 
 | `bg:start/update/end` | Background process | atualiza tray na status line |
 | `step:budget` | Budget warning (80%, 90%) | status line muda cor (dim → bold) |
 | `checkpoint:create` | Novo checkpoint | breve flash na status line (1s) |
-| `update:available` | Cache local (`SECURITY_GUIDELINE` §11.4) indica release mais nova — boot, REPL only | linha permanente discreta após o banner, tom `info`/`accent` (§4.10.9), **não** `warn`; NDJSON serializa o evento, one-shot/`--json`/CI não exibem inline |
+| `update:available` | Cache local (`SECURITY_GUIDELINE` §11.4) indica release mais nova — boot, REPL only | linha permanente discreta após o banner, tom `info`/`accent` (§4.10.9), **não** `warn`; **REPL-only** — não chega ao NDJSON (`--json`/CI/one-shot são recusados antes do REPL, e o serializer NDJSON emite `HarnessEvent`, não `UIEvent`) |
 | `error` | Erro fatal | linha vermelha permanente; mantém sessão se possível |
 | `warn` | Aviso não-fatal | linha dim permanente |
 | `interrupt` | Ctrl+C / Esc Esc | mostra prompt de cancelamento |

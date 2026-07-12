@@ -42,6 +42,7 @@ export const operatorBootstrapFlags = (args: ParsedArgs): Partial<BootstrapInput
   // and `persistModelPin` compares before writing (no churn on repeats).
   ...(args.model !== undefined ? { modelId: args.model, persistModelPin: true } : {}),
   ...(args.noRecap === true ? { noRecap: true } : {}),
+  ...(args.noUpdateCheck === true ? { noUpdateCheck: true } : {}),
   ...(args.maxSteps !== undefined ? { budget: { maxSteps: args.maxSteps } } : {}),
   ...(args.acceptBrokenChain === true ? { acceptBrokenChain: true } : {}),
   ...(args.sandboxHost === true ? { sandboxHost: true } : {}),

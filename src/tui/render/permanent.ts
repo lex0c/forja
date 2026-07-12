@@ -561,6 +561,16 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       const body = paint(caps, 'secondary', ` ${item.message}`);
       return ['', `${prefix}${body}`].map(padFrame);
     }
+    case 'update-available': {
+      // Passive update notice (SECURITY_GUIDELINE §11.4 / UI §4.10.9): a
+      // good-to-know accent line after the banner, NOT the warn channel — this
+      // isn't a problem, it's convenience. The new version is painted `accent`
+      // to draw the eye; the rest stays plain. Leading blank so it reads as its
+      // own line rather than part of the banner frame.
+      const head = paint(caps, 'accent', `Forja v${item.latest} available`);
+      const tail = ` (you have v${item.current}) — update with \`forja update\``;
+      return ['', `${head}${tail}`].map(padFrame);
+    }
     case 'subagent_group_header': {
       // `● Subagents` group title over a burst of finishing subagents.
       // Carries the same `●` chip glyph as a tool/subagent head, but at

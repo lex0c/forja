@@ -508,6 +508,7 @@ export const run = async (options: RunOptions): Promise<number> => {
           prompt: '',
           ...(args.model !== undefined ? { modelId: args.model } : {}),
           ...(args.noRecap === true ? { noRecap: true } : {}),
+          ...(args.noUpdateCheck === true ? { noUpdateCheck: true } : {}),
           signal: options.signal ?? new AbortController().signal,
           // Pipe --json through so bootstrap's first-boot governance
           // banner suppresses correctly for `forja recap --json`

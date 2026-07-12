@@ -73,6 +73,10 @@ proactive_inject = ${m.proactiveInject}
 [recap]
 enabled = true
 
+[update]
+check = false
+interval = "24h"
+
 [mesh]
 max_message_bytes = 32768
 `;

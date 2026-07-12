@@ -17,6 +17,7 @@
 // Shared file/parse/section plumbing lives in `src/config/section.ts`
 // (`loadTomlSection`); path resolution in `src/config/paths.ts`.
 
+import { parseTtlMs } from '../audit/config-loader.ts';
 import { FORJA_EFFORT_LEVELS, type ForjaEffort } from '../harness/effort.ts';
 import { sanitizeWritableCacheDirs } from '../permissions/sandbox-cache-dirs.ts';
 import type { ModelRegistry } from '../providers/registry.ts';
@@ -476,6 +477,80 @@ export const loadRecapConfig = (input: LoadRecapConfigInput): LoadedRecapConfig 
   if (resolvedModel !== undefined) config.renderModel = resolvedModel;
   const resolvedEnabled = projectResult.layer.enabled ?? userResult.layer.enabled;
   if (resolvedEnabled !== undefined) config.enabled = resolvedEnabled;
+
+  return { config, userPath, projectPath, warnings };
+};
+
+// ── [update] ────────────────────────────────────────────────────────────────
+// Passive update-available notice (SECURITY_GUIDELINE §11.4): `check` (opt-in
+// boolean; the off default is owned downstream) + `interval` (throttle
+// duration). Project [update] > user [update]. Per-key merge.
+
+export interface UpdateConfigKeys {
+  check?: boolean;
+  intervalMs?: number;
+}
+
+export interface LoadedUpdateConfig {
+  config: UpdateConfigKeys;
+  userPath: string | null;
+  projectPath: string;
+  warnings: string[];
+}
+
+const parseUpdateLayer = (
+  path: string | null,
+  source: string,
+): { layer: UpdateConfigKeys; warnings: string[] } => {
+  const layer: UpdateConfigKeys = {};
+  const warnings: string[] = [];
+  const section = loadTomlSection(path, 'update', source);
+  if (section.kind === 'absent' || section.kind === 'no-section') return { layer, warnings };
+  if (section.kind === 'invalid') {
+    warnings.push(section.warning);
+    return { layer, warnings };
+  }
+  const u = section.section;
+  if (u.check !== undefined) {
+    if (typeof u.check !== 'boolean') {
+      warnings.push(
+        `${source} config (${path}): [update].check must be a boolean (got ${typeof u.check}); ignoring`,
+      );
+    } else {
+      layer.check = u.check;
+    }
+  }
+  if (u.interval !== undefined) {
+    const ms = parseTtlMs(u.interval);
+    if (ms === null) {
+      warnings.push(
+        `${source} config (${path}): [update].interval must be a duration like "24h" or a number of ms; ignoring`,
+      );
+    } else {
+      layer.intervalMs = ms;
+    }
+  }
+  return { layer, warnings };
+};
+
+export interface LoadUpdateConfigInput {
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+}
+
+export const loadUpdateConfig = (input: LoadUpdateConfigInput): LoadedUpdateConfig => {
+  const env = input.env ?? process.env;
+  const userPath = userConfigPath(env);
+  const projectPath = projectConfigPath(input.cwd);
+  const userResult = parseUpdateLayer(userPath, 'user');
+  const projectResult = parseUpdateLayer(projectPath, 'project');
+  const warnings = [...userResult.warnings, ...projectResult.warnings];
+
+  const config: UpdateConfigKeys = {};
+  const resolvedCheck = projectResult.layer.check ?? userResult.layer.check;
+  if (resolvedCheck !== undefined) config.check = resolvedCheck;
+  const resolvedInterval = projectResult.layer.intervalMs ?? userResult.layer.intervalMs;
+  if (resolvedInterval !== undefined) config.intervalMs = resolvedInterval;
 
   return { config, userPath, projectPath, warnings };
 };
