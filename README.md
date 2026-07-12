@@ -6,6 +6,7 @@ What sets Forja apart is the structure surrounding the model. Every action with 
 
 > **Measure twice, cut once.**
 
+**demo**
 ![Forja demo](docs/demo.gif)
 
 ## Get started
