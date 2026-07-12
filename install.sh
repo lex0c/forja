@@ -113,11 +113,19 @@ STEP_LABEL=''
 ui_cursor_hide() { [ "$UI_TTY" -eq 1 ] && printf '\033[?25l' >&2 || true; }
 ui_cursor_show() { [ "$UI_TTY" -eq 1 ] && printf '\033[?25h' >&2 || true; }
 
-# Replace $HOME with ~ for friendlier paths in messages.
+# Replace $HOME with ~ for friendlier paths in messages. Guard HOME: under
+# `set -u` an unset HOME would abort (e.g. a stripped service/container env with
+# an explicit FORJA_PREFIX), and an EMPTY HOME would make the "$HOME"/* pattern
+# match every absolute path — so only shorten when HOME is set and non-empty.
 tilde() {
-  case "$1" in
-    "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;;
-    *) printf '%s' "$1" ;;
+  case "${HOME:-}" in
+    '') printf '%s' "$1" ;;
+    *)
+      case "$1" in
+        "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;;
+        *) printf '%s' "$1" ;;
+      esac
+      ;;
   esac
 }
 

@@ -168,6 +168,34 @@ describe('install.sh — verification chain (plain / non-TTY)', () => {
       rmSync(fx.root, { recursive: true, force: true });
     }
   });
+
+  test('installs cleanly with an explicit prefix when HOME is unset', () => {
+    // Stripped service/container env: no HOME, but FORJA_PREFIX is explicit.
+    // tilde() must not abort under `set -u`, and the Install step must keep the
+    // destination path (regression: bare $HOME in tilde()).
+    const fx = makeFixture(GOOD_SHA);
+    const env: Record<string, string> = { ...fx.env, FORJA_NO_PROGRESS: '1' };
+    delete env.HOME;
+    try {
+      const r = Bun.spawnSync({
+        cmd: ['sh', INSTALL_SH, '--repo', 'o/r'],
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env,
+      });
+      const stderr = new TextDecoder().decode(r.stderr);
+      expect(r.exitCode).toBe(0);
+      expect(installedSha(fx)).toBe(GOOD_SHA);
+      // bash: "HOME: unbound variable"; dash/ash: "HOME: parameter not set".
+      expect(stderr).not.toMatch(/HOME.*(unbound|not set)/i);
+      // The Install step's detail (in parens) must still carry the dest — a
+      // crashed tilde() leaves "Install ()". (Not toContain(dest): the plain
+      // "installed <dest>" line has the raw path regardless and wouldn't tell.)
+      expect(stderr).toMatch(/Install \([^)]*forja\)/);
+    } finally {
+      rmSync(fx.root, { recursive: true, force: true });
+    }
+  });
 });
 
 // The progress bar only renders on a TTY; drive the script under a pty via
