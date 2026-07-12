@@ -18,6 +18,21 @@ const isNonNegInt = (s: string): boolean =>
   // Bounded length guards against Number() overflow on a hostile tag (§0.4).
   s.length > 0 && s.length <= 9 && [...s].every((c) => c >= '0' && c <= '9');
 
+const isAlnumHyphen = (c: string): boolean =>
+  (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c === '-';
+
+// SemVer §9: a prerelease identifier is a non-empty run of ASCII alphanumerics
+// and hyphens ([0-9A-Za-z-]), and an all-numeric one must not have a leading
+// zero. Enforced BEFORE the tag is cached or rendered — the release response is
+// untrusted (§0.4), so control chars / ANSI escapes / whitespace / non-ASCII
+// must never reach `formatSemver` and the boot notice (terminal injection).
+const isValidPreId = (id: string): boolean => {
+  if (id.length === 0) return false;
+  for (const c of id) if (!isAlnumHyphen(c)) return false;
+  const allDigits = [...id].every((c) => c >= '0' && c <= '9');
+  return !(allDigits && id.length > 1 && id[0] === '0');
+};
+
 // Parses `1.2.3` / `1.2.3-rc.1` / `v1.2.3` (leading `v` tolerated). Returns
 // null on anything malformed — callers treat null as "no signal", never throw.
 export const parseSemver = (raw: string): Semver | null => {
@@ -33,7 +48,7 @@ export const parseSemver = (raw: string): Semver | null => {
   const nums = mainPart.split('.');
   if (nums.length !== 3 || !nums.every(isNonNegInt)) return null;
   const prerelease = prePart === null ? [] : prePart.split('.');
-  if (prerelease.some((id) => id.length === 0)) return null;
+  if (!prerelease.every(isValidPreId)) return null;
   const [maj, min, pat] = nums as [string, string, string];
   return { major: Number(maj), minor: Number(min), patch: Number(pat), prerelease };
 };

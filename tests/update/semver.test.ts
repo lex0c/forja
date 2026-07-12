@@ -87,3 +87,30 @@ describe('isNewer / formatSemver', () => {
     }
   });
 });
+
+describe('parseSemver — untrusted prerelease bytes (§0.4)', () => {
+  // Build the control chars at runtime so no literal ESC/BEL/newline lives in
+  // the source (invisible + fragile). These stand in for a forged release tag.
+  const ch = (code: number): string => String.fromCharCode(code);
+  test('rejects control chars / ANSI / whitespace / non-ASCII in prerelease', () => {
+    for (const bad of [
+      `9.9.9-${ch(27)}[2J`, // ESC — ANSI clear-screen
+      `9.9.9-a${ch(10)}b`, // newline
+      `9.9.9-a${ch(9)}b`, // tab
+      '9.9.9-a b', // space
+      '9.9.9-café', // non-ASCII
+      `9.9.9-a.b${ch(7)}`, // BEL in the second identifier
+    ]) {
+      expect(parseSemver(bad)).toBeNull();
+    }
+  });
+  test('accepts valid alnum/hyphen identifiers', () => {
+    for (const ok of ['9.9.9-rc.1', '9.9.9-alpha-1', '1.0.0-x.7.z.92', '9.9.9-0']) {
+      expect(parseSemver(ok)).not.toBeNull();
+    }
+  });
+  test('rejects a leading-zero numeric identifier (SemVer §9)', () => {
+    expect(parseSemver('9.9.9-01')).toBeNull();
+    expect(parseSemver('9.9.9-1')).not.toBeNull();
+  });
+});
