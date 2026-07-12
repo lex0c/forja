@@ -74,7 +74,7 @@ proactive_inject = ${m.proactiveInject}
 enabled = true
 
 [update]
-check = false
+check = true
 interval = "24h"
 
 [mesh]

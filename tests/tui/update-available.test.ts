@@ -23,8 +23,7 @@ describe('update:available', () => {
     );
     expect(lines[0]?.trim()).toBe(''); // leading blank so it's its own line (UI §4.10.9)
     const body = lines.join('\n');
-    expect(body).toContain('Forja v0.2.0 available');
-    expect(body).toContain('(you have v0.1.3)');
-    expect(body).toContain('forja update');
+    expect(body).toContain('Forja v0.2.0 available!');
+    expect(body).toContain('Update with `forja update`');
   });
 });

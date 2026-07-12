@@ -777,10 +777,10 @@ export interface HarnessConfig {
   // `[recap].render_model`). Undefined → render uses the session's
   // own provider; a `/recap --model <id>` flag overrides per-call.
   recapRenderModel?: string;
-  // Passive update-available notice (SECURITY_GUIDELINE §11.4). Opt-in:
-  // undefined/false → no check, no network. `[update].check = true` enables it;
-  // `--no-update-check` / `[update].check = false` force it off. Read only by
-  // the REPL boot path — the agent loop never consumes it.
+  // Passive update-available notice (SECURITY_GUIDELINE §11.4). On by default:
+  // undefined/true → check; `--no-update-check` / `[update].check = false` force
+  // it off (the boot reads `!== false`). Read only by the REPL boot path — the
+  // agent loop never consumes it.
   updateCheckEnabled?: boolean;
   // Throttle between network probes (`[update].interval`, default 24h). Only
   // meaningful when updateCheckEnabled is true.

@@ -614,8 +614,8 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   const recapLoaded = loadRecapConfig({ cwd: projectConfigCwd, registry });
 
   // [update] config — passive update-available notice (§11.4): `check`
-  // (opt-in, default off) + `interval` (throttle). CLI `--no-update-check`
-  // overrides to off.
+  // (on by default) + `interval` (throttle). CLI `--no-update-check` and
+  // `[update].check = false` override to off.
   const updateLoaded = loadUpdateConfig({ cwd: projectConfigCwd });
 
   // Slice Q — invert S11/S13 LLM-judge default to ON. The loader
@@ -1891,7 +1891,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
       ? { recapRenderModel: recapLoaded.config.renderModel }
       : {}),
     // [update] — `--no-update-check` forces off; else config `check`; else
-    // absent (the boot path treats undefined as off — opt-in default, §11.4).
+    // absent (the boot path treats undefined as ON — default-on via `!== false`, §11.4).
     ...(input.noUpdateCheck === true
       ? { updateCheckEnabled: false }
       : updateLoaded.config.check !== undefined

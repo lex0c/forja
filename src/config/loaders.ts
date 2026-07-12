@@ -482,8 +482,8 @@ export const loadRecapConfig = (input: LoadRecapConfigInput): LoadedRecapConfig 
 };
 
 // ── [update] ────────────────────────────────────────────────────────────────
-// Passive update-available notice (SECURITY_GUIDELINE §11.4): `check` (opt-in
-// boolean; the off default is owned downstream) + `interval` (throttle
+// Passive update-available notice (SECURITY_GUIDELINE §11.4): `check` (on by
+// default; the boot reads `!== false`) + `interval` (throttle
 // duration). Project [update] > user [update]. Per-key merge.
 
 export interface UpdateConfigKeys {

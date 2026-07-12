@@ -559,7 +559,7 @@ Vai pro scrollback — uma vez impresso, scrolla naturalmente conforme a convers
 
 Em modo `--json`, o banner é emitido como `{type: 'session:banner', ...}` no NDJSON em vez de linhas formatadas.
 
-**Aviso de nova versão.** Quando o cache local de update (`SECURITY_GUIDELINE` §11.4) indica release mais nova, o boot emite `update:available` (§3.2) como **linha própria logo após o banner** — leading blank, tom `info`/`accent`. Não entra no frame do banner (que lista só estado corrente) nem usa `warn`: não é problema, é conveniência. Mesma lógica da linha sandboxActive não-afirmativa acima (que também fica fora do banner) — só que ali é `warn` e aqui é informativo. Formato: `Forja v0.2.0 disponível (você tem v0.1.3) — atualize com \`forja update\``. Só REPL; opt-in, cache-first e demais regras no §11.4.
+**Aviso de nova versão.** Quando o cache local de update (`SECURITY_GUIDELINE` §11.4) indica release mais nova, o boot emite `update:available` (§3.2) como **linha própria logo após o banner** — leading blank, tom `info`/`accent`. Não entra no frame do banner (que lista só estado corrente) nem usa `warn`: não é problema, é conveniência. Mesma lógica da linha sandboxActive não-afirmativa acima (que também fica fora do banner) — só que ali é `warn` e aqui é informativo. Formato: `Forja v0.2.0 available! Update with \`forja update\``. Só REPL; on-by-default (desligável por `[update] check = false` / `--no-update-check`), cache-first e demais regras no §11.4.
 
 #### 4.10.10 Step separator
 
@@ -1187,7 +1187,7 @@ Pty harness (`node-pty`) só pra fluxos que dependem de raw stdin parsing (paste
 5. Bootstrap subsystems (memory, checkpoints, providers, ...).
 6. Bus emit `session:banner` (§4.10.9 — em REPL; one-shot pula).
 7. Bus emit `session:start`.
-8. (REPL, opt-in) Se o cache local de update (`SECURITY_GUIDELINE` §11.4) indica release mais nova, bus emit `update:available` (§4.10.9). Dispara em background o refresh assíncrono fail-silent do cache — fora do critical path, nunca bloqueia o loop.
+8. (REPL, on por default) Se o cache local de update (`SECURITY_GUIDELINE` §11.4) indica release mais nova, bus emit `update:available` (§4.10.9). Dispara em background o refresh assíncrono fail-silent do cache — fora do critical path, nunca bloqueia o loop.
 9. Loop: read input, dispatch to harness, emit events.
 10. Em transição de turno (REPL only): bus emit `step:separator` (§4.10.10).
 11. On exit (any path): drain bus, restore stdin mode, cursor visible.

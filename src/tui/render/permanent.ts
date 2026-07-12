@@ -567,8 +567,8 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // isn't a problem, it's convenience. The new version is painted `accent`
       // to draw the eye; the rest stays plain. Leading blank so it reads as its
       // own line rather than part of the banner frame.
-      const head = paint(caps, 'accent', `Forja v${item.latest} available`);
-      const tail = ` (you have v${item.current}) — update with \`forja update\``;
+      const head = paint(caps, 'accent', `Forja v${item.latest} available!`);
+      const tail = ' Update with `forja update`';
       return ['', `${head}${tail}`].map(padFrame);
     }
     case 'subagent_group_header': {

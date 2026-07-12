@@ -3963,8 +3963,8 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       : {}),
   });
 
-  // Passive update-available notice (SECURITY_GUIDELINE §11.4). Gated on opt-in
-  // AND a real version. Reaching runRepl's banner already implies an
+  // Passive update-available notice (SECURITY_GUIDELINE §11.4). On by default
+  // (off via `[update] check = false` / `--no-update-check`), plus a real version. Reaching runRepl's banner already implies an
   // interactive TTY REPL — one-shot, --json and non-TTY/CI are refused upstream
   // (index.ts's --json + TTY gates, and repl.ts's own TTY guard above), and
   // subagents never call runRepl. The VERSION check guards unstamped builds:
@@ -3972,7 +3972,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // release and would nag falsely, so skip the check there. Read the cache,
   // emit the notice once per release, then kick a fail-silent refresh whose
   // result feeds the NEXT session.
-  if (baseConfig.updateCheckEnabled === true && VERSION !== '0.0.0') {
+  if (baseConfig.updateCheckEnabled !== false && VERSION !== '0.0.0') {
     const notice = takeUpdateNotice(db, VERSION);
     if (notice !== null) {
       bus.emit({ type: 'update:available', ts: now(), ...notice });
