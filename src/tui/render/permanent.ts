@@ -567,7 +567,11 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // isn't a problem, it's convenience. The new version is painted `accent`
       // to draw the eye; the rest stays plain. Leading blank so it reads as its
       // own line rather than part of the banner frame.
-      const head = paint(caps, 'accent', `Forja v${item.latest} available!`);
+      const head = paint(
+        caps,
+        'accent',
+        `Forja v${sanitizeOneLineForDisplay(item.latest)} available!`,
+      );
       const tail = ` Update: ${item.url}`;
       return ['', `${head}${tail}`].map(padFrame);
     }

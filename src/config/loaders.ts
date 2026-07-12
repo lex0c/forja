@@ -498,6 +498,11 @@ export interface LoadedUpdateConfig {
   warnings: string[];
 }
 
+// Below this, an `[update].interval` is almost certainly a bare-number typo
+// (parseTtlMs reads a unitless number as milliseconds) rather than an intended
+// duration — reject + warn instead of probing GitHub on nearly every boot.
+const MIN_INTERVAL_MS = 60_000;
+
 const parseUpdateLayer = (
   path: string | null,
   source: string,
@@ -511,6 +516,13 @@ const parseUpdateLayer = (
     return { layer, warnings };
   }
   const u = section.section;
+  for (const key of Object.keys(u)) {
+    if (key !== 'check' && key !== 'interval') {
+      warnings.push(
+        `${source} config (${path}): [update].${key} is not a known update key; ignoring`,
+      );
+    }
+  }
   if (u.check !== undefined) {
     if (typeof u.check !== 'boolean') {
       warnings.push(
@@ -525,6 +537,10 @@ const parseUpdateLayer = (
     if (ms === null) {
       warnings.push(
         `${source} config (${path}): [update].interval must be a duration like "24h" or a number of ms; ignoring`,
+      );
+    } else if (ms < MIN_INTERVAL_MS) {
+      warnings.push(
+        `${source} config (${path}): [update].interval ${ms}ms is implausibly small — a bare number is milliseconds; use a duration like "24h"; ignoring`,
       );
     } else {
       layer.intervalMs = ms;

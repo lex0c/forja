@@ -34,18 +34,7 @@ describe('parseSemver', () => {
     });
   });
   test('rejects malformed (null, never throw)', () => {
-    for (const bad of [
-      '1.2',
-      '1.2.3.4',
-      'abc',
-      '',
-      '1.2.x',
-      '-1.2.3',
-      '1.2.3-',
-      '1..3',
-      'v',
-      '99999999999.0.0',
-    ]) {
+    for (const bad of ['1.2', '1.2.3.4', 'abc', '', '1.2.x', '-1.2.3', '1.2.3-', '1..3', 'v']) {
       expect(parseSemver(bad)).toBeNull();
     }
   });
@@ -112,5 +101,21 @@ describe('parseSemver — untrusted prerelease bytes (§0.4)', () => {
   test('rejects a leading-zero numeric identifier (SemVer §9)', () => {
     expect(parseSemver('9.9.9-01')).toBeNull();
     expect(parseSemver('9.9.9-1')).not.toBeNull();
+  });
+});
+
+describe('parseSemver — length + large-numeric bounds', () => {
+  test('rejects an over-long tag (DoS via a ~64KB prerelease)', () => {
+    expect(parseSemver(`1.0.1-${'a'.repeat(300)}`)).toBeNull();
+    expect(parseSemver(`1.0.0-${'a'.repeat(200)}`)).not.toBeNull(); // within the cap
+  });
+  test('numeric prerelease of 10-15 digits orders numerically, not lexically', () => {
+    // 9999999999 (10 digits) < 10000000000 (11); a lexical compare flips it.
+    expect(isNewer('1.0.0-9999999999', '1.0.0-10000000000')).toBe(false);
+    expect(isNewer('1.0.0-10000000000', '1.0.0-9999999999')).toBe(true);
+  });
+  test('accepts a 10-15 digit main segment (epoch / CalVer)', () => {
+    expect(isNewer('10000000000.0.0', '1.0.0')).toBe(true);
+    expect(parseSemver('20240101.0.0')).not.toBeNull();
   });
 });

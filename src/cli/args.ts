@@ -656,6 +656,7 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
   let json = false;
   let model: string | undefined;
   let noRecap = false;
+  let noUpdateCheck = false;
   const recapArgs: string[] = [];
   let i = 1;
   while (i < argv.length) {
@@ -728,9 +729,10 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
       continue;
     }
     if (token === '--no-update-check') {
-      // Parity with --no-recap: consume it here so the slash-side parser
-      // doesn't surface it as an unknown flag. `forja recap` is headless and
-      // never shows the passive notice, so this is a no-op beyond consumption.
+      // Parity with --no-recap: consume it AND record it so run.ts's recap
+      // bootstrap threads it (recap is headless today and never shows the
+      // notice, but the flag shouldn't silently vanish at the parser boundary).
+      noUpdateCheck = true;
       i += 1;
       continue;
     }
@@ -758,6 +760,7 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
       recap: { args: recapArgs },
       ...(model !== undefined ? { model } : {}),
       ...(noRecap ? { noRecap: true } : {}),
+      ...(noUpdateCheck ? { noUpdateCheck: true } : {}),
     },
   };
 };

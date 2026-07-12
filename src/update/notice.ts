@@ -34,5 +34,8 @@ export const shouldRefresh = (
   intervalMs: number = DEFAULT_INTERVAL_MS,
 ): boolean => {
   if (state.lastCheckedAt === null) return true;
+  // Clock moved backward (bad RTC / NTP) after a probe recorded a future
+  // timestamp → treat as due, else the throttle stalls until wall-clock catches up.
+  if (state.lastCheckedAt > now) return true;
   return now - state.lastCheckedAt >= intervalMs;
 };

@@ -55,4 +55,8 @@ describe('shouldRefresh', () => {
     expect(shouldRefresh(state({ lastCheckedAt: now - 5000 }), now, 10_000)).toBe(false);
     expect(shouldRefresh(state({ lastCheckedAt: now - 15_000 }), now, 10_000)).toBe(true);
   });
+  test('clock skewed backward (lastCheckedAt > now) → due, not stuck forever', () => {
+    const now = 1_000_000;
+    expect(shouldRefresh(state({ lastCheckedAt: now + 999_999 }), now)).toBe(true);
+  });
 });

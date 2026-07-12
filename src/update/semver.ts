@@ -14,9 +14,16 @@ export interface Semver {
   prerelease: string[];
 }
 
+// A real release tag is tiny; a hostile feed (§0.4) could otherwise send ~64KB
+// that passes the char-class checks and gets cached + rendered.
+const MAX_TAG_LEN = 256;
+// Max digits for a numeric identifier. 15 keeps every value exact in a JS number
+// (MAX_SAFE_INTEGER ≈ 9e15, 16 digits) while still bounding a hostile tag. MUST
+// be the same limit the main triplet and the prerelease comparator (comparePreId
+// via isNonNegInt) use, or a ≥10-digit numeric id gets misclassified as alpha.
+const MAX_NUM_DIGITS = 15;
 const isNonNegInt = (s: string): boolean =>
-  // Bounded length guards against Number() overflow on a hostile tag (§0.4).
-  s.length > 0 && s.length <= 9 && [...s].every((c) => c >= '0' && c <= '9');
+  s.length > 0 && s.length <= MAX_NUM_DIGITS && [...s].every((c) => c >= '0' && c <= '9');
 
 const isAlnumHyphen = (c: string): boolean =>
   (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c === '-';
@@ -36,6 +43,9 @@ const isValidPreId = (id: string): boolean => {
 // Parses `1.2.3` / `1.2.3-rc.1` / `v1.2.3` (leading `v` tolerated). Returns
 // null on anything malformed — callers treat null as "no signal", never throw.
 export const parseSemver = (raw: string): Semver | null => {
+  // Total-length bound before any work — a real tag is tiny; a hostile feed
+  // (§0.4) could send ~64KB that passes the per-char checks (see MAX_TAG_LEN).
+  if (raw.length > MAX_TAG_LEN) return null;
   let s = raw.trim();
   if (s.startsWith('v')) s = s.slice(1);
   const plus = s.indexOf('+');

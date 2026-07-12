@@ -40,11 +40,11 @@ describe('loadUpdateConfig', () => {
     }
   });
 
-  test('interval accepts m/s suffixes and a bare number of ms', () => {
+  test('interval accepts durations and a large bare-ms number (>= the 1min floor)', () => {
     for (const [body, expected] of [
       ['interval = "30m"', 30 * 60 * 1000],
       ['interval = "90s"', 90 * 1000],
-      ['interval = 5000', 5000],
+      ['interval = 3600000', 3_600_000],
     ] as const) {
       const cwd = makeTempCwd();
       try {
@@ -73,9 +73,6 @@ describe('loadUpdateConfig', () => {
     try {
       writeProjectUpdate(cwd, '[update]\ncheck = "false"\n');
       const r = load(cwd);
-      // Ignored → check stays undefined → the boot treats it as default-ON. The
-      // warning (surfaced via BootstrapResult.updateConfigWarnings) is what tells
-      // the operator the opt-out did not take and the probe is still enabled.
       expect(r.config.check).toBeUndefined();
       expect(r.warnings[0]).toContain('[update].check must be a boolean');
     } finally {
@@ -83,20 +80,8 @@ describe('loadUpdateConfig', () => {
     }
   });
 
-  test('garbage interval warns and is ignored', () => {
-    const cwd = makeTempCwd();
-    try {
-      writeProjectUpdate(cwd, '[update]\ninterval = "soon"\n');
-      const r = load(cwd);
-      expect(r.config.intervalMs).toBeUndefined();
-      expect(r.warnings[0]).toContain('[update].interval');
-    } finally {
-      rmSync(cwd, { recursive: true, force: true });
-    }
-  });
-
-  test('bare-unit / decimal / zero intervals are rejected (regression: were silently 0)', () => {
-    for (const bad of ['h', 'm', 's', '1.5h', '0', '0h']) {
+  test('garbage / bare-unit / decimal / zero intervals are rejected + warned', () => {
+    for (const bad of ['soon', 'h', 'm', 's', '1.5h', '0', '0h']) {
       const cwd = makeTempCwd();
       try {
         writeProjectUpdate(cwd, `[update]\ninterval = "${bad}"\n`);
@@ -109,13 +94,35 @@ describe('loadUpdateConfig', () => {
     }
   });
 
-  test('interval accepts an ms suffix (shared parseTtlMs)', () => {
-    const cwd = makeTempCwd();
-    try {
-      writeProjectUpdate(cwd, '[update]\ninterval = "500ms"\n');
-      expect(load(cwd).config.intervalMs).toBe(500);
-    } finally {
-      rmSync(cwd, { recursive: true, force: true });
+  test('implausibly small interval (bare number is ms) is rejected + warned', () => {
+    // `interval = 24` means 24ms via parseTtlMs — almost certainly a "24h" typo;
+    // accepting it would probe GitHub on nearly every boot.
+    for (const body of ['interval = 24', 'interval = "500ms"', 'interval = 5000']) {
+      const cwd = makeTempCwd();
+      try {
+        writeProjectUpdate(cwd, `[update]\n${body}\n`);
+        const r = load(cwd);
+        expect(r.config.intervalMs).toBeUndefined();
+        expect(r.warnings[0]).toContain('implausibly small');
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test('unknown / misspelled key warns and is ignored (opt-out typo not silent)', () => {
+    // `chek = false` (typo) or `enabled = false` (recap's key) must not vanish —
+    // with check default-on, a silent drop keeps the probe running.
+    for (const body of ['chek = false', 'enabled = false', 'interval_ms = 3600000']) {
+      const cwd = makeTempCwd();
+      try {
+        writeProjectUpdate(cwd, `[update]\n${body}\n`);
+        const r = load(cwd);
+        expect(r.config.check).toBeUndefined();
+        expect(r.warnings.some((w) => w.includes('not a known update key'))).toBe(true);
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
     }
   });
 });

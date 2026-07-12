@@ -9,27 +9,42 @@ export interface UpdateNotice {
   url: string;
 }
 
-// Boot-path entry point for the passive "update available" notice
-// (SECURITY_GUIDELINE §11.4). Synchronous, local, offline-safe: reads the
-// cache, and if a newer release is known and not yet surfaced, marks it
-// notified and returns the notice to emit — otherwise null. Marking on "take"
-// is what makes the banner fire ONCE per release rather than every boot.
+// Boot-path decision for the passive "update available" notice
+// (SECURITY_GUIDELINE §11.4). Synchronous, local, offline-safe: reads the cache
+// and returns the notice to emit if a newer release is known and not yet
+// surfaced — otherwise null. Does NOT mark it seen; the caller calls
+// markNoticeShown AFTER emitting, so a crash / emit-failure between decide and
+// render doesn't durably suppress the notice (mark-before-render would lose it).
 //
 // Gating (opt-in + REPL + not --json/CI/subagent) is the caller's job, done
-// BEFORE calling this; here we only do the cache → decision → mark step.
-export const takeUpdateNotice = (db: DB, current: string): UpdateNotice | null => {
+// BEFORE calling this.
+export const peekUpdateNotice = (db: DB, current: string): UpdateNotice | null => {
   const decision = decideNotice(getUpdateCheck(db), current);
   if (!decision.show || decision.latest === undefined) return null;
-  markNotified(db, decision.latest);
   return { current, latest: decision.latest, url: RELEASES_PAGE_URL };
+};
+
+// Records that `version` was surfaced, so the notice fires once per release.
+// Call AFTER the notice has been emitted/rendered, not before.
+export const markNoticeShown = (db: DB, version: string): void => {
+  markNotified(db, version);
 };
 
 // Fire-and-forget background refresh whose result feeds the NEXT session's
 // notice. Never throws and never blocks — callers invoke it WITHOUT awaiting on
 // the boot path (the `void` documents the intentional floating promise). Same
 // gating as takeUpdateNotice applies at the call site.
-export const kickUpdateRefresh = (db: DB, now: number, intervalMs?: number): void => {
-  // Build the opts without an explicit `intervalMs: undefined` — the project's
-  // exactOptionalPropertyTypes rejects that in favour of an absent key.
-  void refreshUpdateCache(db, intervalMs === undefined ? { now } : { now, intervalMs });
+export const kickUpdateRefresh = (
+  db: DB,
+  now: number,
+  intervalMs?: number,
+  signal?: AbortSignal,
+): void => {
+  // Build opts without explicit `undefined` props (exactOptionalPropertyTypes).
+  // The session signal lets shutdown abort an in-flight probe before it writes
+  // to a closing db — the fire-and-forget promise is otherwise untracked.
+  const opts: { now: number; intervalMs?: number; signal?: AbortSignal } = { now };
+  if (intervalMs !== undefined) opts.intervalMs = intervalMs;
+  if (signal !== undefined) opts.signal = signal;
+  void refreshUpdateCache(db, opts);
 };

@@ -77,7 +77,7 @@ import {
   type SessionBannerEvent,
   type UIEvent,
 } from '../tui/index.ts';
-import { kickUpdateRefresh, takeUpdateNotice } from '../update/index.ts';
+import { kickUpdateRefresh, markNoticeShown, peekUpdateNotice } from '../update/index.ts';
 import { createWorkingStateStore } from '../working-state/index.ts';
 import type { ParsedArgs } from './args.ts';
 import { buildBgSummary } from './bg-summary.ts';
@@ -3979,11 +3979,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // emit the notice once per release, then kick a fail-silent refresh whose
   // result feeds the NEXT session.
   if (baseConfig.updateCheckEnabled !== false && VERSION !== '0.0.0') {
-    const notice = takeUpdateNotice(db, VERSION);
-    if (notice !== null) {
-      bus.emit({ type: 'update:available', ts: now(), ...notice });
+    // A passive best-effort notice must never crash boot. The async refresh has
+    // its own catch; this wraps the SYNCHRONOUS decide/emit — a DB throw from
+    // peek/mark, or a throwing bus subscriber, would otherwise escape here.
+    try {
+      const notice = peekUpdateNotice(db, VERSION);
+      if (notice !== null) {
+        bus.emit({ type: 'update:available', ts: now(), ...notice });
+        markNoticeShown(db, notice.latest); // mark AFTER the emit, not before
+      }
+      kickUpdateRefresh(db, now(), baseConfig.updateIntervalMs, baseConfig.signal);
+    } catch {
+      // Swallow — the update notice is never worth a failed boot.
     }
-    kickUpdateRefresh(db, now(), baseConfig.updateIntervalMs);
   }
 
   // Trust prompt was already handled in the pre-bootstrap stack —
