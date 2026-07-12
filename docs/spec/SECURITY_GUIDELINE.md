@@ -851,7 +851,7 @@ O `forja update` (§11.1) é **pull**: o operador decide checar. O aviso passivo
 - **Uma vez por versão nova:** o cache grava a última versão notificada; não repete a cada boot até sair uma mais nova ainda.
 - Só REPL interativo. `--json`, subagent, one-shot, CI e offline **não** exibem nem disparam o check (mesma regra do welcome banner, `UI.md` §12).
 
-**Flags** (categorias de `FEATURE_FLAGS.md`): `[update] check | interval` são **config TOML** (§1.2 — persistente, setup-time); `--no-update-check` é **CLI flag** (§1.1 — override pontual por sessão). Sem flag-as-config cruzado.
+**Flags** (categorias de `FEATURE_FLAGS.md`): `[update] check | interval` são **config TOML** (§1.2 — persistente, setup-time); `--no-update-check` é **CLI flag** (§1.1 — override pontual por sessão). Sem flag-as-config cruzado. O template do `forja init` **não** materializa `[update]` — deixa a chave ausente pra herdar o default-on **ou o `check = false` global do operador**, já que o loader resolve project > user e escrever `check = true` no projeto sobrescreveria silenciosamente um opt-out global.
 
 ---
 
