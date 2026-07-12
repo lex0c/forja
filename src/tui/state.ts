@@ -827,7 +827,7 @@ export type PermanentItem =
       durationMs: number;
     }
   | { kind: 'recap-terse'; message: string }
-  | { kind: 'update-available'; current: string; latest: string }
+  | { kind: 'update-available'; current: string; latest: string; url: string }
   // Extended-thinking / reasoning block flushed at `thinking:end`. Rendered as
   // a bold `reasoning:` label over a secondary-toned body (the model's scratch
   // work, not the answer). `text` is already capped at flush.
@@ -1775,7 +1775,14 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
     case 'update:available':
       return {
         state,
-        permanent: [{ kind: 'update-available', current: event.current, latest: event.latest }],
+        permanent: [
+          {
+            kind: 'update-available',
+            current: event.current,
+            latest: event.latest,
+            url: event.url,
+          },
+        ],
       };
 
     case 'interrupt':

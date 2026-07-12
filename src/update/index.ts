@@ -7,6 +7,11 @@ export type { UpdateNotice } from './boot.ts';
 export { kickUpdateRefresh, takeUpdateNotice } from './boot.ts';
 export type { NoticeDecision } from './notice.ts';
 export { DEFAULT_INTERVAL_MS, decideNotice, shouldRefresh } from './notice.ts';
-export { fetchLatestVersion, RELEASES_LATEST_URL, refreshUpdateCache } from './refresh.ts';
+export {
+  fetchLatestVersion,
+  RELEASES_LATEST_URL,
+  RELEASES_PAGE_URL,
+  refreshUpdateCache,
+} from './refresh.ts';
 export type { Semver } from './semver.ts';
 export { compareSemver, formatSemver, isNewer, parseSemver } from './semver.ts';

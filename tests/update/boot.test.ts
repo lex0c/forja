@@ -20,7 +20,11 @@ describe('takeUpdateNotice', () => {
   test('newer known → notice with release url, then silent (once per release)', () => {
     const db = freshDb();
     recordUpdateProbe(db, 1000, '0.2.0');
-    expect(takeUpdateNotice(db, '0.1.3')).toEqual({ current: '0.1.3', latest: '0.2.0' });
+    expect(takeUpdateNotice(db, '0.1.3')).toEqual({
+      current: '0.1.3',
+      latest: '0.2.0',
+      url: 'https://github.com/lex0c/forja/releases/latest',
+    });
     // Marked notified → the same release is silent on the next boot.
     expect(takeUpdateNotice(db, '0.1.3')).toBeNull();
     db.close();

@@ -1,11 +1,12 @@
 import type { DB } from '../storage/db.ts';
 import { getUpdateCheck, markNotified } from '../storage/repos/update-check.ts';
 import { decideNotice } from './notice.ts';
-import { refreshUpdateCache } from './refresh.ts';
+import { RELEASES_PAGE_URL, refreshUpdateCache } from './refresh.ts';
 
 export interface UpdateNotice {
   current: string;
   latest: string;
+  url: string;
 }
 
 // Boot-path entry point for the passive "update available" notice
@@ -20,7 +21,7 @@ export const takeUpdateNotice = (db: DB, current: string): UpdateNotice | null =
   const decision = decideNotice(getUpdateCheck(db), current);
   if (!decision.show || decision.latest === undefined) return null;
   markNotified(db, decision.latest);
-  return { current, latest: decision.latest };
+  return { current, latest: decision.latest, url: RELEASES_PAGE_URL };
 };
 
 // Fire-and-forget background refresh whose result feeds the NEXT session's

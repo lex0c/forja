@@ -12,18 +12,31 @@ describe('update:available', () => {
       ts: 1,
       current: '0.1.3',
       latest: '0.2.0',
+      url: 'https://github.com/lex0c/forja/releases/latest',
     });
-    expect(r.permanent).toEqual([{ kind: 'update-available', current: '0.1.3', latest: '0.2.0' }]);
+    expect(r.permanent).toEqual([
+      {
+        kind: 'update-available',
+        current: '0.1.3',
+        latest: '0.2.0',
+        url: 'https://github.com/lex0c/forja/releases/latest',
+      },
+    ]);
   });
 
   test('renders an accent line after a leading blank, pointing at `forja update`', () => {
     const lines = formatPermanent(
-      { kind: 'update-available', current: '0.1.3', latest: '0.2.0' },
+      {
+        kind: 'update-available',
+        current: '0.1.3',
+        latest: '0.2.0',
+        url: 'https://github.com/lex0c/forja/releases/latest',
+      },
       ascii,
     );
     expect(lines[0]?.trim()).toBe(''); // leading blank so it's its own line (UI §4.10.9)
     const body = lines.join('\n');
     expect(body).toContain('Forja v0.2.0 available!');
-    expect(body).toContain('Update with `forja update`');
+    expect(body).toContain('Update: https://github.com/lex0c/forja/releases/latest');
   });
 });

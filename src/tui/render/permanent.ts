@@ -568,7 +568,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // to draw the eye; the rest stays plain. Leading blank so it reads as its
       // own line rather than part of the banner frame.
       const head = paint(caps, 'accent', `Forja v${item.latest} available!`);
-      const tail = ' Update with `forja update`';
+      const tail = ` Update: ${item.url}`;
       return ['', `${head}${tail}`].map(padFrame);
     }
     case 'subagent_group_header': {

@@ -559,7 +559,7 @@ Vai pro scrollback — uma vez impresso, scrolla naturalmente conforme a convers
 
 Em modo `--json`, o banner é emitido como `{type: 'session:banner', ...}` no NDJSON em vez de linhas formatadas.
 
-**Aviso de nova versão.** Quando o cache local de update (`SECURITY_GUIDELINE` §11.4) indica release mais nova, o boot emite `update:available` (§3.2) como **linha própria logo após o banner** — leading blank, tom `info`/`accent`. Não entra no frame do banner (que lista só estado corrente) nem usa `warn`: não é problema, é conveniência. Mesma lógica da linha sandboxActive não-afirmativa acima (que também fica fora do banner) — só que ali é `warn` e aqui é informativo. Formato: `Forja v0.2.0 available! Update with \`forja update\``. Só REPL; on-by-default (desligável por `[update] check = false` / `--no-update-check`), cache-first e demais regras no §11.4.
+**Aviso de nova versão.** Quando o cache local de update (`SECURITY_GUIDELINE` §11.4) indica release mais nova, o boot emite `update:available` (§3.2) como **linha própria logo após o banner** — leading blank, tom `info`/`accent`. Não entra no frame do banner (que lista só estado corrente) nem usa `warn`: não é problema, é conveniência. Mesma lógica da linha sandboxActive não-afirmativa acima (que também fica fora do banner) — só que ali é `warn` e aqui é informativo. Formato: `Forja v0.2.0 available! Update: https://github.com/lex0c/forja/releases/latest` — aponta pra **release page** (o caminho de update atual: install.sh/npm/assets), **não** pro `forja update`, que ainda não existe (§11.1, fase 2); a URL vem no evento, não hard-coded no render. Só REPL; on-by-default (desligável por `[update] check = false` / `--no-update-check`), cache-first e demais regras no §11.4.
 
 #### 4.10.10 Step separator
 

@@ -32,10 +32,11 @@ describe('update notice — boot data path', () => {
       ts: 2000,
       current: notice.current,
       latest: notice.latest,
+      url: notice.url,
     });
     const body = r.permanent.flatMap((item) => formatPermanent(item, ascii)).join('\n');
     expect(body).toContain('Forja v9.9.9 available!');
-    expect(body).toContain('Update with `forja update`');
+    expect(body).toContain('Update: https://github.com/lex0c/forja/releases/latest');
 
     // Once per release: a second boot with the same cache is silent.
     expect(takeUpdateNotice(db, '0.1.3')).toBeNull();
