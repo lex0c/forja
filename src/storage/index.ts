@@ -310,3 +310,5 @@ export {
   listToolCallsByMessage,
   startToolCall,
 } from './repos/tool-calls.ts';
+export type { UpdateCheckState } from './repos/update-check.ts';
+export { getUpdateCheck, markNotified, recordUpdateProbe } from './repos/update-check.ts';

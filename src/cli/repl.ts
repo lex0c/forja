@@ -77,6 +77,7 @@ import {
   type SessionBannerEvent,
   type UIEvent,
 } from '../tui/index.ts';
+import { isCiEnv, kickUpdateRefresh, markNoticeShown, peekUpdateNotice } from '../update/index.ts';
 import { createWorkingStateStore } from '../working-state/index.ts';
 import type { ParsedArgs } from './args.ts';
 import { buildBgSummary } from './bg-summary.ts';
@@ -655,6 +656,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     memoryConfigWarnings,
     providersConfigWarnings,
     recapConfigWarnings,
+    updateConfigWarnings,
     budgetConfigWarnings,
     effortConfigWarnings,
     auditConfigWarnings,
@@ -895,6 +897,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // [recap] config warnings — unknown render_model / bad enabled type.
   for (const w of recapConfigWarnings) {
     errSink(`forja: recap config: ${w}\n`);
+  }
+  // [update] config warnings — with check default-on, a malformed opt-out
+  // (e.g. check = "false") is ignored and silently keeps the probe on.
+  for (const w of updateConfigWarnings) {
+    errSink(`forja: update config: ${w}\n`);
   }
   // [budget] config warnings — a numeric typo or out-of-range value
   // shouldn't disappear silently.
@@ -3961,6 +3968,31 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       ? { sandboxActive: sandboxEnforcement.tool }
       : {}),
   });
+
+  // Passive update-available notice (SECURITY_GUIDELINE §11.4). On by default
+  // (off via `[update] check = false` / `--no-update-check`), plus a real
+  // version, plus NOT in CI. Reaching runRepl's banner already implies an
+  // interactive TTY REPL — one-shot, --json and non-TTY are refused upstream
+  // (index.ts's --json + TTY gates, repl.ts's own TTY guard), and subagents
+  // never call runRepl. But CI is NOT caught upstream when a job allocates a pty
+  // (script/expect smoke tests), so gate it here — an unsolicited network probe
+  // in CI violates §11.4. The VERSION check guards unstamped builds: the
+  // placeholder '0.0.0' compares older than every release and would nag falsely.
+  if (baseConfig.updateCheckEnabled !== false && VERSION !== '0.0.0' && !isCiEnv()) {
+    // A passive best-effort notice must never crash boot. The async refresh has
+    // its own catch; this wraps the SYNCHRONOUS decide/emit — a DB throw from
+    // peek/mark, or a throwing bus subscriber, would otherwise escape here.
+    try {
+      const notice = peekUpdateNotice(db, VERSION);
+      if (notice !== null) {
+        bus.emit({ type: 'update:available', ts: now(), ...notice });
+        markNoticeShown(db, notice.latest); // mark AFTER the emit, not before
+      }
+      kickUpdateRefresh(db, now(), baseConfig.updateIntervalMs, baseConfig.signal);
+    } catch {
+      // Swallow — the update notice is never worth a failed boot.
+    }
+  }
 
   // Trust prompt was already handled in the pre-bootstrap stack —
   // see "Trust prompt (AGENTIC_CLI §9.1)" earlier in this function.
