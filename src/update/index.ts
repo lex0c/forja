@@ -7,10 +7,11 @@ export type { UpdateNotice } from './boot.ts';
 export { isCiEnv, kickUpdateRefresh, markNoticeShown, peekUpdateNotice } from './boot.ts';
 export type { NoticeDecision } from './notice.ts';
 export { DEFAULT_INTERVAL_MS, decideNotice, shouldRefresh } from './notice.ts';
+export type { InstallOrigin } from './origin.ts';
+export { detectInstallOrigin, updateCommand } from './origin.ts';
 export {
   fetchLatestVersion,
   RELEASES_LATEST_URL,
-  RELEASES_PAGE_URL,
   refreshUpdateCache,
 } from './refresh.ts';
 export type { Semver } from './semver.ts';
