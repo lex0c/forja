@@ -127,6 +127,32 @@ export const verifyAgainstSums = (
   }
 };
 
+// Strip <!-- npm-ignore-start --> … <!-- npm-ignore-end --> blocks from the
+// README shipped to npm. The markers are HTML comments — invisible on GitHub
+// (which renders the full file) — so a single README serves both, with
+// GitHub-only sections (e.g. the install.sh curl one-liner) pruned from the
+// npm page. Fails loud on an unbalanced marker rather than silently shipping
+// or dropping content.
+export const stripNpmIgnored = (markdown: string): string => {
+  const START = '<!-- npm-ignore-start -->';
+  const END = '<!-- npm-ignore-end -->';
+  let out = '';
+  let i = 0;
+  let s = markdown.indexOf(START, i);
+  while (s !== -1) {
+    const e = markdown.indexOf(END, s);
+    if (e === -1) {
+      throw new Error('unbalanced npm-ignore marker in README (start without matching end)');
+    }
+    out += markdown.slice(i, s);
+    i = e + END.length;
+    s = markdown.indexOf(START, i);
+  }
+  out += markdown.slice(i);
+  // Collapse the blank gap a removed block leaves (3+ newlines → 2).
+  return out.replace(/\n{3,}/g, '\n\n');
+};
+
 const writeJson = (path: string, obj: PkgJson): void => {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, `${JSON.stringify(obj, null, 2)}\n`);
@@ -187,8 +213,12 @@ export const pack = (opts: PackOptions): PackedPackage[] => {
   mkdirSync(dirname(shimDest), { recursive: true });
   copyFileSync(join(opts.launcherDir, 'bin', 'forja'), shimDest);
   chmodSync(shimDest, 0o755);
-  // The repo README (opts.readmePath) is what shows on the npm page.
-  copyFileSync(opts.readmePath, join(launcherOut, 'README.md'));
+  // The repo README (opts.readmePath) is what shows on the npm page, minus
+  // any <!-- npm-ignore-start/end --> blocks (GitHub-only sections).
+  writeFileSync(
+    join(launcherOut, 'README.md'),
+    stripNpmIgnored(readFileSync(opts.readmePath, 'utf-8')),
+  );
   packed.push({ name: launcherPkgName(), dir: launcherOut, kind: 'launcher' });
 
   return packed;

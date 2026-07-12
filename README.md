@@ -8,6 +8,7 @@ What sets Forja apart is the structure surrounding the model. Every action with 
 
 ## Get started
 
+<!-- npm-ignore-start -->
 Install the latest release — the script detects your OS/arch, downloads the
 matching binary from GitHub Releases, verifies it against the published
 `SHA256SUMS`, and installs into `$HOME/.local/bin`:
@@ -34,6 +35,7 @@ CycloneDX SBOM, and SLSA build provenance on the
 binary, verify its hash against `SHA256SUMS`, and drop it on your `PATH`.
 
 **Prefer a package manager?**
+<!-- npm-ignore-end -->
 
 ```bash
 npm install -g @lex0c/forja

@@ -12,6 +12,7 @@ import {
   pack,
   platformManifest,
   platformPkgName,
+  stripNpmIgnored,
   verifyAgainstSums,
 } from '../../scripts/npm-pack.ts';
 import { TARGETS } from '../../scripts/targets.ts';
@@ -155,6 +156,35 @@ describe('verifyAgainstSums (fail-closed)', () => {
   });
 });
 
+describe('stripNpmIgnored', () => {
+  test('removes a marked block, keeps surrounding content', () => {
+    const md = 'A\n\n<!-- npm-ignore-start -->\nHIDDEN\n<!-- npm-ignore-end -->\n\nB\n';
+    const out = stripNpmIgnored(md);
+    expect(out).not.toContain('HIDDEN');
+    expect(out).toContain('A');
+    expect(out).toContain('B');
+  });
+
+  test('content without markers is unchanged', () => {
+    expect(stripNpmIgnored('plain readme\n')).toBe('plain readme\n');
+  });
+
+  test('removes multiple blocks', () => {
+    const md =
+      '<!-- npm-ignore-start -->x<!-- npm-ignore-end -->keep<!-- npm-ignore-start -->y<!-- npm-ignore-end -->';
+    expect(stripNpmIgnored(md)).toBe('keep');
+  });
+
+  test('collapses the blank gap a removed block leaves', () => {
+    const md = 'A\n\n<!-- npm-ignore-start -->\nX\n<!-- npm-ignore-end -->\n\nB';
+    expect(stripNpmIgnored(md)).not.toMatch(/\n{3,}/);
+  });
+
+  test('throws on an unbalanced marker', () => {
+    expect(() => stripNpmIgnored('a <!-- npm-ignore-start --> oops')).toThrow(/unbalanced/);
+  });
+});
+
 describe('pack (end to end)', () => {
   test('assembles 6 packages with correct layout, gates, and executable bits', () => {
     const dist = makeDist(VERSION);
@@ -194,10 +224,10 @@ describe('pack (end to end)', () => {
     }
     expect(existsSync(join(launcherDir, 'bin', 'forja'))).toBe(true);
     expect(existsSync(join(launcherDir, 'README.md'))).toBe(true);
-    // The published launcher README is the repo root README verbatim, so
-    // the npm package page mirrors GitHub.
+    // The published launcher README is the repo root README with npm-ignore
+    // blocks stripped, so the npm page mirrors GitHub minus GitHub-only bits.
     expect(readFileSync(join(launcherDir, 'README.md'), 'utf-8')).toBe(
-      readFileSync(README_PATH, 'utf-8'),
+      stripNpmIgnored(readFileSync(README_PATH, 'utf-8')),
     );
     expect(statSync(join(launcherDir, 'bin', 'forja')).mode & 0o111).not.toBe(0);
   });
