@@ -32,10 +32,11 @@ Análise sistemática por categoria, com mitigação primária.
 
 | Ameaça | Mitigação |
 |---|---|
-| Atacante substitui `agent` binary local | Update mechanism com signing (Sigstore/cosign); `agent --version --verify` checa assinatura |
+| Atacante substitui `forja` binary local | Update mechanism com signing (§11.2, cosign deferido); `forja --version --verify` checa integridade (hash + reproducible build hoje; assinatura quando ativa) |
 | Atacante substitui `~/.config/agent/hooks/audit.sh` | Hook scripts de paths confiados; trust prompt em primeira execução; logging em `hook_runs` com hash |
 | MCP server hostil se passa por confiável | Hash de manifest gravado; trust prompt em primeiro contact; tools invisíveis ao modelo se manifest mudou |
 | `AGENTS.md` em repo terceiro se passa por instrução do usuário | Trust prompt por dir; tratamento como input não-confiável; injection scanner |
+| Resposta da version-check API forjada (MITM/DNS spoof) | Aviso passivo (§11.4) só compara string e aponta pro `forja update`; nunca baixa/instala do que a API respondeu; TLS obrigatório, `tag_name` validado como semver, sem redirect a host fora do canônico |
 
 ### 1.2 Tampering (alteração)
 
@@ -306,7 +307,7 @@ Se scanner detecta secret **após** já ter sido persistido (eval offline pega):
 
 - **Reproducible build**: mesmo source ⇒ mesmo binário (Bun compila AOT)
 - **SBOM** gerado em release: lista de deps com versão
-- **Sigstore/cosign** assina binário; `agent --version --verify` checa
+- **Sigstore/cosign** assina binário; `forja --version --verify` checa *(assinatura **deferida** — ver §11.2; até ativar, o gate é `SHA256SUMS` + reproducible build + proveniência SLSA)*
 - **Hash publicado** junto ao release; install script (`curl | sh`) verifica
 - **Distribuição**: oficial via canais signed (brew tap, releases assinados); avoid `curl | sh` sem verify
 
@@ -771,32 +772,87 @@ tool_calls         -- toda invocação de tool
 
 ## 11. Update & signing
 
-### 11.1 Mecanismo de update
+Dois lados do mesmo canal verificado (§7.2): **pull** — `forja update`, o operador atualiza (§11.1–11.3) — e **push** — o aviso passivo que só sinaliza, nunca instala (§11.4). Ambos leem a mesma fonte (GitHub Releases) e confiam na mesma cadeia de integridade.
+
+> **Estado (2026-07).** O update *in-place* ainda não existe: atualiza-se **re-rodando o `install.sh`**, que já baixa a release e verifica hash fail-closed. `forja --version` reporta `VERSION` (carimbado da tag por `scripts/stamp-version.ts`; `0.0.0` até o primeiro release carimbar, `PERFORMANCE.md` §18.6). Esta seção é o **design-alvo** de `forja update`/`rollback`; a cadeia abaixo reusa a verificação do `install.sh`, in-place, com backup e rollback por cima.
+
+### 11.1 Mecanismo de update (`forja update`)
 
 ```
-agent update              # checa, mostra diff de versão, confirma com user
-agent update --check      # só checa
-agent update --auto       # opt-in pra automation; nunca default
+forja update            # resolve latest → mostra diff + notas → confirma → instala
+forja update --check    # só resolve e reporta; não baixa nem instala
+forja update --auto     # opt-in pra automação (CI/cron); nunca default
+forja update --pre      # inclui prereleases (dist-tag next / GitHub --prerelease)
 ```
 
-Antes de instalar:
-1. Download do release
-2. Verifica assinatura via cosign / Sigstore
-3. Verifica hash contra release notes
-4. Backup do binário atual
-5. Replace + verify execution
+**A estratégia depende de como o binário foi instalado** — o comando detecta a origem e nunca pisa no dono do arquivo:
 
-Falha em qualquer step → abort, agente não atualiza.
+- **Standalone** (`install.sh` ou download direto do Release): self-update in-place, a cadeia abaixo.
+- **npm** (launcher `@lex0c/forja` + nativo por-plataforma, `PERFORMANCE.md` §18.6): **delega ao gerenciador**. O binário nativo vive sob `node_modules/@lex0c/forja-<target>/bin/` e é propriedade do npm; self-replace quebraria o `require.resolve` do launcher. `forja update` então **não baixa nada** — reporta a versão nova e roda/instrui `npm i -g @lex0c/forja@<versão>` (mesma proveniência byte-idêntica, §18.6). Detecção: o launcher marca o handoff (ex.: env `FORJA_INSTALL=npm`) ou o binário reconhece seu path sob `node_modules/@lex0c/`.
 
-### 11.2 Signing
+**Cadeia standalone — fail-closed em cada passo** (qualquer falha aborta e deixa o binário atual intacto):
 
-- Releases assinados via Sigstore (keyless)
-- Public key disponível em `https://github.com/<org>/agent/security/...`
-- `agent --version --verify` mostra assinatura + chain
+1. **Resolve alvo.** GitHub Releases: `/releases/latest` (stable), ou o último `--prerelease` quando `--pre` / o operador já roda um RC. Deriva o asset do `<target_id>` (`scripts/targets.ts`: `linux-x64` … `windows-x64`) e baixa `SHA256SUMS` (+ `.sig`/`.asc` quando o release os traz).
+2. **Download** do binário-alvo pra arquivo temporário no **mesmo filesystem** do destino (rename atômico exige same-fs).
+3. **Verifica assinatura** (§11.2) — cosign/Sigstore **quando o release a publica**; enquanto deferida, é um no-op explícito e logado, **nunca** um falso ✓.
+4. **Verifica hash** contra `SHA256SUMS` (§7.2) — **sempre**; é o gate de integridade real hoje. Mismatch = abort.
+5. **Backup atômico** do binário atual → `~/.local/state/forja/backups/forja-<versão>-<epoch>` (habilita §11.3).
+6. **Replace atômico**: `rename(temp, dest)` same-fs. O processo em execução segue no inode antigo (POSIX: unlink-while-open é seguro); a troca vale pro próximo boot. Windows (arquivo travado) é o caso duro — `MoveFileEx`/rename-on-reboot, documentado como limitação de plataforma.
+7. **Verify execution**: roda `dest --version` num subprocess isolado; crash ou versão inesperada → **rollback automático** pro backup (§11.3) e abort. Só aqui o update é declarado bom.
+
+**Confirmação & trace.** `forja update` imprime o diff `current → latest` + URL das notas e confirma (salvo `--auto`); `--check` para no passo 1. Toda execução grava em audit (§0.6): versão origem/destino, hash verificado, e o passo que eventualmente abortou (`old_version`, `new_version`, `step_failed`) — mesmo shape de `FAILURE_MODES.md`.
+
+**Eval (princípio 4).** Fixture de release fake (servidor local servindo binário + `SHA256SUMS` + `.sig` opcional), driver black-box como o teste do `install.sh` (`tests/scripts/install-sh.test.ts`): sucesso, hash-mismatch (abort), assinatura inválida (abort), replace-fail (rollback), verify-exec-fail (rollback automático) e o ramo npm (delega, não baixa). Sem eval, não ship.
+
+### 11.2 Signing & verificação
+
+**Alvo:** cosign **keyless** (Sigstore/OIDC) — o binário é assinado pela identidade do workflow de release (repo + ref via OIDC token), não por chave long-lived; a verificação valida contra essa identidade.
+
+> **Estado: deferido.** O pipeline **reserva** o slot (`id-token: write` no workflow; `.sig`/`.asc` excluídos do `SHA256SUMS` em `scripts/checksums.ts`) mas **ainda não assina** (`PERFORMANCE.md` §18.5). Até ativar, o gate de integridade é **`SHA256SUMS` + reproducible build** (`SOURCE_DATE_EPOCH` fixo, `scripts/repro-check.ts`: mesmo source ⇒ mesmo binário, verificável de fora) **+ proveniência SLSA** (§18.6). Coerência com o princípio §0.7 (limites declarados): a spec **não** afirma "assinado" enquanto não assina — §7.2 e o passo 3 acima tratam a assinatura como camada condicional, não fato.
+
+`forja --version --verify`:
+
+- **Hoje:** confirma o hash do próprio binário contra o `SHA256SUMS` da sua versão e reporta o status de reprodutibilidade. Nunca imprime uma chain de assinatura que não existe.
+- **Com cosign ativo:** + valida `.sig` contra a identidade OIDC e mostra a chain.
+
+Fail-closed: assinatura **presente e inválida** = nunca instala nem executa o update (distinto de assinatura **ausente** sob o regime deferido, que cai no gate de hash).
 
 ### 11.3 Rollback
 
-`agent rollback` volta pra versão anterior se update quebrou. Backup automático preservado por 30 dias.
+`forja rollback` restaura o backup imediatamente anterior — o replace atômico do §11.1 passo 6, ao contrário. Dois gatilhos:
+
+- **Automático:** o passo 7 (verify-exec) falhando reverte sem intervenção — o operador nunca fica com binário quebrado.
+- **Manual:** `forja rollback` quando a versão nova roda mas regride algo.
+
+**Retenção:** backups por **30 dias**, cap nos últimos N (GC do excedente); cada um é o binário inteiro (barato). Sob **npm**, rollback também delega: `npm i -g @lex0c/forja@<versão-anterior>` (o npm guarda as versões; não duplicamos backup).
+
+**O estado final é sempre um binário funcional** — o antigo (abort/rollback) ou o novo já verificado. Nunca um meio-termo: o rename atômico garante que não há janela com binário parcial.
+
+### 11.4 Update-available notice (aviso passivo)
+
+O `forja update` (§11.1) é **pull**: o operador decide checar. O aviso passivo é o complemento **push discreto** — no boot, a TUI sinaliza que existe release mais nova sem que nada tenha sido rodado. É conveniência sobre o canal verificado, **não** um segundo mecanismo de update: nunca baixa nem instala.
+
+**Postura de rede — a decisão que governa o resto.** Este é o único outbound do harness que não é iniciado pelo operador e não passa pela tool `fetch_url` (§9.1) nem pelo host-gate dela — é um `fetch` direto do processo, infra, não ação do modelo. Decisão do operador: **on by default** (`[update] check = true`), na convenção das CLIs de dev (npm/`gh`/brew/rustup checam por default). O que torna o default-on aceitável apesar da postura raiz ("sem rede não-solicitada") é o probe ser deliberadamente benigno: **cache-first** (o boot nunca espera rede, ver abaixo), **fail-silent**, corpo capado, **sem token nem PII**, canal único público (GitHub Releases), **desligável** por `[update] check = false` ou `--no-update-check`. Não é telemetria — não exporta nada do operador; só faz um GET público e compara strings.
+
+> *Decisão de calibração.* A alternativa era opt-in (default off), espelhando a telemetria (§9.3) — o precedente de outbound do projeto. Rejeitada em favor da utilidade: um aviso que a maioria nunca liga quase não avisa, e a distinção da telemetria é material — telemetria **exporta** estado do operador; este check só faz um GET público e compara versão. Trade-off aceito: um probe não-pedido em troca de operadores efetivamente avisados. **Follow-up recomendado (transparência):** um first-boot advisory — uma linha stderr na primeira vez ("update check on; disable com `[update] check = false`"), no padrão do memory-governance em `AGENTIC_CLI` — **ainda não implementado**; decisão do operador se entra.
+
+**Cache-first, refresh assíncrono.** O boot **nunca** espera rede:
+
+- *No boot (síncrono, local):* lê o último resultado conhecido de um cache local (SQLite); se `semver(latest) > semver(current)` e essa versão ainda não foi notificada, emite `update:available` (`UI.md` §3.2). Custo ~0, funciona offline.
+- *Em background (assíncrono, fail-silent):* se habilitado, online e passado o `interval` (default 24h) desde o último check, faz um `fetch` com timeout curto (~2s) e grava o cache. O resultado alimenta a **próxima** sessão — nunca bloqueia a atual nem "aparece no meio" dela.
+
+**Fonte.** Canal único: **GitHub Releases** (`GET …/releases/latest` → `tag_name`), o canal verificado primário do projeto (`PERFORMANCE.md`). Não checamos o npm — ele é só espelho de conveniência sobre os mesmos binários, não agrega sinal de versão e seria uma segunda superfície pra validar sem ganho (princípio anti-cargo-cult). A URL canônica é **constante de build-time**, nunca derivada de `git remote` (o cwd pode ser fork ou não ter remote).
+
+**A resposta é input não-confiável (§0.4).** Um MITM/DNS-spoof pode devolver `tag_name` forjado. Mitigação em camadas: o aviso **só compara string e imprime um comando de update build-time constant** (escolhido pela origem de instalação — `npm i -g …` ou o re-run do `install.sh`; em Windows stock, sem `sh`, a própria página de releases): o único valor derivado da resposta é a **versão** (semver-validada), o comando/URL **nunca** vem da `tag_name` — e nunca baixa, executa ou instala a partir do que a API respondeu (o download verificado por cosign/hash é exclusivo de §11.1/§11.2, e é lá que a assinatura é checada). Além disso: TLS obrigatório; `tag_name` validado como semver **estrito antes** de qualquer comparação — incluindo a gramática de prerelease (ASCII alnum/hyphen, SemVer §9), então control chars / ANSI escapes / whitespace num `tag_name` forjado são rejeitados e **nunca chegam ao cache nem ao render** (terminal injection); body com cap de tamanho; redirect **não** seguido pra host fora do canônico; request sem token nem PII (User-Agent genérico, sem credencial — Releases público não exige auth). Auditabilidade: o check **não** é uma decisão de segurança que §0.6 exija no ledger (approvals/failure_events) — é um GET público read-only, ~1×/dia, sem PII nem mutação, distinto de um `fetch_url` gated pelo modelo. O único rastro é operacional: o `last_checked_at` do cache local (quando o último probe **bem-sucedido** rodou); uma falha não grava nada (retry no próximo boot). Sem audit event dedicado por-probe — proporcional ao risco de um egress benigno; se compliance de rede não-solicitada virar requisito, um log append-only `update_probe_events` (non-chained, como `mesh_events`) é o upgrade.
+
+**Regras de exibição.**
+
+- Notifica só se `semver(latest) > semver(current)`. Nunca em downgrade (checkout de dev à frente da release). Pre-release (`-rc`/`-beta`) só conta se o operador já roda um pre-release.
+- **Uma vez por versão nova:** o cache grava a última versão notificada; não repete a cada boot até sair uma mais nova ainda.
+- Só REPL interativo. `--json`, subagent, one-shot, CI e offline **não** exibem nem disparam o check (mesma regra do welcome banner, `UI.md` §12).
+- **O que mostra:** o comando de update apropriado à instalação, não uma instrução genérica. Se o binário roda sob `node_modules/@lex0c/` (npm é dono dele, §11.1) → `npm i -g @lex0c/forja@<versão>`; senão o re-run do `install.sh` (`curl … | sh`, com `--prefix <dir do binário>` quando não é o prefixo default, pra trocar **in-place** em vez de duplicar). Em Windows stock (sem POSIX `sh`) cai na URL da release page. A versão é **pinada só no ramo npm** (onde é inequívoca); o `install.sh` resolve o latest sozinho (o tag carrega `v`, que não reconstruímos).
+
+**Flags** (categorias de `FEATURE_FLAGS.md`): `[update] check | interval` são **config TOML** (§1.2 — persistente, setup-time); `--no-update-check` é **CLI flag** (§1.1 — override pontual por sessão). Sem flag-as-config cruzado. O template do `forja init` **não** materializa `[update]` — deixa a chave ausente pra herdar o default-on **ou o `check = false` global do operador**, já que o loader resolve project > user e escrever `check = true` no projeto sobrescreveria silenciosamente um opt-out global.
 
 ---
 

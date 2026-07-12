@@ -890,6 +890,22 @@ export type RecapTerseEvent = BaseEvent & {
   message: string;
 };
 
+// Passive "update available" notice (SECURITY_GUIDELINE §11.4). Emitted at
+// boot — REPL only (opt-in) — when the local cache shows a newer release than
+// the running binary. It never reaches a machine-readable stream: --json / CI /
+// non-TTY are refused before the REPL starts, and the NDJSON renderer
+// serializes HarnessEvent, not UIEvent. Distinct from `info`/`warn` so the
+// renderer styles it as a good-to-know accent line, not an alert.
+export type UpdateAvailableEvent = BaseEvent & {
+  type: 'update:available';
+  current: string;
+  latest: string;
+  // Copy-pasteable update command tailored to how the binary was installed (npm
+  // vs install.sh — origin.ts / §11.4). A build-time constant, rendered as-is, so
+  // the UI needn't know the install origin or the repo slug.
+  command: string;
+};
+
 // Diagnostics + interrupts.
 export type ErrorEvent = BaseEvent & {
   type: 'error';
@@ -1021,6 +1037,7 @@ export type UIEvent =
   | OperatorBashDoneEvent
   | BusyChangeEvent
   | RecapTerseEvent
+  | UpdateAvailableEvent
   | ErrorEvent
   | WarnEvent
   | InterruptEvent

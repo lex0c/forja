@@ -41,6 +41,16 @@ describe('renderInitConfigTemplate', () => {
     expect(parsed.memory).toBeDefined();
   });
 
+  test('does not materialize [update] (a project check=true would override a global opt-out)', () => {
+    // The passive update notice defaults on when the key is absent (§11.4), so
+    // scaffolding [update] check = true into every project would silently
+    // override a user-level ~/.config/forja opt-out (loadUpdateConfig resolves
+    // project over user). Leave it out → the global check=false is honored.
+    const scaffold = renderInitConfigTemplate(defaults());
+    expect(scaffold).not.toContain('[update]');
+    expect(scaffold).not.toContain('check =');
+  });
+
   test('[providers].model matches DEFAULT_MODEL', () => {
     const parsed = Bun.TOML.parse(renderInitConfigTemplate(defaults())) as {
       providers: { model: string };

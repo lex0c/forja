@@ -508,6 +508,7 @@ export const run = async (options: RunOptions): Promise<number> => {
           prompt: '',
           ...(args.model !== undefined ? { modelId: args.model } : {}),
           ...(args.noRecap === true ? { noRecap: true } : {}),
+          ...(args.noUpdateCheck === true ? { noUpdateCheck: true } : {}),
           signal: options.signal ?? new AbortController().signal,
           // Pipe --json through so bootstrap's first-boot governance
           // banner suppresses correctly for `forja recap --json`
@@ -780,6 +781,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       memoryConfigWarnings,
       providersConfigWarnings,
       recapConfigWarnings,
+      updateConfigWarnings,
       budgetConfigWarnings,
       effortConfigWarnings,
       auditConfigWarnings,
@@ -879,6 +881,11 @@ export const run = async (options: RunOptions): Promise<number> => {
       // enabled type shouldn't disappear silently.
       for (const w of recapConfigWarnings) {
         errSink(`forja: recap config: ${w}\n`);
+      }
+      // [update] config warnings — a bad `check`/`interval` shouldn't vanish;
+      // with check default-on, a malformed opt-out silently keeps the probe on.
+      for (const w of updateConfigWarnings) {
+        errSink(`forja: update config: ${w}\n`);
       }
       // [budget] config warnings — same rationale: a numeric typo
       // or out-of-range value shouldn't disappear silently.

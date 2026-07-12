@@ -19,6 +19,7 @@ import {
   loadProvidersConfig,
   loadRecapConfig,
   loadSandboxConfig,
+  loadUpdateConfig,
   loadVerifyConfig,
 } from '../config/loaders.ts';
 import { persistModelPin } from '../config/writer.ts';
@@ -156,6 +157,9 @@ export interface BootstrapInput {
   // `--no-recap` global flag: forces `recapEnabled=false` regardless
   // of `[recap].enabled` config.
   noRecap?: boolean;
+  // `--no-update-check` global flag: forces the passive update-available
+  // notice (§11.4) off regardless of `[update].check`.
+  noUpdateCheck?: boolean;
   cwd?: string;
   budget?: Partial<RunBudget>;
   signal?: AbortSignal;
@@ -424,6 +428,10 @@ export interface BootstrapResult {
   // Warnings from the `[recap]` loader (unknown render_model, bad
   // enabled type → warning + ignore).
   recapConfigWarnings: readonly string[];
+  // Warnings from the `[update]` loader (bad `check` type / bad `interval`
+  // → warning + ignore). Matters more since `check` defaults on: a malformed
+  // opt-out is ignored and the probe silently stays enabled.
+  updateConfigWarnings: readonly string[];
   // Warnings from the `[effort].level` loader (unknown level →
   // warn + fall back to DEFAULT_EFFORT). Same fail-soft posture.
   effortConfigWarnings: readonly string[];
@@ -608,6 +616,11 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // + `enabled` master switch. CLI `--no-recap` overrides config to
   // off; otherwise project [recap] wins over user, then default-on.
   const recapLoaded = loadRecapConfig({ cwd: projectConfigCwd, registry });
+
+  // [update] config — passive update-available notice (§11.4): `check`
+  // (on by default) + `interval` (throttle). CLI `--no-update-check` and
+  // `[update].check = false` override to off.
+  const updateLoaded = loadUpdateConfig({ cwd: projectConfigCwd });
 
   // Slice Q — invert S11/S13 LLM-judge default to ON. The loader
   // walks the same `.forja/config.toml` + `~/.config/forja/config.toml`
@@ -1881,6 +1894,16 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     ...(recapLoaded.config.renderModel !== undefined
       ? { recapRenderModel: recapLoaded.config.renderModel }
       : {}),
+    // [update] — `--no-update-check` forces off; else config `check`; else
+    // absent (the boot path treats undefined as ON — default-on via `!== false`, §11.4).
+    ...(input.noUpdateCheck === true
+      ? { updateCheckEnabled: false }
+      : updateLoaded.config.check !== undefined
+        ? { updateCheckEnabled: updateLoaded.config.check }
+        : {}),
+    ...(updateLoaded.config.intervalMs !== undefined
+      ? { updateIntervalMs: updateLoaded.config.intervalMs }
+      : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     // Slice Q — resolved state (always boolean, never undefined).
     // Precedence: CLI explicit > project config > user config > default ON.
@@ -1995,6 +2018,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     memoryConfigWarnings: memoryLoaded.warnings,
     providersConfigWarnings: providersLoaded.warnings,
     recapConfigWarnings: recapLoaded.warnings,
+    updateConfigWarnings: updateLoaded.warnings,
     budgetConfigWarnings: budgetLoaded.warnings,
     effortConfigWarnings: effortLoaded.warnings,
     auditConfigWarnings: auditLoaded.warnings,

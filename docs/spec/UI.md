@@ -151,6 +151,7 @@ Implementação: `EventEmitter` nativo do Node/Bun. Não usar `mitt` ou similar 
 | `bg:start/update/end` | Background process | atualiza tray na status line |
 | `step:budget` | Budget warning (80%, 90%) | status line muda cor (dim → bold) |
 | `checkpoint:create` | Novo checkpoint | breve flash na status line (1s) |
+| `update:available` | Cache local (`SECURITY_GUIDELINE` §11.4) indica release mais nova — boot, REPL only | linha permanente discreta após o banner, tom `info`/`accent` (§4.10.9), **não** `warn`; **REPL-only** — não chega ao NDJSON (`--json`/CI/one-shot são recusados antes do REPL, e o serializer NDJSON emite `HarnessEvent`, não `UIEvent`) |
 | `error` | Erro fatal | linha vermelha permanente; mantém sessão se possível |
 | `warn` | Aviso não-fatal | linha dim permanente |
 | `interrupt` | Ctrl+C / Esc Esc | mostra prompt de cancelamento |
@@ -557,6 +558,8 @@ Os campos correspondentes (`contextWindow`, `maxOutputTokens`, `env`) **continua
 Vai pro scrollback — uma vez impresso, scrolla naturalmente conforme a conversa cresce. **Sem header fixo.** Sem logo. Sem mascot.
 
 Em modo `--json`, o banner é emitido como `{type: 'session:banner', ...}` no NDJSON em vez de linhas formatadas.
+
+**Aviso de nova versão.** Quando o cache local de update (`SECURITY_GUIDELINE` §11.4) indica release mais nova, o boot emite `update:available` (§3.2) como **linha própria logo após o banner** — leading blank, tom `info`/`accent`. Não entra no frame do banner (que lista só estado corrente) nem usa `warn`: não é problema, é conveniência. Mesma lógica da linha sandboxActive não-afirmativa acima (que também fica fora do banner) — só que ali é `warn` e aqui é informativo. Formato (2 linhas): a headline `Forja v0.2.0 available!` em accent e, abaixo, indentada, `Update: <comando>` — o comando de update apropriado à instalação (npm / re-run do `install.sh`; em Windows stock, a URL da release page), **não** o `forja update`, que ainda não existe (§11.1, fase 2). O comando vem no evento (campo `command`), montado por origem/plataforma no boot (`SECURITY_GUIDELINE` §11.4), não hard-coded no render. Só REPL; on-by-default (desligável por `[update] check = false` / `--no-update-check`), cache-first e demais regras no §11.4.
 
 #### 4.10.10 Step separator
 
@@ -1184,9 +1187,10 @@ Pty harness (`node-pty`) só pra fluxos que dependem de raw stdin parsing (paste
 5. Bootstrap subsystems (memory, checkpoints, providers, ...).
 6. Bus emit `session:banner` (§4.10.9 — em REPL; one-shot pula).
 7. Bus emit `session:start`.
-8. Loop: read input, dispatch to harness, emit events.
-9. Em transição de turno (REPL only): bus emit `step:separator` (§4.10.10).
-10. On exit (any path): drain bus, restore stdin mode, cursor visible.
+8. (REPL, on por default) Se o cache local de update (`SECURITY_GUIDELINE` §11.4) indica release mais nova, bus emit `update:available` (§4.10.9). Dispara em background o refresh assíncrono fail-silent do cache — fora do critical path, nunca bloqueia o loop.
+9. Loop: read input, dispatch to harness, emit events.
+10. Em transição de turno (REPL only): bus emit `step:separator` (§4.10.10).
+11. On exit (any path): drain bus, restore stdin mode, cursor visible.
 ```
 
 Restore de stdin mode é crítico — sem isso, o terminal do user fica em raw mode após crash. Use `process.on('exit'|'SIGINT'|'uncaughtException')` para garantir.

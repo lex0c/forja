@@ -83,6 +83,7 @@ import { migration082McpServerRevokedAt } from './082-mcp-server-revoked-at.ts';
 import { migration083McpServersScoped } from './083-mcp-servers-scoped.ts';
 import { migration084MeshEvents } from './084-mesh-events.ts';
 import { migration085MeshEventsMessageBus } from './085-mesh-events-message-bus.ts';
+import { migration086UpdateCheckState } from './086-update-check-state.ts';
 
 export interface Migration {
   id: number;
@@ -176,4 +177,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration083McpServersScoped,
   migration084MeshEvents,
   migration085MeshEventsMessageBus,
+  migration086UpdateCheckState,
 ];

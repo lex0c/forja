@@ -27,6 +27,9 @@ export interface ParsedArgs {
   // (suppresses session-end/Alt+R auto-display, resume
   // auto-rehydrate, and forces deterministic `/recap` render).
   noRecap?: boolean;
+  // `--no-update-check`: disable the passive update-available notice
+  // for this run (SECURITY_GUIDELINE §11.4).
+  noUpdateCheck?: boolean;
   // List-sessions mode (AGENTIC_CLI §2.1): print known sessions
   // (newest first) and exit. Honors --json for headless consumers.
   listSessions: boolean;
@@ -653,6 +656,7 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
   let json = false;
   let model: string | undefined;
   let noRecap = false;
+  let noUpdateCheck = false;
   const recapArgs: string[] = [];
   let i = 1;
   while (i < argv.length) {
@@ -724,6 +728,14 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
       i += 1;
       continue;
     }
+    if (token === '--no-update-check') {
+      // Parity with --no-recap: consume it AND record it so run.ts's recap
+      // bootstrap threads it (recap is headless today and never shows the
+      // notice, but the flag shouldn't silently vanish at the parser boundary).
+      noUpdateCheck = true;
+      i += 1;
+      continue;
+    }
     // Every other token — including recap-specific flags
     // (`--no-llm-render`, `--out`, `--limit`, `--project`, etc.)
     // and positional subcommand verbs (`pr`, `last`, `session`,
@@ -748,6 +760,7 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
       recap: { args: recapArgs },
       ...(model !== undefined ? { model } : {}),
       ...(noRecap ? { noRecap: true } : {}),
+      ...(noUpdateCheck ? { noUpdateCheck: true } : {}),
     },
   };
 };
@@ -1677,6 +1690,10 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         args.noRecap = true;
         i += 1;
         break;
+      case '--no-update-check':
+        args.noUpdateCheck = true;
+        i += 1;
+        break;
       case '--list-sessions':
         args.listSessions = true;
         i += 1;
@@ -2320,6 +2337,7 @@ export const usage = (): string =>
     '                         so a dev build never migrates or pollutes your real Forja state. Also via FORJA_PROFILE env. Name: [a-z0-9][a-z0-9-]*',
     '  --autonomous           Start in Autonomous mode: auto-approve routine confirms (Shift+Tab toggles)',
     '  --no-recap             Disable recap for this run: no session-end/Alt+R auto-display, no resume rehydrate, deterministic /recap render',
+    '  --no-update-check      Disable the passive "update available" notice for this run (SECURITY_GUIDELINE §11.4)',
     '  --list-sessions        Print known sessions (newest first) and exit',
     '  --include-subagents    With --list-sessions, fan parents into their subagent children (requires --list-sessions)',
     '  --limit <n>            With --list-sessions, cap rows returned (default 20; requires --list-sessions)',

@@ -827,6 +827,7 @@ export type PermanentItem =
       durationMs: number;
     }
   | { kind: 'recap-terse'; message: string }
+  | { kind: 'update-available'; current: string; latest: string; command: string }
   // Extended-thinking / reasoning block flushed at `thinking:end`. Rendered as
   // a bold `reasoning:` label over a secondary-toned body (the model's scratch
   // work, not the answer). `text` is already capped at flush.
@@ -1770,6 +1771,19 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
 
     case 'recap:terse':
       return { state, permanent: [{ kind: 'recap-terse', message: event.message }] };
+
+    case 'update:available':
+      return {
+        state,
+        permanent: [
+          {
+            kind: 'update-available',
+            current: event.current,
+            latest: event.latest,
+            command: event.command,
+          },
+        ],
+      };
 
     case 'interrupt':
       // Spec UI.md §4.10.6: soft interrupt flips the footer cue from

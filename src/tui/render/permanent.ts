@@ -561,6 +561,22 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       const body = paint(caps, 'secondary', ` ${item.message}`);
       return ['', `${prefix}${body}`].map(padFrame);
     }
+    case 'update-available': {
+      // Passive update notice (SECURITY_GUIDELINE §11.4 / UI §4.10.9): a
+      // good-to-know accent line after the banner, NOT the warn channel — this
+      // isn't a problem, it's convenience. The new version is painted `accent`
+      // to draw the eye; the copy-pasteable command sits on its own indented
+      // line below (the install.sh one-liner is too long to share the headline).
+      // `command` is a build-time constant (origin.ts), rendered raw; only
+      // `latest` comes off the network, so only it is sanitized. Leading blank so
+      // the notice reads as its own block, not part of the banner frame.
+      const head = paint(
+        caps,
+        'accent',
+        `Forja v${sanitizeOneLineForDisplay(item.latest)} available!`,
+      );
+      return ['', head, `  Update: ${item.command}`].map(padFrame);
+    }
     case 'subagent_group_header': {
       // `● Subagents` group title over a burst of finishing subagents.
       // Carries the same `●` chip glyph as a tool/subagent head, but at

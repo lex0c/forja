@@ -777,6 +777,14 @@ export interface HarnessConfig {
   // `[recap].render_model`). Undefined → render uses the session's
   // own provider; a `/recap --model <id>` flag overrides per-call.
   recapRenderModel?: string;
+  // Passive update-available notice (SECURITY_GUIDELINE §11.4). On by default:
+  // undefined/true → check; `--no-update-check` / `[update].check = false` force
+  // it off (the boot reads `!== false`). Read only by the REPL boot path — the
+  // agent loop never consumes it.
+  updateCheckEnabled?: boolean;
+  // Throttle between network probes (`[update].interval`, default 24h). Only
+  // meaningful when updateCheckEnabled is true.
+  updateIntervalMs?: number;
   // Directory where bg-aware tools' stdout/stderr log files are
   // written. When set, the harness creates a session-scoped
   // BgManager after createSession and threads it through
