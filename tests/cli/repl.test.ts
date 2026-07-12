@@ -172,6 +172,7 @@ const makeBootstrapStub = (
     memoryConfigWarnings: [] as readonly string[],
     providersConfigWarnings: [] as readonly string[],
     recapConfigWarnings: [] as readonly string[],
+    updateConfigWarnings: [] as readonly string[],
     budgetConfigWarnings: [] as readonly string[],
     effortConfigWarnings: [] as readonly string[],
     auditConfigWarnings: [] as readonly string[],

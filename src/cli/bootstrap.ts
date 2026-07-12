@@ -428,6 +428,10 @@ export interface BootstrapResult {
   // Warnings from the `[recap]` loader (unknown render_model, bad
   // enabled type → warning + ignore).
   recapConfigWarnings: readonly string[];
+  // Warnings from the `[update]` loader (bad `check` type / bad `interval`
+  // → warning + ignore). Matters more since `check` defaults on: a malformed
+  // opt-out is ignored and the probe silently stays enabled.
+  updateConfigWarnings: readonly string[];
   // Warnings from the `[effort].level` loader (unknown level →
   // warn + fall back to DEFAULT_EFFORT). Same fail-soft posture.
   effortConfigWarnings: readonly string[];
@@ -2014,6 +2018,7 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
     memoryConfigWarnings: memoryLoaded.warnings,
     providersConfigWarnings: providersLoaded.warnings,
     recapConfigWarnings: recapLoaded.warnings,
+    updateConfigWarnings: updateLoaded.warnings,
     budgetConfigWarnings: budgetLoaded.warnings,
     effortConfigWarnings: effortLoaded.warnings,
     auditConfigWarnings: auditLoaded.warnings,

@@ -68,6 +68,21 @@ describe('loadUpdateConfig', () => {
     }
   });
 
+  test('check = "false" (string opt-out typo) is ignored + warned, not silently kept on', () => {
+    const cwd = makeTempCwd();
+    try {
+      writeProjectUpdate(cwd, '[update]\ncheck = "false"\n');
+      const r = load(cwd);
+      // Ignored → check stays undefined → the boot treats it as default-ON. The
+      // warning (surfaced via BootstrapResult.updateConfigWarnings) is what tells
+      // the operator the opt-out did not take and the probe is still enabled.
+      expect(r.config.check).toBeUndefined();
+      expect(r.warnings[0]).toContain('[update].check must be a boolean');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   test('garbage interval warns and is ignored', () => {
     const cwd = makeTempCwd();
     try {

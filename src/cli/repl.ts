@@ -656,6 +656,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     memoryConfigWarnings,
     providersConfigWarnings,
     recapConfigWarnings,
+    updateConfigWarnings,
     budgetConfigWarnings,
     effortConfigWarnings,
     auditConfigWarnings,
@@ -896,6 +897,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // [recap] config warnings — unknown render_model / bad enabled type.
   for (const w of recapConfigWarnings) {
     errSink(`forja: recap config: ${w}\n`);
+  }
+  // [update] config warnings — with check default-on, a malformed opt-out
+  // (e.g. check = "false") is ignored and silently keeps the probe on.
+  for (const w of updateConfigWarnings) {
+    errSink(`forja: update config: ${w}\n`);
   }
   // [budget] config warnings — a numeric typo or out-of-range value
   // shouldn't disappear silently.
