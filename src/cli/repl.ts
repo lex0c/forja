@@ -77,7 +77,7 @@ import {
   type SessionBannerEvent,
   type UIEvent,
 } from '../tui/index.ts';
-import { kickUpdateRefresh, markNoticeShown, peekUpdateNotice } from '../update/index.ts';
+import { isCiEnv, kickUpdateRefresh, markNoticeShown, peekUpdateNotice } from '../update/index.ts';
 import { createWorkingStateStore } from '../working-state/index.ts';
 import type { ParsedArgs } from './args.ts';
 import { buildBgSummary } from './bg-summary.ts';
@@ -3970,15 +3970,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   });
 
   // Passive update-available notice (SECURITY_GUIDELINE §11.4). On by default
-  // (off via `[update] check = false` / `--no-update-check`), plus a real version. Reaching runRepl's banner already implies an
-  // interactive TTY REPL — one-shot, --json and non-TTY/CI are refused upstream
-  // (index.ts's --json + TTY gates, and repl.ts's own TTY guard above), and
-  // subagents never call runRepl. The VERSION check guards unstamped builds:
-  // the placeholder '0.0.0' (src/cli/version.ts) compares older than every
-  // release and would nag falsely, so skip the check there. Read the cache,
-  // emit the notice once per release, then kick a fail-silent refresh whose
-  // result feeds the NEXT session.
-  if (baseConfig.updateCheckEnabled !== false && VERSION !== '0.0.0') {
+  // (off via `[update] check = false` / `--no-update-check`), plus a real
+  // version, plus NOT in CI. Reaching runRepl's banner already implies an
+  // interactive TTY REPL — one-shot, --json and non-TTY are refused upstream
+  // (index.ts's --json + TTY gates, repl.ts's own TTY guard), and subagents
+  // never call runRepl. But CI is NOT caught upstream when a job allocates a pty
+  // (script/expect smoke tests), so gate it here — an unsolicited network probe
+  // in CI violates §11.4. The VERSION check guards unstamped builds: the
+  // placeholder '0.0.0' compares older than every release and would nag falsely.
+  if (baseConfig.updateCheckEnabled !== false && VERSION !== '0.0.0' && !isCiEnv()) {
     // A passive best-effort notice must never crash boot. The async refresh has
     // its own catch; this wraps the SYNCHRONOUS decide/emit — a DB throw from
     // peek/mark, or a throwing bus subscriber, would otherwise escape here.

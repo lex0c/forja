@@ -2,7 +2,12 @@ import { describe, expect, test } from 'bun:test';
 import { openDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { recordUpdateProbe } from '../../src/storage/repos/update-check.ts';
-import { kickUpdateRefresh, markNoticeShown, peekUpdateNotice } from '../../src/update/boot.ts';
+import {
+  isCiEnv,
+  kickUpdateRefresh,
+  markNoticeShown,
+  peekUpdateNotice,
+} from '../../src/update/boot.ts';
 
 const freshDb = () => {
   const db = openDb(':memory:');
@@ -47,6 +52,17 @@ describe('peekUpdateNotice / markNoticeShown', () => {
     recordUpdateProbe(db, 1000, '0.1.0');
     expect(peekUpdateNotice(db, '0.2.0')).toBeNull();
     db.close();
+  });
+});
+
+describe('isCiEnv', () => {
+  test('detects common CI flags, treats false/empty/0 as not-CI', () => {
+    expect(isCiEnv({ CI: 'true' })).toBe(true);
+    expect(isCiEnv({ CI: '1' })).toBe(true);
+    expect(isCiEnv({})).toBe(false);
+    expect(isCiEnv({ CI: '' })).toBe(false);
+    expect(isCiEnv({ CI: 'false' })).toBe(false);
+    expect(isCiEnv({ CI: '0' })).toBe(false);
   });
 });
 

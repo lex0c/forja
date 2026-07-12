@@ -48,3 +48,13 @@ export const kickUpdateRefresh = (
   if (signal !== undefined) opts.signal = signal;
   void refreshUpdateCache(db, opts);
 };
+
+// True under a CI system — the de facto `CI` env var that GitHub Actions /
+// GitLab / CircleCI / Travis all set. The notice suppresses its network probe in
+// CI even under an allocated pty (script/expect smoke tests), which the upstream
+// TTY gate does NOT catch (§11.4: no unsolicited network in CI). `false`/`0`/
+// empty count as not-CI.
+export const isCiEnv = (env: NodeJS.ProcessEnv = process.env): boolean => {
+  const ci = env.CI;
+  return ci !== undefined && ci !== '' && ci !== 'false' && ci !== '0';
+};

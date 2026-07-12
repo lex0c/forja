@@ -4,7 +4,7 @@
 // will reuse the semver + resolve pieces here when implemented.
 
 export type { UpdateNotice } from './boot.ts';
-export { kickUpdateRefresh, markNoticeShown, peekUpdateNotice } from './boot.ts';
+export { isCiEnv, kickUpdateRefresh, markNoticeShown, peekUpdateNotice } from './boot.ts';
 export type { NoticeDecision } from './notice.ts';
 export { DEFAULT_INTERVAL_MS, decideNotice, shouldRefresh } from './notice.ts';
 export {
