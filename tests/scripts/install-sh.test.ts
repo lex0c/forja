@@ -179,12 +179,21 @@ describe.if(hasScript)('install.sh — TTY progress bar', () => {
   test('download bar goes proportional (regression: render_dl var scope)', () => {
     const fx = makeFixture(GOOD_SHA);
     const typescript = join(fx.root, 'ts.out');
+    // install.sh disables the rich UI (colors + bar) under NO_COLOR,
+    // FORJA_NO_PROGRESS, or TERM=dumb — and this test asserts on the rich UI.
+    // The pty from `script` satisfies `[ -t 2 ]`, but if the host/CI exports any
+    // of those, install.sh would emit only plain lines and the assertions below
+    // would spuriously fail. Strip them and pin a capable TERM so the test is
+    // deterministic regardless of the ambient environment.
+    const richEnv: Record<string, string> = { ...fx.env, TERM: 'xterm-256color' };
+    delete richEnv.NO_COLOR;
+    delete richEnv.FORJA_NO_PROGRESS;
     try {
       const r = Bun.spawnSync({
         cmd: ['script', '-qec', `sh '${INSTALL_SH}' --repo o/r`, typescript],
         stdout: 'ignore',
         stderr: 'ignore',
-        env: fx.env, // no FORJA_NO_PROGRESS → rich UI under the pty
+        env: richEnv,
       });
       expect(r.exitCode).toBe(0);
       expect(fx.prefix && installedSha(fx)).toBe(GOOD_SHA);
