@@ -17,9 +17,13 @@ export const RELEASES_PAGE_URL = `https://github.com/${REPO_SLUG}/releases/lates
 // The refresh must never make boot feel slow, and it runs in the background
 // anyway — a slow/hanging server is treated as "no signal".
 const PROBE_TIMEOUT_MS = 2000;
-// The API response is untrusted (§0.4); a hostile endpoint must not stream us
-// an unbounded body. Release JSON is ~a few KB; 64 KiB is generous.
-const MAX_BODY_BYTES = 64 * 1024;
+// The API response is untrusted (§0.4); a hostile endpoint must not stream us an
+// unbounded body. But `/releases/latest` returns the WHOLE release object — the
+// --generate-notes body (GitHub caps notes at ~125 KB) plus every asset's
+// metadata (binaries, SBOM, SHA256SUMS) — so a 64 KiB cap silently dropped valid
+// large releases before extractTagName ever ran. 1 MiB covers any real GitHub
+// release object with wide margin while still bounding a truly hostile body.
+const MAX_BODY_BYTES = 1024 * 1024;
 
 // Reads the response body up to `max` bytes, returning null if it exceeds the
 // cap (treated as no signal) — never buffers an unbounded stream.

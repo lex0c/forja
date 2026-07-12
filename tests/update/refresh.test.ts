@@ -74,10 +74,21 @@ describe('fetchLatestVersion', () => {
     );
   });
   test('oversized body → null (untrusted response, capped)', async () => {
-    const pad = 'x'.repeat(70 * 1024);
+    const pad = 'x'.repeat(1_100_000); // > the 1 MiB cap
     await withServer(
       () => new Response(JSON.stringify({ tag_name: '0.2.0', pad })),
       async (url) => expect(await fetchLatestVersion(url)).toBeNull(),
+    );
+  });
+
+  test('large real-ish release (100KB notes + assets) still extracts the tag', async () => {
+    // A --generate-notes release object: big body + asset metadata, well under
+    // the 1 MiB cap. 64 KiB would have dropped this valid release.
+    const body = 'release notes line\n'.repeat(6000); // ~114 KB
+    const assets = Array.from({ length: 8 }, (_, i) => ({ name: `asset-${i}`, size: 1000 }));
+    await withServer(
+      () => new Response(JSON.stringify({ tag_name: 'v0.2.0', name: 'v0.2.0', body, assets })),
+      async (url) => expect(await fetchLatestVersion(url)).toBe('0.2.0'),
     );
   });
   test('connection refused → null (fail-silent)', async () => {
