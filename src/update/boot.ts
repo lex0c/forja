@@ -1,12 +1,13 @@
 import type { DB } from '../storage/db.ts';
 import { getUpdateCheck, markNotified } from '../storage/repos/update-check.ts';
 import { decideNotice } from './notice.ts';
-import { RELEASES_PAGE_URL, refreshUpdateCache } from './refresh.ts';
+import { detectInstallOrigin, updateCommand } from './origin.ts';
+import { refreshUpdateCache } from './refresh.ts';
 
 export interface UpdateNotice {
   current: string;
   latest: string;
-  url: string;
+  command: string;
 }
 
 // Boot-path decision for the passive "update available" notice
@@ -21,7 +22,11 @@ export interface UpdateNotice {
 export const peekUpdateNotice = (db: DB, current: string): UpdateNotice | null => {
   const decision = decideNotice(getUpdateCheck(db), current);
   if (!decision.show || decision.latest === undefined) return null;
-  return { current, latest: decision.latest, url: RELEASES_PAGE_URL };
+  return {
+    current,
+    latest: decision.latest,
+    command: updateCommand(detectInstallOrigin(), decision.latest),
+  };
 };
 
 // Records that `version` was surfaced, so the notice fires once per release.

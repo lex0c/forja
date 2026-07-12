@@ -25,15 +25,16 @@ describe('peekUpdateNotice / markNoticeShown', () => {
   test('newer known → notice; silent only AFTER markNoticeShown (once per release)', () => {
     const db = freshDb();
     recordUpdateProbe(db, 1000, '0.2.0');
-    const notice = {
-      current: '0.1.3',
-      latest: '0.2.0',
-      url: 'https://github.com/lex0c/forja/releases/latest',
-    };
     // peek does NOT mark — it stays showable until the caller confirms it shown,
-    // so a crash between decide and render can't lose the notice.
-    expect(peekUpdateNotice(db, '0.1.3')).toEqual(notice);
-    expect(peekUpdateNotice(db, '0.1.3')).toEqual(notice);
+    // so a crash between decide and render can't lose the notice. The decision
+    // (versions + a non-empty command) is checked here; the command VALUE per
+    // install origin/platform is pinned in origin.test.ts, not re-derived from
+    // the SUT (that would be a tautology and would couple this test to the
+    // runner's platform).
+    const first = peekUpdateNotice(db, '0.1.3');
+    expect(first).toMatchObject({ current: '0.1.3', latest: '0.2.0' });
+    expect(first?.command.length).toBeGreaterThan(0);
+    expect(peekUpdateNotice(db, '0.1.3')).toMatchObject({ current: '0.1.3', latest: '0.2.0' });
     // Marking (after emit) makes the same release silent on the next boot.
     markNoticeShown(db, '0.2.0');
     expect(peekUpdateNotice(db, '0.1.3')).toBeNull();

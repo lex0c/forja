@@ -900,10 +900,10 @@ export type UpdateAvailableEvent = BaseEvent & {
   type: 'update:available';
   current: string;
   latest: string;
-  // GitHub releases page the notice points at (the current update path until
-  // the `forja update` subcommand lands). Rendered, so the UI needn't know the
-  // repo slug.
-  url: string;
+  // Copy-pasteable update command tailored to how the binary was installed (npm
+  // vs install.sh — origin.ts / §11.4). A build-time constant, rendered as-is, so
+  // the UI needn't know the install origin or the repo slug.
+  command: string;
 };
 
 // Diagnostics + interrupts.

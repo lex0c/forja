@@ -6,13 +6,8 @@ import { formatSemver, parseSemver } from './semver.ts';
 // Canonical release feed. GitHub Releases is the single verified channel
 // (SECURITY_GUIDELINE §11.4). Build-time constants — never derived from
 // `git remote`, which could point at a fork or be absent.
-const REPO_SLUG = 'lex0c/forja';
+export const REPO_SLUG = 'lex0c/forja';
 export const RELEASES_LATEST_URL = `https://api.github.com/repos/${REPO_SLUG}/releases/latest`;
-
-// Human-facing releases page the notice points at. It's the current update
-// path (install.sh re-run / npm / assets) until the `forja update` subcommand
-// lands (spec §11.1, phase 2) — a constant, so no per-tag v-prefix hazard.
-export const RELEASES_PAGE_URL = `https://github.com/${REPO_SLUG}/releases/latest`;
 
 // The refresh must never make boot feel slow, and it runs in the background
 // anyway — a slow/hanging server is treated as "no signal".

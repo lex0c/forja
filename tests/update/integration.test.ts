@@ -15,7 +15,7 @@ const ascii: Capabilities = { isTTY: true, cols: 80, rows: 24, color: 'none', un
 // markNoticeShown AFTER the emit. The opt-in gate itself (a plain boolean in
 // runRepl) is typecheck-covered; --json / CI / non-TTY are refused upstream.
 describe('update notice — boot data path', () => {
-  test('a newer cached release renders the accent line pointing at the release page', () => {
+  test('a newer cached release renders the accent line with the origin-aware update command', () => {
     const db = openDb(':memory:');
     migrate(db);
     // A refresh in a previous session recorded a newer release.
@@ -31,11 +31,11 @@ describe('update notice — boot data path', () => {
       ts: 2000,
       current: notice.current,
       latest: notice.latest,
-      url: notice.url,
+      command: notice.command,
     });
     const body = r.permanent.flatMap((item) => formatPermanent(item, ascii)).join('\n');
     expect(body).toContain('Forja v9.9.9 available!');
-    expect(body).toContain('Update: https://github.com/lex0c/forja/releases/latest');
+    expect(body).toContain(`Update: ${notice.command}`);
 
     // Mark after emit (as the wire does), then a second boot is silent.
     markNoticeShown(db, notice.latest);
