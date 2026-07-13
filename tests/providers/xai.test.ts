@@ -279,6 +279,27 @@ describe('createXaiProvider', () => {
     expect('stream' in body).toBe(false);
   });
 
+  test('generateConstrained adds reasoning_tokens to output (billed separately)', async () => {
+    const p = createXaiProvider('grok-4.5', {
+      client: makeClient({
+        response: {
+          choices: [
+            { message: { tool_calls: [{ function: { name: 'out', arguments: '{"ok":true}' } }] } },
+          ],
+          usage: {
+            prompt_tokens: 50,
+            completion_tokens: 4,
+            prompt_tokens_details: { cached_tokens: 10 },
+            completion_tokens_details: { reasoning_tokens: 120 },
+          },
+        },
+      }),
+    });
+    const out = await p.generateConstrained(reqCon({ messages: [{ role: 'user', content: 'x' }] }));
+    // output = completion (4) + reasoning (120) = 124; input = 50 - 10.
+    expect(out.usage).toEqual({ input: 40, output: 124, cache_read: 10, cache_creation: 0 });
+  });
+
   test('generateConstrained rejects caller tools', async () => {
     const p = createXaiProvider('grok-4.5', { client: makeClient({}) });
     await expect(

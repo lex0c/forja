@@ -40,12 +40,23 @@ export interface RawXaiChoice {
 // `stream_options: { include_usage: true }` (the adapter opts in). `prompt_tokens`
 // includes the cached portion; `cached_tokens` is the discounted automatic-cache
 // read. xAI reports no cache-WRITE count, so cache_creation stays zero.
+//
+// UNLIKE OpenAI, xAI's `completion_tokens` is the VISIBLE answer ONLY — the
+// billed internal reasoning is reported SEPARATELY as
+// `completion_tokens_details.reasoning_tokens` and is NOT included in
+// `completion_tokens` (verified live: prompt+completion+reasoning == total, and
+// xAI's own `cost_in_usd_ticks` matches computeCost only when reasoning is added
+// to output). So the two must be summed for output; billing them at the output
+// rate is correct (xAI bills reasoning as completion tokens).
 export interface RawXaiUsage {
   prompt_tokens?: number;
   completion_tokens?: number;
   total_tokens?: number;
   prompt_tokens_details?: {
     cached_tokens?: number;
+  };
+  completion_tokens_details?: {
+    reasoning_tokens?: number;
   };
 }
 
@@ -91,6 +102,7 @@ export async function* normalizeXaiStream(
   // with "measured zero".
   let rawPrompt = 0;
   let rawCompletion = 0;
+  let rawReasoning = 0;
   let rawCached = 0;
   let usageSeen = false;
   let usageEmitted = false;
@@ -101,7 +113,9 @@ export async function* normalizeXaiStream(
         kind: 'usage',
         usage: {
           input: Math.max(0, rawPrompt - rawCached),
-          output: rawCompletion,
+          // Reasoning tokens are billed as output but reported separately from
+          // completion_tokens (see RawXaiUsage) — sum them so cost/stats match.
+          output: rawCompletion + rawReasoning,
           cache_read: rawCached,
           cache_creation: 0,
         },
@@ -126,6 +140,10 @@ export async function* normalizeXaiStream(
         }
         if (typeof u.completion_tokens === 'number') {
           rawCompletion = Math.max(rawCompletion, u.completion_tokens);
+          touched = true;
+        }
+        if (typeof u.completion_tokens_details?.reasoning_tokens === 'number') {
+          rawReasoning = Math.max(rawReasoning, u.completion_tokens_details.reasoning_tokens);
           touched = true;
         }
         if (typeof u.prompt_tokens_details?.cached_tokens === 'number') {

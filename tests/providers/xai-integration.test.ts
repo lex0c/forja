@@ -161,5 +161,12 @@ suite('xai integration (real API)', () => {
     // for the UI but NEVER a `reasoning` block (replaysReasoning: false). This is
     // the deliberate divergence from the Anthropic/OpenRouter adapters.
     expect(ev.some((e) => e.kind === 'reasoning')).toBe(false);
+    // xAI bills reasoning tokens SEPARATELY from completion_tokens; the adapter
+    // folds them into usage.output. On an effort:high reasoning turn the internal
+    // reasoning is hundreds of tokens, so output must dwarf the ~one-sentence
+    // visible answer — a guard against regressing to completion_tokens-only
+    // (which would report only the visible tokens and undercount cost ~8x).
+    const usage = ev.find((e) => e.kind === 'usage');
+    expect(usage?.kind === 'usage' && usage.usage.output).toBeGreaterThan(50);
   });
 });

@@ -146,6 +146,34 @@ describe('normalizeXaiStream', () => {
     });
   });
 
+  test('reasoning_tokens are added to output (xAI bills them separately from completion_tokens)', async () => {
+    const events = await collect(
+      normalizeXaiStream(
+        fromChunks([
+          { id: 'x', choices: [{ delta: { content: 'ans' } }] },
+          {
+            choices: [{ delta: {}, finish_reason: 'stop' }],
+            usage: {
+              prompt_tokens: 231,
+              completion_tokens: 14,
+              total_tokens: 642,
+              prompt_tokens_details: { cached_tokens: 128 },
+              // Visible answer is 14 tokens; 397 billed reasoning tokens are
+              // reported here, NOT inside completion_tokens (prompt+completion+
+              // reasoning == total == 642).
+              completion_tokens_details: { reasoning_tokens: 397 },
+            },
+          },
+        ]),
+      ),
+    );
+    expect(events).toContainEqual({
+      kind: 'usage',
+      // output = completion (14) + reasoning (397) = 411; input = 231 - 128.
+      usage: { input: 103, output: 411, cache_read: 128, cache_creation: 0 },
+    });
+  });
+
   test('no usage chunk → no synthetic usage event (compat proxy dropping stream_options)', async () => {
     const events = await collect(
       normalizeXaiStream(

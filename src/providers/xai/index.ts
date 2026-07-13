@@ -170,6 +170,7 @@ export const createXaiProvider = (
         prompt_tokens?: number;
         completion_tokens?: number;
         prompt_tokens_details?: { cached_tokens?: number };
+        completion_tokens_details?: { reasoning_tokens?: number };
       } | null;
     };
 
@@ -182,17 +183,20 @@ export const createXaiProvider = (
         `xai constrained: model returned no tool_call for forced tool '${req.output_schema_name}' (finish_reason=${finish})`,
       );
     }
-    // Usage convention MATCHES the streaming path: prompt_tokens INCLUDES
-    // cached, so input = prompt − cached; cache_read = cached; xAI reports no
-    // cache-write, so cache_creation = 0.
+    // Usage convention MATCHES the streaming path (xai/stream.ts): prompt_tokens
+    // INCLUDES cached, so input = prompt − cached; cache_read = cached; xAI
+    // reports no cache-write, so cache_creation = 0. And `completion_tokens` is
+    // the VISIBLE answer only — the billed reasoning is separate under
+    // completion_tokens_details.reasoning_tokens and must be added to output.
     const u = response.usage;
     const prompt = u?.prompt_tokens ?? 0;
     const cached = u?.prompt_tokens_details?.cached_tokens ?? 0;
+    const reasoning = u?.completion_tokens_details?.reasoning_tokens ?? 0;
     return {
       output: toolCall.function.arguments,
       usage: {
         input: Math.max(0, prompt - cached),
-        output: u?.completion_tokens ?? 0,
+        output: (u?.completion_tokens ?? 0) + reasoning,
         cache_read: cached,
         cache_creation: 0,
       },
