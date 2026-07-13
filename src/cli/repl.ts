@@ -35,7 +35,6 @@ import { RESUME_FULL_WARN_THRESHOLD } from '../harness/resume.ts';
 import { effectiveBudget, isRecapEnabled, resolveMaxOutputTokens } from '../harness/types.ts';
 import { dispatchChain } from '../hooks/dispatcher.ts';
 import type { HookChainResult, HookEventPayload } from '../hooks/types.ts';
-import { framePeerMessage } from '../mesh/envelope.ts';
 import type { PolicySource } from '../permissions/index.ts';
 import { buildAutoTerse } from '../recap/auto-display.ts';
 import { createReminderScheduler } from '../reminders/index.ts';
@@ -84,6 +83,12 @@ import { operatorBootstrapFlags, reportRefusingEngine } from './boot-parity.ts';
 import { type BootstrapInput, type BootstrapResult, bootstrap } from './bootstrap.ts';
 import { maybeEmitHistoryBanner } from './history-banner.ts';
 import { concatQueuedBodies } from './inbox-drain.ts';
+import {
+  formatNotification,
+  formatNotificationHeadline,
+  type NotificationPayload,
+  NotificationQueue,
+} from './notification-queue.ts';
 import { PROJECT_GUIDE_FILENAMES } from './project-context.ts';
 import { prepareResumeContext } from './resume-prepare.ts';
 import { replayProviderMessages, replaySessionMessages } from './resume-replay.ts';
@@ -786,10 +791,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // Bound the inbox (§9): past MAX_PENDING_PEER_MESSAGES queued, drop the newest
     // with a one-shot notice rather than grow heap / build an oversized coalesced
     // turn. Re-armed when the queue drains (drainNotifications).
-    const pendingPeers = notifications.reduce(
-      (acc, n) => acc + (n.kind === 'peer_message' ? 1 : 0),
-      0,
-    );
+    const pendingPeers = notifQueue.peerMessageCount();
     if (pendingPeers >= MAX_PENDING_PEER_MESSAGES) {
       if (!peerInboxFullAnnounced) {
         peerInboxFullAnnounced = true;
@@ -1445,56 +1447,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // adds a variant to the union and a `case` to the formatter.
   // `drainNotifications` is forward-declared like `drainInbox` (body
   // assigned after startTurn, since the wake calls startTurn).
-  type BgDoneNotification = {
-    kind: 'bg_done';
-    command: string;
-    status: 'exited' | 'killed' | 'failed';
-    exitCode: number | null;
-    processId: string;
-    // Head-tail of the process output (OUTPUT_POLICY), read
-    // observationally at completion so the model sees the result in the
-    // wake-turn without a bash_output round-trip. Undefined when the
-    // process was silent or the read failed; the full output is always
-    // recoverable via bash_output(processId).
-    summary?: string;
-  };
-  type ReminderNotification = {
-    kind: 'reminder';
-    // The model-authored context that becomes the wake-turn input — the
-    // reminder's headline IS the note (no separate body/summary).
-    note: string;
-    scheduledAt: number;
-  };
-  type PeerMessageNotification = {
-    kind: 'peer_message';
-    // Peer alias (scrollback origin header + the reply handle in the untrusted
-    // preamble). `text` is the raw peer message — a request, a reply, or a
-    // follow-up (the wire doesn't distinguish, §4) — enveloped as untrusted DATA
-    // before it reaches the model.
-    peerAlias: string;
-    text: string;
-  };
-  // Reply safety net (MESH.md §6.4): a peer-driven turn ended with no mesh_send back
-  // to a peer we owe. Enqueued at session_finished; drives ONE wake-turn whose input
-  // tells the model to answer via mesh_send. Harness-authored (the aliases are
-  // grammar-validated), NOT untrusted peer text — so it is not enveloped.
-  type PeerReplyNudgeNotification = {
-    kind: 'peer_reply_nudge';
-    aliases: string[];
-  };
-  // Producer payload (no id yet); `enqueueNotification` stamps the id.
-  type NotificationPayload =
-    | BgDoneNotification
-    | ReminderNotification
-    | PeerMessageNotification
-    | PeerReplyNudgeNotification;
-  type Notification =
-    | (BgDoneNotification & { id: string })
-    | (ReminderNotification & { id: string })
-    | (PeerMessageNotification & { id: string })
-    | (PeerReplyNudgeNotification & { id: string });
-  const notifications: Notification[] = [];
-  let notifSeq = 0;
+  const notifQueue = new NotificationQueue();
   // Peer attribution (MESH.md §6.2): the alias(es) of the peer(s) whose message(s)
   // drive the CURRENT turn, or null on operator/non-peer turns. Set at the drain
   // when the batch contains a peer_message; kept so a confirm firing mid-turn can
@@ -1580,61 +1533,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // notice, re-armed when the queue drains). Generous — legitimate bursts are small.
   const MAX_PENDING_PEER_MESSAGES = 32;
   let peerInboxFullAnnounced = false;
-  // The headline line — the `● `-able status sentence, no body. One
-  // `case` per producer `kind`.
-  const formatNotificationHeadline = (n: Notification): string => {
-    switch (n.kind) {
-      case 'bg_done': {
-        const code = n.exitCode === null ? '' : ` (exit ${n.exitCode})`;
-        return (
-          `[background] \`${flattenControlToLine(n.command)}\` ${n.status}${code}. ` +
-          `process_id=${n.processId} — read complete output with bash_output.`
-        );
-      }
-      case 'reminder':
-        return `[reminder] ${flattenControlToLine(n.note)}`;
-      case 'peer_message':
-        // Peer alias is attacker-controlled — flatten control/ANSI (like
-        // bg_done/reminder) so it can't spoof the operator's scrollback. Name the
-        // channel ("peer") — unlike [background]/[reminder] the bare alias gives no
-        // cue this came in over the mesh from ANOTHER repo.
-        return `▸ peer '${flattenControlToLine(n.peerAlias)}'`;
-      case 'peer_reply_nudge': {
-        // Dual audience: the operator sees this in scrollback (● [reply pending] …)
-        // and the model receives it as the wake-turn input (formatNotification returns
-        // the headline verbatim — harness-authored, not enveloped). Names what a prose
-        // answer does NOT do (the observed miss) and points at mesh_send — but ALSO
-        // that a concluded exchange needs NO reply. Without that, two polite instances
-        // ping-pong farewells (each closing message becomes the other's inbound → its
-        // own nudge → another closing message) until the wake cap pauses it.
-        const who = n.aliases.map((a) => `'${flattenControlToLine(a)}'`).join(', ');
-        const one = n.aliases.length === 1;
-        const noun = one ? 'peer' : 'peers';
-        const verb = one ? 'is' : 'are';
-        const them = one ? 'it' : 'them';
-        return `[reply pending] ${noun} ${who} ${verb} unanswered over the mesh — your plain text reply, if any, did NOT reach ${them}. If you owe a real answer or a decision, call mesh_send now. If the exchange has simply run its course (a thanks or a goodbye needs no reply), just end the turn — do NOT send another closing message back. Either way you will not be reminded again.`;
-      }
-    }
-  };
-  // Full text fed to the model as the wake-turn input: headline + any
-  // attached body. Only bg_done carries a body (the output head-tail);
-  // reminder's headline is complete on its own.
-  const formatNotification = (n: Notification): string => {
-    // A peer message is fed to the model enveloped as untrusted DATA (§5.2) — NOT
-    // the operator-facing origin headline. To respond, the model calls mesh_send
-    // back to the alias (this turn or a later one — §6.4).
-    if (n.kind === 'peer_message') return framePeerMessage(n.peerAlias, n.text);
-    return n.kind === 'bg_done' && n.summary !== undefined
-      ? `${formatNotificationHeadline(n)}\n${n.summary}`
-      : formatNotificationHeadline(n);
-  };
   // Head + tail caps for the inline summary. The tail is bigger: for a
   // build/test, the RESULT (pass/fail counts, errors) lives at the END.
   const enqueueNotification = (n: NotificationPayload): void => {
-    // Spreading a discriminated union widens `kind` (a known TS quirk),
-    // so cast back to the union after stamping the id — the spread only
-    // adds `id`, the variant fields are untouched.
-    notifications.push({ ...n, id: String(notifSeq++) } as Notification);
+    notifQueue.push(n);
     // Wake-when-idle: nothing running → drain now (fires a turn). During
     // a turn, the boundary drain (drainInbox → drainNotifications) gets
     // it instead.
@@ -2497,7 +2399,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // later boundary or the operator's next submit.
   drainNotifications = (): void => {
     if (exiting || isBusy()) return;
-    if (notifications.length === 0) return;
+    if (notifQueue.size() === 0) return;
     // Operator-typing gate: don't steal the turn while they compose.
     if (renderer.state().input.value.length > 0) return;
     // Consecutive-wake cap: anti-loop backstop. peer_message RESPECTS the cap now
@@ -2510,7 +2412,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       // is theirs, and silence would strand a waiting peer. Only for peer_message;
       // bg_done/reminder semi-pushing at the cap is the ordinary, already-visible case.
       if (!peerPausePendingAnnounced) {
-        const waiting = notifications.filter((n) => n.kind === 'peer_message').length;
+        const waiting = notifQueue.peerMessageCount();
         if (waiting > 0) {
           peerPausePendingAnnounced = true;
           bus.emit({
@@ -2533,7 +2435,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // messages — from one peer or several — becomes one turn, so the model sees
     // them together and replies/consolidates as it decides; bg_done/reminder ride
     // along. Each still renders its own scrollback line with its origin stamp.
-    const drained = notifications.splice(0);
+    const drained = notifQueue.drainAll();
     consecutiveWakes += 1;
     peerInboxFullAnnounced = false; // the queue drained → re-arm the inbox-full cue
     // Surface each notification in the scrollback as a system `info` entry (distinct
