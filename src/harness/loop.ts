@@ -23,7 +23,7 @@ import {
   parseCapability,
 } from '../permissions/capabilities.ts';
 import { createDegradedBannerEmitter } from '../permissions/degraded-banner.ts';
-import { addUsage, computeCost, emptyUsage } from '../providers/cost.ts';
+import { computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
   ProviderMessage,
@@ -44,7 +44,6 @@ import {
   insertSubagentGateDecision,
   reopenSession,
   type SessionStatus,
-  updateSessionCost,
 } from '../storage/index.ts';
 import { isBilledCompactionStrategy } from '../storage/repos/compaction-events.ts';
 import {
@@ -80,6 +79,7 @@ import {
   relevanceVerbatimBudgetBytes,
 } from './compaction.ts';
 import type { RelevanceAudit } from './compaction-relevance.ts';
+import { CostAccountant } from './cost-accountant.ts';
 import { resolveProviderEffort } from './effort.ts';
 import { safeEmit } from './emit.ts';
 import {
@@ -543,27 +543,31 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // drives the provenance write (recompute = the working-state focus changed).
   let proactiveRecalled: RecalledMemory[] = [];
   let proactiveRecomputed = false;
-  // Per-run totals. Each completed provider turn adds its usage and
-  // its computed cost; HarnessResult.usage / costUsd report THIS
-  // RUN's numbers — caller telemetry that has to stay self-
-  // consistent (zero usage means zero cost, etc.).
-  let totalUsage = emptyUsage();
-  let totalCostUsd = 0;
-  // Stays true until an assistant turn produces output without an
-  // accompanying usage event. The aggregate `usage`/`costUsd` only
-  // sums measured turns; this flag tells the caller whether those
-  // numbers are complete or a lower-bound estimate.
-  let usageComplete = true;
-  // Cumulative state from prior runs of the same session id (zero
-  // for new sessions). Held SEPARATELY from the per-run totals so
-  // HarnessResult stays per-run while the persisted column stays
-  // cumulative — fixing the contract mismatch where seeding
-  // totalCostUsd from the existing row made costUsd report
-  // "current run + prior" while usage was still "current only".
-  // Persistence at finish() writes (priorCostUsd + totalCostUsd);
-  // the result reports just totalCostUsd.
-  let priorCostUsd = 0;
-  let priorUsageComplete = true;
+  // Cost/budget accountant (N2 — extracted to cost-accountant.ts). Owns the
+  // run's cost state (per-run totals, prior-run cumulative, this-run + prior-run
+  // child cost, the soft-cap latch) and the write seam runAgent already used
+  // inline: recordUsage / markUsageIncomplete / emitCostUpdate / costCapDetail —
+  // the exact callbacks it injects into `synthesizeOnExhaustion`. HarnessResult
+  // reports the per-run totals (acct.runCostUsd / runUsage) while the persisted
+  // column stays cumulative (prior + run). `getSessionId` and
+  // `getReservedChildCostUsd` are lazy because `sessionId` (400) starts '' and
+  // the handle store (426) is built later; the resume seed / child rehydrate
+  // arrive via seedFromResume / setRehydratedChildCost during init.
+  const acct = new CostAccountant({
+    db: config.db,
+    onEvent: config.onEvent,
+    getSessionId: () => sessionId,
+    maxCostUsd: budget.maxCostUsd,
+    softCostUsd: budget.softCostUsd,
+    getReservedChildCostUsd: (excludeHandleId) =>
+      subagentHandleStore?.getReservedChildCostUsd(excludeHandleId) ?? 0,
+  });
+  // Thin closures over the accountant's function-valued seam so the many
+  // existing call sites (and the `synthesizeOnExhaustion` injection) keep their
+  // exact spelling. Arrow wrappers rather than bare `acct.method` references
+  // because a class method passed unbound would lose `this`.
+  const emitCostUpdate = (delta: number): void => acct.emitCostUpdate(delta);
+  const costCapDetailIfExceeded = (): string | null => acct.costCapDetail();
 
   // Captured at resume init BEFORE reopenSession flips the row to
   // `running`. Used by the auto-rehydrate block (RECAP §3.2 +
@@ -575,127 +579,6 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // operator's prior status as `running` in the rehydrate event,
   // which is wrong on both counts.
   let preResumeStatus: SessionStatus | null = null;
-
-  // Cost incurred by settled child handles inherited from prior
-  // runs of the resumed session. Lives SEPARATELY from
-  // `priorCostUsd` because the two flow to different sinks:
-  //
-  //   - `priorCostUsd` is parent-self only and is round-tripped
-  //     through `sessions.totalCostUsd` (loaded at resume, written
-  //     back at finish via `priorCostUsd + totalCostUsd`).
-  //   - `rehydratedChildCostUsd` is the sum of `costUsd` across
-  //     SETTLED rows in `subagent_handles` — already persisted by
-  //     each child's `runSubagent` settle event. Folding it back
-  //     into `priorCostUsd` would double-persist on every resume:
-  //     finish() would write `(priorCostUsd + childA + childB) +
-  //     totalCostUsd` to sessions.totalCostUsd; the next resume
-  //     loads that into `priorCostUsd` and adds the same children
-  //     again. After N resumes, `sessions.totalCostUsd` shows
-  //     `parentSelf + N * childTotal` even though no new work
-  //     ran.
-  //
-  // The budget gate (cap check, getCostBudget, watchdog) sums all
-  // four — priorCostUsd + totalCostUsd + cumulativeChildCostUsd
-  // (this run's children) + rehydratedChildCostUsd (prior runs'
-  // children) + reserved (in-flight) — so a resumed run still
-  // sees the full picture and can't burn the cap a second time.
-  // Persistence stays parent-self only.
-  let rehydratedChildCostUsd = 0;
-
-  // Per-turn cost-delta event emitter (spec ORCHESTRATION.md §3.5
-  // shared-budget contract). Fires every time the run's
-  // `totalCostUsd` advances — turn settle, compaction, partial
-  // provider-error charge. Carries `delta` (the latest charge
-  // alone) and `cumulative` (this session's running self-cost).
-  // For a subagent run, the parent's IPC observer reads these
-  // events and tracks live in-flight spend. Skipped on zero
-  // deltas so a misbehaving provider that emitted a usage event
-  // with all zeros doesn't generate noise — which is why this is
-  // a BILLING event, not the display cue: `usage_persisted`
-  // (emitted by the same call sites right after) is the
-  // unconditional per-response signal the REPL refreshes on.
-  //
-  // Post-persist contract: callers emit AFTER persisting the rows
-  // the charge came from (message / compaction_events; the partial
-  // provider-error site has no row — the turn died — so only the
-  // rollup below lands there), and the emitter persists the
-  // session cost rollup first — by the time a consumer reads the
-  // DB, it reflects the charge. NOTE the memory-verify scheduler
-  // (chargeSchedulerThenCheckCap below) hand-rolls a cost_update
-  // for CHILD spend, which lives in the children's own session
-  // rows, not this rollup.
-  // Sticky flag — set true the first time the soft cap is
-  // crossed and never reset. Idempotent emission per run.
-  // Declared ahead of `emitCostUpdate` so the closure reads a
-  // name already in scope.
-  //
-  // Per-session, NOT cumulative-across-resumes: the check uses
-  // `totalCostUsd` (this session only), unlike `maxCostUsd`
-  // which compares `priorCostUsd + totalCostUsd`. Subagents are
-  // one-shot so the divergence doesn't affect them; for a
-  // resumed top-level run, the soft warn re-arms each session
-  // (matches the "you crossed your estimate THIS session"
-  // framing and avoids spamming on every resume of an already-
-  // expensive session).
-  let softCapWarned = false;
-  const emitCostUpdate = (delta: number): void => {
-    if (!Number.isFinite(delta) || delta <= 0) return;
-    // Persist the lifetime cost rollup BEFORE announcing the charge.
-    // `cost_update` is the REPL's cue to recompute the footer's
-    // DB-derived usage chips per model response (not per turn), so
-    // the event carries an ordering contract: when it fires, the DB
-    // already reflects this charge — both the rows the charge came
-    // from (callers persist message / compaction rows first) and the
-    // session's cost rollup written here. Same incremental write the
-    // operator `/compact` does; `finish()` remains the canonical
-    // final writeback with the identical prior+run figure.
-    // Best-effort like the finish() write: a DB hiccup must not turn
-    // a billed, otherwise-healthy step into a run failure.
-    if (sessionId.length > 0) {
-      try {
-        updateSessionCost(config.db, sessionId, priorCostUsd + totalCostUsd);
-      } catch {
-        // Display-cadence bookkeeping only; finish() re-writes it.
-      }
-    }
-    safeEmit(config.onEvent, {
-      type: 'cost_update',
-      delta,
-      cumulative: totalCostUsd,
-    });
-    // Soft cap (spec ORCHESTRATION.md §3.5.0). Fires ONCE when
-    // cumulative first crosses the threshold. The flag stays
-    // sticky for the rest of the run — re-emitting on every
-    // subsequent cost_update would spam the operator's
-    // scrollback and obscure the original warning. Run does
-    // NOT terminate at this threshold; only `maxCostUsd` (the
-    // hard cap) does.
-    if (
-      !softCapWarned &&
-      budget.softCostUsd !== undefined &&
-      budget.softCostUsd > 0 &&
-      totalCostUsd > budget.softCostUsd
-    ) {
-      softCapWarned = true;
-      safeEmit(config.onEvent, {
-        type: 'cost_soft_cap_warn',
-        threshold: budget.softCostUsd,
-        cumulative: totalCostUsd,
-      });
-    }
-  };
-
-  // Cumulative cost of every child this run spawned (sync `task`
-  // and async `task_async` alike). Increments inside
-  // `spawnSubagentImpl` after each `runSubagent` returns. Used
-  // by both the per-step cap check and the pre-spawn budget
-  // gate to ensure the parent + children share `maxCostUsd`
-  // (spec ORCHESTRATION.md §3.5). Reserved-but-not-yet-settled
-  // async children are tracked separately by the handle store
-  // (`getReservedChildCostUsd`); the projected total combines
-  // both so a burst of concurrent `task_async` calls can't slip
-  // past the gate while their reservations are pending.
-  let cumulativeChildCostUsd = 0;
 
   // Parallel-tool dispatch counters (spec ORCHESTRATION.md
   // §1.3). Updated inside the parallel branch's `runPool`
@@ -753,28 +636,6 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // the user wants different exit reasons.
   const isWallClockTimeout = (): boolean =>
     wallClockController.signal.aborted && !callerSignal.aborted;
-
-  // Cumulative-cost cap check. Returns a detail string when the cap
-  // is exceeded so callers can build the finish() call inline; null
-  // otherwise. The comparison uses TOTAL cumulative cost
-  // (parent self + children settled + reserved in-flight) so the
-  // parent's turn-end gate stays consistent with the pre-spawn
-  // budget gate in `spawnSubagentImpl`. Without including
-  // children, a resumed run with $4 of prior child cost and $0
-  // of parent self-cost could pass every turn-end check forever
-  // while `task_async` refuses new spawns at $1.01 — incoherent
-  // surface the reviewer flagged as risk #2. Matches the
-  // persistence contract where the session row stores cumulative
-  // spend. Strict `>` so a `maxCostUsd: 0` config trips the gate
-  // on the first paid turn, not before any work runs.
-  const costCapDetailIfExceeded = (): string | null => {
-    if (budget.maxCostUsd === undefined) return null;
-    const reserved = subagentHandleStore?.getReservedChildCostUsd() ?? 0;
-    const cumulative =
-      priorCostUsd + totalCostUsd + cumulativeChildCostUsd + rehydratedChildCostUsd + reserved;
-    if (cumulative <= budget.maxCostUsd) return null;
-    return `cumulative cost $${cumulative.toFixed(6)} exceeded cap $${budget.maxCostUsd.toFixed(6)}`;
-  };
 
   // Hook chain dispatch (spec AGENTIC_CLI.md §10). All sites
   // funnel through this helper so the dispatcher's deps (db,
@@ -875,11 +736,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       ...(detail !== undefined ? { detail } : {}),
       ...(abortCause !== undefined ? { abortCause } : {}),
       sessionId,
-      priorCostUsd,
-      totalCostUsd,
-      priorUsageComplete,
-      usageComplete,
-      totalUsage,
+      priorCostUsd: acct.priorCostUsd,
+      totalCostUsd: acct.runCostUsd,
+      priorUsageComplete: acct.priorUsageComplete,
+      usageComplete: acct.runUsageComplete,
+      totalUsage: acct.runUsage,
       steps,
       startMs,
       ctx,
@@ -908,7 +769,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // like a harness bug in audit. Wall-clock timeout takes precedence
   // (matches the in-loop check).
   const guardedFinish = async (e: unknown): Promise<HarnessResult> => {
-    usageComplete = false;
+    acct.markUsageIncomplete();
     const detail = e instanceof Error ? e.message || e.name || String(e) : String(e);
     if (signal.aborted) {
       return isWallClockTimeout()
@@ -959,17 +820,17 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // 'must be running' WHERE guard. We validate the id BEFORE
       // any side effects so a typo'd session id doesn't leave a
       // half-initialized state.
-      // Resume budget semantics: `steps`, `consecutiveErrors`,
-      // `totalUsage`, `totalCostUsd`, and `usageComplete` are
-      // PER-RUN accumulators that start at zero/true — they drive
-      // HarnessResult, which is per-run telemetry that has to
-      // stay self-consistent (zero usage means zero cost, etc.).
-      // The CUMULATIVE state (prior + this run) is held separately
-      // in `priorCostUsd` / `priorUsageComplete` and only used at
-      // completeSession time so the persisted column reflects the
-      // session's lifetime cost. This separation closes the bug
-      // where seeding totalCostUsd from the row made costUsd
-      // report cumulative while usage stayed per-run.
+      // Resume budget semantics: `steps` / `consecutiveErrors` and the
+      // CostAccountant's per-run accumulators (run usage / cost /
+      // usageComplete) start at zero/true — they drive HarnessResult,
+      // which is per-run telemetry that has to stay self-consistent
+      // (zero usage means zero cost, etc.). The CUMULATIVE state (prior
+      // + this run) lives separately in the accountant's prior fields
+      // and is only used at completeSession time so the persisted
+      // column reflects the session's lifetime cost. The resume seed
+      // lands via `acct.seedFromResume(...)` below. This separation
+      // closes the bug where seeding the per-run cost from the row made
+      // costUsd report cumulative while usage stayed per-run.
       // The CLI's run.ts also calls getSession before constructing
       // the config (`resolveResumeId`) so a typo'd id fails fast on
       // stderr. The duplicate check here is intentional defense in
@@ -1006,8 +867,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             `sessionContext session ${liveCtx.sessionId}: cwd '${existing.cwd}' != config cwd '${config.cwd}'`,
           );
         }
-        priorCostUsd = existing.totalCostUsd;
-        priorUsageComplete = existing.usageComplete;
+        acct.seedFromResume(existing.totalCostUsd, existing.usageComplete);
         // Fresh-process resume that pre-hydrated its own context (the
         // `--resume-mode full|summary` paths): snapshot the pre-resume status
         // BEFORE reopenSession flips it to 'running', so the auto-rehydrate
@@ -1039,8 +899,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             `cannot resume session ${resumeId}: original cwd was '${existing.cwd}', current cwd is '${config.cwd}'. cd to the original directory or start a new session.`,
           );
         }
-        priorCostUsd = existing.totalCostUsd;
-        priorUsageComplete = existing.usageComplete;
+        acct.seedFromResume(existing.totalCostUsd, existing.usageComplete);
         // Snapshot the pre-resume status BEFORE `reopenSession`
         // flips the row to 'running'. The auto-rehydrate block
         // far below depends on this — re-reading the row at that
@@ -1717,12 +1576,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             // with `handleId === undefined`; the exclude is a
             // no-op there.
             const reserved = subagentHandleStore?.getReservedChildCostUsd(handleId) ?? 0;
-            const spent =
-              priorCostUsd +
-              totalCostUsd +
-              cumulativeChildCostUsd +
-              rehydratedChildCostUsd +
-              reserved;
+            const spent = acct.cumulativeSpend(reserved);
             const projected = spent + estimate;
             if (projected > budget.maxCostUsd) {
               return {
@@ -1940,12 +1794,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     }
                     if (budget.maxCostUsd !== undefined) {
                       const reserved = trackerStore.getReservedChildCostUsd();
-                      const total =
-                        priorCostUsd +
-                        totalCostUsd +
-                        cumulativeChildCostUsd +
-                        rehydratedChildCostUsd +
-                        reserved;
+                      const total = acct.cumulativeSpend(reserved);
                       if (total > budget.maxCostUsd && !capWatchdogFired) {
                         // Latch the fire-once flag BEFORE the
                         // cancellations run so a re-entrant
@@ -2136,9 +1985,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // emits a non-finite costUsd would otherwise poison
           // the cumulative counter and trip every subsequent
           // budget gate.
-          if (Number.isFinite(childCostUsd)) {
-            cumulativeChildCostUsd += childCostUsd;
-          }
+          acct.addChildCost(childCostUsd);
           return {
             kind: 'ran',
             output: child.output,
@@ -2216,7 +2063,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // when no new work runs. The budget gate sums both
         // priorCostUsd and rehydratedChildCostUsd; persistence
         // does not.
-        rehydratedChildCostUsd = subagentHandleStore.getRehydratedChildCostUsd();
+        acct.setRehydratedChildCost(subagentHandleStore.getRehydratedChildCostUsd());
       }
 
       // Checkpoint manager. Only built when the caller opted in —
@@ -2734,12 +2581,8 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             : {}),
           ...(pinnedBlock !== undefined ? { pinnedBlock } : {}),
         });
-        const acct = accountCompaction(compaction, config.provider.capabilities);
-        totalUsage = addUsage(totalUsage, compaction.usage);
-        totalCostUsd += acct.costUsd;
-        if (acct.usageIncomplete) {
-          usageComplete = false;
-        }
+        const compAcct = accountCompaction(compaction, config.provider.capabilities);
+        acct.recordUsage(compaction.usage, compAcct.costUsd, !compAcct.usageIncomplete);
         persistCompaction({
           strategy: compaction.strategy,
           foldedCount: compaction.foldedCount,
@@ -2763,7 +2606,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // After persistCompaction so the post-persist contract holds:
         // the compaction_events row (token side of the charge) is
         // queryable when these fire.
-        emitCostUpdate(acct.costUsd);
+        emitCostUpdate(compAcct.costUsd);
         safeEmit(config.onEvent, { type: 'usage_persisted' });
         const finishedEvent: HarnessEvent = {
           type: 'compaction_finished',
@@ -2771,7 +2614,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           foldedCount: compaction.foldedCount,
           durationMs: Date.now() - compactStart,
           usage: compaction.usage,
-          costUsd: acct.costUsd,
+          costUsd: compAcct.costUsd,
           ...(compaction.reason !== undefined ? { reason: compaction.reason } : {}),
           ...(relevanceAudit !== undefined ? { relevance: relevanceAudit } : {}),
         };
@@ -2785,9 +2628,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // exhaustion-synthesis.ts so its decision + orchestration are unit-testable
       // in isolation — makes ONE tool-less provider call before the → exhausted
       // transition and RETURNS the cost-cap overage (or null) so the caller can
-      // finish maxCostUsd vs maxSteps. The loop owns the mutable run totals;
-      // `recordUsage` / `markUsageIncomplete` are the single write seam, and the
-      // cost-cap / compaction closures pass straight through.
+      // finish maxCostUsd vs maxSteps. The CostAccountant (`acct`) owns the
+      // mutable run totals; the injected `recordUsage` / `markUsageIncomplete`
+      // delegate to it and are the single write seam, and the cost-cap /
+      // compaction closures pass straight through.
       const runSynthesis = async (): Promise<ExhaustionSynthesisResult> => {
         if (ctx === undefined) return { costOverage: null, truncation: null };
         return synthesizeOnExhaustion({
@@ -2797,14 +2641,8 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           signal,
           costCapDetailIfExceeded,
           maybeCompact,
-          recordUsage: (usage, cost, usageSeen) => {
-            totalUsage = addUsage(totalUsage, usage);
-            totalCostUsd += cost;
-            if (!usageSeen) usageComplete = false;
-          },
-          markUsageIncomplete: () => {
-            usageComplete = false;
-          },
+          recordUsage: (usage, cost, usageSeen) => acct.recordUsage(usage, cost, usageSeen),
+          markUsageIncomplete: () => acct.markUsageIncomplete(),
           emit: (event) => safeEmit(config.onEvent, event),
           emitCostUpdate,
         });
@@ -3085,7 +2923,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // tokens) before the throw. Always flip the aggregate flag —
           // even if we recover partial usage, totals are by definition
           // a lower bound when the turn ended in error.
-          usageComplete = false;
+          acct.markUsageIncomplete();
 
           // Recover whatever the stream emitted before the throw.
           // Adapters yield `usage` from their `finally` block precisely
@@ -3098,8 +2936,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             const partial = e.partial;
             if (partial.usageSeen) {
               const partialCost = computeCost(config.provider.capabilities, partial.usage);
-              totalUsage = addUsage(totalUsage, partial.usage);
-              totalCostUsd += partialCost;
+              acct.recordUsage(partial.usage, partialCost, partial.usageSeen);
               emitCostUpdate(partialCost);
               // Display cue AFTER the rollup write above. This site
               // never persists a message row (the turn died before
@@ -3151,17 +2988,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         const assistantContent = buildAssistantContent(collected);
 
         const turnCostUsd = computeCost(config.provider.capabilities, collected.usage);
-        totalUsage = addUsage(totalUsage, collected.usage);
-        totalCostUsd += turnCostUsd;
         // ANY assistant turn that completes without a usage event is
         // unmeasured — every successful provider call bills input tokens
         // for the prompt, even when the model emits no text, no
         // tool_use, and no thinking. Stream errors and aborts don't
         // reach here (they exit via providerError/aborted finish paths),
         // so we're only counting turns that the provider actually
-        // accepted and processed. Flipping the flag tells the renderer
-        // to mark aggregate cost as a lower bound.
-        if (!collected.usageSeen) usageComplete = false;
+        // accepted and processed. `usageSeen=false` marks the aggregate
+        // as a lower bound for the renderer.
+        acct.recordUsage(collected.usage, turnCostUsd, collected.usageSeen);
 
         // When the adapter never emitted a `usage` event, persist NULL on
         // the token/cost columns instead of zeroes. Future analytics can
@@ -3496,12 +3331,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // (`spawnSubagentImpl`) re-checks as the load-bearing
           // gate.
           getCostBudget: () => ({
-            spent:
-              priorCostUsd +
-              totalCostUsd +
-              cumulativeChildCostUsd +
-              rehydratedChildCostUsd +
-              (subagentHandleStore?.getReservedChildCostUsd() ?? 0),
+            spent: acct.cumulativeSpend(subagentHandleStore?.getReservedChildCostUsd() ?? 0),
             cap: budget.maxCostUsd,
           }),
           // Subagent budget lookup. Returns the definition's
@@ -4288,12 +4118,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         //
         // Cost wiring (post-review fix): each detector's LLM-judge
         // dispatch is a real billed call but only tracked in
-        // scheduler-local counters until this helper folds the
-        // delta into `cumulativeChildCostUsd`. Pre-fix, a session
-        // at/near `maxCostUsd` could still run verify-* dispatches
-        // because `costCapDetailIfExceeded()` only consults
-        // {totalCostUsd, cumulativeChildCostUsd, reserved} — never
-        // the scheduler counters. With default-on detectors,
+        // scheduler-local counters until this helper folds the delta
+        // into the accountant's child cost (`acct.addChildCost`).
+        // Pre-fix, a session at/near `maxCostUsd` could still run
+        // verify-* dispatches because `costCapDetailIfExceeded()` only
+        // consults the accountant's cumulative spend (prior + run +
+        // child + rehydrated + reserved) — never the scheduler
+        // counters. With default-on detectors,
         // operator's hard cap was silently exceeded by the
         // detector spend. The helper folds delta in + fires a
         // cost_update event (with the FULL composite cumulative
@@ -4324,11 +4155,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           const after = scheduler.getCounters().costUsdSpent;
           const delta = after - before;
           if (delta > 0) {
-            cumulativeChildCostUsd += delta;
+            acct.addChildCost(delta);
             safeEmit(config.onEvent, {
               type: 'cost_update',
               delta,
-              cumulative: priorCostUsd + totalCostUsd + cumulativeChildCostUsd,
+              // Child-inclusive cumulative (self + this run's children),
+              // deliberately distinct from emitCostUpdate's self-only figure:
+              // this charge is child spend that lives in the children's own
+              // session rows, not the parent's rollup.
+              cumulative: acct.priorCostUsd + acct.runCostUsd + acct.cumulativeChildCostUsd,
             });
           }
           return costCapDetailIfExceeded();
