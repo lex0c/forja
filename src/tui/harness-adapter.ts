@@ -20,7 +20,7 @@ import { forjaCommand } from '../cli/forja-command.ts';
 import type { FileDiff } from '../diff/line-diff.ts';
 import type { ExitReason, HarnessEvent } from '../harness/types.ts';
 import type { Decision } from '../permissions/index.ts';
-import { sanitizeOneLineForDisplay, stripAnsi } from '../sanitize/index.ts';
+import { sanitizeCardSubject, sanitizeOneLineForDisplay, stripAnsi } from '../sanitize/index.ts';
 import type { SessionEndEvent, TodoItemForUI, UIEvent } from './events.ts';
 import { formatWorkingStatePanel } from './render/working-state.ts';
 import { lookupToolVocab, shortToolName } from './tool-vocab.ts';
@@ -135,12 +135,12 @@ const mapExitReason = (reason: ExitReason): SessionEndEvent['reason'] => {
 // erase math and leaking a stale card into scrollback. Collapse each
 // line break (and the whitespace hugging it) to a single space.
 // Intra-line spacing and single-line subjects (file paths, patterns)
-// are left untouched. Applied to the top-level tool:start path. (The
-// subagent row's line-2 `currentTool` uses sanitizeOneLineForDisplay
-// instead — it additionally strips ANSI/C0 control bytes, since that
-// label re-renders into the live region every heartbeat tick.)
-const flattenSubject = (subject: string | null): string | null =>
-  subject?.includes('\n') ? subject.replace(/\s*\n\s*/g, ' ').trim() : subject;
+// are left untouched. The model-authored subject is sanitized (ANSI/C0
+// stripped, single-lined, capped) by the shared `sanitizeCardSubject` so the
+// live card and the resume-replay card render it identically; applied to the
+// top-level tool:start path at the call site below. (The subagent row's
+// line-2 `currentTool` uses `sanitizeOneLineForDisplay` — a distinct display
+// context re-rendered every heartbeat tick.)
 
 export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => {
   const now = ctx.now ?? (() => Date.now());
@@ -430,7 +430,7 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           // through with null subject.
           subject = null;
         }
-        subject = flattenSubject(subject);
+        subject = sanitizeCardSubject(subject);
         state.tools.set(event.toolUseId, {
           name: event.toolName,
           decision: null,

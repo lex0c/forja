@@ -233,6 +233,26 @@ describe('loadModelProvidersFile — per-entry fail-soft', () => {
     }
   });
 
+  test('tools: false → warn + skip (Forja requires a tool-calling model)', () => {
+    // The agent loop is tool-driven; a model that declares no tool-calling
+    // support can't run it. Unlike cache/constrained (which may be false),
+    // `tools: false` is rejected at load so the capability is load-bearing.
+    const noTools = entry({
+      id: 'ollama/nt',
+      model_name: 'nt',
+      capabilities: { ...VALID_CAPS, tools: false },
+    });
+    writeCatalog(catalogJson([noTools, entry()]));
+    const r = loadModelProvidersFile(env);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      // Only the valid default (tool-calling) entry survives.
+      expect(r.entries).toHaveLength(1);
+      expect(r.entries[0]?.id).toBe('ollama/qwen3:14b');
+      expect(r.warnings.join(' ')).toContain('requires tool calling');
+    }
+  });
+
   test('non-positive / non-integer num_ctx → warn + skip', () => {
     const zero = entry({ id: 'ollama/a', model_name: 'a', num_ctx: 0 });
     const frac = entry({ id: 'ollama/b', model_name: 'b', num_ctx: 1.5 });

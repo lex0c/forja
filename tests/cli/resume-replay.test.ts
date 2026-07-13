@@ -581,6 +581,83 @@ describe('replaySessionMessages — text + tool replay (Phase 3)', () => {
     });
   });
 
+  test('replayed assistant prose is stripped of ANSI/C0 (resume injection defense)', () => {
+    // Persisted assistant text is stored raw; the live path strips ANSI
+    // at the adapter, so replay must strip too or a resumed session
+    // renders model-authored escape sequences to the operator terminal.
+    const db = setupSession('s1');
+    appendMessage(db, { sessionId: 's1', role: 'user', content: 'hi', createdAt: 1_000_000 });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'ok \x1b[31mred\x1b[0m \x07bell done' }],
+      createdAt: 1_001_000,
+    });
+    const { bus, events } = recordEvents();
+    replaySessionMessages(db, 's1', bus);
+    const delta = events.find((e) => e.type === 'assistant:delta');
+    const text = (delta as { text?: string } | undefined)?.text ?? '';
+    expect(text).not.toContain('\x1b');
+    expect(text).not.toContain('\x07');
+    expect(text).toContain('red');
+    expect(text).toContain('done');
+  });
+
+  test('replayed plain-string assistant content is stripped of ANSI (string branch)', () => {
+    // Covers the `typeof content === 'string'` strip branch (the sibling of
+    // the block-array branch): legacy/plain-string assistant rows must also
+    // have model control bytes stripped on replay.
+    const db = setupSession('s1');
+    appendMessage(db, { sessionId: 's1', role: 'user', content: 'hi', createdAt: 1_000_000 });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: 'plain \x1b[31mred\x1b[0m done',
+      createdAt: 1_001_000,
+    });
+    const { bus, events } = recordEvents();
+    replaySessionMessages(db, 's1', bus);
+    const delta = events.find((e) => e.type === 'assistant:delta');
+    const text = (delta as { text?: string } | undefined)?.text ?? '';
+    expect(text).not.toContain('\x1b');
+    expect(text).toContain('red');
+    expect(text).toContain('done');
+  });
+
+  test('replayed tool subject is stripped of ANSI/C0 (resume injection defense)', () => {
+    // The subject flows through subjectFromInput → sanitizeOneLineForDisplay
+    // on the replay path, mirroring the live tool-card subject.
+    const db = setupSession('s1');
+    appendMessage(db, { sessionId: 's1', role: 'user', content: 'go', createdAt: 1_000_000 });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'assistant',
+      content: [
+        {
+          type: 'tool_use',
+          id: 'tu1',
+          name: 'bash',
+          input: { command: 'echo \x1b[31mx\x1b[0m \x07 done\rOVER' },
+        },
+      ],
+      createdAt: 1_001_000,
+    });
+    appendMessage(db, {
+      sessionId: 's1',
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'tu1', content: 'ok' }],
+      createdAt: 1_002_000,
+    });
+    const { bus, events } = recordEvents();
+    replaySessionMessages(db, 's1', bus);
+    const start = events.find((e) => e.type === 'tool:start');
+    const subject = (start as { subject?: string | null } | undefined)?.subject ?? '';
+    expect(subject).not.toContain('\x1b');
+    expect(subject).not.toContain('\x07');
+    expect(subject).not.toContain('\r');
+    expect(subject).toContain('done');
+  });
+
   test('unknown tool name falls back to generic vocab (Calling X / Called X)', () => {
     const db = setupSession('s1');
     appendMessage(db, {
