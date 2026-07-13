@@ -35,6 +35,7 @@ const SUPPORTED_FAMILIES = new Set<ProviderFamily>([
   'ollama',
   'google',
   'openrouter',
+  'xai',
 ]);
 
 // Whether Forja ships an adapter for this family. Exported so the

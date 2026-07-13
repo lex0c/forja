@@ -370,7 +370,7 @@ describe('replaySessionMessages — text + tool replay (Phase 3)', () => {
     // The bug this slice fixes. The harness persists one assistant
     // message per LLM completion; a run that uses tools writes
     // (assistant text+tool_use → user tool_result → assistant
-    // text). The live operator saw ONE `Cogitated for Xs` footer
+    // text). The live operator saw ONE `Worked for Xs` footer
     // covering the whole run. Naive per-assistant-row footer
     // emission would show TWO footers AND collapse the duration
     // of the second to 0 (no preceding "user submit" to anchor).
@@ -822,7 +822,7 @@ describe('replaySessionMessages — text + tool replay (Phase 3)', () => {
     // assistant message carrying a tool_use with no tool_result
     // after it = the run crashed / was killed waiting on the tool.
     // The footer must NOT say 'done' — that would render a
-    // successful "Cogitated for Xs" marker over a dead run.
+    // successful "Worked for Xs" marker over a dead run.
     const db = setupSession('s1');
     appendMessage(db, {
       sessionId: 's1',

@@ -9,6 +9,7 @@ import {
 import { OPENAI_MODEL_NAMES } from '../../src/providers/openai/capabilities.ts';
 import { OPENROUTER_MODEL_NAMES } from '../../src/providers/openrouter/capabilities.ts';
 import { createRegistry, type ModelEntry } from '../../src/providers/registry.ts';
+import { XAI_MODEL_NAMES } from '../../src/providers/xai/capabilities.ts';
 
 const dummyEntry = (id: string): ModelEntry => ({
   id,
@@ -119,13 +120,17 @@ describe('createDefaultRegistry', () => {
     for (const modelName of OPENROUTER_MODEL_NAMES) {
       expect(reg.has(`openrouter/${modelName}`)).toBe(true);
     }
+    for (const modelName of XAI_MODEL_NAMES) {
+      expect(reg.has(`xai/${modelName}`)).toBe(true);
+    }
     expect(reg.list()).toHaveLength(
       ANTHROPIC_MODEL_NAMES.length +
         GOOGLE_MODEL_NAMES.length +
         OPENAI_MODEL_NAMES.length +
         OLLAMA_MODEL_NAMES.length +
         OLLAMA_CLOUD_MODEL_NAMES.length +
-        OPENROUTER_MODEL_NAMES.length,
+        OPENROUTER_MODEL_NAMES.length +
+        XAI_MODEL_NAMES.length,
     );
   });
 

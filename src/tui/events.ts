@@ -104,7 +104,7 @@ export type SessionEndEvent = BaseEvent & {
   reason: 'done' | 'maxSteps' | 'maxCostUsd' | 'aborted' | 'error' | string;
   // Wall-clock duration of the run, in ms (mirrors
   // `HarnessResult.durationMs`). Powers the turn-end marker's
-  // "Cogitated for 1m23s" rendering (UI.md §3.2). Optional only for
+  // "Worked for 1m23s" rendering (UI.md §3.2). Optional only for
   // legacy / replay paths that don't have timing — production
   // emitters always set it.
   durationMs?: number;

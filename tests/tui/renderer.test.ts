@@ -836,11 +836,11 @@ describe('renderer wiring', () => {
     r.close();
   });
 
-  test('session:end emits the turn-end marker (Cogitated for X) into scrollback', () => {
+  test('session:end emits the turn-end marker (Worked for X) into scrollback', () => {
     // Operator-reported regression: the AI text would print but no
     // turn-end marker. This pins the e2e contract: the renderer
     // catches session:end → reducer creates session-footer →
-    // formatPermanent renders `Cogitated for X` → writeTransition
+    // formatPermanent renders `Worked for X` → writeTransition
     // includes it in the captured writes.
     const bus = createBus();
     const sink = makeSink();
@@ -863,13 +863,13 @@ describe('renderer wiring', () => {
       durationMs: 8200,
     });
     const out = sink.joined();
-    expect(out).toContain('Cogitated for 8s');
+    expect(out).toContain('Worked for 8s');
     r.close();
   });
 
-  test('full turn flow: streamed AI text + Cogitated marker both land in scrollback', () => {
+  test('full turn flow: streamed AI text + Worked marker both land in scrollback', () => {
     // Operator-reported regression: the AI text appeared truncated
-    // and the turn-end marker (`Cogitated for X`) didn't show. This
+    // and the turn-end marker (`Worked for X`) didn't show. This
     // pins the e2e contract for a full turn:
     //   user:submit → assistant:start → deltas → assistant:end →
     //   step:budget → session:end
@@ -913,9 +913,9 @@ describe('renderer wiring', () => {
     // Full streamed text must be present (no truncation).
     expect(out).toContain('Hello, how can I help?');
     // Turn-end marker must be present.
-    expect(out).toContain('Cogitated for 6s');
+    expect(out).toContain('Worked for 6s');
     // Marker comes AFTER the assistant text (turn-end ordering).
-    expect(out.indexOf('Cogitated for 6s')).toBeGreaterThan(out.indexOf('Hello, how can I help?'));
+    expect(out.indexOf('Worked for 6s')).toBeGreaterThan(out.indexOf('Hello, how can I help?'));
     r.close();
   });
 
@@ -987,8 +987,8 @@ describe('renderer wiring', () => {
     // Final assistant text MUST survive in full.
     expect(out).toContain('I ran ls and saw the files.');
     // Turn-end marker MUST appear AFTER the AI text.
-    expect(out).toContain('Cogitated for 9s');
-    expect(out.indexOf('Cogitated for 9s')).toBeGreaterThan(
+    expect(out).toContain('Worked for 9s');
+    expect(out.indexOf('Worked for 9s')).toBeGreaterThan(
       out.indexOf('I ran ls and saw the files.'),
     );
     r.close();

@@ -1,14 +1,14 @@
 // Resume scrollback replay. Reads persisted messages for a session
 // and emits the UIEvents that rebuild the visual scrollback the
 // operator saw at exit. Slice 3 (this file): user prompts +
-// assistant text + tool cards + the per-run `Cogitated for Xs`
+// assistant text + tool cards + the per-run `Worked for Xs`
 // footer.
 //
 // Why timestamps matter. The reducer's `assistant:end` branch reads
 // `event.ts - buf.startedAt` to fill `durationMs` on the assistant
 // PermanentItem (UI.md §3.2 turn-end marker). Synthesizing replay
 // timestamps from a single now() snapshot collapses the duration to
-// 0 and the footer renders `Cogitated for 0s` — accurate for the
+// 0 and the footer renders `Worked for 0s` — accurate for the
 // replay itself but a lie about the original turn. So we use the
 // persisted `createdAt` of each message: `assistant:start.ts` =
 // the immediately preceding message's createdAt (user submit for
@@ -22,7 +22,7 @@
 // assistant message per LLM completion: a run with tool_use can
 // produce assistant → user(tool_result) → assistant chains across
 // several rows (see src/harness/loop.ts). The live operator saw
-// ONE `Cogitated for Xs` footer at the end of the whole run, not
+// ONE `Worked for Xs` footer at the end of the whole run, not
 // one per assistant row. We mirror that here: `session:end` fires
 // only at the run boundary (= the last assistant message before
 // either end-of-session or a user message with STRING content,
@@ -446,7 +446,7 @@ export const replaySessionMessages = (
         // that clean stop: the prior run crashed / was killed
         // with a tool outstanding (or before its result was
         // persisted). Emitting reason='done' there would render a
-        // successful "Cogitated for Xs" marker over a dead run —
+        // successful "Worked for Xs" marker over a dead run —
         // misrepresenting it as completed and misleading the
         // operator about what the resumed context holds. Mark it
         // 'interrupted' so the footer reads "Interrupted after Xs"
@@ -485,7 +485,7 @@ const SUMMARY_MARKER = '[compacted_history]';
 // the scrollback. Unlike replaySessionMessages (DB rows with real createdAt),
 // this renders an in-memory array whose head is the synthetic compaction
 // summary — there are no per-message timestamps, so turn/tool durations render
-// as 0 / "Cogitated." (acceptable for a resumed-compacted view). The summary
+// as 0 / "Worked." (acceptable for a resumed-compacted view). The summary
 // head is painted in the secondary (scaffold) channel, NEVER as an operator
 // inverse bar. Compacting BEFORE replay is the whole point: the scrollback
 // shows only what survives (summary + preserved tail), not the folded history.
@@ -576,7 +576,7 @@ export const replayProviderMessages = (
         startTs: now,
         bodyTs: now,
       });
-      // Run boundary: close the footer (no durationMs → "Cogitated." without a
+      // Run boundary: close the footer (no durationMs → "Worked." without a
       // bogus "0s" — timestamps don't survive into the compacted array).
       if (!isMidRun && runActive) {
         bus.emit({

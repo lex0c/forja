@@ -1031,7 +1031,7 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           sessionId: r.sessionId,
           reason: mapped,
           // Wall-clock duration of the turn, plumbed to the
-          // turn-end marker (UI.md §3.2 → "Cogitated for 1m23s").
+          // turn-end marker (UI.md §3.2 → "Worked for 1m23s").
           durationMs: r.durationMs,
           // Pass-through abortCause when the harness produced one.
           // Meaningful only when reason ==='aborted'

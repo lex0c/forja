@@ -700,7 +700,7 @@ export type PermanentItem =
       kind: 'session-footer';
       reason: string;
       // Wall-clock duration of the run; mirrors SessionEndEvent.
-      // Renderer formats as `Cogitated for 1m23s` for `done`.
+      // Renderer formats as `Worked for 1m23s` for `done`.
       // Optional for legacy paths that don't track timing.
       durationMs?: number;
       abortCause?: 'soft' | 'hard';

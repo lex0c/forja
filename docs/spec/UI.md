@@ -132,7 +132,7 @@ Implementação: `EventEmitter` nativo do Node/Bun. Não usar `mitt` ou similar 
 | Evento | Quando | Renderer reage |
 |---|---|---|
 | `session:start` | Início da sessão (cada turn em REPL, único em one-shot) | atualiza status interno (sessionId, profile, model, planMode, projeto); reseta flags per-session (softInterrupted, exitArmed, bgProcesses). **Sem permanente em scrollback** — o user-submit inverse bar (§4.10.8) já marca início de turno; cabeçalho com session UUID seria ruído por turno em REPL e não agrega info útil ao operator (UUID interessa só pra resume/audit, lookup feito via CLI separada). |
-| `session:end` | Fim da sessão | imprime marcador final em scrollback: linha em branco + verbo terminal com **duração wall-clock** quando disponível: `Cogitated for 1m23s` (done) / `Aborted (soft) after 12s` / `Failed after 8s` / `Stopped (max steps) after 1m` / `Stopped (max cost) after 1m`. Sem duração (legacy/replay): cai pra forma curta `Cogitated.` / `Aborted.` / `Failed.` etc. Formato curto, sem régua decorativa nem session UUID — o boundary é visível e a duração responde "quanto tempo isso levou?" sem o operator ter que olhar o footer ou procurar elsewhere. |
+| `session:end` | Fim da sessão | imprime marcador final em scrollback: linha em branco + verbo terminal com **duração wall-clock** quando disponível: `Worked for 1m23s` (done) / `Aborted (soft) after 12s` / `Failed after 8s` / `Stopped (max steps) after 1m` / `Stopped (max cost) after 1m`. Sem duração (legacy/replay): cai pra forma curta `Worked.` / `Aborted.` / `Failed.` etc. Formato curto, sem régua decorativa nem session UUID — o boundary é visível e a duração responde "quanto tempo isso levou?" sem o operator ter que olhar o footer ou procurar elsewhere. |
 | `user:submit` | User pressiona Enter | imprime echo permanente; limpa input |
 | `assistant:start` | Provider começa a streamar | abre buffer vivo de mensagem |
 | `assistant:delta` | Cada chunk de texto | append no buffer; redraw |
@@ -382,7 +382,7 @@ Verbo no presente contínuo enquanto ativo. Particípio passado quando completo.
 
 | Operação | Ativo | Finalizado |
 |---|---|---|
-| Provider call (texto streaming) | `Generating… (8s · ↑ 234 tokens)` | (suprimido — assistant turn não imprime chip final, só a prosa direto; duração vai no marcador de fim de turno §3.2 `Cogitated for X`, contagem de tokens vai no footer §4.10.6) |
+| Provider call (texto streaming) | `Generating… (8s · ↑ 234 tokens)` | (suprimido — assistant turn não imprime chip final, só a prosa direto; duração vai no marcador de fim de turno §3.2 `Worked for X`, contagem de tokens vai no footer §4.10.6) |
 | Extended thinking | `Thinking… (3s)` | `Thought for 3.1s` |
 | Tool execution | per-tool verb (§4.10.4) | per-tool verb (§4.10.4) |
 | Compaction | `Compacting context… (12s)` | `Compacted 12 messages in 850ms` |
@@ -578,7 +578,7 @@ Banidos do vocabulário operacional:
 - `Working`, `Loading`, `Processing`, `Please wait` — vagos.
 - `Handling`, `Managing`, `Orchestrating` — abstratos.
 - `Just a moment…`, `Working on it…` — cortesia, desperdício de coluna.
-- `Ready!`, `Done!`, `Success!` (com **exclamação**) — banidos como **status messages durante operação**. O **marcador de fim de turno** em scrollback (§3.2 `session:end`) usa verbo no particípio passado + duração wall-clock: `Cogitated for 1m23s` (done) / `Aborted after 12s` / `Failed after 8s` / `Stopped (max steps) after 1m`. Verbo concreto + número responde "quanto tempo o turno levou?" sem entusiasmo nem duplicação com o footer. Sem duração disponível (legacy/replay): forma curta `Cogitated.` / `Aborted.` / `Failed.`
+- `Ready!`, `Done!`, `Success!` (com **exclamação**) — banidos como **status messages durante operação**. O **marcador de fim de turno** em scrollback (§3.2 `session:end`) usa verbo no particípio passado + duração wall-clock: `Worked for 1m23s` (done) / `Aborted after 12s` / `Failed after 8s` / `Stopped (max steps) after 1m`. Verbo concreto + número responde "quanto tempo o turno levou?" sem entusiasmo nem duplicação com o footer. Sem duração disponível (legacy/replay): forma curta `Worked.` / `Aborted.` / `Failed.`
 - Emoji decorativo (✓ ✗ ⚠️ 🔧 💭 🚀) — depende de fonte/terminal, conflita com paleta dim. Glyphs canônicos da §6.2 são exceção (são informativos, não decorativos).
 - Metáforas culinárias/artesanais ("Baking", "Cooking", "Brewing", "Forging") — engenheiro lê verbo literal melhor que metáfora.
 - Mascote, ícones de marca, logo — fora de escopo do core; flag opcional se virar pauta.
@@ -602,7 +602,7 @@ Banidos do vocabulário operacional:
 │                                                 ← blank             │
 │   Sim, em teoria funciona...                    ← assistant text    │
 │                                                 ← blank             │
-│   Cogitated for 8.2s                            ← turn-end (§3.2)   │
+│   Worked for 8.2s                            ← turn-end (§3.2)   │
 └─────────────────────────────────────────────────────────────────────┘
 ─────────────────────────────────────────────────────────────────────  ← régua (full width, col 0)
 > ▌                                                                   ← input + cursor (col 0)
@@ -994,7 +994,7 @@ function dispatch(k: Key) { for (let i=stack.length-1; i>=0; i--) if (stack[i](k
 |---|---|---|
 | `default` | texto normal | (sem escape) |
 | `dim` | meta, hints, separadores (réguas, footer, sub-content `└─`) | `\x1b[2m` (faint) |
-| `secondary` | marker visivelmente grey que precisa se separar do conteúdo primário (turn-end `Cogitated for X`, §3.2) | `\x1b[90m` (bright-black ≈ grey) |
+| `secondary` | marker visivelmente grey que precisa se separar do conteúdo primário (turn-end `Worked for X`, §3.2) | `\x1b[90m` (bright-black ≈ grey) |
 | `accent` | structural anchors (top rule + título de modal) e inline code de Markdown na prosa do assistant (§4.11) | `\x1b[94m` (bright blue) |
 | `bold` | ênfase, header de modal, headings de Markdown (§4.11) | `\x1b[1m` |
 | `italic` | ênfase de Markdown (`*…*`) na prosa do assistant (§4.11) | `\x1b[3m` |
@@ -1005,7 +1005,7 @@ function dispatch(k: Key) { for (let i=stack.length-1; i>=0; i--) if (stack[i](k
 
 **Sem cores não-listadas.** Sem ciano, sem magenta, sem gradientes, sem 256-color, sem truecolor. A tabela acima é a paleta inteira. Profile/model/etc. ficam em `default`. Se você precisa de cor pra distinguir, o layout falhou.
 
-**Nota sobre `dim` vs `secondary` vs `accent`:** `dim` (SGR 2 faint) é o token tradicional para meta — réguas, hints, sub-content. Em xterm com config padrão, SGR 2 renderiza idêntico ao default; aceito porque no contexto desses elementos a posição já carrega a hierarquia. **`secondary`** (SGR 90 bright-black) é o variante explicitamente visível, reservado pra marker que PRECISA destacar do conteúdo primário (turn-end `Cogitated for X` da §3.2; matched-rule e hint footer no permission modal). **`accent`** (SGR 94 bright blue) é o token mais saturado da paleta. Structural chrome (top rule e título de modal) e — desde o render de Markdown (§4.11) — inline code na prosa do assistant; inline code é a âncora técnica mais frequente da prosa (flags, paths, identificadores) e o azul a separa do greyscale. Os três SGRs são cores 16-color (cinza, cinza-bright, blue-bright), parte do baseline universal de qualquer terminal; o `accent` foi pesado contra a regra "sem azul" porque a estrutura do modal precisa de um anchor visual além do dim baseline pra ler como uma decisão deliberada e não como conteúdo de fluxo.
+**Nota sobre `dim` vs `secondary` vs `accent`:** `dim` (SGR 2 faint) é o token tradicional para meta — réguas, hints, sub-content. Em xterm com config padrão, SGR 2 renderiza idêntico ao default; aceito porque no contexto desses elementos a posição já carrega a hierarquia. **`secondary`** (SGR 90 bright-black) é o variante explicitamente visível, reservado pra marker que PRECISA destacar do conteúdo primário (turn-end `Worked for X` da §3.2; matched-rule e hint footer no permission modal). **`accent`** (SGR 94 bright blue) é o token mais saturado da paleta. Structural chrome (top rule e título de modal) e — desde o render de Markdown (§4.11) — inline code na prosa do assistant; inline code é a âncora técnica mais frequente da prosa (flags, paths, identificadores) e o azul a separa do greyscale. Os três SGRs são cores 16-color (cinza, cinza-bright, blue-bright), parte do baseline universal de qualquer terminal; o `accent` foi pesado contra a regra "sem azul" porque a estrutura do modal precisa de um anchor visual além do dim baseline pra ler como uma decisão deliberada e não como conteúdo de fluxo.
 
 `NO_COLOR` env var ou `--no-color`: desativa todos os escapes. `CLICOLOR_FORCE=1` ignora `!isTTY` e força cores (útil em log capture).
 

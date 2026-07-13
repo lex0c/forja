@@ -207,7 +207,7 @@ export interface RunReplOptions {
 // `session:end` so the renderer wouldn't flip into `ended` state
 // between REPL turns and hide the input box. With `state.ended` no
 // longer gating draws (renderer.ts), the filter became unnecessary —
-// session:end now produces the turn-end marker (`Cogitated for X`,
+// session:end now produces the turn-end marker (`Worked for X`,
 // UI.md §3.2) on every turn, the input stays visible during the
 // gap between session:end and the next user:submit, and one-shot
 // callers still get their final marker.
@@ -1594,13 +1594,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // seconds in ref deletion") AFTER session_finished is emitted —
     // those are bookkeeping, not turn-visible work. Pre-fix the
     // Promise chain held `running=true` through that window, so the
-    // operator who saw `Cogitated for Xs` rendered and started typing
+    // operator who saw `Worked for Xs` rendered and started typing
     // immediately found that Enter was silently gated and Ctrl+C
     // routed to triggerInterrupt-on-resolved-abort (no-op). Visibly
     // identical to "input frozen" for several seconds.
     //
     // Cumulative totals + lastSessionId are also rolled up here so a
-    // back-to-back submit (operator hits Enter the moment Cogitated
+    // back-to-back submit (operator hits Enter the moment Worked
     // appears) sees the correct prior session id for resume — the
     // runAgent Promise's `.then` would not have fired yet under the
     // old timing.
@@ -2241,7 +2241,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     const runAgentImpl = options.runAgentOverride ?? runAgent;
     // Cumulative totals + lastSessionId are rolled up in
     // `onHarnessEvent` on `session_finished` (synchronous with
-    // Cogitated rendering) — see the comment there. The .then()
+    // Worked rendering) — see the comment there. The .then()
     // here intentionally does no bookkeeping; it exists only so
     // .catch can intercept rejections from runAgent itself
     // (provider crash before any harness event, etc.).

@@ -9,14 +9,15 @@ import { computeCost } from '../../providers/cost.ts';
 import type { ProviderCapabilities, UsageInfo } from '../../providers/types.ts';
 
 // The provider prefix of a model id (the part before the first '/') maps to the host its traffic goes
-// to — the egress allowlist the sidecar proxy enforces. Seeded openrouter/* and google/* entries ship
-// with NO base_url (the adapter uses its own default endpoint), so the host must come from here.
+// to — the egress allowlist the sidecar proxy enforces. Seeded openrouter/*, google/*, and xai/* entries
+// ship with NO base_url (the adapter uses its own default endpoint), so the host must come from here.
 export const PROVIDER_HOST: Record<string, string> = {
   ollama: 'ollama.com',
   anthropic: 'api.anthropic.com',
   openai: 'api.openai.com',
   openrouter: 'openrouter.ai',
   google: 'generativelanguage.googleapis.com',
+  xai: 'api.x.ai',
 };
 
 export interface CatalogEntry {

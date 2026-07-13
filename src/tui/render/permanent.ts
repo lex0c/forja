@@ -102,7 +102,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // UI.md §3.2 turn-end marker: blank line + the terminal verb.
       // The verb shape depends on `reason`:
       //
-      //   done       → `Cogitated for 1m23s`     (or `Cogitated for 450ms` short turns)
+      //   done       → `Worked for 1m23s`     (or `Worked for 450ms` short turns)
       //   aborted    → `Aborted (soft) after 12s` / `Aborted (hard) after 12s`
       //                or `Aborted after 12s` if cause unknown
       //   error      → `Failed after 12s`        (operator-speak)
@@ -112,11 +112,11 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       //
       // Duration is plumbed from `HarnessResult.durationMs` via the
       // session:end event. When it's missing (legacy / replay), we
-      // fall back to the bare verb (`Cogitated.`, `Aborted.` etc)
+      // fall back to the bare verb (`Worked.`, `Aborted.` etc)
       // so the marker stays grammatical.
       //
       // §4.10.11 anti-vocabulario: `Done!` (with !) is banido. The
-      // `Cogitated for X` shape avoids the static "Done." while
+      // `Worked for X` shape avoids the static "Done." while
       // surfacing useful info — wall-clock time the model spent on
       // the turn — which the operator likely wants to see anyway.
       const dur = item.durationMs;
@@ -124,7 +124,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       const verb = (() => {
         switch (item.reason) {
           case 'done':
-            return dur !== undefined ? `Cogitated for ${formatCoarseDuration(dur)}` : 'Cogitated.';
+            return dur !== undefined ? `Worked for ${formatCoarseDuration(dur)}` : 'Worked.';
           case 'aborted': {
             const cause = item.abortCause !== undefined ? ` (${item.abortCause})` : '';
             return dur !== undefined ? `Aborted${cause} after${tail}` : `Aborted${cause}.`;
@@ -211,7 +211,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // blank line (UI.md §6.3) so it visually separates from the
       // user-submit bar / tool blocks above. The legacy
       // `· Generated N tokens in Xs` chip header was removed —
-      // duration is in the turn-end marker (`Cogitated for Xs`) and
+      // duration is in the turn-end marker (`Worked for Xs`) and
       // token count lives in the footer's right column. A per-turn
       // chip header just duplicates info the operator already sees
       // and clutters scrollback.
@@ -312,7 +312,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // grey) rather than `dim` (SGR 2 faint, frequently invisible
       // in default xterm/i3 setups) so the operator can actually
       // read the subject — same rationale as the session-footer
-      // `Cogitated for X` marker (UI.md §6.1). Nested chips indent
+      // `Worked for X` marker (UI.md §6.1). Nested chips indent
       // the sub-content too so the connector lines under the nest
       // glyph stay visually tied to the nested chip head.
       if (subText !== null) {
@@ -552,7 +552,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
     case 'recap-terse': {
       // RECAP §3.3 auto-display: bold "recap:" prefix + the line
       // body in `secondary` (SGR 90 = bright-grey, the same
-      // greyscale meta channel used for the turn-end "Cogitated
+      // greyscale meta channel used for the turn-end "Worked
       // for X" marker). Bold is layered with secondary via
       // `paintMulti` so a single trailing reset wraps both
       // attributes — nesting `paint(paint(...))` would double-emit
