@@ -426,4 +426,4 @@ coverage improvement would be a pty-backed test that compares a real framebuffer
 6. `assistant:end` with text → flushes the batch to scrollback (grouped) and
    lands the assistant prose.
 7. `session:end` → flushes any remaining batch, emits the `session-footer`
-   (`Cogitated for Xs`), clears per-turn state; the input box returns.
+   (`Worked for Xs`), clears per-turn state; the input box returns.

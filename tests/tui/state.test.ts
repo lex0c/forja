@@ -511,7 +511,7 @@ describe('assistant streaming', () => {
     // emit a metadata-only permanent so formatPermanent could render
     // a `· Generated N tokens` chip header above the tool chips.
     // The chip header was removed (UI.md §4.10.5) — duration shows
-    // up in the turn-end marker (§3.2 `Cogitated for X`), tokens
+    // up in the turn-end marker (§3.2 `Worked for X`), tokens
     // roll up into the footer cost. Emitting a metadata-only
     // permanent the formatter would render as [] forces the
     // renderer through writeTransition (erase + full redraw) for no

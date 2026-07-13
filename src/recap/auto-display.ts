@@ -117,7 +117,7 @@ export const buildAutoTerse = (input: BuildAutoTerseInput): BuildAutoTerseResult
     // Miss: render fresh, write through to cache, then audit.
     // `omitMetrics: true` drops the `<duration>, <cost>.` suffix —
     // RECAP §3.3 surfaces (TUI session-end + Alt+R) display
-    // immediately after the "Cogitated for X" footer where the
+    // immediately after the "Worked for X" footer where the
     // duration is already shown and cost is on the spend line,
     // so repeating it is redundant. The full form (with metrics)
     // remains the default for `/recap terse` and the goldens.
