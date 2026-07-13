@@ -354,6 +354,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // duration; the /compact body composes this with its own timeout. Without
   // it, Ctrl+C during a stalled compaction does nothing.
   let compactAbortController: AbortController | null = null;
+  // The in-flight exclusive prep — a /compact `runExclusive` fold or a
+  // full/summary --resume `prepareResumeContext` + replay — or null. It reads
+  // the DB and emits to the bus but, unlike a turn, has no `runningPromise`, so
+  // shutdown() awaits THIS to avoid closing the renderer/DB underneath it.
+  // Resolved from each flow's own `finally`, so awaiting it never throws.
+  let compactionPromise: Promise<void> | null = null;
   // Kill switch for the in-flight `!cmd`, handed up by the executor so
   // the interrupt path (Ctrl+C / Esc) can terminate the command's
   // process group instead of waiting out the timeout. Null when no
@@ -2510,6 +2516,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // function does the work without needing its own guard.
   const shutdown = async (): Promise<void> => {
     if (abortController !== null) abortController.abort();
+    // A /compact fold or a full/summary --resume prep holds the exclusive
+    // compaction handle (compactAbortController), NOT abortController — a
+    // process-level stop (SIGTERM/HUP/QUIT) or a Ctrl+D quit can land while one
+    // is in flight. Abort it so prepareResumeContext / the summary fold unwinds
+    // via its deterministic fallback instead of blocking teardown; the awaited
+    // settle below then lets its DB reads + bus emits finish before we close.
+    if (compactAbortController !== null) compactAbortController.abort();
     // SIGKILL an in-flight operator `!cmd`'s process group so it doesn't
     // outlive the REPL (detached → would keep running for up to the
     // timeout) and so its completion settles + emits BEFORE renderer.close
@@ -2540,6 +2553,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // settled with an error already surfaced as the bash card.
       }
     }
+    // Same use-after-close guard for an in-flight exclusive compaction /
+    // resume-prep (aborted above): let it settle — it reads the DB and emits to
+    // the bus — before renderer/DB teardown. Resolves from that work's own
+    // `finally`, so the await never throws.
+    const cp = compactionPromise;
+    if (cp !== null) await cp;
     modalManager.close();
     renderer.close();
     stdin.removeListener('data', onData);
@@ -2836,9 +2855,17 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       compactAbortController = ctrl;
       compacting = true;
       syncBusy();
+      // Expose an awaitable settle so a shutdown() landing mid-fold waits for
+      // this compaction before closing the DB/renderer (resolved in `finally`).
+      let settleCompaction: () => void = () => {};
+      compactionPromise = new Promise<void>((resolve) => {
+        settleCompaction = resolve;
+      });
       try {
         return await fn(ctrl.signal);
       } finally {
+        settleCompaction();
+        compactionPromise = null;
         compactAbortController = null;
         compacting = false;
         syncBusy();
@@ -4013,6 +4040,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // into its deterministic fallback, so the prep still completes.
         const prepAbort = new AbortController();
         compactAbortController = prepAbort;
+        // Awaitable settle so a shutdown() landing mid-prep waits for the
+        // hydrate / compaction / replay (all DB + bus work) before teardown
+        // closes the DB/renderer (resolved in `finally`).
+        let settleCompaction: () => void = () => {};
+        compactionPromise = new Promise<void>((resolve) => {
+          settleCompaction = resolve;
+        });
         try {
           // Hydrate the WHOLE log (uncapped) and, for summary, compact BEFORE
           // replay (so the scrollback shows only what survives). Shared with the
@@ -4081,6 +4115,8 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           liveContext = ctx;
           resumeRecapPending = true;
         } finally {
+          settleCompaction();
+          compactionPromise = null;
           compactAbortController = null;
           resumePrepping = false;
           syncBusy();
