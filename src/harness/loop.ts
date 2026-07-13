@@ -25,7 +25,6 @@ import {
 import { createDegradedBannerEmitter } from '../permissions/degraded-banner.ts';
 import { computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
-  GenerateRequest,
   ProviderMessage,
   ProviderToolDef,
   ProviderToolResultBlock,
@@ -67,9 +66,9 @@ import type {
   ToolSearchHit,
 } from '../tools/types.ts';
 import { createWorkingStateStore, type WorkingStateStore } from '../working-state/index.ts';
-import { abortableIterable, StepStallError, stallWatchdog, withAbort } from './abortable.ts';
+import { StepStallError, withAbort } from './abortable.ts';
 import { buildAssistantContent } from './assistant-content.ts';
-import { type CollectedToolUse, CollectStepError, collectStep } from './collect.ts';
+import { type CollectedStep, type CollectedToolUse, CollectStepError } from './collect.ts';
 import {
   accountCompaction,
   compactionTriggerTokens,
@@ -95,8 +94,8 @@ import {
   recordProactiveExposures,
   resolveCachedRecall,
 } from './proactive-memory-inject.ts';
+import { buildGenerateRequest, collectProviderStep } from './provider-turn.ts';
 import { MAX_RESUME_MESSAGES } from './resume.ts';
-import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
 import { type HydrateInfo, SessionContext } from './session-context.ts';
 import { injectStaticGuidance } from './static-guidance.ts';
 import { finalizeSession, type TerminalSessionStatus } from './terminal.ts';
@@ -2822,24 +2821,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             reqMessages,
             isSmallWindow(config.provider?.capabilities?.context_window ?? 0),
           );
-        const req: GenerateRequest = {
-          model: config.provider.id,
+        const req = buildGenerateRequest({
+          config,
           messages: reqMessages,
-          max_tokens: resolvedMaxTokens,
-          ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
-          ...(config.systemSegments !== undefined ? { systemSegments: config.systemSegments } : {}),
-          ...(tools.length > 0 ? { tools } : {}),
-          ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
-          ...(config.topP !== undefined ? { top_p: config.topP } : {}),
-          ...(config.thinkingBudget !== undefined
-            ? { thinking_budget: config.thinkingBudget }
-            : {}),
-          // Provider reasoning-effort axis (resolved above). Each
-          // adapter maps it to its native surface; the operational
-          // caps ride `budget` separately via effectiveBudget.
-          ...(reqEffort !== undefined ? { effort: reqEffort } : {}),
-          ...(config.seedInEval !== undefined ? { seed_in_eval: config.seedInEval } : {}),
-        };
+          maxTokens: resolvedMaxTokens,
+          tools,
+          effort: reqEffort,
+        });
 
         // Verify-gate output buffering. If the gate is armed entering this turn
         // (code mutated, a declared verify-command still unsatisfied, retries
@@ -2869,34 +2857,19 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // the turn streams live.
         let holdingAnswer = verifyArmed;
 
-        let collected: Awaited<ReturnType<typeof collectStep>>;
+        let collected: CollectedStep;
         try {
-          // Wrap the provider stream so the combined abort signal (user +
-          // wall-clock) actually reaches the for-await inside collectStep.
-          // The Provider interface doesn't propagate signals to the SDK,
-          // so without this a hung HTTP request blocks indefinitely and
-          // neither Ctrl+C nor maxWallClockMs can interrupt it.
-          // Stream wrapping order is load-bearing:
-          //   1. generateWithRetry produces the raw stream.
-          //   2. stallWatchdog wraps inside-out so silent stalls
-          //      throw StepStallError; reset on every yield.
-          //   3. abortableIterable wraps OUTSIDE so external
-          //      aborts (Ctrl+C, wall-clock) take precedence over
-          //      stall detection.
-          // Inverting (1) and (2) would let the stall timer
-          // count time the consumer spends processing each event
-          // (e.g. heavy renderer work between deltas) against
-          // the stall budget, which would falsely trip on slow
-          // consumers rather than real provider hangs.
-          collected = await collectStep(
-            abortableIterable(
-              stallWatchdog(
-                generateWithRetry(config.provider, req, DEFAULT_RETRY),
-                budget.maxStepStallMs,
-              ),
-              signal,
-            ),
-            (ev) => {
+          // The provider call + stream drain (the four-primitive load-bearing
+          // composition: retry → stall-watchdog → abort → collect) lives in
+          // `collectProviderStep`. The verify-gate output buffering rides in via
+          // the `onEvent` callback, which keeps its loop-local state
+          // (holdingAnswer / bufferedAnswer) here.
+          collected = await collectProviderStep({
+            provider: config.provider,
+            req,
+            maxStepStallMs: budget.maxStepStallMs,
+            signal,
+            onEvent: (ev) => {
               // A tool call settles that this turn is not a suppressible final
               // answer: flush the held preamble BEFORE the tool's events (keeping
               // the model's emission order) and stop holding for the rest of it.
@@ -2912,10 +2885,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               }
               safeEmit(config.onEvent, { type: 'provider_event', event: ev });
             },
-          );
+          });
         } catch (e) {
-          // collectStep threw, so this turn produced no settled answer the gate
-          // could suppress — flush any answer text buffered for the verify gate
+          // collectProviderStep threw, so this turn produced no settled answer the
+          // gate could suppress — flush any answer text buffered for the verify gate
           // (partial text the provider streamed before the error) so it isn't
           // silently swallowed by the buffering. No-op unless the gate was armed.
           flushBufferedAnswer();
@@ -2930,7 +2903,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // for this case, so a failed turn that already received
           // input/cache numbers from the provider can still be charged.
           // CollectStepError carries the partial CollectedStep; non-
-          // wrapped errors (extreme: collectStep itself crashed before
+          // wrapped errors (extreme: the collect step itself crashed before
           // catching) have no recoverable state.
           if (e instanceof CollectStepError) {
             const partial = e.partial;
