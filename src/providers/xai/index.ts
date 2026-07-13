@@ -1,6 +1,11 @@
 import OpenAI from 'openai';
 import { XAI_REASONING_EFFORT } from '../effort.ts';
-import { type OpenAIMessage, toOpenAIMessages, toOpenAITools } from '../openai/index.ts';
+import {
+  type OpenAIMessage,
+  openaiPromptCacheKey,
+  toOpenAIMessages,
+  toOpenAITools,
+} from '../openai/index.ts';
 import { deriveSeedFromRequest } from '../seed.ts';
 import { estimateMessagesTokens } from '../tokens.ts';
 import type {
@@ -87,6 +92,19 @@ export const createXaiProvider = (
   // the same capability the OpenAI adapter uses to detect reasoning models.
   const isReasoningModel = caps.supports_reasoning_effort === true;
   const includeUsage = options.includeUsage ?? includeUsageFromEnv();
+  // xAI prompt-cache sticky routing: the `x-grok-conv-id` header routes a
+  // conversation's requests to the same server so the automatic prompt cache is
+  // actually reused turn-to-turn (without it, cached_tokens is often 0 on a long
+  // loop and the caller pays full input price). Keyed on the STABLE prefix
+  // (system + tools) via the shared openaiPromptCacheKey — the same derivation the
+  // OpenAI adapter routes on — so every turn of a session, and any session with
+  // the same prefix, routes together (system/tools don't change within a session).
+  // Only on the real api.x.ai path: a custom `base_url` (proxy) has its own
+  // routing and the header is meaningless there. `client`-injected callers (tests)
+  // pass no baseURL, so the header is still emitted and observable.
+  const sendConvId = options.baseURL === undefined;
+  const convIdOptions = (req: GenerateRequest): { headers: Record<string, string> } | undefined =>
+    sendConvId ? { headers: { 'x-grok-conv-id': openaiPromptCacheKey(req) } } : undefined;
 
   const buildMessages = (req: GenerateRequest): OpenAIMessage[] => {
     const messages: OpenAIMessage[] = [];
@@ -126,6 +144,7 @@ export const createXaiProvider = (
 
     const stream = (await client.chat.completions.create(
       params as unknown as Parameters<typeof client.chat.completions.create>[0],
+      convIdOptions(req),
     )) as unknown as AsyncIterable<RawXaiChunk>;
     yield* normalizeXaiStream(stream);
   };
@@ -161,6 +180,7 @@ export const createXaiProvider = (
 
     const response = (await client.chat.completions.create(
       params as unknown as Parameters<typeof client.chat.completions.create>[0],
+      convIdOptions(req),
     )) as {
       choices?: Array<{
         finish_reason?: string;

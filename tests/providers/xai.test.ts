@@ -18,12 +18,14 @@ const makeClient = (opts: {
   chunks?: RawXaiChunk[];
   response?: unknown;
   onBody?: (b: Body) => void;
+  onOptions?: (o: Body | undefined) => void;
 }): OpenAI =>
   ({
     chat: {
       completions: {
-        create: async (body: Body) => {
+        create: async (body: Body, options?: Body) => {
           opts.onBody?.(body);
+          opts.onOptions?.(options);
           if (body.stream === true) {
             return (async function* () {
               for (const c of opts.chunks ?? []) yield c;
@@ -250,6 +252,68 @@ describe('createXaiProvider', () => {
     );
     expect(body.temperature).toBe(0.3);
     expect(body.top_p).toBe(0.9);
+  });
+
+  test('sends x-grok-conv-id, stable across a session (sticky prompt-cache routing)', async () => {
+    const capture = async (over: Partial<GenerateRequest>): Promise<Body | undefined> => {
+      let options: Body | undefined;
+      const p = createXaiProvider('grok-4.5', {
+        client: makeClient({
+          chunks: textChunks,
+          onOptions: (o) => {
+            options = o;
+          },
+        }),
+      });
+      await collect(
+        p.generate(
+          reqGen({
+            system: 'you are terse',
+            tools: [{ name: 't', description: 'd', input_schema: { type: 'object' } }],
+            ...over,
+          }),
+        ),
+      );
+      return options;
+    };
+    // Turn 1 and a later turn (same system+tools, an appended message) must carry
+    // the SAME conv-id so both route to the cache-warm server.
+    const o1 = await capture({ messages: [{ role: 'user', content: 'first' }] });
+    const o2 = await capture({
+      messages: [
+        { role: 'user', content: 'first' },
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: 'second' },
+      ],
+    });
+    const id1 = o1?.headers?.['x-grok-conv-id'] as string | undefined;
+    const id2 = o2?.headers?.['x-grok-conv-id'] as string | undefined;
+    expect(typeof id1).toBe('string');
+    expect((id1 ?? '').length).toBeGreaterThan(0);
+    expect(id2).toBe(id1);
+    // A different system prefix → a different conv-id (distinct cache bucket).
+    const o3 = await capture({
+      system: 'different',
+      messages: [{ role: 'user', content: 'first' }],
+    });
+    expect(o3?.headers?.['x-grok-conv-id']).not.toBe(id1);
+  });
+
+  test('x-grok-conv-id is NOT sent when a custom base_url (proxy) is pinned', async () => {
+    let options: Body | undefined = { sentinel: true };
+    const p = createXaiProvider('grok-4.5', {
+      baseURL: 'https://proxy.internal/v1',
+      client: makeClient({
+        chunks: textChunks,
+        onOptions: (o) => {
+          options = o;
+        },
+      }),
+    });
+    await collect(p.generate(reqGen({ messages: [{ role: 'user', content: 'x' }] })));
+    // convIdOptions returns undefined off the real api.x.ai path → create called
+    // with no request options.
+    expect(options).toBeUndefined();
   });
 
   test('generateConstrained forces a schema tool and returns output + usage', async () => {
