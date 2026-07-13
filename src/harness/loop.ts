@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import { runGc } from '../audit/gc.ts';
 import { type BgManager, createBgManager } from '../bg/index.ts';
 import {
   type CheckpointManager,
@@ -34,13 +33,11 @@ import type {
 } from '../providers/index.ts';
 import { resolveProviderFromId } from '../providers/resolve.ts';
 import { estimatePromptTokens } from '../providers/tokens.ts';
-import { buildAutoTerse } from '../recap/auto-display.ts';
 import { projectRecap } from '../recap/projection.ts';
 import { buildResumeContext, shouldSkipResumeContext } from '../recap/resume-context.ts';
 import { buildRetrievalRunner } from '../retrieval/index.ts';
 import { redactSecrets } from '../sanitize/secrets.ts';
 import {
-  completeSession,
   createSession,
   getSession,
   insertCostProgressEvent,
@@ -49,7 +46,6 @@ import {
   type SessionStatus,
   updateSessionCost,
 } from '../storage/index.ts';
-import { listApprovalsLogBySessionRecent } from '../storage/repos/approvals-log.ts';
 import { isBilledCompactionStrategy } from '../storage/repos/compaction-events.ts';
 import {
   createContextPinsStore,
@@ -85,6 +81,7 @@ import {
 } from './compaction.ts';
 import type { RelevanceAudit } from './compaction-relevance.ts';
 import { resolveProviderEffort } from './effort.ts';
+import { safeEmit } from './emit.ts';
 import {
   type ExhaustionSynthesisResult,
   endsWithSettledAnswer,
@@ -102,6 +99,7 @@ import { MAX_RESUME_MESSAGES } from './resume.ts';
 import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
 import { type HydrateInfo, SessionContext } from './session-context.ts';
 import { injectStaticGuidance } from './static-guidance.ts';
+import { finalizeSession, type TerminalSessionStatus } from './terminal.ts';
 import {
   type ExitReason,
   effectiveBudget,
@@ -122,17 +120,6 @@ import {
   verifyGateNudge,
 } from './verify-gate.ts';
 import { injectWorkingStateBlock } from './working-state-inject.ts';
-
-type TerminalSessionStatus = 'done' | 'interrupted' | 'exhausted' | 'error';
-
-const safeEmit = (onEvent: HarnessConfig['onEvent'], event: HarnessEvent): void => {
-  if (onEvent === undefined) return;
-  try {
-    onEvent(event);
-  } catch {
-    // Renderers throwing must not derail the loop.
-  }
-};
 
 const stableStringify = (obj: unknown): string => {
   if (obj === null || typeof obj !== 'object') return JSON.stringify(obj);
@@ -855,6 +842,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     return chain;
   };
 
+  // Idempotency backstop for `session_finished`: the harness contract is to
+  // emit it EXACTLY once. Today `finish` is total — nothing throws after the
+  // emit — so a double-emit is unreachable, but that once-only property rests
+  // entirely on that discipline with no guard. If a future throwing `await`
+  // ever lands after the emit, the outer catch → guardedFinish → finish would
+  // re-enter and emit a second `session_finished`. This flag makes the
+  // once-only invariant explicit and regression-proof (first step of the
+  // terminal-FSM extraction, N1).
+  let sessionFinishedEmitted = false;
   // `abortCause` is only meaningful when reason === 'aborted'; ignored
   // otherwise. Callers thread it from the abort site that knew which
   // signal fired (hard signal.aborted vs softStopSignal.aborted) so
@@ -865,192 +861,35 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     abortCause?: 'soft' | 'hard',
   ): Promise<HarnessResult> => {
     clearTimeout(wallClockTimer);
-    // Skip completeSession when init failed before createSession — there's
-    // no row to mark and SQLite would just throw a foreign-key error.
-    if (sessionId.length > 0) {
-      try {
-        // Persist CUMULATIVE totals (prior + this run) so the row
-        // reflects the session's lifetime cost. The result returned
-        // below stays per-run (caller telemetry). abortCause is
-        // threaded through so audit / replay tools can recover the
-        // discriminator after the process exits — without this, the
-        // in-memory HarnessResult.abortCause died at the boundary.
-        completeSession(
-          config.db,
-          sessionId,
-          exitToStatus[reason],
-          priorCostUsd + totalCostUsd,
-          priorUsageComplete && usageComplete,
-          undefined,
-          abortCause,
-        );
-      } catch {
-        // Storage already broken; nothing useful to do beyond return the
-        // result so the caller knows the run is over.
-      }
-    }
-    const result: HarnessResult = {
-      status: exitToHarnessStatus[reason],
+    // N1: the session-end sequence (persist row, build result, outcome
+    // signals, Stop hooks, gc-on-Stop, drain, recap) moved to
+    // `finalizeSession` in terminal.ts — it takes an explicit snapshot of run
+    // state instead of closing over these locals. This closure keeps only the
+    // two bits that MUST live with the run: clearing the wall-clock timer
+    // (above) and the guarded once-only `session_finished` emit (below).
+    const result = await finalizeSession({
+      config,
       reason,
+      status: exitToStatus[reason],
+      harnessStatus: exitToHarnessStatus[reason],
+      ...(detail !== undefined ? { detail } : {}),
+      ...(abortCause !== undefined ? { abortCause } : {}),
       sessionId,
-      steps,
-      durationMs: Date.now() - startMs,
-      usage: totalUsage,
-      costUsd: totalCostUsd,
+      priorCostUsd,
+      totalCostUsd,
+      priorUsageComplete,
       usageComplete,
-      unmetered: config.provider.capabilities.unmetered === true,
-      // ctx is undefined only if init failed before the session-
-      // decision block resolved it (early internalError) — keep the
-      // pre-ctx '' so that path's result shape is unchanged.
-      lastMessageId: ctx !== undefined ? ctx.getLastMessageId() : '',
-    };
-    // Hand the live context back so a multi-turn caller (REPL) reuses
-    // it next turn instead of re-deriving from the DB log.
-    if (ctx !== undefined) result.sessionContext = ctx;
-    if (detail !== undefined) result.detail = detail;
-    if (reason === 'aborted' && abortCause !== undefined) {
-      result.abortCause = abortCause;
+      totalUsage,
+      steps,
+      startMs,
+      ctx,
+      dispatchHooks,
+      pendingHookChains,
+    });
+    if (!sessionFinishedEmitted) {
+      sessionFinishedEmitted = true;
+      safeEmit(config.onEvent, { type: 'session_finished', result });
     }
-
-    // Slice 131 wire: when the session terminates in an
-    // interrupted/error state, emit a `session_aborted`
-    // outcome_signal for the last N approvals. Weak signal
-    // (weight 0.20) — sessions abort for many reasons not all
-    // "decision-was-wrong" (Ctrl+C, timeout, cost cap, provider
-    // crash). N=5 is a heuristic floor: the problem is more
-    // likely in the recent few approvals than the session's
-    // very first. Best-effort: signal emit failure stderrs but
-    // never blocks the result.
-    if (
-      config.outcomeSink !== undefined &&
-      sessionId.length > 0 &&
-      (exitToStatus[reason] === 'interrupted' || exitToStatus[reason] === 'error')
-    ) {
-      // Slice 131 fixup #5: bounded query (ORDER BY seq DESC
-      // LIMIT 5) so a long session (10k tool calls) doesn't
-      // materialize the full list on every abort. Per-emit
-      // try/catch so a transient SQLITE_BUSY on one signal
-      // doesn't drop the rest of the cohort.
-      const SESSION_ABORTED_TAIL_N = 5;
-      const recent = listApprovalsLogBySessionRecent(config.db, sessionId, SESSION_ABORTED_TAIL_N);
-      for (const a of recent) {
-        try {
-          config.outcomeSink.emit({
-            approval_seq: a.seq,
-            signal_kind: 'session_aborted',
-            payload: {
-              exit_reason: reason,
-              ...(abortCause !== undefined ? { abort_cause: abortCause } : {}),
-            },
-          });
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          process.stderr.write(
-            `forja outcome_signals: session_aborted emit failed for approval_seq=${a.seq} (${msg})\n`,
-          );
-        }
-      }
-    }
-    // Stop hooks (spec AGENTIC_CLI.md §10.1). Fired AFTER the
-    // session row is marked complete and the result struct is
-    // built — so the operator's hook can read the final row /
-    // status as authoritative — but BEFORE the renderer sees
-    // session_finished, so any "session ended at $cost"
-    // notification from a Stop hook lands while the UI is still
-    // around. Audit is awaited; latency is bounded by the
-    // dispatcher's MAX_HOOK_CHAIN_MS.
-    //
-    // Skipped on init-fail paths where createSession never
-    // landed (`sessionId === ''`) — the spec contract on
-    // HookEventPayload promises a non-empty sessionId, and
-    // there's no real session for the operator's Stop hook to
-    // act on. Mirrors the symmetric guard around SessionStart
-    // (which only fires after the session_start emit, by which
-    // point sessionId is guaranteed set).
-    if (sessionId.length > 0) {
-      await dispatchHooks({
-        schema: 'v1',
-        event: 'Stop',
-        sessionId,
-        data: {
-          durationMs: result.durationMs,
-          costUsd: result.costUsd,
-          steps: result.steps,
-        },
-      });
-    }
-    // Built-in gc-on-Stop trigger (AGENTIC_CLI.md §2.1.3 Stop hook
-    // integration). Operator opted in via `[audit] run_gc_on_stop =
-    // true` in config.toml. Synchronous: session-end awaits gc
-    // completion so that "when the agent command returns, hygiene
-    // is done" holds. Errors land in stderr but never propagate —
-    // gc drift is not a task failure, and aborting session-end
-    // because of cleanup hygiene would confuse the operator.
-    // Reuses `config.db` (already open + migrated by the harness's
-    // own bootstrap); no second openDb cycle.
-    //
-    // Runs AFTER operator-declared Stop hooks so an operator hook
-    // that needed the pre-gc state (e.g., backup) sees the DB
-    // untouched. A future `PostGc` event would cover hooks that
-    // need the post-gc state — out of scope for this slice.
-    if (config.auditRetention?.runGcOnStop === true) {
-      try {
-        const report = runGc({
-          db: config.db,
-          config: config.auditRetention,
-          nowMs: Date.now(),
-          dryRun: false,
-        });
-        for (const e of report.errors) {
-          process.stderr.write(`forja gc-on-Stop: ${e.table}: ${e.reason}\n`);
-        }
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        process.stderr.write(`forja gc-on-Stop: unexpected error: ${msg}\n`);
-      }
-    }
-    // Drain any fire-and-forget chains still in flight
-    // (PostToolUse from the last tool of the run, Notification
-    // from a confirm modal that opened mid-step, PreCheckpoint
-    // from the last writes-true step). Without this, a chain
-    // that hadn't yet reached its `createHookRun` call by the
-    // time runAgent returns races `db.close()` in the CLI
-    // driver — surfacing as stderr "AUDIT DRIFT" lines instead
-    // of a landed row. The dispatcher's per-hook + chain
-    // timeouts already bound how long this can take. Use
-    // allSettled so a rogue chain that throws here doesn't
-    // crash the harness's exit path.
-    if (pendingHookChains.size > 0) {
-      await Promise.allSettled([...pendingHookChains]);
-    }
-
-    // Auto-display terse line (RECAP §3.3). Project the recap
-    // determinístically and cache the result so the operator's
-    // next `/recap` is a hit, plus the harness emits the markdown
-    // so the TUI surfaces it above session:end. Skipped silently
-    // on any failure — operator's exit footer comes through
-    // regardless. Init-fail paths where `sessionId === ''` are
-    // also skipped (no real session to project). Suppressed
-    // entirely when the recap master switch is off
-    // (`[recap].enabled=false` / `--no-recap`).
-    if (isRecapEnabled(config) && sessionId.length > 0) {
-      const auto = buildAutoTerse({ db: config.db, sessionId, now: Date.now() });
-      if (auto.ok) {
-        safeEmit(config.onEvent, {
-          type: 'recap_terse_ready',
-          sessionId,
-          markdown: auto.markdown,
-          cacheHit: auto.cacheHit,
-        });
-      }
-      // Failure case: swallow. The harness contract is "always
-      // emit session_finished"; the recap surface is best-effort.
-      // Diagnostic is observable via `recap_runs` (no row was
-      // written) and the rare crash that this catches is
-      // typically a transient SQLite lock that the next manual
-      // /recap would also surface.
-    }
-    safeEmit(config.onEvent, { type: 'session_finished', result });
     return result;
   };
 

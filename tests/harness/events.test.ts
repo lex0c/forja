@@ -117,6 +117,25 @@ describe('runAgent onEvent', () => {
     expect(events[events.length - 1]?.type).toBe('session_finished');
   });
 
+  test('emits session_finished exactly once (N1 once-only guard)', async () => {
+    // The `sessionFinishedEmitted` flag (N1 terminal-FSM extraction) makes the
+    // once-only emit invariant explicit instead of resting on "finish is total".
+    // The bracketing test above pins that it is LAST; this pins that it is
+    // SINGLE — so a future path that settles the run twice (e.g. a throwing
+    // await landing after the emit) is caught here, not shipped.
+    const events: HarnessEvent[] = [];
+    await runAgent({
+      provider: mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]),
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+      onEvent: (e) => events.push(e),
+    });
+    expect(events.filter((e) => e.type === 'session_finished')).toHaveLength(1);
+  });
+
   test('emits recap_terse_ready immediately before session_finished (RECAP §3.3)', async () => {
     // Auto-display contract: harness MUST project + render a
     // terse line and emit it as a discrete event so the TUI can
