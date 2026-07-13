@@ -86,7 +86,20 @@ const validateCapabilities = (
     if (typeof val === 'string' && set.has(val)) return;
     errs.push(`${name} must be false or one of ${[...set].join('/')}`);
   };
-  enumOrFalse(c.tools, TOOLS_VALUES, 'tools');
+  // tools: a catalog model is selectable as the agent model, and the agent
+  // loop is tool-driven — so, unlike cache/constrained (which degrade
+  // gracefully when `false`), the model MUST declare a tool-calling mode.
+  // (Auxiliary surfaces such as `[recap].render_model` render via
+  // `constrained`, not tools, but the catalog doesn't distinguish
+  // auxiliary-only entries, so every entry has to be main-eligible.) A
+  // `tools: false` entry would be announced as usable then 400 / stall as
+  // the agent model — reject it at load so the capability is load-bearing
+  // rather than documentary.
+  if (typeof c.tools !== 'string' || !TOOLS_VALUES.has(c.tools)) {
+    errs.push(
+      `tools must be one of ${[...TOOLS_VALUES].join('/')} — a catalog model is selectable as the agent model, which requires tool calling`,
+    );
+  }
   enumOrFalse(c.cache, CACHE_VALUES, 'cache');
   enumOrFalse(c.constrained, CONSTRAINED_VALUES, 'constrained');
   if (typeof c.vision !== 'boolean') errs.push('vision must be a boolean');

@@ -2,6 +2,7 @@ export {
   collapseBlankLines,
   flattenControlToLine,
   SAFE_ONE_LINE_MAX,
+  sanitizeCardSubject,
   sanitizeOneLineForDisplay,
   sanitizeToolOutput,
   stripAnsi,

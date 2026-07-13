@@ -613,6 +613,16 @@ export const invokeTool = async (
   // allow-result JSON fields were dropped on the floor.
   let preToolUseContext = '';
   let effectiveArgs = input.args;
+  // The sandbox profile enforced at exec must be planned for the args
+  // that ACTUALLY run. When a PreToolUse hook rewrites the input
+  // (`updatedInput` below), the re-check computes a fresh profile for
+  // the rewritten command; without threading it here, exec would keep
+  // the ORIGINAL decision's profile — e.g. a hook rewriting a network
+  // command into an untrusted-dir build would retain `net-egress` that
+  // the rewritten plan drops (the `dirTrusted` build-exfil gate).
+  // Defaults to the original decision's profile; overwritten iff a hook
+  // rewrite passes its re-check.
+  let effectiveSandboxProfile = decision.sandboxProfile;
   if (deps.fireHook !== undefined) {
     const chain = await deps.fireHook({
       schema: 'v1',
@@ -724,6 +734,15 @@ export const invokeTool = async (
           };
         }
         effectiveArgs = chain.updatedInput;
+        // Enforce the sandbox profile planned for the REWRITTEN args:
+        // the re-check above ran the full engine on `updatedInput`, so
+        // its profile reflects the mutated command's trust / network /
+        // fs footprint. `recheck` is an allow here (deny/confirm
+        // returned above), so its profile is the authoritative one for
+        // exec — using the stale `decision.sandboxProfile` would let a
+        // hook rewrite run under a profile planned for a different
+        // command.
+        effectiveSandboxProfile = recheck.sandboxProfile;
         // Slice 178 (hardening M4). Audit the args mutation. The
         // hook_runs row carries the hook's stdout (including the
         // updatedInput JSON) and the original tool_calls.input
@@ -815,7 +834,7 @@ export const invokeTool = async (
     ...deps.ctx,
     toolCallId: toolCall.id,
     ...(approvalIdForCtx !== undefined ? { approvalId: approvalIdForCtx } : {}),
-    ...(decision.sandboxProfile !== undefined ? { sandboxProfile: decision.sandboxProfile } : {}),
+    ...(effectiveSandboxProfile !== undefined ? { sandboxProfile: effectiveSandboxProfile } : {}),
   };
 
   let rawResult: unknown;

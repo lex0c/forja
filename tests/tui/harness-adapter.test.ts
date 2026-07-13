@@ -589,6 +589,27 @@ describe('harness-adapter — tool lifecycle', () => {
     expect(e.subject).toBe('grep -n "foo  bar" file');
   });
 
+  test('tool-card subject strips ANSI/C0 control bytes (injection defense)', () => {
+    // The subject is model-authored (bash command / grep pattern / path).
+    // A raw ESC/BEL/CR must never reach the terminal — it would paint fake
+    // SGR, ring the bell, or overwrite a scrollback row when the card
+    // prints. Same defense the assistant delta and subagent row apply.
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'tool_invoking',
+      toolUseId: 't1',
+      toolName: 'bash',
+      args: { command: 'echo \x1b[31mred\x1b[0m \x07bell\x1b]0;title\x07 done\rOVER' },
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:start' }>;
+    expect(e.subject).not.toContain('\x1b');
+    expect(e.subject).not.toContain('\x07');
+    expect(e.subject).not.toContain('\r');
+    // Visible text survives the strip.
+    expect(e.subject).toContain('red');
+    expect(e.subject).toContain('done');
+  });
+
   test('tool_execution_started → tool:execution-started', () => {
     const a = createHarnessAdapter(baseCtx());
     const out = a.translate({ type: 'tool_execution_started', toolUseId: 't1' });

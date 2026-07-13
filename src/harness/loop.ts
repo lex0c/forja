@@ -1,14 +1,10 @@
 import { createHash } from 'node:crypto';
-import { runGc } from '../audit/gc.ts';
 import { type BgManager, createBgManager } from '../bg/index.ts';
 import {
   type CheckpointManager,
   createCheckpointManager,
   detectCheckpointSupport,
 } from '../checkpoints/index.ts';
-import { maybeRewriteBashCommand } from '../feedback/dispatch-rewrite.ts';
-import { emitToolCallOutcome } from '../feedback/outcome-emitter.ts';
-import { buildScopeChain } from '../feedback/scope-detect.ts';
 import { dispatchChain, type HookChainResult, type HookEventPayload } from '../hooks/index.ts';
 import { resolveRepoRoot } from '../memory/paths.ts';
 import type { RecalledMemory } from '../memory/proactive-recall.ts';
@@ -24,43 +20,15 @@ import {
   parseCapability,
 } from '../permissions/capabilities.ts';
 import { createDegradedBannerEmitter } from '../permissions/degraded-banner.ts';
-import { addUsage, computeCost, emptyUsage } from '../providers/cost.ts';
-import type {
-  GenerateRequest,
-  ProviderMessage,
-  ProviderToolDef,
-  ProviderToolResultBlock,
-  StreamEvent,
-} from '../providers/index.ts';
-import { resolveProviderFromId } from '../providers/resolve.ts';
-import { estimatePromptTokens } from '../providers/tokens.ts';
-import { buildAutoTerse } from '../recap/auto-display.ts';
+import { computeCost } from '../providers/cost.ts';
+import type { ProviderToolDef, ProviderToolResultBlock, StreamEvent } from '../providers/index.ts';
 import { projectRecap } from '../recap/projection.ts';
 import { buildResumeContext, shouldSkipResumeContext } from '../recap/resume-context.ts';
-import { buildRetrievalRunner } from '../retrieval/index.ts';
 import { redactSecrets } from '../sanitize/secrets.ts';
-import {
-  completeSession,
-  createSession,
-  getSession,
-  insertCostProgressEvent,
-  insertSubagentGateDecision,
-  reopenSession,
-  type SessionStatus,
-  updateSessionCost,
-} from '../storage/index.ts';
-import { listApprovalsLogBySessionRecent } from '../storage/repos/approvals-log.ts';
-import { isBilledCompactionStrategy } from '../storage/repos/compaction-events.ts';
-import {
-  createContextPinsStore,
-  formatPinnedBlock,
-  getActivePinsBySession,
-} from '../storage/repos/context-pins.ts';
-import { createDispatchRewrite } from '../storage/repos/dispatch-rewrites.ts';
+import { createSession, getSession, reopenSession, type SessionStatus } from '../storage/index.ts';
+import { createContextPinsStore } from '../storage/repos/context-pins.ts';
 import { getEagerProvenanceKeys, recordProvenance } from '../storage/repos/memory-provenance.ts';
 import { createSubagentHandleStore, type SubagentHandleStore } from '../subagents/handle-store.ts';
-import type { PermissionDecision } from '../subagents/ipc.ts';
-import { MAX_SUBAGENT_DEPTH, runSubagent } from '../subagents/runtime.ts';
 import { createTodoStore, type TodoStore } from '../todo/index.ts';
 import { rankDeferredTools } from '../tools/builtin/tool-search.ts';
 import { isDeferred, isSmallWindow } from '../tools/context-budget.ts';
@@ -72,25 +40,18 @@ import type {
   ToolSearchHit,
 } from '../tools/types.ts';
 import { createWorkingStateStore, type WorkingStateStore } from '../working-state/index.ts';
-import { abortableIterable, StepStallError, stallWatchdog, withAbort } from './abortable.ts';
+import { StepStallError } from './abortable.ts';
 import { buildAssistantContent } from './assistant-content.ts';
-import { type CollectedToolUse, CollectStepError, collectStep } from './collect.ts';
-import {
-  accountCompaction,
-  compactionTriggerTokens,
-  hashContext,
-  recordCompactionEvent,
-  refineCompactionTrigger,
-  relevanceVerbatimBudgetBytes,
-} from './compaction.ts';
-import type { RelevanceAudit } from './compaction-relevance.ts';
+import { type CollectedStep, type CollectedToolUse, CollectStepError } from './collect.ts';
+import { runMaybeCompact } from './compaction-controller.ts';
+import { CostAccountant } from './cost-accountant.ts';
 import { resolveProviderEffort } from './effort.ts';
+import { safeEmit } from './emit.ts';
 import {
   type ExhaustionSynthesisResult,
   endsWithSettledAnswer,
   synthesizeOnExhaustion,
 } from './exhaustion-synthesis.ts';
-import { invokeTool } from './invoke-tool.ts';
 import {
   createProactiveRecall,
   injectProactiveMemoryBlock,
@@ -98,10 +59,14 @@ import {
   recordProactiveExposures,
   resolveCachedRecall,
 } from './proactive-memory-inject.ts';
+import { buildGenerateRequest, collectProviderStep } from './provider-turn.ts';
 import { MAX_RESUME_MESSAGES } from './resume.ts';
-import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
 import { type HydrateInfo, SessionContext } from './session-context.ts';
 import { injectStaticGuidance } from './static-guidance.ts';
+import { dispatchSubagent } from './subagent-dispatcher.ts';
+import { finalizeSession, type TerminalSessionStatus } from './terminal.ts';
+import { buildToolContext } from './tool-context.ts';
+import { invokeOneTool } from './tool-executor.ts';
 import {
   type ExitReason,
   effectiveBudget,
@@ -117,22 +82,10 @@ import {
 import {
   createVerifyState,
   MAX_VERIFY_ATTEMPTS,
-  recordToolForVerify,
   unsatisfiedVerifyCommands,
   verifyGateNudge,
 } from './verify-gate.ts';
 import { injectWorkingStateBlock } from './working-state-inject.ts';
-
-type TerminalSessionStatus = 'done' | 'interrupted' | 'exhausted' | 'error';
-
-const safeEmit = (onEvent: HarnessConfig['onEvent'], event: HarnessEvent): void => {
-  if (onEvent === undefined) return;
-  try {
-    onEvent(event);
-  } catch {
-    // Renderers throwing must not derail the loop.
-  }
-};
 
 const stableStringify = (obj: unknown): string => {
   if (obj === null || typeof obj !== 'object') return JSON.stringify(obj);
@@ -556,27 +509,31 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // drives the provenance write (recompute = the working-state focus changed).
   let proactiveRecalled: RecalledMemory[] = [];
   let proactiveRecomputed = false;
-  // Per-run totals. Each completed provider turn adds its usage and
-  // its computed cost; HarnessResult.usage / costUsd report THIS
-  // RUN's numbers — caller telemetry that has to stay self-
-  // consistent (zero usage means zero cost, etc.).
-  let totalUsage = emptyUsage();
-  let totalCostUsd = 0;
-  // Stays true until an assistant turn produces output without an
-  // accompanying usage event. The aggregate `usage`/`costUsd` only
-  // sums measured turns; this flag tells the caller whether those
-  // numbers are complete or a lower-bound estimate.
-  let usageComplete = true;
-  // Cumulative state from prior runs of the same session id (zero
-  // for new sessions). Held SEPARATELY from the per-run totals so
-  // HarnessResult stays per-run while the persisted column stays
-  // cumulative — fixing the contract mismatch where seeding
-  // totalCostUsd from the existing row made costUsd report
-  // "current run + prior" while usage was still "current only".
-  // Persistence at finish() writes (priorCostUsd + totalCostUsd);
-  // the result reports just totalCostUsd.
-  let priorCostUsd = 0;
-  let priorUsageComplete = true;
+  // Cost/budget accountant (N2 — extracted to cost-accountant.ts). Owns the
+  // run's cost state (per-run totals, prior-run cumulative, this-run + prior-run
+  // child cost, the soft-cap latch) and the write seam runAgent already used
+  // inline: recordUsage / markUsageIncomplete / emitCostUpdate / costCapDetail —
+  // the exact callbacks it injects into `synthesizeOnExhaustion`. HarnessResult
+  // reports the per-run totals (acct.runCostUsd / runUsage) while the persisted
+  // column stays cumulative (prior + run). `getSessionId` and
+  // `getReservedChildCostUsd` are lazy because `sessionId` (400) starts '' and
+  // the handle store (426) is built later; the resume seed / child rehydrate
+  // arrive via seedFromResume / setRehydratedChildCost during init.
+  const acct = new CostAccountant({
+    db: config.db,
+    onEvent: config.onEvent,
+    getSessionId: () => sessionId,
+    maxCostUsd: budget.maxCostUsd,
+    softCostUsd: budget.softCostUsd,
+    getReservedChildCostUsd: (excludeHandleId) =>
+      subagentHandleStore?.getReservedChildCostUsd(excludeHandleId) ?? 0,
+  });
+  // Thin closures over the accountant's function-valued seam so the many
+  // existing call sites (and the `synthesizeOnExhaustion` injection) keep their
+  // exact spelling. Arrow wrappers rather than bare `acct.method` references
+  // because a class method passed unbound would lose `this`.
+  const emitCostUpdate = (delta: number): void => acct.emitCostUpdate(delta);
+  const costCapDetailIfExceeded = (): string | null => acct.costCapDetail();
 
   // Captured at resume init BEFORE reopenSession flips the row to
   // `running`. Used by the auto-rehydrate block (RECAP §3.2 +
@@ -588,127 +545,6 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // operator's prior status as `running` in the rehydrate event,
   // which is wrong on both counts.
   let preResumeStatus: SessionStatus | null = null;
-
-  // Cost incurred by settled child handles inherited from prior
-  // runs of the resumed session. Lives SEPARATELY from
-  // `priorCostUsd` because the two flow to different sinks:
-  //
-  //   - `priorCostUsd` is parent-self only and is round-tripped
-  //     through `sessions.totalCostUsd` (loaded at resume, written
-  //     back at finish via `priorCostUsd + totalCostUsd`).
-  //   - `rehydratedChildCostUsd` is the sum of `costUsd` across
-  //     SETTLED rows in `subagent_handles` — already persisted by
-  //     each child's `runSubagent` settle event. Folding it back
-  //     into `priorCostUsd` would double-persist on every resume:
-  //     finish() would write `(priorCostUsd + childA + childB) +
-  //     totalCostUsd` to sessions.totalCostUsd; the next resume
-  //     loads that into `priorCostUsd` and adds the same children
-  //     again. After N resumes, `sessions.totalCostUsd` shows
-  //     `parentSelf + N * childTotal` even though no new work
-  //     ran.
-  //
-  // The budget gate (cap check, getCostBudget, watchdog) sums all
-  // four — priorCostUsd + totalCostUsd + cumulativeChildCostUsd
-  // (this run's children) + rehydratedChildCostUsd (prior runs'
-  // children) + reserved (in-flight) — so a resumed run still
-  // sees the full picture and can't burn the cap a second time.
-  // Persistence stays parent-self only.
-  let rehydratedChildCostUsd = 0;
-
-  // Per-turn cost-delta event emitter (spec ORCHESTRATION.md §3.5
-  // shared-budget contract). Fires every time the run's
-  // `totalCostUsd` advances — turn settle, compaction, partial
-  // provider-error charge. Carries `delta` (the latest charge
-  // alone) and `cumulative` (this session's running self-cost).
-  // For a subagent run, the parent's IPC observer reads these
-  // events and tracks live in-flight spend. Skipped on zero
-  // deltas so a misbehaving provider that emitted a usage event
-  // with all zeros doesn't generate noise — which is why this is
-  // a BILLING event, not the display cue: `usage_persisted`
-  // (emitted by the same call sites right after) is the
-  // unconditional per-response signal the REPL refreshes on.
-  //
-  // Post-persist contract: callers emit AFTER persisting the rows
-  // the charge came from (message / compaction_events; the partial
-  // provider-error site has no row — the turn died — so only the
-  // rollup below lands there), and the emitter persists the
-  // session cost rollup first — by the time a consumer reads the
-  // DB, it reflects the charge. NOTE the memory-verify scheduler
-  // (chargeSchedulerThenCheckCap below) hand-rolls a cost_update
-  // for CHILD spend, which lives in the children's own session
-  // rows, not this rollup.
-  // Sticky flag — set true the first time the soft cap is
-  // crossed and never reset. Idempotent emission per run.
-  // Declared ahead of `emitCostUpdate` so the closure reads a
-  // name already in scope.
-  //
-  // Per-session, NOT cumulative-across-resumes: the check uses
-  // `totalCostUsd` (this session only), unlike `maxCostUsd`
-  // which compares `priorCostUsd + totalCostUsd`. Subagents are
-  // one-shot so the divergence doesn't affect them; for a
-  // resumed top-level run, the soft warn re-arms each session
-  // (matches the "you crossed your estimate THIS session"
-  // framing and avoids spamming on every resume of an already-
-  // expensive session).
-  let softCapWarned = false;
-  const emitCostUpdate = (delta: number): void => {
-    if (!Number.isFinite(delta) || delta <= 0) return;
-    // Persist the lifetime cost rollup BEFORE announcing the charge.
-    // `cost_update` is the REPL's cue to recompute the footer's
-    // DB-derived usage chips per model response (not per turn), so
-    // the event carries an ordering contract: when it fires, the DB
-    // already reflects this charge — both the rows the charge came
-    // from (callers persist message / compaction rows first) and the
-    // session's cost rollup written here. Same incremental write the
-    // operator `/compact` does; `finish()` remains the canonical
-    // final writeback with the identical prior+run figure.
-    // Best-effort like the finish() write: a DB hiccup must not turn
-    // a billed, otherwise-healthy step into a run failure.
-    if (sessionId.length > 0) {
-      try {
-        updateSessionCost(config.db, sessionId, priorCostUsd + totalCostUsd);
-      } catch {
-        // Display-cadence bookkeeping only; finish() re-writes it.
-      }
-    }
-    safeEmit(config.onEvent, {
-      type: 'cost_update',
-      delta,
-      cumulative: totalCostUsd,
-    });
-    // Soft cap (spec ORCHESTRATION.md §3.5.0). Fires ONCE when
-    // cumulative first crosses the threshold. The flag stays
-    // sticky for the rest of the run — re-emitting on every
-    // subsequent cost_update would spam the operator's
-    // scrollback and obscure the original warning. Run does
-    // NOT terminate at this threshold; only `maxCostUsd` (the
-    // hard cap) does.
-    if (
-      !softCapWarned &&
-      budget.softCostUsd !== undefined &&
-      budget.softCostUsd > 0 &&
-      totalCostUsd > budget.softCostUsd
-    ) {
-      softCapWarned = true;
-      safeEmit(config.onEvent, {
-        type: 'cost_soft_cap_warn',
-        threshold: budget.softCostUsd,
-        cumulative: totalCostUsd,
-      });
-    }
-  };
-
-  // Cumulative cost of every child this run spawned (sync `task`
-  // and async `task_async` alike). Increments inside
-  // `spawnSubagentImpl` after each `runSubagent` returns. Used
-  // by both the per-step cap check and the pre-spawn budget
-  // gate to ensure the parent + children share `maxCostUsd`
-  // (spec ORCHESTRATION.md §3.5). Reserved-but-not-yet-settled
-  // async children are tracked separately by the handle store
-  // (`getReservedChildCostUsd`); the projected total combines
-  // both so a burst of concurrent `task_async` calls can't slip
-  // past the gate while their reservations are pending.
-  let cumulativeChildCostUsd = 0;
 
   // Parallel-tool dispatch counters (spec ORCHESTRATION.md
   // §1.3). Updated inside the parallel branch's `runPool`
@@ -732,7 +568,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // re-emissions for the rest of the run — `cancelAll` is
   // idempotent so the structural side effect is fine; only
   // the operator-visible signal needs deduplication.
-  let capWatchdogFired = false;
+  // Held in a mutable object so the extracted dispatcher
+  // (subagent-dispatcher.ts) can set the latch across dispatches within the run.
+  const capWatchdog = { fired: false };
 
   // Helper: snapshot the current parallelism state and fire a
   // `parallel_status` HarnessEvent. Called from two sources:
@@ -766,28 +604,6 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // the user wants different exit reasons.
   const isWallClockTimeout = (): boolean =>
     wallClockController.signal.aborted && !callerSignal.aborted;
-
-  // Cumulative-cost cap check. Returns a detail string when the cap
-  // is exceeded so callers can build the finish() call inline; null
-  // otherwise. The comparison uses TOTAL cumulative cost
-  // (parent self + children settled + reserved in-flight) so the
-  // parent's turn-end gate stays consistent with the pre-spawn
-  // budget gate in `spawnSubagentImpl`. Without including
-  // children, a resumed run with $4 of prior child cost and $0
-  // of parent self-cost could pass every turn-end check forever
-  // while `task_async` refuses new spawns at $1.01 — incoherent
-  // surface the reviewer flagged as risk #2. Matches the
-  // persistence contract where the session row stores cumulative
-  // spend. Strict `>` so a `maxCostUsd: 0` config trips the gate
-  // on the first paid turn, not before any work runs.
-  const costCapDetailIfExceeded = (): string | null => {
-    if (budget.maxCostUsd === undefined) return null;
-    const reserved = subagentHandleStore?.getReservedChildCostUsd() ?? 0;
-    const cumulative =
-      priorCostUsd + totalCostUsd + cumulativeChildCostUsd + rehydratedChildCostUsd + reserved;
-    if (cumulative <= budget.maxCostUsd) return null;
-    return `cumulative cost $${cumulative.toFixed(6)} exceeded cap $${budget.maxCostUsd.toFixed(6)}`;
-  };
 
   // Hook chain dispatch (spec AGENTIC_CLI.md §10). All sites
   // funnel through this helper so the dispatcher's deps (db,
@@ -855,6 +671,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     return chain;
   };
 
+  // Idempotency backstop for `session_finished`: the harness contract is to
+  // emit it EXACTLY once. Today `finish` is total — nothing throws after the
+  // emit — so a double-emit is unreachable, but that once-only property rests
+  // entirely on that discipline with no guard. If a future throwing `await`
+  // ever lands after the emit, the outer catch → guardedFinish → finish would
+  // re-enter and emit a second `session_finished`. This flag makes the
+  // once-only invariant explicit and regression-proof (first step of the
+  // terminal-FSM extraction, N1).
+  let sessionFinishedEmitted = false;
   // `abortCause` is only meaningful when reason === 'aborted'; ignored
   // otherwise. Callers thread it from the abort site that knew which
   // signal fired (hard signal.aborted vs softStopSignal.aborted) so
@@ -865,192 +690,35 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     abortCause?: 'soft' | 'hard',
   ): Promise<HarnessResult> => {
     clearTimeout(wallClockTimer);
-    // Skip completeSession when init failed before createSession — there's
-    // no row to mark and SQLite would just throw a foreign-key error.
-    if (sessionId.length > 0) {
-      try {
-        // Persist CUMULATIVE totals (prior + this run) so the row
-        // reflects the session's lifetime cost. The result returned
-        // below stays per-run (caller telemetry). abortCause is
-        // threaded through so audit / replay tools can recover the
-        // discriminator after the process exits — without this, the
-        // in-memory HarnessResult.abortCause died at the boundary.
-        completeSession(
-          config.db,
-          sessionId,
-          exitToStatus[reason],
-          priorCostUsd + totalCostUsd,
-          priorUsageComplete && usageComplete,
-          undefined,
-          abortCause,
-        );
-      } catch {
-        // Storage already broken; nothing useful to do beyond return the
-        // result so the caller knows the run is over.
-      }
-    }
-    const result: HarnessResult = {
-      status: exitToHarnessStatus[reason],
+    // N1: the session-end sequence (persist row, build result, outcome
+    // signals, Stop hooks, gc-on-Stop, drain, recap) moved to
+    // `finalizeSession` in terminal.ts — it takes an explicit snapshot of run
+    // state instead of closing over these locals. This closure keeps only the
+    // two bits that MUST live with the run: clearing the wall-clock timer
+    // (above) and the guarded once-only `session_finished` emit (below).
+    const result = await finalizeSession({
+      config,
       reason,
+      status: exitToStatus[reason],
+      harnessStatus: exitToHarnessStatus[reason],
+      ...(detail !== undefined ? { detail } : {}),
+      ...(abortCause !== undefined ? { abortCause } : {}),
       sessionId,
+      priorCostUsd: acct.priorCostUsd,
+      totalCostUsd: acct.runCostUsd,
+      priorUsageComplete: acct.priorUsageComplete,
+      usageComplete: acct.runUsageComplete,
+      totalUsage: acct.runUsage,
       steps,
-      durationMs: Date.now() - startMs,
-      usage: totalUsage,
-      costUsd: totalCostUsd,
-      usageComplete,
-      unmetered: config.provider.capabilities.unmetered === true,
-      // ctx is undefined only if init failed before the session-
-      // decision block resolved it (early internalError) — keep the
-      // pre-ctx '' so that path's result shape is unchanged.
-      lastMessageId: ctx !== undefined ? ctx.getLastMessageId() : '',
-    };
-    // Hand the live context back so a multi-turn caller (REPL) reuses
-    // it next turn instead of re-deriving from the DB log.
-    if (ctx !== undefined) result.sessionContext = ctx;
-    if (detail !== undefined) result.detail = detail;
-    if (reason === 'aborted' && abortCause !== undefined) {
-      result.abortCause = abortCause;
+      startMs,
+      ctx,
+      dispatchHooks,
+      pendingHookChains,
+    });
+    if (!sessionFinishedEmitted) {
+      sessionFinishedEmitted = true;
+      safeEmit(config.onEvent, { type: 'session_finished', result });
     }
-
-    // Slice 131 wire: when the session terminates in an
-    // interrupted/error state, emit a `session_aborted`
-    // outcome_signal for the last N approvals. Weak signal
-    // (weight 0.20) — sessions abort for many reasons not all
-    // "decision-was-wrong" (Ctrl+C, timeout, cost cap, provider
-    // crash). N=5 is a heuristic floor: the problem is more
-    // likely in the recent few approvals than the session's
-    // very first. Best-effort: signal emit failure stderrs but
-    // never blocks the result.
-    if (
-      config.outcomeSink !== undefined &&
-      sessionId.length > 0 &&
-      (exitToStatus[reason] === 'interrupted' || exitToStatus[reason] === 'error')
-    ) {
-      // Slice 131 fixup #5: bounded query (ORDER BY seq DESC
-      // LIMIT 5) so a long session (10k tool calls) doesn't
-      // materialize the full list on every abort. Per-emit
-      // try/catch so a transient SQLITE_BUSY on one signal
-      // doesn't drop the rest of the cohort.
-      const SESSION_ABORTED_TAIL_N = 5;
-      const recent = listApprovalsLogBySessionRecent(config.db, sessionId, SESSION_ABORTED_TAIL_N);
-      for (const a of recent) {
-        try {
-          config.outcomeSink.emit({
-            approval_seq: a.seq,
-            signal_kind: 'session_aborted',
-            payload: {
-              exit_reason: reason,
-              ...(abortCause !== undefined ? { abort_cause: abortCause } : {}),
-            },
-          });
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          process.stderr.write(
-            `forja outcome_signals: session_aborted emit failed for approval_seq=${a.seq} (${msg})\n`,
-          );
-        }
-      }
-    }
-    // Stop hooks (spec AGENTIC_CLI.md §10.1). Fired AFTER the
-    // session row is marked complete and the result struct is
-    // built — so the operator's hook can read the final row /
-    // status as authoritative — but BEFORE the renderer sees
-    // session_finished, so any "session ended at $cost"
-    // notification from a Stop hook lands while the UI is still
-    // around. Audit is awaited; latency is bounded by the
-    // dispatcher's MAX_HOOK_CHAIN_MS.
-    //
-    // Skipped on init-fail paths where createSession never
-    // landed (`sessionId === ''`) — the spec contract on
-    // HookEventPayload promises a non-empty sessionId, and
-    // there's no real session for the operator's Stop hook to
-    // act on. Mirrors the symmetric guard around SessionStart
-    // (which only fires after the session_start emit, by which
-    // point sessionId is guaranteed set).
-    if (sessionId.length > 0) {
-      await dispatchHooks({
-        schema: 'v1',
-        event: 'Stop',
-        sessionId,
-        data: {
-          durationMs: result.durationMs,
-          costUsd: result.costUsd,
-          steps: result.steps,
-        },
-      });
-    }
-    // Built-in gc-on-Stop trigger (AGENTIC_CLI.md §2.1.3 Stop hook
-    // integration). Operator opted in via `[audit] run_gc_on_stop =
-    // true` in config.toml. Synchronous: session-end awaits gc
-    // completion so that "when the agent command returns, hygiene
-    // is done" holds. Errors land in stderr but never propagate —
-    // gc drift is not a task failure, and aborting session-end
-    // because of cleanup hygiene would confuse the operator.
-    // Reuses `config.db` (already open + migrated by the harness's
-    // own bootstrap); no second openDb cycle.
-    //
-    // Runs AFTER operator-declared Stop hooks so an operator hook
-    // that needed the pre-gc state (e.g., backup) sees the DB
-    // untouched. A future `PostGc` event would cover hooks that
-    // need the post-gc state — out of scope for this slice.
-    if (config.auditRetention?.runGcOnStop === true) {
-      try {
-        const report = runGc({
-          db: config.db,
-          config: config.auditRetention,
-          nowMs: Date.now(),
-          dryRun: false,
-        });
-        for (const e of report.errors) {
-          process.stderr.write(`forja gc-on-Stop: ${e.table}: ${e.reason}\n`);
-        }
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        process.stderr.write(`forja gc-on-Stop: unexpected error: ${msg}\n`);
-      }
-    }
-    // Drain any fire-and-forget chains still in flight
-    // (PostToolUse from the last tool of the run, Notification
-    // from a confirm modal that opened mid-step, PreCheckpoint
-    // from the last writes-true step). Without this, a chain
-    // that hadn't yet reached its `createHookRun` call by the
-    // time runAgent returns races `db.close()` in the CLI
-    // driver — surfacing as stderr "AUDIT DRIFT" lines instead
-    // of a landed row. The dispatcher's per-hook + chain
-    // timeouts already bound how long this can take. Use
-    // allSettled so a rogue chain that throws here doesn't
-    // crash the harness's exit path.
-    if (pendingHookChains.size > 0) {
-      await Promise.allSettled([...pendingHookChains]);
-    }
-
-    // Auto-display terse line (RECAP §3.3). Project the recap
-    // determinístically and cache the result so the operator's
-    // next `/recap` is a hit, plus the harness emits the markdown
-    // so the TUI surfaces it above session:end. Skipped silently
-    // on any failure — operator's exit footer comes through
-    // regardless. Init-fail paths where `sessionId === ''` are
-    // also skipped (no real session to project). Suppressed
-    // entirely when the recap master switch is off
-    // (`[recap].enabled=false` / `--no-recap`).
-    if (isRecapEnabled(config) && sessionId.length > 0) {
-      const auto = buildAutoTerse({ db: config.db, sessionId, now: Date.now() });
-      if (auto.ok) {
-        safeEmit(config.onEvent, {
-          type: 'recap_terse_ready',
-          sessionId,
-          markdown: auto.markdown,
-          cacheHit: auto.cacheHit,
-        });
-      }
-      // Failure case: swallow. The harness contract is "always
-      // emit session_finished"; the recap surface is best-effort.
-      // Diagnostic is observable via `recap_runs` (no row was
-      // written) and the rare crash that this catches is
-      // typically a transient SQLite lock that the next manual
-      // /recap would also surface.
-    }
-    safeEmit(config.onEvent, { type: 'session_finished', result });
     return result;
   };
 
@@ -1069,7 +737,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // like a harness bug in audit. Wall-clock timeout takes precedence
   // (matches the in-loop check).
   const guardedFinish = async (e: unknown): Promise<HarnessResult> => {
-    usageComplete = false;
+    acct.markUsageIncomplete();
     const detail = e instanceof Error ? e.message || e.name || String(e) : String(e);
     if (signal.aborted) {
       return isWallClockTimeout()
@@ -1120,17 +788,17 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // 'must be running' WHERE guard. We validate the id BEFORE
       // any side effects so a typo'd session id doesn't leave a
       // half-initialized state.
-      // Resume budget semantics: `steps`, `consecutiveErrors`,
-      // `totalUsage`, `totalCostUsd`, and `usageComplete` are
-      // PER-RUN accumulators that start at zero/true — they drive
-      // HarnessResult, which is per-run telemetry that has to
-      // stay self-consistent (zero usage means zero cost, etc.).
-      // The CUMULATIVE state (prior + this run) is held separately
-      // in `priorCostUsd` / `priorUsageComplete` and only used at
-      // completeSession time so the persisted column reflects the
-      // session's lifetime cost. This separation closes the bug
-      // where seeding totalCostUsd from the row made costUsd
-      // report cumulative while usage stayed per-run.
+      // Resume budget semantics: `steps` / `consecutiveErrors` and the
+      // CostAccountant's per-run accumulators (run usage / cost /
+      // usageComplete) start at zero/true — they drive HarnessResult,
+      // which is per-run telemetry that has to stay self-consistent
+      // (zero usage means zero cost, etc.). The CUMULATIVE state (prior
+      // + this run) lives separately in the accountant's prior fields
+      // and is only used at completeSession time so the persisted
+      // column reflects the session's lifetime cost. The resume seed
+      // lands via `acct.seedFromResume(...)` below. This separation
+      // closes the bug where seeding the per-run cost from the row made
+      // costUsd report cumulative while usage stayed per-run.
       // The CLI's run.ts also calls getSession before constructing
       // the config (`resolveResumeId`) so a typo'd id fails fast on
       // stderr. The duplicate check here is intentional defense in
@@ -1167,8 +835,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             `sessionContext session ${liveCtx.sessionId}: cwd '${existing.cwd}' != config cwd '${config.cwd}'`,
           );
         }
-        priorCostUsd = existing.totalCostUsd;
-        priorUsageComplete = existing.usageComplete;
+        acct.seedFromResume(existing.totalCostUsd, existing.usageComplete);
         // Fresh-process resume that pre-hydrated its own context (the
         // `--resume-mode full|summary` paths): snapshot the pre-resume status
         // BEFORE reopenSession flips it to 'running', so the auto-rehydrate
@@ -1200,8 +867,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             `cannot resume session ${resumeId}: original cwd was '${existing.cwd}', current cwd is '${config.cwd}'. cd to the original directory or start a new session.`,
           );
         }
-        priorCostUsd = existing.totalCostUsd;
-        priorUsageComplete = existing.usageComplete;
+        acct.seedFromResume(existing.totalCostUsd, existing.usageComplete);
         // Snapshot the pre-resume status BEFORE `reopenSession`
         // flips the row to 'running'. The auto-rehydrate block
         // far below depends on this — re-reading the row at that
@@ -1523,9 +1189,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               ? { spawnChildProcess: config.spawnChildProcess }
               : {}),
             // PERMISSION_ENGINE.md §10.1: seal the verify subagent's
-            // effective envelope. Mirror the task-tool spawn shape
-            // (loop.ts:1289) — intersect parent's envelope against
-            // the playbook's declared capabilities.
+            // effective envelope. Mirror the task-tool spawn's
+            // capability-intersect (extracted to subagent-dispatcher.ts
+            // `dispatchSubagent`, via intersectCapabilities) — intersect
+            // the parent's envelope against the playbook's declared
+            // capabilities.
             //
             // Pre-R2 the loop passed the parent's FULL envelope
             // verbatim because verify-semantic.md didn't declare
@@ -1780,549 +1448,23 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // Subagent dispatcher + handle store. Wired only when a
       // subagent registry is configured; both `task` (sync) and the
       // `task_async` family (async) flow through `spawnSubagentImpl`,
-      // which centralizes the runSubagent option assembly and lets
-      // callers pass a per-call signal override. The store wraps
-      // the impl with bounded-concurrency slot semantics so multiple
-      // `task_async` calls overlap up to the cap.
+      // a thin wrapper that binds the run deps and delegates to
+      // `dispatchSubagent` (subagent-dispatcher.ts) — which centralizes
+      // the refusal gates, the cost/capability checks, the runSubagent
+      // option assembly, and the cost watchdog. Callers pass a per-call
+      // signal override. The store wraps the impl with bounded-concurrency
+      // slot semantics so multiple `task_async` calls overlap up to the cap.
       if (config.subagentRegistry !== undefined) {
-        spawnSubagentImpl = async (args, signalOverride, handleId) => {
-          const registry = config.subagentRegistry;
-          if (registry === undefined) {
-            return { kind: 'unknown_subagent', requested: args.name, available: [] };
-          }
-          const def = registry.byName.get(args.name);
-          if (def === undefined) {
-            return {
-              kind: 'unknown_subagent',
-              requested: args.name,
-              available: Array.from(registry.byName.keys()).sort(),
-            };
-          }
-          // Depth check happens here (before runSubagent's own
-          // throw) so the model gets a recoverable tool error
-          // instead of a wrapped exception. The tool surface
-          // distinguishes "you passed a bad name"
-          // (unknown_subagent) from "you nested too deep"
-          // (depth_exceeded) — both are model-fixable.
-          const childDepth = (config.subagentDepth ?? 0) + 1;
-          if (childDepth > MAX_SUBAGENT_DEPTH) {
-            return {
-              kind: 'depth_exceeded',
-              requested: args.name,
-              depth: childDepth,
-              maxDepth: MAX_SUBAGENT_DEPTH,
-            };
-          }
-
-          // Per-playbook execution model (PLAYBOOKS.md §1.1). When the
-          // playbook declares `model`, run the child on a provider
-          // resolved from the catalog instead of the session provider;
-          // absence inherits it. Fail-soft preflight: a bad id or an
-          // uninstantiable provider (e.g. missing credential) refuses the
-          // spawn with a model-fixable envelope BEFORE any child process
-          // starts — same posture as the unknown/depth checks above. The
-          // child session records this provider's id (runSubagent →
-          // createSession), so cost attribution and audit stay honest.
-          let childProvider = config.provider;
-          if (def.model !== undefined) {
-            if (config.modelRegistry === undefined) {
-              return {
-                kind: 'playbook_model_unavailable',
-                requested: args.name,
-                model: def.model,
-                reason: 'no model catalog is wired to resolve the override',
-              };
-            }
-            const resolved = resolveProviderFromId(config.modelRegistry, def.model);
-            if (!resolved.ok) {
-              return {
-                kind: 'playbook_model_unavailable',
-                requested: args.name,
-                model: def.model,
-                reason:
-                  resolved.kind === 'unknown'
-                    ? `unknown model '${def.model}' is not in the catalog${resolved.knownIds.length > 0 ? ` (known: ${resolved.knownIds.join(', ')})` : ''}`
-                    : `provider for '${def.model}' could not be instantiated: ${resolved.message}`,
-              };
-            }
-            childProvider = resolved.provider;
-          }
-
-          // Cost-cap gate (spec ORCHESTRATION.md §3.5).
-          // Single source of truth for budget enforcement —
-          // covers BOTH the sync `task` and async `task_async`
-          // surfaces because both flow through this dispatcher.
-          // Pessimistic projection: parent self-cost + child
-          // cumulative settled + reserved in-flight (async only)
-          // + this spawn's worst-case estimate from its
-          // definition. Refuse with a structured envelope when
-          // the cap would be crossed; the calling tool maps it
-          // to `subagent.budget_exhausted`.
-          //
-          // The strict `>` matches `costCapDetailIfExceeded` —
-          // a `maxCostUsd: 0` config refuses on the first non-
-          // zero-cost spawn rather than before any work runs.
-          if (budget.maxCostUsd !== undefined) {
-            const estimate =
-              Number.isFinite(def.budget.maxCostUsd) && def.budget.maxCostUsd > 0
-                ? def.budget.maxCostUsd
-                : 0;
-            // Exclude THIS handle's own reservation from the
-            // sum: when the store dispatches us, the record is
-            // already in `records` with `estimateCostUsd =
-            // estimate`. Without the exclude, the same estimate
-            // counts in both `reserved` and the `+ estimate`
-            // below — false rejections at cap boundaries (e.g.
-            // a single async spawn whose estimate exactly
-            // matches the remaining budget). Sync `task` runs
-            // with `handleId === undefined`; the exclude is a
-            // no-op there.
-            const reserved = subagentHandleStore?.getReservedChildCostUsd(handleId) ?? 0;
-            const spent =
-              priorCostUsd +
-              totalCostUsd +
-              cumulativeChildCostUsd +
-              rehydratedChildCostUsd +
-              reserved;
-            const projected = spent + estimate;
-            if (projected > budget.maxCostUsd) {
-              return {
-                kind: 'budget_exhausted',
-                requested: args.name,
-                spent,
-                estimate,
-                projected,
-                cap: budget.maxCostUsd,
-              };
-            }
-          }
-          // Capability intersection gate (PERMISSION_ENGINE.md §10.1).
-          // When the model requested capabilities via `task`'s
-          // `capabilities` arg (→ `args.declaredCapabilities`), the
-          // spawn factory enforces declared ⊆ parent. Any declared
-          // capability not covered by the parent set refuses the
-          // spawn with `subagent_escalation`; the tool layer maps
-          // it onto `subagent.escalation`.
-          //
-          // Slice 25 closes the §10 wiring: when the caller didn't
-          // pass an explicit `parentCapabilities`, derive it from
-          // the parent's active policy via
-          // `deriveParentCapabilities`. The intersection now fires
-          // automatically whenever the model declares capabilities,
-          // matching the §10 spec wording ("subagent inherits the
-          // parent's effective set"). Tests still pass an explicit
-          // `parentCapabilities` when they want to pin the parent
-          // set verbatim — caller-supplied takes precedence over
-          // derivation.
-          // Slice 95: capture the `effective` array from the
-          // intersection result so we can seal it onto the child's
-          // audit row (§10.1 evaluation-side gate). Pre-slice this
-          // value was discarded — only `excess` mattered for the
-          // refuse path. Defaults to `undefined` (no envelope,
-          // root behavior) so callers that don't declare
-          // capabilities preserve their legacy semantics.
-          let effectiveForChild: string[] | undefined;
-          if (args.declaredCapabilities !== undefined) {
-            try {
-              const declared = args.declaredCapabilities.map(parseCapability);
-              // Slice 128 (R4 P0-Bypass-2): when the engine has a
-              // narrowed envelope (i.e., it's a CHILD engine
-              // spawning a grandchild), use the engine's actual
-              // effective set as the parent caps for the
-              // intersection. Pre-slice we derived from
-              // `engine.policy()` which is the INHERITED policy
-              // snapshot (parent's full set), not the child's
-              // narrowed envelope — grandchild intersection then
-              // succeeded against a wider set than the child
-              // itself was allowed, violating §10.3 "escape
-              // impossível" across depth-2.
-              //
-              // `engine.effectiveCapabilities()` returns null on
-              // a ROOT engine (no envelope applied at
-              // construction) → fall back to the legacy
-              // deriveParentCapabilities path. Caller-supplied
-              // `parentCapabilities` still wins (tests).
-              const envelopeOverride = config.permissionEngine.effectiveCapabilities();
-              const parentCaps =
-                args.parentCapabilities !== undefined
-                  ? args.parentCapabilities.map(parseCapability)
-                  : envelopeOverride !== null
-                    ? envelopeOverride
-                    : deriveParentCapabilities(config.permissionEngine.policy());
-              const { effective, excess } = intersectCapabilities(parentCaps, declared);
-              if (excess.length > 0) {
-                return {
-                  kind: 'subagent_escalation',
-                  requested: args.name,
-                  excess: excess.map(formatCapability),
-                };
-              }
-              // Effective is what survived ⊆ declared, in declared
-              // order. Format back to the wire form for persistence.
-              // `[]` (pure-LLM) survives as `[]`, distinct from
-              // `undefined` — the child engine treats the two
-              // differently (see EngineOptions.effectiveCapabilities).
-              effectiveForChild = effective.map(formatCapability);
-            } catch (e) {
-              // Malformed capability string slipped through the
-              // tool-layer validation (programmer error, not a
-              // model error). Refuse defensively rather than
-              // silently letting the spawn proceed.
-              return {
-                kind: 'subagent_escalation',
-                requested: args.name,
-                excess: [`<parse error: ${(e as Error).message}>`],
-              };
-            }
-          }
-          // Validate child's whitelist against the ROOT registry
-          // (full toolset), NOT against this harness's `toolRegistry`
-          // (which is narrowed to OUR own whitelist when we're a
-          // subagent). A coordinator subagent with `tools: [task]`
-          // must still be able to spawn a worker with
-          // `tools: [read_file]` even though it doesn't have
-          // `read_file` itself.
-          const rootRegistry = config.rootToolRegistry ?? config.toolRegistry;
-          // Combine the run's signal with the optional per-call
-          // override. Both must be live at the same time: the run
-          // signal carries hard-abort + wall-clock from the parent;
-          // the override is the per-handle controller `task_cancel`
-          // flips. `AbortSignal.any` handles the case where the
-          // override is undefined (returns the run signal directly,
-          // no wrapping cost).
-          const combinedSignal =
-            signalOverride === undefined ? signal : AbortSignal.any([signal, signalOverride]);
-
-          // Wrap the parent's event observer when (a) we need
-          // the cost-update budget tracker (async path: we got a
-          // handleId AND a store) OR (b) the operator wired
-          // `config.onEvent` for observability. When NEITHER
-          // applies (sync `task` from a headless test, no
-          // operator TUI), we omit `onChildEvent` entirely —
-          // the runtime's `effectiveIpc = input.ipc === true ||
-          // input.onChildEvent !== undefined` (runtime.ts ~535)
-          // would otherwise spin up an IPC channel for every
-          // sync subagent solely so a dead `handleId !==
-          // undefined` check could fire.
-          //
-          // The wrapper has two responsibilities (spec
-          // ORCHESTRATION.md §3.5):
-          //   (1) update the handle store's per-record live cost
-          //       via `recordLiveCost` so `getReservedChildCostUsd`
-          //       reflects actual spend instead of the
-          //       pessimistic floor.
-          //   (2) cap watchdog: when cumulative live spend
-          //       crosses `maxCostUsd`, hard-signal every active
-          //       handle ("subagent ativo recebe sinal de
-          //       finalizar"). The pre-spawn gate above handles
-          //       NEW spawn refusal; this branch handles
-          //       in-flight termination.
-          // Local-rebind so TS narrowing survives the closure
-          // body (the outer `let` widens back to optional inside
-          // a lambda).
-          const trackerStore = handleId !== undefined ? subagentHandleStore : undefined;
-          const trackerHandleId = handleId;
-          const onChildEventForwarder: ((e: HarnessEvent) => void) | undefined =
-            trackerStore !== undefined || config.onEvent !== undefined
-              ? (e: HarnessEvent) => {
-                  if (
-                    trackerStore !== undefined &&
-                    trackerHandleId !== undefined &&
-                    e.type === 'subagent_progress' &&
-                    e.lastEvent.type === 'cost_update'
-                  ) {
-                    // R4 — defensive validation on the IPC boundary.
-                    // IPC.md §7 ("mensagens do filho NÃO são
-                    // confiáveis"): a malformed cost_update (negative
-                    // values, cumulative-regression, NaN) could
-                    // mis-steer the cap watchdog into a false trip
-                    // (cancelAll fires) or — worse — silently grow
-                    // the reservation under the cap. The handle-store's
-                    // monotonic guard catches REGRESSION but accepts
-                    // any non-negative finite value; reject upstream.
-                    const { delta, cumulative } = e.lastEvent;
-                    if (
-                      !Number.isFinite(delta) ||
-                      !Number.isFinite(cumulative) ||
-                      delta < 0 ||
-                      cumulative < 0
-                    ) {
-                      process.stderr.write(
-                        `subagent ${trackerHandleId}: cost_update rejected (delta=${delta}, cumulative=${cumulative})\n`,
-                      );
-                      return;
-                    }
-                    trackerStore.recordLiveCost(trackerHandleId, e.lastEvent.cumulative);
-                    // Persist the cost-update into the audit
-                    // stream (migration 022, audit fix #2). The
-                    // in-memory tracker drives live behavior
-                    // (reservation tracking, watchdog); this
-                    // INSERT is purely for postmortem
-                    // reconstruction. Best-effort: a DB throw
-                    // (SQLITE_BUSY under WAL contention; FK
-                    // violation if the parent session row was
-                    // dropped mid-run) MUST NOT take the harness
-                    // down — losing one event degrades curve
-                    // resolution but the live tracker already
-                    // observed it.
-                    //
-                    // Persist runs UNCONDITIONALLY of the
-                    // tracker's monotonic / cancelled guards.
-                    // A late `cost_update` arriving after
-                    // `cancelAll` lands at the parent will be
-                    // no-op'd by `recordLiveCost` (cancelled
-                    // record guard) but STILL inserted here —
-                    // audit truth: the child kept burning
-                    // tokens until its observed-abort point,
-                    // and forensic queries deserve to see
-                    // those rows. The model-side view (settled
-                    // `cancelled` envelope) and the table view
-                    // (post-cancel cumulative growth) are both
-                    // correct; they describe different layers.
-                    try {
-                      insertCostProgressEvent(config.db, {
-                        handleId: trackerHandleId,
-                        parentSessionId: sessionId,
-                        delta: e.lastEvent.delta,
-                        cumulative: e.lastEvent.cumulative,
-                      });
-                    } catch (persistErr) {
-                      const message =
-                        persistErr instanceof Error ? persistErr.message : String(persistErr);
-                      // R4: `console.error` violates the hard rule
-                      // "stdout is pure, stderr is for logs" — Bun
-                      // sometimes interleaves console.error with
-                      // stdout in --json mode despite the underlying
-                      // routing. Route to process.stderr explicitly
-                      // to keep --json's NDJSON stdout clean.
-                      process.stderr.write(
-                        `cost_progress persist failed for handle ${trackerHandleId}: ${message}\n`,
-                      );
-                    }
-                    if (budget.maxCostUsd !== undefined) {
-                      const reserved = trackerStore.getReservedChildCostUsd();
-                      const total =
-                        priorCostUsd +
-                        totalCostUsd +
-                        cumulativeChildCostUsd +
-                        rehydratedChildCostUsd +
-                        reserved;
-                      if (total > budget.maxCostUsd && !capWatchdogFired) {
-                        // Latch the fire-once flag BEFORE the
-                        // cancellations run so a re-entrant
-                        // `cost_update` that lands while
-                        // cancelAll is still propagating sees
-                        // `capWatchdogFired === true` and
-                        // skips. The latch never resets — once
-                        // the watchdog fires for a run, the
-                        // operator banner has the data they
-                        // need; subsequent cap-crosses (which
-                        // only happen because cumulative cost
-                        // doesn't decrease) carry no new signal.
-                        capWatchdogFired = true;
-                        // Snapshot the dispatched count BEFORE
-                        // cancelAll. `inFlightCount` returns
-                        // every record with `status: 'running'`,
-                        // which includes records still queued
-                        // on `acquireSlot` — those have no
-                        // child session yet, so saying "3
-                        // subagents cancelled" when only 2
-                        // dispatched would mislead the operator.
-                        // Subtract `queuedCount()` to land on
-                        // "actually dispatched" (D236 review
-                        // fix). cancelAll is idempotent on
-                        // already-settled rows, so the firing
-                        // count and the actual-cancel count
-                        // match in practice for the dispatched
-                        // set.
-                        const cancelledCount =
-                          trackerStore.inFlightCount() - trackerStore.queuedCount();
-                        trackerStore.cancelAll('cap_watchdog');
-                        // Surface to the operator. Pre-D233 this
-                        // event was missing — handles just
-                        // disappeared from the live region and
-                        // the operator had to root-cause via
-                        // audit logs. The TUI adapter converts
-                        // this into a permanent banner line.
-                        safeEmit(config.onEvent, {
-                          type: 'cap_watchdog_fired',
-                          cancelledCount: Math.max(0, cancelledCount),
-                          cumulativeUsd: total,
-                          capUsd: budget.maxCostUsd,
-                        });
-                      }
-                    }
-                  }
-                  config.onEvent?.(e);
-                }
-              : undefined;
-
-          // Subagents inherit the operator's reasoning-effort axis
-          // (the resolved provider-effort) so `/effort` applies
-          // task-wide — but NOT the operational caps, which stay
-          // per-playbook (the child gets `providerEffort`, not
-          // `effort`). Transitive: a child that is itself a parent
-          // forwards its own resolved value on the next hop.
-          const childProviderEffort = resolveProviderEffort(config);
-          // Custom credential env vars for every catalog model, forwarded so the
-          // child preserves them through scrubEnv (PLAYBOOKS.md §1.1). A child
-          // resolving a grandchild's `model` override needs that model's
-          // credential var to have survived this boundary — its own apiKeyEnv
-          // isn't enough. Gated to a child that can SPAWN: only then are those
-          // OTHER-model credentials reachable. The gate mirrors the subagent-
-          // child spawn gate (`toolsWhitelist.includes('task')`), so a leaf
-          // carries no catalog credentials it cannot use (env-credential
-          // minimization — the creds never reach tools, but tighter is better).
-          const childCanSpawn = def.tools.includes('task');
-          const catalogApiKeyEnvVars =
-            childCanSpawn && config.modelRegistry !== undefined
-              ? [
-                  ...new Set(
-                    config.modelRegistry
-                      .list()
-                      .map((e) => e.apiKeyEnv)
-                      .filter((v): v is string => v !== undefined),
-                  ),
-                ]
-              : [];
-          const child = await runSubagent({
-            definition: def,
-            prompt: args.prompt,
-            parentSessionId: sessionId,
-            provider: childProvider,
-            ...(catalogApiKeyEnvVars.length > 0 ? { catalogApiKeyEnvVars } : {}),
-            parentToolRegistry: rootRegistry,
-            permissionEngine: config.permissionEngine,
-            db: config.db,
-            cwd: config.cwd,
-            // Migration 058 — back-link the audit row to the approval
-            // that admitted the spawning tool call.
-            ...(args.parentApprovalId !== undefined
-              ? { parentApprovalId: args.parentApprovalId }
-              : {}),
-            ...(onChildEventForwarder !== undefined ? { onChildEvent: onChildEventForwarder } : {}),
-            ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
-            // §10.1 effective envelope (slice 95). When the model
-            // declared capabilities, we forward the intersection
-            // result so the child engine can gate every resolved
-            // capability at evaluation time. `undefined` ⇒ child
-            // runs without a bound (root semantics) for callers
-            // that didn't declare.
-            ...(effectiveForChild !== undefined
-              ? { effectiveCapabilities: effectiveForChild }
-              : {}),
-            signal: combinedSignal,
-            ...(config.softStopSignal !== undefined
-              ? { softStopSignal: config.softStopSignal }
-              : {}),
-            subagentRegistry: registry,
-            ...(config.isCwdTrusted === true ? { cwdTrusted: true } : {}),
-            // S5 CRIT/H3: forward shared-scope fail-closed verdict
-            // to the child. Without this, a subagent spawned after
-            // the operator revoked (or after verify_failed) would
-            // re-read disk and surface bodies the parent gated.
-            // Array → boolean translation: the child receives a
-            // single boolean via `--subagent-shared-scope-offline`
-            // (cleaner IPC than serializing an array of scopes);
-            // S5's only excluded scope is `project_shared` so the
-            // collapse is lossless today. If a future detector
-            // gates a different scope, this site widens to encode
-            // the array (and the spawn-factory grows a list flag).
-            ...(config.memoryExcludeScopes?.includes('project_shared')
-              ? { sharedScopeOffline: true }
-              : {}),
-            ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
-            ...(childProviderEffort !== undefined ? { providerEffort: childProviderEffort } : {}),
-            depth: childDepth,
-            // Forward the spawn factory test seam. Production
-            // callers leave it unset; runSubagent falls back to
-            // its default Bun.spawn-based factory.
-            ...(config.spawnChildProcess !== undefined
-              ? { spawnChildProcess: config.spawnChildProcess }
-              : {}),
-            // Permission proxy (spec docs/spec/IPC.md §7).
-            // Forward only when the parent has a `confirmPermission`
-            // callback wired (REPL does; one-shot / headless do
-            // not). Local rebind so the narrowed type survives
-            // across the async closure (the outer
-            // `config.confirmPermission !== undefined` guard
-            // wouldn't follow a member access through the promise
-            // hop).
-            ...((): {
-              onPermissionAsk?: (req: {
-                toolName: string;
-                args: Record<string, unknown>;
-                cwd: string;
-                prompt: string;
-                subagent: { sessionId: string; name: string };
-                signal: AbortSignal;
-              }) => Promise<PermissionDecision>;
-            } => {
-              const ask = config.confirmPermission;
-              if (ask === undefined) return {};
-              return {
-                onPermissionAsk: async (req) => {
-                  const allowed = await ask({
-                    toolName: req.toolName,
-                    args: req.args,
-                    cwd: req.cwd,
-                    prompt: req.prompt,
-                    subagent: req.subagent,
-                    signal: req.signal,
-                  });
-                  return allowed ? 'allow' : 'deny';
-                },
-              };
-            })(),
+        spawnSubagentImpl = (args, signalOverride, handleId) =>
+          dispatchSubagent(args, signalOverride, handleId, {
+            config,
+            budget,
+            acct,
+            signal,
+            sessionId,
+            getHandleStore: () => subagentHandleStore,
+            capWatchdog,
           });
-          // Reconcile the child's terminal `costUsd` against the
-          // live tracker captured via cost_update IPC events.
-          // The runtime hardcodes `costUsd: 0` for kill paths
-          // (interrupted / aborted / wall_clock / heartbeat_stale
-          // — see runtime.ts ~1152/1171/1184/1203). Without the
-          // max, a watchdog-killed child that had spent $2 would
-          // contribute $0 to `cumulativeChildCostUsd`, defeating
-          // the kill-during-run cap enforcement THIS branch
-          // explicitly added. The live tracker only exists for
-          // async path (handleId provided); sync `task` falls
-          // through to the unmodified terminal value.
-          const childCostUsd =
-            handleId !== undefined && subagentHandleStore !== undefined
-              ? Math.max(child.costUsd, subagentHandleStore.getLiveCostUsd(handleId))
-              : child.costUsd;
-          // Charge the reconciled cost against the run-wide
-          // tracker. Both `task` (sync) and `task_async` reach
-          // this dispatcher, so this single increment captures
-          // every spawn. NaN-guarded: a misbehaving child that
-          // emits a non-finite costUsd would otherwise poison
-          // the cumulative counter and trip every subsequent
-          // budget gate.
-          if (Number.isFinite(childCostUsd)) {
-            cumulativeChildCostUsd += childCostUsd;
-          }
-          return {
-            kind: 'ran',
-            output: child.output,
-            sessionId: child.sessionId,
-            status: child.status,
-            reason: child.reason,
-            // Surface the reconciled cost in the envelope so
-            // task_await consumers and persisted audit rows
-            // reflect the truth even when the runtime emitted 0
-            // on a kill path.
-            costUsd: childCostUsd,
-            steps: child.steps,
-            durationMs: child.durationMs,
-            ...(child.auditFailure !== undefined ? { auditFailure: child.auditFailure } : {}),
-            ...(child.worktree !== undefined ? { worktree: child.worktree } : {}),
-            ...(child.worktreeError !== undefined ? { worktreeError: child.worktreeError } : {}),
-            // Forward the child's diagnostic detail (provider
-            // error text, tool-budget breakdown, etc.) so
-            // task / task_await error strings can show the
-            // cause instead of just the categorical reason.
-            ...(child.detail !== undefined ? { detail: child.detail } : {}),
-          };
-        };
         const subagentCap = Math.max(
           1,
           Math.min(budget.maxConcurrentSubagents, MAX_CONCURRENT_SUBAGENTS_CAP),
@@ -2377,7 +1519,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // when no new work runs. The budget gate sums both
         // priorCostUsd and rehydratedChildCostUsd; persistence
         // does not.
-        rehydratedChildCostUsd = subagentHandleStore.getRehydratedChildCostUsd();
+        acct.setRehydratedChildCost(subagentHandleStore.getRehydratedChildCostUsd());
       }
 
       // Checkpoint manager. Only built when the caller opted in —
@@ -2632,313 +1774,29 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // three overflow gaps the post-tool-result-only site left open: the
       // first call of a resumed session (up to MAX_RESUME_MESSAGES restored),
       // a turn that crosses the threshold without tool_results, and the start
-      // of each run. Returns a cost-cap detail when its own billed summary
-      // call pushed the cumulative total over the cap (caller must finish),
-      // else null. Mutates `messages` in place and folds usage into the run
-      // totals via closure.
-      // `force` runs the compaction even at steps >= maxSteps — for the exhaustion
-      // synthesis, which builds its request from the live history AT the cap and
-      // must fit the window (the normal top-of-loop call skips there). It also
-      // estimates the prompt WITHOUT tools, matching that synthesis request (which
-      // sends none): a history that fits tool-less must not trigger a paid compaction
-      // just because the tool schemas would have pushed the normal request over.
-      const maybeCompact = async (force = false) => {
-        // Skip when aborted / window unknown — don't burn a billed summary call
-        // whose result the loop is about to discard. At steps >= maxSteps the loop
-        // is exiting, so skip too — UNLESS forced (the synthesis still needs it).
-        if (
-          ctx === undefined ||
-          signal.aborted ||
-          (!force && steps >= budget.maxSteps) ||
-          config.provider.capabilities.context_window <= 0
-        ) {
-          return null;
-        }
-        const estimateOpts = {
-          ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
-          // force ⇒ the tool-less synthesis request; don't count tool schemas the
-          // synthesis won't send (else a tool-less-fitting history compacts needlessly).
-          ...(!force && tools.length > 0 ? { tools } : {}),
-          countReasoning: config.provider.replaysReasoning === true,
-        };
-        const contextWindow = config.provider.capabilities.context_window;
-        // The NEXT request reserves max_tokens; the provider rejects
-        // input + max_tokens > window. The 0.7 trigger's 30% headroom covers a
-        // normal output cap, but a model whose cap exceeds it (e.g. 64k on a 200k
-        // window) needs this tighter ceiling. Shared by the refine skip AND the
-        // relevance short-circuit so neither leaves the next request over-window.
-        const outputFitCeiling =
-          contextWindow - resolveMaxOutputTokens(budget, config.provider.capabilities);
-        // The real request the step loop sends appends the working-state panel +
-        // static guidance to the last user message (the forced synthesis path sends
-        // its own directive instead, so skip them under `force`). Build that
-        // POST-INJECTION shape so the trigger, the refine fit decision, AND the
-        // relevance short-circuit all measure what's ACTUALLY sent —
-        // enableStaticGuidance is on for the main CLI and a populated panel can add
-        // several KB, enough to flip a near-ceiling decision. The exact step arg
-        // only sizes the "N steps ago" labels (a few chars), so the prior
-        // iteration's `steps` is close enough.
-        const buildRequestShape = (messages: readonly ProviderMessage[]): ProviderMessage[] => {
-          const shape = [...messages];
-          if (!force) {
-            injectWorkingStateBlock(shape, workingStateStore.get(sessionId), steps);
-            // Count the proactive bodies too (computed before this call): they're
-            // appended to the real request below, AFTER this gate — omitting them
-            // here lets a near-ceiling request tip over context_window instead of
-            // compacting first.
-            injectProactiveMemoryBlock(shape, proactiveRecalled);
-            if (config.enableStaticGuidance)
-              injectStaticGuidance(shape, isSmallWindow(contextWindow));
-          }
-          return shape;
-        };
-        const requestMessages = buildRequestShape(ctx.getMessages());
-        const promptTokens = estimatePromptTokens(requestMessages, estimateOpts);
-        const triggerAt = compactionTriggerTokens(budget.compactionThreshold, contextWindow);
-        // Need goal + something-to-fold + an assistant boundary for the tail;
-        // shorter histories make compactMessages skip (and emit noisy events).
-        if (!(promptTokens > triggerAt && ctx.length >= budget.compactionPreserveTail + 3)) {
-          return null;
-        }
-        // PreCompact hook (blocking, spec §10.1) — fired before the
-        // compaction_started event so a refusing hook skips both the LLM call and
-        // the renderer's "compacting…" signal, AND before the native token-count
-        // refine below so a blocking hook prevents the full prompt from reaching the
-        // provider's count_tokens endpoint at all (HOOKS.md: PreCompact can cancel
-        // compaction; a policy hook may exist precisely to deny the compaction
-        // provider access). Blocked ⇒ no compaction this turn; the loop proceeds
-        // with the un-compacted history and the next top-of-loop call re-checks (no
-        // continue — we're at the top, so returning simply falls through to the
-        // provider call). Deliberate vs the old post-tool-result site, whose
-        // `continue` ALSO skipped that turn's detector schedulers: the turn now runs
-        // normally, because the schedulers don't depend on compaction.
-        const preCompact = await dispatchHooks({
-          schema: 'v1',
-          event: 'PreCompact',
-          sessionId,
-          data: { promptTokens, threshold: triggerAt },
-        });
-        if (preCompact !== null && preCompact.blockedBy !== null) {
-          return null;
-        }
-        // Trigger refinement (#3 / CONTEXT_TUNING §12) — EXPERIMENTAL, gated OFF by
-        // default (compactionTriggerRefine; see the budget-field doc). Runs AFTER
-        // the PreCompact hook so a blocking hook prevents the external count_tokens
-        // request (a blocked compaction must touch no compaction-provider endpoint).
-        // The chars/4 estimate over-counts ~10-25% vs a real tokenizer, so a
-        // near-trigger estimate may be a false alarm; when ON, confirm with the
-        // provider's real token count and 'skip' only when the real total is
-        // genuinely under both the trigger and the output-fit ceiling. When OFF
-        // (default) the over-counting estimate compacts directly — the safe,
-        // conservative path that never over-fills the window. `countTokens` takes no
-        // AbortSignal (providers/types.ts), so a hung native endpoint would block
-        // Ctrl+C / maxWallClockMs — race it against the run signal: on abort the
-        // count rejects → refine catches → 'compact', and `signal.aborted` bails the
-        // whole compaction (the run is ending). On a fallback-counter provider the
-        // count is local + instant, so the race is a no-op. `requestMessages` is an
-        // already-materialized array (the post-injection shape), so no ctx-narrowing
-        // pin is needed across the await. (A blocking hook returns above, so a
-        // PreCompact that then refine-skips fires only on the experimental path —
-        // the hook is a permission gate, not a compaction-happened signal.)
-        if (budget.compactionTriggerRefine === true) {
-          const refine = await refineCompactionTrigger({
-            promptTokens,
-            triggerAt,
-            fixedTokens: estimatePromptTokens([], estimateOpts),
-            outputFitCeiling,
-            countMessages: () => withAbort(config.provider.countTokens(requestMessages), signal),
-          });
-          if (refine === 'skip' || signal.aborted) return null;
-        }
-        // Read pins BEFORE emitting compaction_started, so the
-        // started→finished pair has NO throwing statement between them: a DB
-        // error here would otherwise skip compaction_finished and leave the
-        // adapter-bracketed "Compacting context…" chip open until session:end.
-        // (CONTEXT_TUNING §12.4: pins preserved literally across the fold,
-        // else they elide with the middle and only reappear on resume.)
-        const pinnedBlock = formatPinnedBlock(getActivePinsBySession(config.db, sessionId));
-        safeEmit(config.onEvent, {
-          type: 'compaction_started',
-          promptTokens,
-          threshold: triggerAt,
-          contextWindow,
-        });
-        const compactStart = Date.now();
-        // Audit/replay trail (compaction_events, AUDIT / CONTEXT_TUNING §12).
-        // beforeHash is the pre-compaction context; afterHash is computed at
-        // persist time (after the array was rewritten). estimateNow re-reads
-        // the live array. Persist is best-effort — never aborts the run.
-        // ctxRef pins the (guard-narrowed) context so the closures below don't
-        // re-widen `ctx` to `| undefined`.
-        const ctxRef = ctx;
-        // Post-injection + force-aware (same buildRequestShape + estimateOpts as
-        // promptTokens) so the relevance short-circuit's tokensAfterElide and the
-        // audit's before/after deltas measure the real request, not the bare history.
-        const estimateNow = (): number =>
-          estimatePromptTokens(buildRequestShape(ctxRef.getMessages()), estimateOpts);
-        const beforeHash = hashContext(ctxRef.getMessages());
-        // Thin adapter over the shared recorder: supplies the loop's beforeHash
-        // + live array + trigger tokens. The skip-skipped / hashing /
-        // best-effort-with-stderr-log all live in recordCompactionEvent.
-        const persistCompaction = (e: {
-          strategy: string;
-          foldedCount: number;
-          tokensAfter?: number;
-          freedBytes?: number;
-          elidedIds?: readonly string[];
-          summary?: string;
-          reason?: string;
-          callUsage?: {
-            tokensIn: number;
-            tokensOut: number;
-            cacheRead: number;
-            cacheCreation: number;
-          };
-        }): void =>
-          recordCompactionEvent(config.db, {
-            sessionId,
-            beforeHash,
-            messagesAfter: ctxRef.getMessages(),
-            tokensBefore: promptTokens,
-            recordedAt: Date.now(),
-            ...e,
-            // The compaction provider's id (migration 078), recorded only when a provider
-            // call BILLED (llm / fallback). The relevance pre-pass makes no call → NULL, so a
-            // zero-cost relevance never marks the session metered.
-            model: isBilledCompactionStrategy(e.strategy) ? config.provider.id : null,
-          });
-
-        // Relevance pre-pass (opt-in): cheaply pointer-elide low-goal-
-        // relevance tool_result bodies (NO provider call). If that alone
-        // drops the prompt back under the trigger, skip the billed LLM
-        // summary entirely. Token-driven — the gate is the real threshold,
-        // not a byte heuristic. No spin: a re-trigger finds the now-pointered
-        // bodies ineligible and falls through to the LLM.
-        //
-        // Gated on memoryRegistry: an elided body is recoverable ONLY via
-        // retrieve_context (session view), which the harness wires only when
-        // memoryRegistry is present (effectiveMemoryRegistry below). Without it
-        // (headless / SDK runs) the pointer's "recover via retrieve_context"
-        // promise is empty — so skip the pre-pass and let the LLM fold keep a
-        // summary in context instead of stranding the body unreachable.
-        let relevanceAudit: RelevanceAudit | undefined;
-        if (budget.compactionRelevance === true && config.memoryRegistry !== undefined) {
-          // Verbatim budget derived from the trigger (shared helper, not a
-          // magic constant) — see relevanceVerbatimBudgetBytes.
-          // Blend the model's live working-state focus into the relevance query
-          // so it tracks the CURRENT sub-task, not just the original goal
-          // (which drifts on a long session). Absent panel ⇒ goal-only.
-          const wsFocus = workingStateStore.get(sessionId).focus?.text;
-          const elide = ctx.relevanceElide({
-            verbatimBudgetBytes: relevanceVerbatimBudgetBytes(triggerAt),
-            preserveTail: budget.compactionPreserveTail,
-            ...(wsFocus !== undefined && wsFocus.length > 0 ? { queryHint: wsFocus } : {}),
-          });
-          if (elide !== null && elide.elidedCount > 0) {
-            relevanceAudit = {
-              elidedCount: elide.elidedCount,
-              keptCount: elide.keptCount,
-              freedBytes: elide.freedBytes,
-              elidedIds: elide.elidedIds,
-            };
-            const tokensAfterElide = estimateNow();
-            // Short-circuit the billed LLM summary ONLY when relevance alone got
-            // us under the threshold AND no pins are active. Active pins are
-            // re-injected into the goal exclusively by ctx.compact's pinnedBlock
-            // path; taking this relevance-only return with pins active would
-            // bypass it, so a pin whose carrier (e.g. its pin_context
-            // tool_result) was just elided here would vanish from the next
-            // request — violating the "survives compaction" contract
-            // (CONTEXT_TUNING §12.4). With pins active, fall through to the LLM
-            // fold below; it runs on the already-gated history, so the pre-pass
-            // still pays off, and pinnedBlock re-injection is honored.
-            if (
-              tokensAfterElide <= Math.min(triggerAt, outputFitCeiling) &&
-              pinnedBlock === undefined
-            ) {
-              // Relevance alone got us under BOTH the threshold and the output-fit
-              // ceiling, no pins — done, no LLM. (Same min() the refine skip uses,
-              // and tokensAfterElide is the post-injection shape, so the next
-              // request can't re-add the panel/guidance and overflow.)
-              const relevanceReason = `relevance-elide: ${elide.elidedCount} tool_results pointered, ${elide.freedBytes}B freed`;
-              persistCompaction({
-                strategy: 'relevance',
-                foldedCount: elide.elidedCount,
-                tokensAfter: tokensAfterElide,
-                freedBytes: elide.freedBytes,
-                elidedIds: elide.elidedIds,
-                reason: relevanceReason,
-              });
-              safeEmit(config.onEvent, {
-                type: 'compaction_finished',
-                strategy: 'relevance',
-                foldedCount: elide.elidedCount,
-                durationMs: Date.now() - compactStart,
-                usage: emptyUsage(),
-                costUsd: 0,
-                reason: relevanceReason,
-                relevance: relevanceAudit,
-              });
-              return costCapDetailIfExceeded();
-            }
-          }
-        }
-
-        // Still over the threshold (relevance disabled, freed nothing, or
-        // freed too little): run the billed LLM summary on the — possibly
-        // already gated — history.
-        const compaction = await ctx.compact(config.provider, {
-          preserveTail: budget.compactionPreserveTail,
+      // of each run. N4: the ~290-line body moved to `runMaybeCompact` in
+      // compaction-controller.ts (an explicit snapshot of run state instead of
+      // closing over ~13 locals); this thin wrapper reads the per-iteration
+      // state (ctx / steps / tools / proactiveRecalled) live and threads the
+      // cost seam. Returns a cost-cap detail when its billed summary pushed the
+      // cumulative over the cap (caller must finish), else null.
+      const maybeCompact = (force = false): Promise<string | null> =>
+        runMaybeCompact({
+          force,
+          ctx,
           signal,
-          ...(budget.compactionMaxTokens !== undefined
-            ? { maxTokens: budget.compactionMaxTokens }
-            : {}),
-          ...(pinnedBlock !== undefined ? { pinnedBlock } : {}),
+          steps,
+          budget,
+          config,
+          tools,
+          workingStateStore,
+          sessionId,
+          proactiveRecalled,
+          dispatchHooks,
+          recordUsage: (usage, cost, usageSeen) => acct.recordUsage(usage, cost, usageSeen),
+          emitCostUpdate,
+          costCapDetail: costCapDetailIfExceeded,
         });
-        const acct = accountCompaction(compaction, config.provider.capabilities);
-        totalUsage = addUsage(totalUsage, compaction.usage);
-        totalCostUsd += acct.costUsd;
-        if (acct.usageIncomplete) {
-          usageComplete = false;
-        }
-        persistCompaction({
-          strategy: compaction.strategy,
-          foldedCount: compaction.foldedCount,
-          tokensAfter: estimateNow(),
-          // Billed usage of the summary call, so the aggregator's token
-          // totals account for compaction (cost already does, via
-          // sessions.total_cost_usd). compaction.usage is zeroed on the
-          // relevance-only path (no provider call).
-          callUsage: {
-            tokensIn: compaction.usage.input,
-            tokensOut: compaction.usage.output,
-            cacheRead: compaction.usage.cache_read,
-            cacheCreation: compaction.usage.cache_creation,
-          },
-          ...(relevanceAudit !== undefined
-            ? { freedBytes: relevanceAudit.freedBytes, elidedIds: relevanceAudit.elidedIds }
-            : {}),
-          ...(compaction.summary !== undefined ? { summary: compaction.summary } : {}),
-          ...(compaction.reason !== undefined ? { reason: compaction.reason } : {}),
-        });
-        // After persistCompaction so the post-persist contract holds:
-        // the compaction_events row (token side of the charge) is
-        // queryable when these fire.
-        emitCostUpdate(acct.costUsd);
-        safeEmit(config.onEvent, { type: 'usage_persisted' });
-        const finishedEvent: HarnessEvent = {
-          type: 'compaction_finished',
-          strategy: compaction.strategy,
-          foldedCount: compaction.foldedCount,
-          durationMs: Date.now() - compactStart,
-          usage: compaction.usage,
-          costUsd: acct.costUsd,
-          ...(compaction.reason !== undefined ? { reason: compaction.reason } : {}),
-          ...(relevanceAudit !== undefined ? { relevance: relevanceAudit } : {}),
-        };
-        safeEmit(config.onEvent, finishedEvent);
-        return costCapDetailIfExceeded();
-      };
 
       // Pre-terminal synthesis turn (STATE_MACHINE.md §2.2 / ORCHESTRATION.md
       // §8.2): a run that spent its whole step budget on tool calls would
@@ -2946,9 +1804,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // exhaustion-synthesis.ts so its decision + orchestration are unit-testable
       // in isolation — makes ONE tool-less provider call before the → exhausted
       // transition and RETURNS the cost-cap overage (or null) so the caller can
-      // finish maxCostUsd vs maxSteps. The loop owns the mutable run totals;
-      // `recordUsage` / `markUsageIncomplete` are the single write seam, and the
-      // cost-cap / compaction closures pass straight through.
+      // finish maxCostUsd vs maxSteps. The CostAccountant (`acct`) owns the
+      // mutable run totals; the injected `recordUsage` / `markUsageIncomplete`
+      // delegate to it and are the single write seam, and the cost-cap /
+      // compaction closures pass straight through.
       const runSynthesis = async (): Promise<ExhaustionSynthesisResult> => {
         if (ctx === undefined) return { costOverage: null, truncation: null };
         return synthesizeOnExhaustion({
@@ -2958,14 +1817,8 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           signal,
           costCapDetailIfExceeded,
           maybeCompact,
-          recordUsage: (usage, cost, usageSeen) => {
-            totalUsage = addUsage(totalUsage, usage);
-            totalCostUsd += cost;
-            if (!usageSeen) usageComplete = false;
-          },
-          markUsageIncomplete: () => {
-            usageComplete = false;
-          },
+          recordUsage: (usage, cost, usageSeen) => acct.recordUsage(usage, cost, usageSeen),
+          markUsageIncomplete: () => acct.markUsageIncomplete(),
           emit: (event) => safeEmit(config.onEvent, event),
           emitCostUpdate,
         });
@@ -3145,24 +1998,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             reqMessages,
             isSmallWindow(config.provider?.capabilities?.context_window ?? 0),
           );
-        const req: GenerateRequest = {
-          model: config.provider.id,
+        const req = buildGenerateRequest({
+          config,
           messages: reqMessages,
-          max_tokens: resolvedMaxTokens,
-          ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
-          ...(config.systemSegments !== undefined ? { systemSegments: config.systemSegments } : {}),
-          ...(tools.length > 0 ? { tools } : {}),
-          ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
-          ...(config.topP !== undefined ? { top_p: config.topP } : {}),
-          ...(config.thinkingBudget !== undefined
-            ? { thinking_budget: config.thinkingBudget }
-            : {}),
-          // Provider reasoning-effort axis (resolved above). Each
-          // adapter maps it to its native surface; the operational
-          // caps ride `budget` separately via effectiveBudget.
-          ...(reqEffort !== undefined ? { effort: reqEffort } : {}),
-          ...(config.seedInEval !== undefined ? { seed_in_eval: config.seedInEval } : {}),
-        };
+          maxTokens: resolvedMaxTokens,
+          tools,
+          effort: reqEffort,
+        });
 
         // Verify-gate output buffering. If the gate is armed entering this turn
         // (code mutated, a declared verify-command still unsatisfied, retries
@@ -3192,34 +2034,19 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // the turn streams live.
         let holdingAnswer = verifyArmed;
 
-        let collected: Awaited<ReturnType<typeof collectStep>>;
+        let collected: CollectedStep;
         try {
-          // Wrap the provider stream so the combined abort signal (user +
-          // wall-clock) actually reaches the for-await inside collectStep.
-          // The Provider interface doesn't propagate signals to the SDK,
-          // so without this a hung HTTP request blocks indefinitely and
-          // neither Ctrl+C nor maxWallClockMs can interrupt it.
-          // Stream wrapping order is load-bearing:
-          //   1. generateWithRetry produces the raw stream.
-          //   2. stallWatchdog wraps inside-out so silent stalls
-          //      throw StepStallError; reset on every yield.
-          //   3. abortableIterable wraps OUTSIDE so external
-          //      aborts (Ctrl+C, wall-clock) take precedence over
-          //      stall detection.
-          // Inverting (1) and (2) would let the stall timer
-          // count time the consumer spends processing each event
-          // (e.g. heavy renderer work between deltas) against
-          // the stall budget, which would falsely trip on slow
-          // consumers rather than real provider hangs.
-          collected = await collectStep(
-            abortableIterable(
-              stallWatchdog(
-                generateWithRetry(config.provider, req, DEFAULT_RETRY),
-                budget.maxStepStallMs,
-              ),
-              signal,
-            ),
-            (ev) => {
+          // The provider call + stream drain (the four-primitive load-bearing
+          // composition: retry → stall-watchdog → abort → collect) lives in
+          // `collectProviderStep`. The verify-gate output buffering rides in via
+          // the `onEvent` callback, which keeps its loop-local state
+          // (holdingAnswer / bufferedAnswer) here.
+          collected = await collectProviderStep({
+            provider: config.provider,
+            req,
+            maxStepStallMs: budget.maxStepStallMs,
+            signal,
+            onEvent: (ev) => {
               // A tool call settles that this turn is not a suppressible final
               // answer: flush the held preamble BEFORE the tool's events (keeping
               // the model's emission order) and stop holding for the rest of it.
@@ -3235,10 +2062,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               }
               safeEmit(config.onEvent, { type: 'provider_event', event: ev });
             },
-          );
+          });
         } catch (e) {
-          // collectStep threw, so this turn produced no settled answer the gate
-          // could suppress — flush any answer text buffered for the verify gate
+          // collectProviderStep threw, so this turn produced no settled answer the
+          // gate could suppress — flush any answer text buffered for the verify gate
           // (partial text the provider streamed before the error) so it isn't
           // silently swallowed by the buffering. No-op unless the gate was armed.
           flushBufferedAnswer();
@@ -3246,21 +2073,20 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // tokens) before the throw. Always flip the aggregate flag —
           // even if we recover partial usage, totals are by definition
           // a lower bound when the turn ended in error.
-          usageComplete = false;
+          acct.markUsageIncomplete();
 
           // Recover whatever the stream emitted before the throw.
           // Adapters yield `usage` from their `finally` block precisely
           // for this case, so a failed turn that already received
           // input/cache numbers from the provider can still be charged.
           // CollectStepError carries the partial CollectedStep; non-
-          // wrapped errors (extreme: collectStep itself crashed before
+          // wrapped errors (extreme: the collect step itself crashed before
           // catching) have no recoverable state.
           if (e instanceof CollectStepError) {
             const partial = e.partial;
             if (partial.usageSeen) {
               const partialCost = computeCost(config.provider.capabilities, partial.usage);
-              totalUsage = addUsage(totalUsage, partial.usage);
-              totalCostUsd += partialCost;
+              acct.recordUsage(partial.usage, partialCost, partial.usageSeen);
               emitCostUpdate(partialCost);
               // Display cue AFTER the rollup write above. This site
               // never persists a message row (the turn died before
@@ -3312,17 +2138,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         const assistantContent = buildAssistantContent(collected);
 
         const turnCostUsd = computeCost(config.provider.capabilities, collected.usage);
-        totalUsage = addUsage(totalUsage, collected.usage);
-        totalCostUsd += turnCostUsd;
         // ANY assistant turn that completes without a usage event is
         // unmeasured — every successful provider call bills input tokens
         // for the prompt, even when the model emits no text, no
         // tool_use, and no thinking. Stream errors and aborts don't
         // reach here (they exit via providerError/aborted finish paths),
         // so we're only counting turns that the provider actually
-        // accepted and processed. Flipping the flag tells the renderer
-        // to mark aggregate cost as a lower bound.
-        if (!collected.usageSeen) usageComplete = false;
+        // accepted and processed. `usageSeen=false` marks the aggregate
+        // as a lower bound for the renderer.
+        acct.recordUsage(collected.usage, turnCostUsd, collected.usageSeen);
 
         // When the adapter never emitted a `usage` event, persist NULL on
         // the token/cost columns instead of zeroes. Future analytics can
@@ -3603,213 +2427,24 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ? createScopeFilteredRegistry(config.memoryRegistry, config.memoryExcludeScopes)
             : config.memoryRegistry;
 
-        const buildCtx = (tu: CollectedToolUse): ToolContext => ({
-          signal,
-          cwd: config.cwd,
-          sessionId,
-          stepId: assistantMsgId,
-          permissions: config.permissionEngine.view(),
-          permissionCheck: (toolName, category, args) =>
-            config.permissionEngine.check(toolName, category, args),
-          // Deferred-tool reveal (AGENTIC_CLI §7.6), top level only — a subagent
-          // runs a pre-narrowed whitelist (the curation), so nothing is deferred
-          // and tool_search has nothing to reveal there.
-          ...((config.subagentDepth ?? 0) === 0 ? { searchTools } : {}),
-          todoStore,
-          workingStateStore,
-          // Session-monotonic step number for working-state staleness stamps
-          // (WORKING_STATE.md §6) — read from the store, which carries it across
-          // REPL turns (vs the per-run `steps` that resets each runAgent call).
-          getStepNumber: () => workingStateStore.currentStep(sessionId),
-          ...(bgManager !== undefined ? { bgManager } : {}),
-          // Session-scoped reminder scheduler (ORCHESTRATION.md §3B.9).
-          // Owned by the REPL (like the bgManagerHolder); the loop just
-          // forwards it to the reminder tools. Absent in one-shot runs.
-          ...(config.reminderScheduler !== undefined
-            ? { reminderScheduler: config.reminderScheduler }
-            : {}),
-          ...(spawnSubagentClosure !== undefined ? { spawnSubagent: spawnSubagentClosure } : {}),
-          ...(subagentHandleStore !== undefined ? { subagentHandleStore } : {}),
-          // Slice 157 (review — phase 2 of macOS /tmp isolation). Per-
-          // CLI-run sandbox tmpdir. Tools that wrap argv via
-          // `maybeWrapSandboxArgv` forward this so the SBPL profile
-          // scopes write access on darwin. Undefined on linux (already
-          // isolated by `bwrap --tmpfs /tmp`) or when bootstrap mkdir
-          // failed (graceful fallback to pre-slice-156 behavior).
-          ...(config.sandboxTmpdir !== undefined ? { sandboxTmpdir: config.sandboxTmpdir } : {}),
-          // Boot sandbox tool → drives the wrap's fail-closed posture in
-          // tools that spawn (grep): a tool present at boot but gone now is a
-          // mid-session loss → tool error, not a silent unsandboxed run.
-          ...(config.sandboxBootTool !== undefined
-            ? { sandboxBootTool: config.sandboxBootTool }
-            : {}),
-          subagentDepth: config.subagentDepth ?? 0,
-          // Cost budget tracker (spec ORCHESTRATION.md §3.5).
-          // Returns the cumulative spend (parent self-cost +
-          // run-scoped child cost cumulative + pessimistic
-          // reservation for in-flight async children) and the
-          // cap. Reads from the run-level `cumulativeChildCostUsd`
-          // counter rather than the store's settled-child
-          // sum, so a resumed run does NOT double-count
-          // rehydrated handles whose cost flowed via prior
-          // sessions. `task_async` reads this pre-spawn for
-          // immediate UX feedback; the dispatcher
-          // (`spawnSubagentImpl`) re-checks as the load-bearing
-          // gate.
-          getCostBudget: () => ({
-            spent:
-              priorCostUsd +
-              totalCostUsd +
-              cumulativeChildCostUsd +
-              rehydratedChildCostUsd +
-              (subagentHandleStore?.getReservedChildCostUsd() ?? 0),
-            cap: budget.maxCostUsd,
-          }),
-          // Subagent budget lookup. Returns the definition's
-          // `budget.maxCostUsd` worst-case spend for the named
-          // subagent, or null when the name doesn't resolve.
-          // `task_async` uses this to compute the pessimistic
-          // reservation for the spawn it's about to issue.
-          getSubagentBudgetEstimate: (name: string): number | null => {
-            const def = config.subagentRegistry?.byName.get(name);
-            if (def === undefined) return null;
-            const cost = def.budget.maxCostUsd;
-            return Number.isFinite(cost) && cost > 0 ? cost : 0;
-          },
-          // Sorted list of available subagent names. Empty when
-          // no registry wired. `task_async` reads this to
-          // populate the `subagent.unknown` error's
-          // `available` field — same shape as sync `task`.
-          getKnownSubagentNames: (): string[] =>
-            config.subagentRegistry !== undefined
-              ? Array.from(config.subagentRegistry.byName.keys()).sort()
-              : [],
-          // Pre-spawn refusal recorder (audit fix #3,
-          // migration 023). Each subagent tool calls this
-          // immediately before returning its
-          // `subagent.budget_exhausted` / `subagent.unknown`
-          // / `subagent.depth_exceeded` tool error. Fail-soft
-          // try/catch — a DB throw at audit time MUST NOT
-          // shadow the model-visible refusal: the error is
-          // already on its way back; losing the audit row is
-          // strictly worse than crashing the harness, but
-          // crashing because we couldn't audit is worse than
-          // either.
-          recordGateDecision: (input) => {
-            try {
-              insertSubagentGateDecision(config.db, {
-                parentSessionId: sessionId,
-                decisionType: input.decisionType,
-                toolName: input.toolName,
-                requestedName: input.requestedName,
-                details: input.details,
-              });
-            } catch (e) {
-              // Inner try wraps `console.error` itself: in stdio
-              // edge cases (EPIPE, exhausted stderr) the error
-              // sink can throw, which would escape the outer
-              // catch and propagate up through the tool's
-              // execute path — defeating the entire fail-soft
-              // promise. Audit data is the LEAST important
-              // signal here; the tool-error return MUST land
-              // even when both the DB write AND its diagnostic
-              // fail.
-              try {
-                const message = e instanceof Error ? e.message : String(e);
-                console.error(
-                  `gate decision persist failed (${input.decisionType} for '${input.requestedName}'): ${message}`,
-                );
-              } catch {
-                // Truly nothing left to do — let the tool error
-                // through.
-              }
-            }
-          },
-          ...(effectiveMemoryRegistry !== undefined
-            ? { memoryRegistry: effectiveMemoryRegistry }
-            : {}),
-          // Retrieval subsystem runner (slice 4.9). Wired when the
-          // memory registry is configured — db is always available
-          // since harness can't run without it. retrieve_context
-          // tool surfaces 'retrieval.unavailable' when this is
-          // absent (headless / SDK runs without memory).
-          //
-          // Uses the same `effectiveMemoryRegistry` the tool ctx
-          // exposes, so the retrieval and direct-tool surfaces stay
-          // at parity on the trust posture (both filter excluded
-          // scopes; one couldn't legitimately bypass the other).
-          // `memoryExcludeScopes` still flows into the retrieval
-          // runner because the retrieval pipeline plumbs it
-          // separately (e.g., into the BM25 view's own filter
-          // path) — defense in depth: even if the wrapper missed
-          // something at some surface, the explicit memoryExcludeScopes
-          // there continues to enforce the same policy.
-          ...(effectiveMemoryRegistry !== undefined
-            ? {
-                retrieveContext: buildRetrievalRunner({
-                  db: config.db,
-                  sessionId,
-                  memoryRegistry: effectiveMemoryRegistry,
-                  ...(config.memoryExcludeScopes !== undefined &&
-                  config.memoryExcludeScopes.length > 0
-                    ? { memoryExcludeScopes: config.memoryExcludeScopes }
-                    : {}),
-                }),
-              }
-            : {}),
-          ...(config.confirmMemoryWrite !== undefined
-            ? { confirmMemoryWrite: config.confirmMemoryWrite }
-            : {}),
-          ...(config.confirmMemoryUserScope !== undefined
-            ? { confirmMemoryUserScope: config.confirmMemoryUserScope }
-            : {}),
-          ...(config.clarify !== undefined ? { clarify: config.clarify } : {}),
-          ...(config.meshManager !== undefined ? { meshManager: config.meshManager } : {}),
-          // Built once per run above (REPL-injected or a fresh wrapper over
-          // the db), so pin_context works in any mode (like the todolist),
-          // not just the interactive REPL.
-          contextPinsStore,
-          ...(config.skillCatalog !== undefined ? { skillCatalog: config.skillCatalog } : {}),
-          // Trust state — required on ToolContext, optional on
-          // HarnessConfig. Default-false at the harness layer is
-          // the fail-closed answer when bootstrap (or a test
-          // harness) didn't supply one.
-          isCwdTrusted: config.isCwdTrusted ?? false,
-          // Operator-facing warn channel. Closure captures the
-          // current tool call's id + name so the adapter can
-          // attribute the warning to the right invocation.
-          // Always wired — tools that don't use it just don't
-          // call it. Optional in ToolContext for headless / SDK
-          // contexts that don't construct via the harness; here
-          // we always set it because we know the onEvent sink.
-          emitWarn: (message: string) =>
-            safeEmit(config.onEvent, {
-              type: 'tool_warning',
-              toolUseId: tu.id,
-              toolName: tu.name,
-              message,
-            }),
-          // Display-only diff channel (sibling of emitWarn). The
-          // structured before→after goes to the TUI card; it never enters
-          // the model-facing tool_result.
-          emitDiff: (diff) =>
-            safeEmit(config.onEvent, {
-              type: 'tool_diff',
-              toolUseId: tu.id,
-              toolName: tu.name,
-              diff,
-            }),
-          // Hook chain — bound to the same dispatcher invoke-tool
-          // already uses. Tools fire blocking events (today only
-          // memory_write fires MemoryWrite); chain failure is
-          // null-returned so tools fail-open per spec line 1057.
-          fireHook: dispatchHooks,
-          // Broker for exec-tagged tools (PERMISSION_ENGINE.md
-          // §13.7). When bootstrap wired one through HarnessConfig,
-          // the bash tool routes through `broker.execute`. Absent
-          // ⇒ bash returns `bash.spawn_failed` (fail-loud).
-          ...(config.broker !== undefined ? { broker: config.broker } : {}),
-        });
+        const buildCtx = (tu: CollectedToolUse): ToolContext =>
+          buildToolContext(tu, {
+            signal,
+            config,
+            sessionId,
+            assistantMsgId,
+            searchTools,
+            todoStore,
+            workingStateStore,
+            bgManager,
+            spawnSubagentClosure,
+            subagentHandleStore,
+            acct,
+            budget,
+            effectiveMemoryRegistry,
+            contextPinsStore,
+            dispatchHooks,
+          });
 
         // Per-tu worker. Emits tool_invoking, dispatches through
         // invokeTool (permission check + checkpoint hook + tool
@@ -3817,256 +2452,22 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // Returns a shape rich enough for the post-batch
         // consecutive-error replay plus the tool_result the
         // harness must persist.
-        const invokeOne = async (
-          tu: CollectedToolUse,
-        ): Promise<{ toolResult: ProviderToolResultBlock; failed: boolean }> => {
-          // FEEDBACK_ADAPTATION §9.1 dispatch rewrite. When the
-          // model issues a bash command whose leading binary has an
-          // active L1 alias policy in the operator's scope chain,
-          // rewrite before the permission engine + tool dispatch
-          // see the call. CRITICAL: the engine sees the REWRITTEN
-          // command, so target validation (bare-binary name only,
-          // no shell metas) lives inside maybeRewriteBashCommand
-          // — a poisoned action_json with shell injection would
-          // otherwise bypass the allow-list.
-          //
-          // Audit gap (declared follow-up): the pre-rewrite command
-          // is NOT structurally persisted today. tool_calls.input
-          // captures the rewritten value; stderr below captures the
-          // rewrite event. A future slice adds a dispatch_rewrites
-          // audit table linking the policy id to the original
-          // command — operator forensic queries need it. For now
-          // operators trace via /agent policy history <id>.
-          // Tracks the L1 signature that drove a successful rewrite
-          // (null when no rewrite happened). Threaded into the
-          // outcome emitter so the policy's signature keeps
-          // accumulating evidence after promotion — without this,
-          // the post-rewrite command's bash-parser pass would
-          // either pick the rewritten binary (not in alias table)
-          // or nothing, and the policy's effectiveness signal
-          // would go dark immediately after promotion.
-          let appliedL1Signature: string | null = null;
-          // Pending rewrite audit deferred until after invokeTool
-          // creates the tool_calls row. `tu.id` is the provider's
-          // tool_use id; `tool_calls.id` is a separate UUID that
-          // invokeTool generates inside the same call. Persisting
-          // here with tu.id would always hit the FK on
-          // dispatch_rewrites.tool_call_id → tool_calls.id and
-          // fall into the catch path — the behavior change happened
-          // but the structured audit row never landed.
-          let pendingRewriteAudit: {
-            policyId: string;
-            actionSignature: string;
-            originalCommand: string;
-            rewrittenCommand: string;
-            matchedScope: 'global' | 'language' | 'repo' | 'user' | 'session';
-          } | null = null;
-          if (tu.name === 'bash' && typeof tu.input.command === 'string') {
-            const originalCommand = tu.input.command;
-            const rewrite = maybeRewriteBashCommand(
-              config.db,
-              originalCommand,
-              buildScopeChain({ sessionId, repoCwd: repoRoot }),
-            );
-            if (
-              rewrite.rewritten &&
-              rewrite.appliedPolicyId !== null &&
-              rewrite.appliedSignature !== null &&
-              rewrite.matchedScope !== null
-            ) {
-              appliedL1Signature = rewrite.appliedSignature;
-              tu.input = { ...tu.input, command: rewrite.command };
-              pendingRewriteAudit = {
-                policyId: rewrite.appliedPolicyId,
-                actionSignature: rewrite.appliedSignature,
-                originalCommand,
-                rewrittenCommand: rewrite.command,
-                matchedScope: rewrite.matchedScope as
-                  | 'global'
-                  | 'language'
-                  | 'repo'
-                  | 'user'
-                  | 'session',
-              };
-            }
-          }
-          safeEmit(config.onEvent, {
-            type: 'tool_invoking',
-            toolUseId: tu.id,
-            toolName: tu.name,
-            args: tu.input,
-          });
-          const inv = await invokeTool(
-            {
-              toolUseId: tu.id,
-              toolName: tu.name,
-              args: tu.input,
-              messageId: assistantMsgId,
-            },
-            {
-              db: config.db,
-              registry: config.toolRegistry,
-              engine: config.permissionEngine,
-              ctx: buildCtx(tu),
-              ...(config.confirmPermission !== undefined
-                ? { confirmPermission: config.confirmPermission }
-                : {}),
-              ...(config.systemPromptHash !== undefined
-                ? { systemPromptHash: config.systemPromptHash }
-                : {}),
-              fireHook: dispatchHooks,
-              signal,
-              onExecutionStart: () => {
-                safeEmit(config.onEvent, { type: 'tool_execution_started', toolUseId: tu.id });
-              },
-            },
-          );
-          if (inv.decision !== null) {
-            safeEmit(config.onEvent, {
-              type: 'tool_decided',
-              toolUseId: tu.id,
-              decision: inv.decision,
-            });
-          }
-          safeEmit(config.onEvent, {
-            type: 'tool_finished',
-            toolUseId: tu.id,
-            toolName: tu.name,
-            failed: inv.failed,
-            durationMs: inv.durationMs,
-            ...(inv.denied === true ? { denied: true } : {}),
-            ...(inv.errorMessage !== undefined ? { errorMessage: inv.errorMessage } : {}),
-            ...(inv.outputTruncated === true ? { outputTruncated: true } : {}),
-            ...(inv.exitCode !== undefined ? { exitCode: inv.exitCode } : {}),
-            ...(inv.resultDetail !== undefined ? { resultDetail: inv.resultDetail } : {}),
-          });
-          // Verify-gate accounting (STATE_MACHINE §3.2.1): fold this settled tool
-          // into the run's mutation/verification evidence so the claim-time gate
-          // at no_tool_use is deterministic. No-op when the gate is off.
-          // Use the EXECUTED args (`inv.effectiveArgs`) — a PreToolUse hook can
-          // rewrite a `bun test` call into another command that exits 0, and the
-          // gate must match what actually ran, not the model's pre-hook args.
-          // A fresh mutation re-arms the gate (starts a new verification cycle),
-          // so reset the per-cycle nudge budget — otherwise a later edit inherits
-          // attempts spent on an earlier one and, once the run-wide count hits the
-          // max, every subsequent post-edit claim is accepted with only a warning.
-          if (
-            recordToolForVerify(
-              verifyState,
-              verifyCommands,
-              tu.name,
-              inv.effectiveArgs ?? tu.input,
-              inv.failed,
-              inv.exitCode,
-            )
-          ) {
-            verifyAttempts = 0;
-          }
-          // Persist the dispatch-rewrite audit row now that invokeTool
-          // created the tool_calls row that the FK points at. Skipped
-          // when invokeTool returned an empty toolCallId (unknown
-          // tool — no tool_call row to anchor against). Best-effort:
-          // FK / IO failure stderr-logs and lets the rewrite proceed;
-          // the behavior change already happened on tu.input mutation
-          // upstream, only the forensic surface degrades.
-          if (pendingRewriteAudit !== null && inv.toolCallId !== '') {
-            try {
-              createDispatchRewrite(config.db, {
-                toolCallId: inv.toolCallId,
-                sessionId,
-                policyId: pendingRewriteAudit.policyId,
-                actionSignature: pendingRewriteAudit.actionSignature,
-                originalCommand: pendingRewriteAudit.originalCommand,
-                rewrittenCommand: pendingRewriteAudit.rewrittenCommand,
-                matchedScope: pendingRewriteAudit.matchedScope,
-              });
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              process.stderr.write(
-                `forja adaptation: dispatch_rewrites insert failed for tool_call=${inv.toolCallId} (${msg})\n`,
-              );
-            }
-          }
-          // Slice 131 wire: when a tool execution fails AFTER
-          // permission allowed it (failed=true, denied!=true)
-          // AND we have an approval_seq from the decision, emit
-          // an outcome_signal kind=tool_error. Calibration sweeps
-          // use this as a weak proxy for "the allow decision led
-          // to a bad outcome". Best-effort: outcome-sink failure
-          // surfaces to stderr but never crashes the loop. Skip
-          // denied paths — denials are by construction the
-          // engine refusing the call; outcome of a deny is
-          // already encoded in the decision itself.
-          if (
-            config.outcomeSink !== undefined &&
-            inv.failed === true &&
-            inv.denied !== true &&
-            inv.decision?.approvalSeq !== undefined
-          ) {
-            try {
-              config.outcomeSink.emit({
-                approval_seq: inv.decision.approvalSeq,
-                signal_kind: 'tool_error',
-                payload: {
-                  tool_name: tu.name,
-                  duration_ms: inv.durationMs,
-                  ...(inv.errorMessage !== undefined ? { error_message: inv.errorMessage } : {}),
-                },
-              });
-            } catch (e) {
-              const msg = e instanceof Error ? e.message : String(e);
-              process.stderr.write(
-                `forja outcome_signals: tool_error wire failed for approval_seq=${inv.decision.approvalSeq} (${msg})\n`,
-              );
-            }
-          }
-          // FEEDBACK_ADAPTATION §3.1 loop quente write — emit a
-          // `outcomes` row capturing the (action_signature, tier,
-          // result) tuple for the dispatch. Coexists with the
-          // outcome_signals emission above per AUDIT.md §1.1.1:
-          // the two tables record different audit dimensions and
-          // never dual-write the same fact. The signal_kind=
-          // 'tool_error' block above feeds the permission engine's
-          // calibration; THIS row feeds the loop frio adaptation
-          // engine (3.4). Best-effort — failures stderr but don't
-          // crash. Denied calls are skipped inside the emitter (no
-          // body ran, no action_signature outcome to record).
-          emitToolCallOutcome(config.db, {
+        const invokeOne = (tu: CollectedToolUse) =>
+          invokeOneTool(tu, {
+            config,
             sessionId,
-            toolCallId: inv.toolCallId,
-            toolName: tu.name,
-            failed: inv.failed,
-            ...(inv.denied === true ? { denied: true } : {}),
-            durationMs: inv.durationMs,
-            ...(inv.errorMessage !== undefined ? { errorMessage: inv.errorMessage } : {}),
-            // Pass tool input so the emitter can derive L1 alias
-            // signatures from bash commands (3.5a). Other tools
-            // ignore the input; only `bash` carries a `command`
-            // field the parser inspects.
-            toolInput: tu.input,
-            // When a dispatch rewrite manifested, pin the L1
-            // signature to the policy's — the post-rewrite
-            // command's leading binary (rg) isn't in the alias
-            // table, so without this override the emitter would
-            // skip the L1 row entirely and the policy would lose
-            // its evidence stream immediately after promotion
-            // (3.6d).
-            ...(appliedL1Signature !== null ? { appliedL1Signature } : {}),
-            // Pass the scope chain so outcomes land at scope=repo
-            // (when detected). Without this, every outcome lands
-            // at scope=session and repo/user/language-scoped
-            // policies never accumulate evidence (3.7b — fixes
-            // H1 from the branch review).
-            scopeChain: buildScopeChain({ sessionId, repoCwd: repoRoot }),
+            repoRoot,
+            assistantMsgId,
+            signal,
+            dispatchHooks,
+            buildCtx,
+            verifyState,
+            verifyCommands,
+            degradedBannerEmitter,
+            resetVerifyAttempts: () => {
+              verifyAttempts = 0;
+            },
           });
-          // §13.6 degraded banner heartbeat (slice 92). Fires after
-          // every tool call; emitter is cheap + queries engine state
-          // internally. Emits a `sandbox_degraded_active` harness
-          // event on first-entry to degraded + every N calls
-          // thereafter (default 10).
-          degradedBannerEmitter.notifyToolCall(sessionId);
-          return { toolResult: inv.toolResult, failed: inv.failed };
-        };
 
         // Pre-batch abort gate. Both paths defer to the same check
         // up here — without this, a hard abort or a soft cooperative
@@ -4449,12 +2850,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         //
         // Cost wiring (post-review fix): each detector's LLM-judge
         // dispatch is a real billed call but only tracked in
-        // scheduler-local counters until this helper folds the
-        // delta into `cumulativeChildCostUsd`. Pre-fix, a session
-        // at/near `maxCostUsd` could still run verify-* dispatches
-        // because `costCapDetailIfExceeded()` only consults
-        // {totalCostUsd, cumulativeChildCostUsd, reserved} — never
-        // the scheduler counters. With default-on detectors,
+        // scheduler-local counters until this helper folds the delta
+        // into the accountant's child cost (`acct.addChildCost`).
+        // Pre-fix, a session at/near `maxCostUsd` could still run
+        // verify-* dispatches because `costCapDetailIfExceeded()` only
+        // consults the accountant's cumulative spend (prior + run +
+        // child + rehydrated + reserved) — never the scheduler
+        // counters. With default-on detectors,
         // operator's hard cap was silently exceeded by the
         // detector spend. The helper folds delta in + fires a
         // cost_update event (with the FULL composite cumulative
@@ -4485,11 +2887,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           const after = scheduler.getCounters().costUsdSpent;
           const delta = after - before;
           if (delta > 0) {
-            cumulativeChildCostUsd += delta;
+            acct.addChildCost(delta);
             safeEmit(config.onEvent, {
               type: 'cost_update',
               delta,
-              cumulative: priorCostUsd + totalCostUsd + cumulativeChildCostUsd,
+              // Child-inclusive cumulative (self + this run's children),
+              // deliberately distinct from emitCostUpdate's self-only figure:
+              // this charge is child spend that lives in the children's own
+              // session rows, not the parent's rollup.
+              cumulative: acct.priorCostUsd + acct.runCostUsd + acct.cumulativeChildCostUsd,
             });
           }
           return costCapDetailIfExceeded();

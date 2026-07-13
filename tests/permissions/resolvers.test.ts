@@ -1187,6 +1187,46 @@ describe('bash resolver — simple commands', () => {
     }
   });
 
+  test('frobnicate -o/etc/hosts: UNMODELED command, glued short flag surfaces protected write (§11 backstop)', () => {
+    // The generic §11 backstop is the ONLY check for an UNMODELED command (no
+    // per-command resolver parses its output flags — unlike rsync/mv/curl/go
+    // above). Pre-fix it skipped the glued short-flag form (`-o/etc/hosts`, no
+    // `=`), so the protected write slipped and the `unknown-command`
+    // conservative read as cwd-confined — auto-approvable under autonomous,
+    // silently allowed under bypass/host/degraded. Now the destination is
+    // visible to policy.
+    const r = resolveCapabilities('bash', { command: 'frobnicate -o/etc/hosts' }, CTX);
+    const caps = r.kind === 'ok' || r.kind === 'conservative' ? capStrings(r.capabilities) : [];
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain('/etc/hosts');
+    } else {
+      expect(caps).toContain('write-fs:/etc/hosts');
+    }
+  });
+
+  test('frobnicate -d@/etc/passwd: unmodeled @-file operand is unwrapped and surfaced', () => {
+    // `@<path>` (contents-of-file, as in `curl -d@file`) is unwrapped so the
+    // protected path underneath still reaches policy on an unmodeled command.
+    const r = resolveCapabilities('bash', { command: 'frobnicate -d@/etc/passwd' }, CTX);
+    const caps = r.kind === 'ok' || r.kind === 'conservative' ? capStrings(r.capabilities) : [];
+    if (r.kind === 'refuse') {
+      expect(r.reason).toContain('/etc/passwd');
+    } else {
+      expect(caps.some((c) => c.includes('/etc/passwd'))).toBe(true);
+    }
+  });
+
+  test('frobnicate -j4: non-path glued short flag does NOT mint a protected cap (fail-safe extraction)', () => {
+    // Over-extraction is harmless: the candidate `4` resolves under cwd and
+    // never matches a protected/sensitive zone, so no spurious escalate-tier
+    // write-fs is minted and the command's approvability is unchanged.
+    const r = resolveCapabilities('bash', { command: 'frobnicate -j4' }, CTX);
+    const caps = r.kind === 'ok' || r.kind === 'conservative' ? capStrings(r.capabilities) : [];
+    expect(
+      caps.some((c) => c.startsWith('write-fs:/') && !c.startsWith('write-fs:/work/proj')),
+    ).toBe(false);
+  });
+
   test('curl -o/tmp/out https://api.example: attached short -o emits write-fs', () => {
     const r = resolveCapabilities('bash', { command: 'curl -o/tmp/out https://api.example' }, CTX);
     expect(r.kind).toBe('ok');

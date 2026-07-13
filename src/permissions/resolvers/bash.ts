@@ -5300,10 +5300,32 @@ const analyzeCommand = (
   // capabilities that the engine's downstream §11 walk catches.
   const extractFlagValue = (arg: string): string | null => {
     if (!arg.startsWith('-')) return arg;
+    let value: string | null = null;
     const eq = arg.indexOf('=');
-    if (eq === -1) return null;
-    const value = arg.slice(eq + 1);
-    return value.length > 0 ? value : null;
+    if (eq !== -1) {
+      // `--flag=<value>` / `-f=<value>`.
+      value = arg.slice(eq + 1);
+    } else if (!arg.startsWith('--') && arg.length > 2) {
+      // Attached short-flag value in the SAME token: `-o/etc/x`,
+      // `-d@/etc/passwd` — one letter after the single `-`, the rest is the
+      // value. Slice 100 caught the `=` shapes but not this glued form, so
+      // on an UNMODELED command (no per-command resolver to parse its output
+      // flags) a protected-path operand slipped past §11: `frobnicate
+      // -o/etc/hosts` surfaced no write-fs cap, and its `unknown-command`
+      // conservative read as cwd-confined (auto-approvable under autonomous,
+      // silently allowed under bypass/host/degraded). Over-extraction is
+      // fail-safe — a non-path value (`make -j4` → `4`) never matches a
+      // protected zone. A GNU long flag / bare short flag takes its value as
+      // the NEXT token, still out of scope for this per-token walk.
+      value = arg.slice(2);
+    }
+    if (value === null || value.length === 0) return null;
+    // Some tools spell "contents of this file" as `@<path>` (`curl
+    // -d@/etc/passwd`, `--data=@/etc/passwd`); unwrap a leading `@` so the
+    // protected path underneath is still classified. Harmless for non-`@`
+    // values (they never match a protected zone anyway).
+    const unwrapped = value.startsWith('@') ? value.slice(1) : value;
+    return unwrapped.length > 0 ? unwrapped : null;
   };
   let escalated = false;
   // cwd-scope escape (symlink resolving outside cwd) — tracked separately

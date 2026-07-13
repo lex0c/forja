@@ -59,6 +59,7 @@
 
 import { ALIGNMENT_FETCH_MARGIN, MAX_RESUME_MESSAGES, resumeWindowCut } from '../harness/resume.ts';
 import type { ProviderMessage } from '../providers/index.ts';
+import { sanitizeCardSubject, stripAnsi } from '../sanitize/index.ts';
 import { type DB, listMessageTailBySession } from '../storage/index.ts';
 import type { Bus } from '../tui/bus.ts';
 import { lookupToolVocab } from '../tui/tool-vocab.ts';
@@ -139,7 +140,12 @@ const subjectFromInput = (
 ): string | null => {
   if (typeof input !== 'object' || input === null || Array.isArray(input)) return null;
   try {
-    return vocab.subject?.(input as Record<string, unknown>) ?? null;
+    const raw = vocab.subject?.(input as Record<string, unknown>) ?? null;
+    // The subject is model-authored (a bash command / grep pattern /
+    // path). This replay path bypasses the live adapter, so a persisted
+    // ESC/BEL/CR would reach the terminal on resume — run it through the
+    // SAME `sanitizeCardSubject` the live card uses so both render alike.
+    return sanitizeCardSubject(raw);
   } catch {
     return null;
   }
@@ -244,7 +250,11 @@ const emitAssistantBlocks = (
   if (typeof content === 'string') {
     if (content.length > 0) {
       ensureStart();
-      bus.emit({ type: 'assistant:delta', ts: bodyTs, messageId, text: content });
+      // Persisted assistant prose is stored raw (collect.ts appends
+      // model text verbatim); the live path strips ANSI at the adapter,
+      // so this replay path must strip too or a resumed session renders
+      // raw model control bytes to the terminal.
+      bus.emit({ type: 'assistant:delta', ts: bodyTs, messageId, text: stripAnsi(content) });
     }
   } else if (Array.isArray(content)) {
     for (const block of content) {
@@ -258,7 +268,9 @@ const emitAssistantBlocks = (
       };
       if (b.type === 'text' && typeof b.text === 'string' && b.text.length > 0) {
         ensureStart();
-        bus.emit({ type: 'assistant:delta', ts: bodyTs, messageId, text: b.text });
+        // Strip ANSI/C0 (parity with the live adapter, which sanitizes
+        // assistant deltas at intake — see the string branch above).
+        bus.emit({ type: 'assistant:delta', ts: bodyTs, messageId, text: stripAnsi(b.text) });
       } else if (b.type === 'tool_use' && typeof b.id === 'string' && typeof b.name === 'string') {
         const vocab = lookupToolVocab(b.name);
         bus.emit({

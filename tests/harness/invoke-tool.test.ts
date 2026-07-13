@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 import { invokeTool } from '../../src/harness/invoke-tool.ts';
 import type { HookChainResult, HookEventPayload } from '../../src/hooks/index.ts';
-import type { Policy } from '../../src/permissions/index.ts';
+import type { Policy, SandboxProfile } from '../../src/permissions/index.ts';
 import { createPermissionEngine } from '../../src/permissions/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
@@ -1211,6 +1211,88 @@ describe('invokeTool', () => {
       expect(inv.failed).toBe(true);
       expect(inv.denied).toBe(true);
       expect(inv.toolResult.content).toContain('additional confirmation');
+    });
+
+    test('Fix A: exec uses the re-check profile of the rewritten args, not the stale original', async () => {
+      // A PreToolUse hook rewrites the args. The sandbox profile that
+      // reaches the tool must be the one PLANNED FOR THE REWRITTEN args
+      // (from the engine re-check), not the original decision's profile
+      // — otherwise a hook could rewrite a network command into an
+      // untrusted-dir build and keep `net-egress` (the dirTrusted
+      // build-exfil gate). Model the split with a per-args profile:
+      // 'original.txt' → cwd-rw-net (the permissive, stale one);
+      // 'mutated.txt' → cwd-rw (what a fresh plan for the rewrite yields).
+      let receivedProfile: string | undefined;
+      const capturingWrite: Tool = {
+        name: 'write_file',
+        description: 'captures ctx.sandboxProfile',
+        inputSchema: {
+          type: 'object',
+          properties: { path: { type: 'string' } },
+          required: ['path'],
+        },
+        metadata: { category: 'fs.write', writes: true, idempotent: false },
+        async execute(_args, ctx) {
+          receivedProfile = ctx.sandboxProfile;
+          return { ok: true };
+        },
+      };
+      const base = buildDeps(capturingWrite, { tools: { write_file: { allow_paths: ['**'] } } });
+      const profileFor = (args: unknown): SandboxProfile =>
+        (args as { path?: string }).path === 'mutated.txt' ? 'cwd-rw' : 'cwd-rw-net';
+      // Stamp a per-args sandbox profile on top of the real engine's
+      // decision so the original and rewritten shapes resolve to
+      // different profiles.
+      const realCheck = base.engine.check.bind(base.engine);
+      (base.engine as { check: typeof base.engine.check }).check = (name, category, args) => ({
+        ...realCheck(name, category, args),
+        sandboxProfile: profileFor(args),
+      });
+      const deps = { ...base, fireHook: makeFireHook({ path: 'mutated.txt' }) };
+      const inv = await invokeTool(
+        { toolUseId: 'tu1', toolName: 'write_file', args: { path: 'original.txt' }, messageId },
+        deps,
+      );
+      expect(inv.failed).toBe(false);
+      // Before the fix this was 'cwd-rw-net' (the original decision's
+      // profile leaking onto the rewritten command); the fix threads the
+      // re-check's profile instead.
+      expect(receivedProfile).toBe('cwd-rw');
+    });
+
+    test('Fix A (default path): exec uses the decision profile when no hook rewrites args', async () => {
+      // Guards the common branch — `effectiveSandboxProfile` defaults to the
+      // ORIGINAL decision's profile so ordinary (non-rewrite) sandboxed calls
+      // still carry it. A regression zeroing that init would silently drop
+      // the profile on every normal call and pass the rewrite-only test above.
+      let receivedProfile: string | undefined;
+      const capturingWrite: Tool = {
+        name: 'write_file',
+        description: 'captures ctx.sandboxProfile',
+        inputSchema: {
+          type: 'object',
+          properties: { path: { type: 'string' } },
+          required: ['path'],
+        },
+        metadata: { category: 'fs.write', writes: true, idempotent: false },
+        async execute(_args, ctx) {
+          receivedProfile = ctx.sandboxProfile;
+          return { ok: true };
+        },
+      };
+      const base = buildDeps(capturingWrite, { tools: { write_file: { allow_paths: ['**'] } } });
+      const realCheck = base.engine.check.bind(base.engine);
+      (base.engine as { check: typeof base.engine.check }).check = (name, category, args) => ({
+        ...realCheck(name, category, args),
+        sandboxProfile: 'cwd-rw-net' as SandboxProfile,
+      });
+      // No fireHook on `base` → no updatedInput → the default branch runs.
+      const inv = await invokeTool(
+        { toolUseId: 'tu1', toolName: 'write_file', args: { path: 'original.txt' }, messageId },
+        base,
+      );
+      expect(inv.failed).toBe(false);
+      expect(receivedProfile).toBe('cwd-rw-net');
     });
   });
 });
