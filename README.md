@@ -75,10 +75,20 @@ cd ~/projects/my-repo
 forja init
 ```
 
+List default available models:
+```bash
+forja --list-models
+```
+*catalog `~/.config/forja/model_providers.json`*
+
 Then open the interactive REPL:
 
 ```bash
 forja
+```
+or
+```bash
+forja --model <MODEL>
 ```
 
 The first time Forja sees a directory, it asks you to attest the trust
