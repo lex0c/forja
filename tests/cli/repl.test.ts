@@ -446,6 +446,93 @@ describe('repl — boot + smoke', () => {
     expect(stderr).toContain('forja: budget config: bad budget value');
   });
 
+  test('SIGTERM triggers graceful shutdown (broker + db close) and exits 143', async () => {
+    // The long-lived REPL must trap SIGTERM/SIGHUP/SIGQUIT like the one-shot
+    // path: pre-fix it wired only SIGINT, so a SIGTERM (systemd stop, SSH
+    // hangup, terminal close) took Node's default termination — bg children
+    // orphaned to PID 1 and the DB closed dirty. Now it runs the graceful
+    // shutdown() and exits 128+signum.
+    let brokerClosed = false;
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({
+        broker: {
+          close: async () => {
+            brokerClosed = true;
+          },
+        },
+      }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    process.emit('SIGTERM' as NodeJS.Signals);
+    expect(await promise).toBe(143);
+    expect(brokerClosed).toBe(true);
+  });
+
+  test('a broker that rejects on close still completes shutdown (no hang)', async () => {
+    // The two shutdown awaits (broker.close, meshManager.shutdown) were
+    // unguarded; a reject escaped `void shutdown()` (no `.catch`), so
+    // `await exitPromise` never resolved — the REPL hung with a dirty WAL.
+    // Guarded now: shutdown finishes and the REPL exits even when broker.close
+    // throws. (Without the guard this test hangs and times out.)
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({
+        broker: {
+          close: async () => {
+            throw new Error('broker close failed');
+          },
+        },
+      }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    process.emit('SIGTERM' as NodeJS.Signals);
+    expect(await promise).toBe(143);
+  });
+
+  test('SIGTERM mid-turn hard-aborts the running turn and still shuts down (exit 143)', async () => {
+    // The orphan scenario the fix targets: a turn is in flight (with the LLM's
+    // bg children) when SIGTERM lands. terminate() hard-aborts the turn, then
+    // shutdown() runs regardless — it does not wait for the turn (the REPL is
+    // event-driven; the aborted turn unwinds on its own into the closed,
+    // no-op renderer).
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+      errSink: () => undefined,
+    });
+    await tick();
+    stdin.feed('do something\r'); // starts a turn (running=true)
+    await tick();
+    process.emit('SIGTERM' as NodeJS.Signals);
+    // The signal hard-aborts the turn; a real runAgent observes the abort and
+    // unwinds. The stub ignores the signal, so settle it explicitly to model
+    // that unwind — shutdown then completes and the REPL exits 143.
+    ra.finish(0);
+    expect(await promise).toBe(143);
+  });
+
   test('aborts boot with exit 2 when the permission engine is refusing (matches run.ts)', async () => {
     // Regression: BootstrapResult is consumed by BOTH run.ts and runRepl,
     // but only run.ts honored `permissionState === 'refusing'`. The REPL

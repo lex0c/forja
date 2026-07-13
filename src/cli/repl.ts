@@ -2712,7 +2712,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // §13.7 broker drain BEFORE storage close — same rationale as
     // src/cli/run.ts. Awaits in-flight exec; closes idempotently.
     if (baseConfig.broker !== undefined) {
-      await baseConfig.broker.close();
+      try {
+        await baseConfig.broker.close();
+      } catch {
+        // Best-effort: a broker that rejects on close must not strand the
+        // rest of teardown (closeDb + resolveExit below) — an unguarded
+        // reject here escapes `void shutdown()` (no `.catch`), so
+        // `await exitPromise` never resolves: the REPL hangs forever with a
+        // dirty WAL. Matches the bgManager/mcpManager guards below.
+      }
     }
     // Session-scoped bg processes (spec ORCHESTRATION.md §3B.1): the
     // REPL owns the holder, so teardown runs HERE at session exit, not
@@ -2741,7 +2749,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // socket, remove the descriptor. The CLI owns this teardown
     // (harness/types.ts) — without it the .sock + descriptor leak on exit.
     if (baseConfig.meshManager !== undefined) {
-      await baseConfig.meshManager.shutdown();
+      try {
+        await baseConfig.meshManager.shutdown();
+      } catch {
+        // Best-effort — a mesh shutdown reject must not block closeDb /
+        // resolveExit (see the broker guard above); it would hang exit.
+      }
     }
     // Session-scoped reminders (ORCHESTRATION.md §3B.9): clear every
     // pending timer so a fired callback can't run after teardown. Pure
@@ -3890,6 +3903,30 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   };
   process.on('SIGINT', sigintHandler);
 
+  // SIGTERM / SIGHUP / SIGQUIT: process-level "stop" (operator, systemd,
+  // terminal close, SSH hangup) — distinct from SIGINT's interactive
+  // per-turn interrupt above. Pre-slice the long-lived REPL trapped NONE of
+  // these (only the one-shot `run.ts` path installs the full suite via
+  // `signal.ts`), so the runtime took Node's default termination: bg
+  // children the LLM spawned orphaned to PID 1 and the DB closed dirty (no
+  // WAL checkpoint). Trap them like the one-shot path — hard-abort a running
+  // turn so the harness unwinds, then run the same graceful `shutdown()`
+  // (bgManager.cleanup() SIGTERMs every live bg job; broker + DB close).
+  // The renderer no-ops after close(), so the aborted turn's async unwind
+  // can emit freely. Exit code is 128+signum, matching the shell convention
+  // and Node's own default for an untrapped signal.
+  const terminate = (code: number): void => {
+    if (running && abortController !== null) abortController.abort();
+    exitCode = code;
+    requestShutdown();
+  };
+  const sigtermHandler = (): void => terminate(143);
+  const sighupHandler = (): void => terminate(129);
+  const sigquitHandler = (): void => terminate(131);
+  process.on('SIGTERM', sigtermHandler);
+  process.on('SIGHUP', sighupHandler);
+  process.on('SIGQUIT', sigquitHandler);
+
   // Welcome banner (UI.md §4.10.9). Goes to scrollback before any
   // live frame so it sits at the top of the conversation transcript.
   // Env summary entries land conditionally — D68 says omit when
@@ -4249,5 +4286,8 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
 
   await exitPromise;
   process.removeListener('SIGINT', sigintHandler);
+  process.removeListener('SIGTERM', sigtermHandler);
+  process.removeListener('SIGHUP', sighupHandler);
+  process.removeListener('SIGQUIT', sigquitHandler);
   return exitCode;
 };
