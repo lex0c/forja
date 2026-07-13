@@ -1189,9 +1189,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               ? { spawnChildProcess: config.spawnChildProcess }
               : {}),
             // PERMISSION_ENGINE.md §10.1: seal the verify subagent's
-            // effective envelope. Mirror the task-tool spawn shape
-            // (loop.ts:1289) — intersect parent's envelope against
-            // the playbook's declared capabilities.
+            // effective envelope. Mirror the task-tool spawn's
+            // capability-intersect (extracted to subagent-dispatcher.ts
+            // `dispatchSubagent`, via intersectCapabilities) — intersect
+            // the parent's envelope against the playbook's declared
+            // capabilities.
             //
             // Pre-R2 the loop passed the parent's FULL envelope
             // verbatim because verify-semantic.md didn't declare
