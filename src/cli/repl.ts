@@ -51,7 +51,6 @@ import {
   HISTORY_CAP,
   historyOptOutReason,
   loadHistory,
-  searchHistory,
 } from '../storage/history.ts';
 import { closeDb, computeUsageStats, countMessagesBySession } from '../storage/index.ts';
 import { createContextPinsStore } from '../storage/repos/context-pins.ts';
@@ -88,6 +87,7 @@ import { concatQueuedBodies } from './inbox-drain.ts';
 import { PROJECT_GUIDE_FILENAMES } from './project-context.ts';
 import { prepareResumeContext } from './resume-prepare.ts';
 import { replayProviderMessages, replaySessionMessages } from './resume-replay.ts';
+import { ReverseSearchController } from './reverse-search-controller.ts';
 import { resolveResumeIdOnDb } from './run.ts';
 import { shapeSystemPrompt } from './shape-system-prompt.ts';
 import {
@@ -1368,78 +1368,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // re-runs searchHistory against the project's table; Ctrl+R while
   // open cycles to older matches with the same query.
   //
-  // Cap match list at 200 — operator scrolls via Ctrl+R, which means
-  // visiting more than ~10 entries is rare; 200 is generous enough
-  // to cover heavy typists without keeping a 10k-row mirror in JS
-  // for every keystroke.
-  const REVERSE_SEARCH_LIMIT = 200;
-  let reverseSearchQuery: string | null = null;
-  let reverseSearchResults: string[] = [];
-  let reverseSearchIdx = -1;
-
-  const isReverseSearchOpen = (): boolean => reverseSearchQuery !== null;
-
-  // Sanitize a query before it lands in state. The overlay renders as
-  // a single visual row (HISTORY.md §2.2); embedded newlines from a
-  // multi-line paste would otherwise spill into multiple rows and
-  // break the live region's row accounting. Collapse `\r?\n` → space,
-  // matching the same treatment we apply to recalled multi-line
-  // matches in render/reverse-search.ts.
-  const sanitizeReverseSearchQuery = (raw: string): string => raw.replace(/\r?\n/g, ' ');
-
-  const refreshReverseSearch = (query: string): void => {
-    const clean = sanitizeReverseSearchQuery(query);
-    reverseSearchQuery = clean;
-    reverseSearchResults =
-      clean === '' ? [] : searchHistory(db, baseConfig.cwd, clean, REVERSE_SEARCH_LIMIT);
-    reverseSearchIdx = reverseSearchResults.length > 0 ? 0 : -1;
-    bus.emit({
-      type: 'reverse-search:update',
-      ts: now(),
-      query: clean,
-      results: reverseSearchResults,
-      selectedIdx: reverseSearchIdx,
-    });
-  };
-
-  const openReverseSearch = (): void => {
-    if (isReverseSearchOpen()) return;
-    refreshReverseSearch('');
-  };
-
-  const closeReverseSearch = (): void => {
-    if (!isReverseSearchOpen()) return;
-    reverseSearchQuery = null;
-    reverseSearchResults = [];
-    reverseSearchIdx = -1;
-    bus.emit({ type: 'reverse-search:close', ts: now() });
-  };
-
-  const cycleReverseSearchOlder = (): void => {
-    if (!isReverseSearchOpen() || reverseSearchResults.length === 0) return;
-    // Clamp at the oldest match (last index). Ctrl+R past the bottom
-    // is a no-op rather than a wrap — bash beeps in this case; we
-    // just stop. Cycling past oldest would surprise an operator who
-    // expects "more presses → older".
-    if (reverseSearchIdx < reverseSearchResults.length - 1) {
-      reverseSearchIdx += 1;
-    }
-    bus.emit({
-      type: 'reverse-search:update',
-      ts: now(),
-      query: reverseSearchQuery ?? '',
-      results: reverseSearchResults,
-      selectedIdx: reverseSearchIdx,
-    });
-  };
-
-  // The match the operator is currently looking at, or null when the
-  // overlay has zero matches. Used by accept (Enter / Tab) to know
-  // what to drop into the input buffer.
-  const currentReverseSearchMatch = (): string | null => {
-    if (reverseSearchIdx < 0) return null;
-    return reverseSearchResults[reverseSearchIdx] ?? null;
-  };
+  const reverseSearch = new ReverseSearchController({ db, cwd: baseConfig.cwd, bus, now });
+  // Thin wrappers so the keypress handler's call sites keep their spelling; the
+  // overlay's state + logic live in ReverseSearchController (reverse-search-controller.ts).
+  const isReverseSearchOpen = (): boolean => reverseSearch.isOpen();
+  const refreshReverseSearch = (query: string): void => reverseSearch.refresh(query);
+  const openReverseSearch = (): void => reverseSearch.open();
+  const closeReverseSearch = (): void => reverseSearch.close();
+  const cycleReverseSearchOlder = (): void => reverseSearch.cycleOlder();
+  const currentReverseSearchMatch = (): string | null => reverseSearch.currentMatch();
   // Two controllers per turn (spec UI.md §3 soft/hard distinction):
   //   abortController     → hard, preempts in-flight work (mid-tool kill,
   //                         provider-stream cancel). Fires on second
@@ -3242,7 +3179,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         }
         // Backspace shortens the query and re-runs the search.
         if (key.name === 'backspace') {
-          const q = reverseSearchQuery ?? '';
+          const q = reverseSearch.query() ?? '';
           refreshReverseSearch(q.slice(0, -1));
           cancelExitArm();
           return true;
@@ -3309,14 +3246,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // Esc to leave the overlay and then has the full editor
         // shortcut palette available again.
         if (key.ctrl) return true;
-        const q = reverseSearchQuery ?? '';
+        const q = reverseSearch.query() ?? '';
         refreshReverseSearch(q + key.char);
         cancelExitArm();
         return true;
       }
       // Paste: append the pasted text wholesale and re-search.
       if (key.kind === 'paste') {
-        const q = reverseSearchQuery ?? '';
+        const q = reverseSearch.query() ?? '';
         refreshReverseSearch(q + key.text);
         cancelExitArm();
         return true;
