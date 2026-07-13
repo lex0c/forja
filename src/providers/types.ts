@@ -11,7 +11,8 @@ export type ProviderFamily =
   | 'llama_cpp'
   | 'google'
   | 'mistral'
-  | 'openrouter';
+  | 'openrouter'
+  | 'xai';
 
 export type ToolCallingMode = 'native' | 'adapted';
 export type CacheMode = 'server_5min' | 'server_persistent' | 'client_only';

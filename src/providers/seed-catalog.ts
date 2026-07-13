@@ -19,6 +19,7 @@ import { OLLAMA_CAPS, OLLAMA_CLOUD_CAPS } from './ollama/capabilities.ts';
 import { OPENAI_CAPS } from './openai/capabilities.ts';
 import { OPENROUTER_CAPS } from './openrouter/capabilities.ts';
 import type { ModelProviderEntry, ProviderCapabilities, ProviderFamily } from './types.ts';
+import { XAI_CAPS } from './xai/capabilities.ts';
 
 const fromCaps = (
   family: ProviderFamily,
@@ -69,4 +70,7 @@ export const CANONICAL_MODEL_PROVIDERS: ReadonlyArray<ModelProviderEntry> = [
   // OpenRouter carries no env fallback either — the catalog's api_key_env
   // (OPENROUTER_API_KEY) is the sole key source, mapped to a bearer header.
   ...fromCaps('openrouter', OPENROUTER_CAPS, 'OPENROUTER_API_KEY'),
+  // xAI (Grok) via the native api.x.ai endpoint. Like OpenRouter, the catalog's
+  // api_key_env (XAI_API_KEY) is the sole key source — no adapter env fallback.
+  ...fromCaps('xai', XAI_CAPS, 'XAI_API_KEY'),
 ];

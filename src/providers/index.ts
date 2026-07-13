@@ -72,3 +72,14 @@ export type {
   ToolCallingMode,
   UsageInfo,
 } from './types.ts';
+export { XAI_CAPS, XAI_MODEL_NAMES } from './xai/capabilities.ts';
+// xAI (Grok)
+export type { CreateXaiProviderOptions } from './xai/index.ts';
+export { createXaiProvider, DEFAULT_XAI_BASE_URL } from './xai/index.ts';
+export type {
+  RawXaiChoice,
+  RawXaiChoiceDelta,
+  RawXaiChunk,
+  RawXaiToolCallDelta,
+} from './xai/stream.ts';
+export { normalizeXaiStream } from './xai/stream.ts';

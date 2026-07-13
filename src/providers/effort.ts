@@ -48,6 +48,20 @@ export const OPENAI_REASONING_EFFORT: Record<ProviderEffort, 'low' | 'medium' | 
     max: 'xhigh',
   };
 
+// xAI Grok's `reasoning_effort` (Chat Completions, a FLAT field like OpenAI's
+// chat path) accepts low|medium|high only — there is no `none`/`xhigh`, and on
+// grok-4.5 reasoning cannot be disabled at all. `high` is the model default and
+// its top level, so both the Forja `xhigh` and `max` clamp down onto `high`;
+// low/medium/high are 1:1. Centralized here so the whole effort-translation
+// surface stays in one file.
+export const XAI_REASONING_EFFORT: Record<ProviderEffort, 'low' | 'medium' | 'high'> = {
+  low: 'low',
+  medium: 'medium',
+  high: 'high',
+  xhigh: 'high',
+  max: 'high',
+};
+
 // Anthropic's native `output_config.effort` maps 1:1 with the agnostic ladder
 // EXCEPT `xhigh`, which only Opus 4.7/4.8 expose; on every other model a request
 // for `xhigh` 400s, so clamp it down to `high`. Centralized here (beside the

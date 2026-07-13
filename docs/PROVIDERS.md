@@ -57,8 +57,8 @@ interface Provider {
   observable effect today — a real tokenizer lands only when 4.9 wires
   `countTokens` into budgeting.
 
-The five implemented adapters live in
-`src/providers/{anthropic,openai,google,ollama,openrouter}/`. `ProviderFamily` also
+The six implemented adapters live in
+`src/providers/{anthropic,openai,google,ollama,openrouter,xai}/`. `ProviderFamily` also
 declares `llama_cpp` and `mistral` for the future local path; those have no catalog
 entries yet.
 
@@ -90,6 +90,7 @@ seeded models:
 | **ollama** (local) | `qwen2.5-coder:7b/14b`, `qwen3:8b/14b`, `llama3.1:8b`, `mistral-nemo:12b`, `gpt-oss:20b` — all native tool calling, `$0` |
 | **ollama** (cloud) | `glm-5.2`, `qwen3-coder:480b`, `qwen3-coder-next`, `devstral-2:123b` — hosted on `ollama.com`, seeded with `base_url` + `api_key_env`; need `OLLAMA_API_KEY` (see § Ollama — cloud) |
 | **openrouter** (gateway) | `deepseek/deepseek-v4-flash`, `deepseek/deepseek-v4-pro`, `minimax/minimax-m3`, `z-ai/glm-5.2`, `moonshotai/kimi-k2.6`, `qwen/qwen3.6-plus`, `x-ai/grok-4.5`, `tencent/hy3:free` — models not reachable as a first-class family; ids are `openrouter/<vendor>/<model>` (two slashes) |
+| **xai** (Grok) | `grok-4.5` — native `api.x.ai`, `XAI_API_KEY`; distinct from the OpenRouter route to Grok (§5.6) |
 
 To add, remove, or adjust a model, edit the file (§2.1) — no recompile. The
 registry test (`tests/providers/registry.test.ts`) asserts every seeded model
@@ -123,7 +124,7 @@ Each entry:
 ```
 
 - **`id`** — `family/model_name`. `family` must be one Forja ships an adapter for
-  (`anthropic`, `openai`, `ollama`, `google`, `openrouter`); the file registers
+  (`anthropic`, `openai`, `ollama`, `google`, `openrouter`, `xai`); the file registers
   *models*, not new adapters (those are a code change — §8). For `openrouter` the
   `model_name` itself is `<vendor>/<model>`, so the id carries two slashes
   (`openrouter/deepseek/deepseek-v4-flash`).
@@ -250,6 +251,20 @@ FORJA_OPENROUTER_REASONING_REPLAY=0            # opt out of reasoning replay
 
 See §5.5 for what the adapter does with caching, reasoning, and routing.
 
+#### xAI — Grok (native)
+
+Grok direct from xAI (not via the OpenRouter gateway). Set the key and select the
+seeded model:
+
+```sh
+export XAI_API_KEY=xai-...
+forja --model xai/grok-4.5
+```
+
+Any other Grok model works via a catalog entry (§2.1) with `family: "xai"`. Optional
+env: `FORJA_XAI_INCLUDE_USAGE=0` opts out of the usage payload for a param-strict
+proxy pinned via `base_url`. See §5.6 for reasoning-effort, caching, and sampling.
+
 ---
 
 ## 3. Capabilities
@@ -295,7 +310,8 @@ is responsible for accumulating them). `stop.reason` is `tool_use` when the turn
 emitted any tool call (so the loop continues), else `end_turn` / `max_tokens` /
 etc. Each adapter has its own normalizer: `anthropic/stream.ts`,
 `openai/stream.ts` (Chat Completions), `openai/responses-stream.ts` (Responses),
-`google/stream.ts`, `ollama/stream.ts` (native NDJSON).
+`google/stream.ts`, `ollama/stream.ts` (native NDJSON), `openrouter/stream.ts`,
+`xai/stream.ts` (both OpenAI-shape Chat Completions).
 
 ---
 
@@ -452,6 +468,44 @@ add any other OpenRouter model via a catalog entry (§2.1).
 - **Not wired (deferred):** response caching (`X-OpenRouter-Cache`), `session_id`
   sticky routing, and `:exacto`/provider-routing controls.
 
+### 5.6 xAI (Grok, native api.x.ai)
+
+`xai/index.ts` — reaches the native xAI API (`https://api.x.ai/v1`, `XAI_API_KEY`),
+distinct from the OpenRouter route to Grok (§5.5). It is OpenAI-compatible Chat
+Completions, so it reuses the OpenAI SDK as transport and the OpenAI request
+assembly (`toOpenAIMessages` / `toOpenAITools`) — but earns its own family because
+Grok's shape diverges from both the OpenAI adapter (which forces reasoning models
+onto the Responses API) and the OpenRouter adapter (nested `reasoning` object +
+reasoning-detail replay). Seeded model: `grok-4.5` (500K window).
+
+- **Reasoning** — flat `reasoning_effort` (Chat Completions), gated on
+  `supports_reasoning_effort`. `grok-4.5` accepts `low`/`medium`/`high` (default
+  `high`) and CANNOT disable reasoning: the agnostic effort maps low/medium/high
+  1:1, `xhigh`/`max` clamp to `high` (`XAI_REASONING_EFFORT`), and a disable intent
+  (`thinking_budget: 0`) is dropped rather than sending an invalid `none`.
+  `reasoning_content` is streamed and surfaced as `thinking_delta` for the live UI
+  only — Chat Completions has no reasoning-input slot, so nothing is replayed
+  (`replaysReasoning: false`).
+- **`stop`** — withheld from reasoning models (xAI rejects `stop` there); sent for a
+  non-reasoning model.
+- **Tokens** — `max_completion_tokens` (visible output, excluding reasoning), the
+  current field (`max_tokens` is deprecated).
+- **Caching** — automatic server-side (declared `server_5min`); the discounted
+  `cached_tokens` read is captured passively into `cache_read`. No explicit
+  breakpoints (no `cache_control`, no `prompt_cache_key`).
+- **Usage** — `stream_options:{include_usage:true}` by default; opt out with the
+  `includeUsage` option / `FORJA_XAI_INCLUDE_USAGE=0` for a param-strict proxy.
+- **Sampling** — `temperature`/`top_p` are forwarded (Grok accepts them; only
+  presence/frequency-penalty and `stop` are reasoning-rejected).
+- **Config (env):** `XAI_API_KEY` (sole key source, no fallback),
+  `FORJA_XAI_INCLUDE_USAGE`.
+- **Verified live (2026-07-13, real api.x.ai):** Chat Completions accepts
+  `tools`+`reasoning_effort` together (grok-4.5 called a tool with `effort:'high'`
+  set — it does NOT share OpenAI's "use /v1/responses" limitation), and grok-4.5
+  accepts `temperature`/`top_p`. Standing gate:
+  `tests/providers/xai-integration.test.ts` (opt-in `FORJA_XAI_INTEGRATION=1`) +
+  `evals/providers/xai/` + the `eval:smoke:xai` script.
+
 ---
 
 ## 6. Cross-cutting conventions
@@ -479,6 +533,7 @@ coding/agentic sweet spot (Opus 4.7/4.8). Omitted for models that don't support 
 | Gemini | implicit | none wired yet (`CachedContent` pending) |
 | Ollama | none (local, `$0`) | n/a — no server-side cache |
 | OpenRouter | per-model: automatic (most) or explicit `cache_control` (Qwen) | passive `cached_tokens` capture; markers on the stable prefix for explicit-cache models |
+| xAI (Grok) | automatic server-side | passive `cached_tokens` capture; no markers |
 
 **Retry** is **shared, not per-adapter** — `src/harness/retry.ts` wraps the
 provider call at the harness level, so all families get the same policy: retry on

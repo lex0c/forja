@@ -490,6 +490,7 @@ describe('seed catalog + serialization', () => {
     expect(ids.some((id) => id.startsWith('google/'))).toBe(true);
     // OpenRouter ids carry two slashes (openrouter/<vendor>/<model>).
     expect(ids.some((id) => id.startsWith('openrouter/'))).toBe(true);
+    expect(ids).toContain('xai/grok-4.5');
   });
 
   test('every seed entry has an id of the form family/model_name', () => {

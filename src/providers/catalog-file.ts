@@ -25,6 +25,7 @@ import {
 import { createRegistry, type ModelRegistry } from './registry.ts';
 import { CANONICAL_MODEL_PROVIDERS } from './seed-catalog.ts';
 import type { ModelProviderEntry, Provider } from './types.ts';
+import { type CreateXaiProviderOptions, createXaiProvider } from './xai/index.ts';
 
 // Build the lazily-evaluated provider factory for an entry. The API key
 // is read from the named env var INSIDE the closure (lazy), so only the
@@ -122,6 +123,13 @@ const entryToFactory =
             ...(hasKey ? { apiKey } : {}),
             ...(baseURL !== undefined ? { baseURL } : {}),
             ...((opts as CreateOpenRouterProviderOptions | undefined) ?? {}),
+          });
+        case 'xai':
+          return createXaiProvider(entry.model_name, {
+            capabilities: entry.capabilities,
+            ...(hasKey ? { apiKey } : {}),
+            ...(baseURL !== undefined ? { baseURL } : {}),
+            ...((opts as CreateXaiProviderOptions | undefined) ?? {}),
           });
         default:
           // Unreachable: the loader rejects unsupported families before an
