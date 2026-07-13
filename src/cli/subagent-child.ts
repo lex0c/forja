@@ -473,6 +473,18 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // own onMessage subscription (constructed below); no work
       // for this listener.
     });
+    // Hard parent death (kill -9 / OOM): the parent can't send a
+    // `shutdown` message, but its end of the pipe closes, so the
+    // transport's onClose fires. Without aborting here the child's
+    // onMessage listener never triggers and the harness run keeps going
+    // until its OWN wall-clock (≤24h, harness/types.ts) — reparented to
+    // init, its bg grandchildren leaking. Abort the hard signal so the
+    // run unwinds and the outer finally cleans up. The graceful path's
+    // own `ipcChannel.close()` (in cleanup below) also fires this — a
+    // no-op, since the run is already ending and abort() is idempotent.
+    ipcChannel.onClose(() => {
+      signalController.abort();
+    });
     permissionBridge = createChildPermissionBridge({
       channel: ipcChannel,
       signal: signalController.signal,

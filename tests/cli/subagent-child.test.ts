@@ -27,6 +27,7 @@ import {
   hashPromptContent,
   listPromptVersionsByName,
 } from '../../src/storage/repos/prompt-versions.ts';
+import { fakeTransportPair, IPC_PROTOCOL_VERSION } from '../../src/subagents/ipc.ts';
 import { seedModelCatalog } from '../helpers/seed-catalog.ts';
 
 // Cover the canonical happy + error paths for the
@@ -176,6 +177,69 @@ describe('runSubagentChild', () => {
     // Round-trip invariant: flatten(segments) === systemPrompt.
     expect(flattenSystemSegments(capturedSegments ?? [])).toBe(capturedSystemPrompt ?? '');
   });
+
+  test('aborts the run when the IPC channel closes (hard parent death)', async () => {
+    // A hard parent death (kill -9 / OOM) can't send a `shutdown` message —
+    // the pipe just EOFs, firing the transport's onClose. Without an
+    // onClose→abort the child's run keeps going until its own wall-clock
+    // (≤24h), orphaned under init with its bg grandchildren. With the fix,
+    // channel-close aborts the run so it unwinds and the child exits.
+    // (Pre-fix this test hangs and times out — the hanging provider never
+    // returns on its own; only the abort can end the run.)
+    const pair = fakeTransportPair();
+    const { sessionId } = seedChildSession(dbDir);
+    // Inject a fake runAgent that hangs on its abort signal, then returns
+    // once aborted — isolating the fix (channel close → the signal the run
+    // holds aborts) from provider-stream / generator-cleanup mechanics.
+    let runSignal: AbortSignal | undefined;
+    const runAgentFn: typeof runAgent = async (config) => {
+      runSignal = config.signal;
+      await new Promise<void>((resolve) => {
+        if (config.signal?.aborted === true) {
+          resolve();
+          return;
+        }
+        config.signal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+      return {
+        status: 'interrupted',
+        reason: 'aborted',
+        sessionId,
+        steps: 0,
+        durationMs: 0,
+        usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+        costUsd: 0,
+        usageComplete: true,
+      };
+    };
+    const runPromise = runSubagentChild({
+      sessionId,
+      dbPath,
+      providerOverride: stubProvider(''),
+      runAgentFn,
+      // Gate the IPC block on (subagent-child.ts:379) — without a version the
+      // channel (and thus the onClose→abort under test) is never created.
+      ipcVersion: IPC_PROTOCOL_VERSION,
+      ipcTransportFactory: () => pair.a,
+      userAgentsDir: null,
+      projectAgentsDir: null,
+      errSink: () => {},
+    });
+    // Wait until the child booted (past its onClose subscription) and called
+    // runAgent, so closing the channel can't race child setup.
+    const deadline = Date.now() + 5000;
+    while (runSignal === undefined && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(runSignal).toBeDefined();
+    expect(runSignal?.aborted).toBe(false);
+    // Parent goes away: close its side → child's onClose → signalController
+    // aborts → the signal runAgent holds fires → the run returns → child exits.
+    pair.b.close();
+    const exitCode = await runPromise;
+    expect(typeof exitCode).toBe('number');
+    expect(runSignal?.aborted).toBe(true);
+  }, 15_000);
 
   test('resolves [sandbox] config from the repo ROOT when the child cwd is a subdir', async () => {
     // Regression: an isolation:none child whose session.cwd is a repo
