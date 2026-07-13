@@ -89,7 +89,7 @@ seeded models:
 | **google** | `gemini-3.5-flash`, `gemini-3.1-pro-preview`, `gemini-3.1-flash-lite`, `gemini-3-flash-preview`, `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.5-flash-lite` |
 | **ollama** (local) | `qwen2.5-coder:7b/14b`, `qwen3:8b/14b`, `llama3.1:8b`, `mistral-nemo:12b`, `gpt-oss:20b` — all native tool calling, `$0` |
 | **ollama** (cloud) | `glm-5.2`, `qwen3-coder:480b`, `qwen3-coder-next`, `devstral-2:123b` — hosted on `ollama.com`, seeded with `base_url` + `api_key_env`; need `OLLAMA_API_KEY` (see § Ollama — cloud) |
-| **openrouter** (gateway) | `deepseek/deepseek-v4-flash`, `deepseek/deepseek-v4-pro`, `minimax/minimax-m3`, `z-ai/glm-5.2`, `moonshotai/kimi-k2.6`, `qwen/qwen3.6-plus`, `x-ai/grok-4.5`, `tencent/hy3:free` — models not reachable as a first-class family; ids are `openrouter/<vendor>/<model>` (two slashes) |
+| **openrouter** (gateway) | `deepseek/deepseek-v4-flash`, `deepseek/deepseek-v4-pro`, `minimax/minimax-m3`, `z-ai/glm-5.2`, `moonshotai/kimi-k2.6`, `qwen/qwen3.6-plus`, `x-ai/grok-4.5`, `nvidia/nemotron-3-ultra-550b-a55b:free`, `openai/gpt-oss-20b:free`, `tencent/hy3:free` — models not reachable as a first-class family; ids are `openrouter/<vendor>/<model>` (two slashes). `:free` tiers are heavily rate-limited |
 | **xai** (Grok) | `grok-4.5` — native `api.x.ai`, `XAI_API_KEY`; distinct from the OpenRouter route to Grok (§5.6) |
 
 To add, remove, or adjust a model, edit the file (§2.1) — no recompile. The

@@ -184,6 +184,39 @@ export const OPENROUTER_CAPS: Record<string, ProviderCapabilities> = {
       'Tencent HY3 (free tier); 256K context; reasoning (effort levels); free but heavily rate-limited — fallback/eval use',
     ],
   },
+  // NVIDIA Nemotron 3 Ultra (free tier) — hybrid Transformer-Mamba MoE (550B
+  // total / 55B active), 1M served context; built for long-running agentic
+  // workflows (agent orchestration, coding agents, deep research). Reasoning
+  // WITH effort levels + native tools. Free route is heavily rate-limited, and
+  // the free endpoint carries provider-side data collection — treat as
+  // fallback/eval, not a throughput workhorse.
+  'nvidia/nemotron-3-ultra-550b-a55b:free': {
+    ...OPENROUTER_BASE,
+    context_window: 1_000_000,
+    output_max_tokens: 32_768,
+    supports_reasoning_effort: true,
+    recommended_max_tools_per_step: 8,
+    cost_per_1k_input: 0,
+    cost_per_1k_output: 0,
+    notes: [
+      'NVIDIA Nemotron 3 Ultra (free tier); 550B MoE (55B active); 1M served context; agentic/coding; reasoning (effort levels) + native tools; free but heavily rate-limited + free-endpoint data collection — fallback/eval use',
+    ],
+  },
+  // OpenAI gpt-oss-20b (free tier) — open-weight 21B MoE (3.6B active), 131K
+  // context; native tools + configurable reasoning effort. Small/efficient; the
+  // free route is heavily rate-limited.
+  'openai/gpt-oss-20b:free': {
+    ...OPENROUTER_BASE,
+    context_window: 131_072,
+    output_max_tokens: 32_768,
+    supports_reasoning_effort: true,
+    recommended_max_tools_per_step: 6,
+    cost_per_1k_input: 0,
+    cost_per_1k_output: 0,
+    notes: [
+      'OpenAI gpt-oss-20b (free tier); open-weight 21B MoE (3.6B active); 131K context; native tools + reasoning (effort levels); free but heavily rate-limited — fallback/eval use',
+    ],
+  },
 };
 
 export const OPENROUTER_MODEL_NAMES = Object.keys(OPENROUTER_CAPS);

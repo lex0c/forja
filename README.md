@@ -141,7 +141,7 @@ forja --json "lint the src/ tree" | jq 'select(.type=="tool:end")'
 | OpenAI | gpt-4o, gpt-4o-mini, gpt-5.x (selected) | — | ✓ | Reads the canonical system prompt; ignores per-segment cache markers. Also covers OpenAI-compatible endpoints via a catalog `base_url`. |
 | Google | gemini-2.5 / 3.x families | — | ✓ | Same compat path as OpenAI. |
 | Ollama (local) | qwen2.5-coder, qwen3, qwen3-coder, llama3.1, mistral-nemo, gpt-oss, devstral | — | ✓ | Native tool calling, `$0`. `--model ollama/<name>`; `llama.cpp` planned. |
-| OpenRouter (gateway) | deepseek-v4 flash/pro, minimax-m3, glm-5.2, kimi-k2.6, qwen3.6-plus, grok-4.5, tencent/hy3:free | 5min server (auto; qwen explicit) | ✓ | One `OPENROUTER_API_KEY` reaches many vendors. Own adapter: reasoning-effort/replay, `cache_control`, in-band-error handling, middle-out off. `--model openrouter/<vendor>/<model>` (two slashes). |
+| OpenRouter (gateway) | deepseek-v4 flash/pro, minimax-m3, glm-5.2, kimi-k2.6, qwen3.6-plus, grok-4.5, nemotron-3-ultra:free, gpt-oss-20b:free, tencent/hy3:free | 5min server (auto; qwen explicit) | ✓ | One `OPENROUTER_API_KEY` reaches many vendors. Own adapter: reasoning-effort/replay, `cache_control`, in-band-error handling, middle-out off. `--model openrouter/<vendor>/<model>` (two slashes). Free tiers are heavily rate-limited. |
 | xAI (Grok) | grok-4.5 | 5min server (auto) | ✓ | Native `api.x.ai` (not the OpenRouter route). Own adapter: flat `reasoning_effort` (low/medium/high, default high, non-disableable), `reasoning_content` streamed as thinking, `stop` withheld from reasoning models. `--model xai/grok-4.5`. |
 
 Cost is computed per-turn from declared per-1M pricing in
