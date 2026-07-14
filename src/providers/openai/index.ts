@@ -114,7 +114,7 @@ interface OpenAIToolCall {
   function: { name: string; arguments: string };
 }
 
-interface OpenAIMessage {
+export interface OpenAIMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content?: string | null;
   tool_calls?: OpenAIToolCall[];
@@ -131,7 +131,13 @@ interface OpenAIMessage {
 // tool_results come first (they answer the prior assistant call) and the
 // new user text follows. Emitting text first would make the model see a
 // new user prompt before the tool results it requested.
-const toOpenAIMessages = (m: ProviderMessage): OpenAIMessage[] => {
+//
+// Exported for reuse by the xAI adapter (identical OpenAI-shape Chat
+// Completions messages; Grok has no reasoning-replay input slot, so it needs
+// exactly this mapping — reasoning blocks dropped — not the OpenRouter variant
+// that round-trips reasoning_details). Kept here so the OpenAI request
+// assembly stays the single owner, mirroring `toOpenAITools`.
+export const toOpenAIMessages = (m: ProviderMessage): OpenAIMessage[] => {
   if (typeof m.content === 'string') {
     return [{ role: m.role, content: m.content }];
   }

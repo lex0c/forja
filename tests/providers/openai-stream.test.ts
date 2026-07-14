@@ -262,6 +262,42 @@ describe('normalizeOpenAIStream', () => {
     expect(firstDeltaIdx).toBeGreaterThan(startIdx);
   });
 
+  test('a name split across deltas is accumulated to the full name before start', async () => {
+    // `read_` then `file` must reconstruct to `read_file`, not truncate to the
+    // first fragment (which would invoke an unknown `read_` tool).
+    const events = await collectNonUsage(
+      normalizeOpenAIStream(
+        fromChunks([
+          {
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    { index: 0, id: 'call_x', type: 'function', function: { name: 'read_' } },
+                  ],
+                },
+              },
+            ],
+          },
+          { choices: [{ delta: { tool_calls: [{ index: 0, function: { name: 'file' } }] } }] },
+          {
+            choices: [
+              { delta: { tool_calls: [{ index: 0, function: { arguments: '{"path":"a.ts"}' } }] } },
+            ],
+          },
+          { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+        ]),
+      ),
+    );
+    const start = events.find((e) => e.kind === 'tool_use_start');
+    expect(start?.kind === 'tool_use_start' && start.name).toBe('read_file');
+    expect(events.find((e) => e.kind === 'tool_use_stop')).toEqual({
+      kind: 'tool_use_stop',
+      id: 'call_x',
+      final_args: { path: 'a.ts' },
+    });
+  });
+
   test('tool_call that ends without a name emits an error (no orphan stop)', async () => {
     // Pathological stream: a tool_call delta with id and args but no
     // name ever arrives. We must not emit tool_use_stop with name='' —

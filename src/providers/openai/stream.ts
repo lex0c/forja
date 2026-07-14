@@ -54,13 +54,18 @@ interface ToolCallInProgress {
   // harness's name lookup keys on it. Mutating id mid-stream orphans
   // the downstream tool_use_stop in `harness/collect.ts`.
   id: string;
+  // Accumulated by APPENDING each delta's name fragment until the call starts.
+  // OpenAI sends the full name in one delta, but if it ever splits (`read_`
+  // then `file`) replacing with the first fragment would start an unknown
+  // `read_` tool; appending reconstructs `read_file`. Locked once started.
   name: string;
   partialArgs: string;
-  // `tool_use_start` is deferred until we have a non-empty `name`. OpenAI
-  // can split the name across deltas; emitting start with name='' would
-  // make the harness invoke a tool with empty name (`unknown tool` error)
-  // even when a later delta supplies the real name. Once started, `name`
-  // is locked and `partialArgs` is flushed as a single delta.
+  // `tool_use_start` is deferred until the first args fragment arrives (args
+  // always follow the COMPLETE name in the Chat Completions stream shape), or
+  // until finalization for a no-argument call — never on a first name fragment
+  // that may still be partial. Emitting start with name='' would make the
+  // harness invoke an empty-named (`unknown`) tool. `partialArgs` buffered so
+  // far is flushed as the first delta when start fires.
   started: boolean;
 }
 
@@ -169,19 +174,17 @@ export async function* normalizeOpenAIStream(
           for (const tc of delta.tool_calls) {
             let inProgress = toolCalls.get(tc.index);
             if (inProgress === undefined) {
-              // Register the entry but DON'T emit start yet — name may
-              // arrive in a later delta. id is locked here regardless.
+              // Register the entry but DON'T emit start yet — the name may be
+              // absent or partial. id is locked here regardless.
               const id = tc.id ?? `call_${tc.index}_${crypto.randomUUID()}`;
-              const name = tc.function?.name ?? '';
-              inProgress = { id, name, partialArgs: '', started: false };
+              inProgress = { id, name: '', partialArgs: '', started: false };
               toolCalls.set(tc.index, inProgress);
-            } else if (
-              typeof tc.function?.name === 'string' &&
-              tc.function.name.length > 0 &&
-              inProgress.name.length === 0
-            ) {
-              // Name straggled in. id stays locked from the first delta.
-              inProgress.name = tc.function.name;
+            }
+            // Accumulate a (possibly multi-delta) name by APPENDING until the
+            // call starts — replacing with the first fragment would truncate a
+            // split name. id stays locked from the first delta.
+            if (!inProgress.started && typeof tc.function?.name === 'string') {
+              inProgress.name += tc.function.name;
             }
 
             // Always buffer args; we may not be started yet.
@@ -191,20 +194,18 @@ export async function* normalizeOpenAIStream(
               inProgress.partialArgs += argsChunk;
             }
 
-            // Emit start the moment we have a name. Flush whatever args
-            // we've buffered as a single delta so consumers that mirror
-            // partial_args chunks see the same byte stream they would
-            // have seen if the name had arrived first.
-            if (!inProgress.started && inProgress.name.length > 0) {
+            // Defer start until the first args fragment: args always follow the
+            // COMPLETE name, so their arrival signals the name is fully
+            // accumulated. Flush whatever args buffered so far (non-empty here)
+            // as the first delta. A no-argument call is started at finalization.
+            if (!inProgress.started && hasArgs && inProgress.name.length > 0) {
               yield { kind: 'tool_use_start', id: inProgress.id, name: inProgress.name };
               inProgress.started = true;
-              if (inProgress.partialArgs.length > 0) {
-                yield {
-                  kind: 'tool_use_delta',
-                  id: inProgress.id,
-                  partial_args: inProgress.partialArgs,
-                };
-              }
+              yield {
+                kind: 'tool_use_delta',
+                id: inProgress.id,
+                partial_args: inProgress.partialArgs,
+              };
             } else if (inProgress.started && hasArgs) {
               yield {
                 kind: 'tool_use_delta',
@@ -225,7 +226,7 @@ export async function* normalizeOpenAIStream(
     // parse and emit at end-of-stream, ordered by the original tool_call index.
     const sortedTools = Array.from(toolCalls.entries()).sort(([a], [b]) => a - b);
     for (const [, tool] of sortedTools) {
-      if (!tool.started) {
+      if (tool.name.length === 0) {
         // Name never arrived. Emitting tool_use_stop without a matching
         // start would orphan in `harness/collect.ts`. Surface as an error
         // so the harness fails the step instead of silently dropping.
@@ -236,6 +237,12 @@ export async function* normalizeOpenAIStream(
           retryable: false,
         };
         continue;
+      }
+      // A no-argument call never hit the args-triggered start above (start is
+      // deferred until args arrive); emit it now so its stop isn't orphaned.
+      if (!tool.started) {
+        yield { kind: 'tool_use_start', id: tool.id, name: tool.name };
+        tool.started = true;
       }
       let parsed: Record<string, unknown> = {};
       if (tool.partialArgs.length > 0) {

@@ -146,6 +146,25 @@ export const sanitizeOneLineForDisplay = (raw: string, max = SAFE_ONE_LINE_MAX):
   return cleaned;
 };
 
+// Sanitize a model-authored tool-card SUBJECT (a bash command / grep pattern
+// / path) for a single scrollback line — shared by the live tool card
+// (harness-adapter) and the resume-replay card so both render the SAME
+// subject. Strips ANSI + C0 control bytes (a raw ESC/BEL paints fake SGR or
+// rings the bell; a bare `\r` overwrites a row), collapses `\r`/`\t` and any
+// newline-hugging whitespace to a single space while leaving ordinary
+// intra-line spacing untouched (so `grep -n "foo  bar"` keeps its double
+// space), and caps the line so a huge command can't blow past the card.
+// `null` passes through unchanged.
+export const sanitizeCardSubject = (
+  subject: string | null,
+  max = SAFE_ONE_LINE_MAX,
+): string | null => {
+  if (subject === null) return null;
+  const cleaned = stripAnsi(subject).replace(/[\r\t]+/g, ' ');
+  const flat = cleaned.includes('\n') ? cleaned.replace(/\s*\n\s*/g, ' ').trim() : cleaned;
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+};
+
 // Anti-spoof for untrusted text that lands in the operator's SCROLLBACK
 // (not a modal — so, unlike `sanitizeOneLineForDisplay`, no width cap;
 // the wake-turn input that shares this path shouldn't be truncated).

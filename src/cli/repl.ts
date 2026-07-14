@@ -35,7 +35,6 @@ import { RESUME_FULL_WARN_THRESHOLD } from '../harness/resume.ts';
 import { effectiveBudget, isRecapEnabled, resolveMaxOutputTokens } from '../harness/types.ts';
 import { dispatchChain } from '../hooks/dispatcher.ts';
 import type { HookChainResult, HookEventPayload } from '../hooks/types.ts';
-import { framePeerMessage } from '../mesh/envelope.ts';
 import type { PolicySource } from '../permissions/index.ts';
 import { buildAutoTerse } from '../recap/auto-display.ts';
 import { createReminderScheduler } from '../reminders/index.ts';
@@ -51,7 +50,6 @@ import {
   HISTORY_CAP,
   historyOptOutReason,
   loadHistory,
-  searchHistory,
 } from '../storage/history.ts';
 import { closeDb, computeUsageStats, countMessagesBySession } from '../storage/index.ts';
 import { createContextPinsStore } from '../storage/repos/context-pins.ts';
@@ -85,9 +83,16 @@ import { operatorBootstrapFlags, reportRefusingEngine } from './boot-parity.ts';
 import { type BootstrapInput, type BootstrapResult, bootstrap } from './bootstrap.ts';
 import { maybeEmitHistoryBanner } from './history-banner.ts';
 import { concatQueuedBodies } from './inbox-drain.ts';
+import {
+  formatNotification,
+  formatNotificationHeadline,
+  type NotificationPayload,
+  NotificationQueue,
+} from './notification-queue.ts';
 import { PROJECT_GUIDE_FILENAMES } from './project-context.ts';
 import { prepareResumeContext } from './resume-prepare.ts';
 import { replayProviderMessages, replaySessionMessages } from './resume-replay.ts';
+import { ReverseSearchController } from './reverse-search-controller.ts';
 import { resolveResumeIdOnDb } from './run.ts';
 import { shapeSystemPrompt } from './shape-system-prompt.ts';
 import {
@@ -202,7 +207,7 @@ export interface RunReplOptions {
 // `session:end` so the renderer wouldn't flip into `ended` state
 // between REPL turns and hide the input box. With `state.ended` no
 // longer gating draws (renderer.ts), the filter became unnecessary —
-// session:end now produces the turn-end marker (`Cogitated for X`,
+// session:end now produces the turn-end marker (`Worked for X`,
 // UI.md §3.2) on every turn, the input stays visible during the
 // gap between session:end and the next user:submit, and one-shot
 // callers still get their final marker.
@@ -349,6 +354,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // duration; the /compact body composes this with its own timeout. Without
   // it, Ctrl+C during a stalled compaction does nothing.
   let compactAbortController: AbortController | null = null;
+  // The in-flight exclusive prep — a /compact `runExclusive` fold or a
+  // full/summary --resume `prepareResumeContext` + replay — or null. It reads
+  // the DB and emits to the bus but, unlike a turn, has no `runningPromise`, so
+  // shutdown() awaits THIS to avoid closing the renderer/DB underneath it.
+  // Resolved from each flow's own `finally`, so awaiting it never throws.
+  let compactionPromise: Promise<void> | null = null;
   // Kill switch for the in-flight `!cmd`, handed up by the executor so
   // the interrupt path (Ctrl+C / Esc) can terminate the command's
   // process group instead of waiting out the timeout. Null when no
@@ -786,10 +797,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // Bound the inbox (§9): past MAX_PENDING_PEER_MESSAGES queued, drop the newest
     // with a one-shot notice rather than grow heap / build an oversized coalesced
     // turn. Re-armed when the queue drains (drainNotifications).
-    const pendingPeers = notifications.reduce(
-      (acc, n) => acc + (n.kind === 'peer_message' ? 1 : 0),
-      0,
-    );
+    const pendingPeers = notifQueue.peerMessageCount();
     if (pendingPeers >= MAX_PENDING_PEER_MESSAGES) {
       if (!peerInboxFullAnnounced) {
         peerInboxFullAnnounced = true;
@@ -1368,78 +1376,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // re-runs searchHistory against the project's table; Ctrl+R while
   // open cycles to older matches with the same query.
   //
-  // Cap match list at 200 — operator scrolls via Ctrl+R, which means
-  // visiting more than ~10 entries is rare; 200 is generous enough
-  // to cover heavy typists without keeping a 10k-row mirror in JS
-  // for every keystroke.
-  const REVERSE_SEARCH_LIMIT = 200;
-  let reverseSearchQuery: string | null = null;
-  let reverseSearchResults: string[] = [];
-  let reverseSearchIdx = -1;
-
-  const isReverseSearchOpen = (): boolean => reverseSearchQuery !== null;
-
-  // Sanitize a query before it lands in state. The overlay renders as
-  // a single visual row (HISTORY.md §2.2); embedded newlines from a
-  // multi-line paste would otherwise spill into multiple rows and
-  // break the live region's row accounting. Collapse `\r?\n` → space,
-  // matching the same treatment we apply to recalled multi-line
-  // matches in render/reverse-search.ts.
-  const sanitizeReverseSearchQuery = (raw: string): string => raw.replace(/\r?\n/g, ' ');
-
-  const refreshReverseSearch = (query: string): void => {
-    const clean = sanitizeReverseSearchQuery(query);
-    reverseSearchQuery = clean;
-    reverseSearchResults =
-      clean === '' ? [] : searchHistory(db, baseConfig.cwd, clean, REVERSE_SEARCH_LIMIT);
-    reverseSearchIdx = reverseSearchResults.length > 0 ? 0 : -1;
-    bus.emit({
-      type: 'reverse-search:update',
-      ts: now(),
-      query: clean,
-      results: reverseSearchResults,
-      selectedIdx: reverseSearchIdx,
-    });
-  };
-
-  const openReverseSearch = (): void => {
-    if (isReverseSearchOpen()) return;
-    refreshReverseSearch('');
-  };
-
-  const closeReverseSearch = (): void => {
-    if (!isReverseSearchOpen()) return;
-    reverseSearchQuery = null;
-    reverseSearchResults = [];
-    reverseSearchIdx = -1;
-    bus.emit({ type: 'reverse-search:close', ts: now() });
-  };
-
-  const cycleReverseSearchOlder = (): void => {
-    if (!isReverseSearchOpen() || reverseSearchResults.length === 0) return;
-    // Clamp at the oldest match (last index). Ctrl+R past the bottom
-    // is a no-op rather than a wrap — bash beeps in this case; we
-    // just stop. Cycling past oldest would surprise an operator who
-    // expects "more presses → older".
-    if (reverseSearchIdx < reverseSearchResults.length - 1) {
-      reverseSearchIdx += 1;
-    }
-    bus.emit({
-      type: 'reverse-search:update',
-      ts: now(),
-      query: reverseSearchQuery ?? '',
-      results: reverseSearchResults,
-      selectedIdx: reverseSearchIdx,
-    });
-  };
-
-  // The match the operator is currently looking at, or null when the
-  // overlay has zero matches. Used by accept (Enter / Tab) to know
-  // what to drop into the input buffer.
-  const currentReverseSearchMatch = (): string | null => {
-    if (reverseSearchIdx < 0) return null;
-    return reverseSearchResults[reverseSearchIdx] ?? null;
-  };
+  const reverseSearch = new ReverseSearchController({ db, cwd: baseConfig.cwd, bus, now });
+  // Thin wrappers so the keypress handler's call sites keep their spelling; the
+  // overlay's state + logic live in ReverseSearchController (reverse-search-controller.ts).
+  const isReverseSearchOpen = (): boolean => reverseSearch.isOpen();
+  const refreshReverseSearch = (query: string): void => reverseSearch.refresh(query);
+  const openReverseSearch = (): void => reverseSearch.open();
+  const closeReverseSearch = (): void => reverseSearch.close();
+  const cycleReverseSearchOlder = (): void => reverseSearch.cycleOlder();
+  const currentReverseSearchMatch = (): string | null => reverseSearch.currentMatch();
   // Two controllers per turn (spec UI.md §3 soft/hard distinction):
   //   abortController     → hard, preempts in-flight work (mid-tool kill,
   //                         provider-stream cancel). Fires on second
@@ -1508,56 +1453,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // adds a variant to the union and a `case` to the formatter.
   // `drainNotifications` is forward-declared like `drainInbox` (body
   // assigned after startTurn, since the wake calls startTurn).
-  type BgDoneNotification = {
-    kind: 'bg_done';
-    command: string;
-    status: 'exited' | 'killed' | 'failed';
-    exitCode: number | null;
-    processId: string;
-    // Head-tail of the process output (OUTPUT_POLICY), read
-    // observationally at completion so the model sees the result in the
-    // wake-turn without a bash_output round-trip. Undefined when the
-    // process was silent or the read failed; the full output is always
-    // recoverable via bash_output(processId).
-    summary?: string;
-  };
-  type ReminderNotification = {
-    kind: 'reminder';
-    // The model-authored context that becomes the wake-turn input — the
-    // reminder's headline IS the note (no separate body/summary).
-    note: string;
-    scheduledAt: number;
-  };
-  type PeerMessageNotification = {
-    kind: 'peer_message';
-    // Peer alias (scrollback origin header + the reply handle in the untrusted
-    // preamble). `text` is the raw peer message — a request, a reply, or a
-    // follow-up (the wire doesn't distinguish, §4) — enveloped as untrusted DATA
-    // before it reaches the model.
-    peerAlias: string;
-    text: string;
-  };
-  // Reply safety net (MESH.md §6.4): a peer-driven turn ended with no mesh_send back
-  // to a peer we owe. Enqueued at session_finished; drives ONE wake-turn whose input
-  // tells the model to answer via mesh_send. Harness-authored (the aliases are
-  // grammar-validated), NOT untrusted peer text — so it is not enveloped.
-  type PeerReplyNudgeNotification = {
-    kind: 'peer_reply_nudge';
-    aliases: string[];
-  };
-  // Producer payload (no id yet); `enqueueNotification` stamps the id.
-  type NotificationPayload =
-    | BgDoneNotification
-    | ReminderNotification
-    | PeerMessageNotification
-    | PeerReplyNudgeNotification;
-  type Notification =
-    | (BgDoneNotification & { id: string })
-    | (ReminderNotification & { id: string })
-    | (PeerMessageNotification & { id: string })
-    | (PeerReplyNudgeNotification & { id: string });
-  const notifications: Notification[] = [];
-  let notifSeq = 0;
+  const notifQueue = new NotificationQueue();
   // Peer attribution (MESH.md §6.2): the alias(es) of the peer(s) whose message(s)
   // drive the CURRENT turn, or null on operator/non-peer turns. Set at the drain
   // when the batch contains a peer_message; kept so a confirm firing mid-turn can
@@ -1643,61 +1539,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // notice, re-armed when the queue drains). Generous — legitimate bursts are small.
   const MAX_PENDING_PEER_MESSAGES = 32;
   let peerInboxFullAnnounced = false;
-  // The headline line — the `● `-able status sentence, no body. One
-  // `case` per producer `kind`.
-  const formatNotificationHeadline = (n: Notification): string => {
-    switch (n.kind) {
-      case 'bg_done': {
-        const code = n.exitCode === null ? '' : ` (exit ${n.exitCode})`;
-        return (
-          `[background] \`${flattenControlToLine(n.command)}\` ${n.status}${code}. ` +
-          `process_id=${n.processId} — read complete output with bash_output.`
-        );
-      }
-      case 'reminder':
-        return `[reminder] ${flattenControlToLine(n.note)}`;
-      case 'peer_message':
-        // Peer alias is attacker-controlled — flatten control/ANSI (like
-        // bg_done/reminder) so it can't spoof the operator's scrollback. Name the
-        // channel ("peer") — unlike [background]/[reminder] the bare alias gives no
-        // cue this came in over the mesh from ANOTHER repo.
-        return `▸ peer '${flattenControlToLine(n.peerAlias)}'`;
-      case 'peer_reply_nudge': {
-        // Dual audience: the operator sees this in scrollback (● [reply pending] …)
-        // and the model receives it as the wake-turn input (formatNotification returns
-        // the headline verbatim — harness-authored, not enveloped). Names what a prose
-        // answer does NOT do (the observed miss) and points at mesh_send — but ALSO
-        // that a concluded exchange needs NO reply. Without that, two polite instances
-        // ping-pong farewells (each closing message becomes the other's inbound → its
-        // own nudge → another closing message) until the wake cap pauses it.
-        const who = n.aliases.map((a) => `'${flattenControlToLine(a)}'`).join(', ');
-        const one = n.aliases.length === 1;
-        const noun = one ? 'peer' : 'peers';
-        const verb = one ? 'is' : 'are';
-        const them = one ? 'it' : 'them';
-        return `[reply pending] ${noun} ${who} ${verb} unanswered over the mesh — your plain text reply, if any, did NOT reach ${them}. If you owe a real answer or a decision, call mesh_send now. If the exchange has simply run its course (a thanks or a goodbye needs no reply), just end the turn — do NOT send another closing message back. Either way you will not be reminded again.`;
-      }
-    }
-  };
-  // Full text fed to the model as the wake-turn input: headline + any
-  // attached body. Only bg_done carries a body (the output head-tail);
-  // reminder's headline is complete on its own.
-  const formatNotification = (n: Notification): string => {
-    // A peer message is fed to the model enveloped as untrusted DATA (§5.2) — NOT
-    // the operator-facing origin headline. To respond, the model calls mesh_send
-    // back to the alias (this turn or a later one — §6.4).
-    if (n.kind === 'peer_message') return framePeerMessage(n.peerAlias, n.text);
-    return n.kind === 'bg_done' && n.summary !== undefined
-      ? `${formatNotificationHeadline(n)}\n${n.summary}`
-      : formatNotificationHeadline(n);
-  };
   // Head + tail caps for the inline summary. The tail is bigger: for a
   // build/test, the RESULT (pass/fail counts, errors) lives at the END.
   const enqueueNotification = (n: NotificationPayload): void => {
-    // Spreading a discriminated union widens `kind` (a known TS quirk),
-    // so cast back to the union after stamping the id — the spread only
-    // adds `id`, the variant fields are untouched.
-    notifications.push({ ...n, id: String(notifSeq++) } as Notification);
+    notifQueue.push(n);
     // Wake-when-idle: nothing running → drain now (fires a turn). During
     // a turn, the boundary drain (drainInbox → drainNotifications) gets
     // it instead.
@@ -1749,13 +1594,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // seconds in ref deletion") AFTER session_finished is emitted —
     // those are bookkeeping, not turn-visible work. Pre-fix the
     // Promise chain held `running=true` through that window, so the
-    // operator who saw `Cogitated for Xs` rendered and started typing
+    // operator who saw `Worked for Xs` rendered and started typing
     // immediately found that Enter was silently gated and Ctrl+C
     // routed to triggerInterrupt-on-resolved-abort (no-op). Visibly
     // identical to "input frozen" for several seconds.
     //
     // Cumulative totals + lastSessionId are also rolled up here so a
-    // back-to-back submit (operator hits Enter the moment Cogitated
+    // back-to-back submit (operator hits Enter the moment Worked
     // appears) sees the correct prior session id for resume — the
     // runAgent Promise's `.then` would not have fired yet under the
     // old timing.
@@ -2396,7 +2241,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     const runAgentImpl = options.runAgentOverride ?? runAgent;
     // Cumulative totals + lastSessionId are rolled up in
     // `onHarnessEvent` on `session_finished` (synchronous with
-    // Cogitated rendering) — see the comment there. The .then()
+    // Worked rendering) — see the comment there. The .then()
     // here intentionally does no bookkeeping; it exists only so
     // .catch can intercept rejections from runAgent itself
     // (provider crash before any harness event, etc.).
@@ -2560,7 +2405,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // later boundary or the operator's next submit.
   drainNotifications = (): void => {
     if (exiting || isBusy()) return;
-    if (notifications.length === 0) return;
+    if (notifQueue.size() === 0) return;
     // Operator-typing gate: don't steal the turn while they compose.
     if (renderer.state().input.value.length > 0) return;
     // Consecutive-wake cap: anti-loop backstop. peer_message RESPECTS the cap now
@@ -2573,7 +2418,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       // is theirs, and silence would strand a waiting peer. Only for peer_message;
       // bg_done/reminder semi-pushing at the cap is the ordinary, already-visible case.
       if (!peerPausePendingAnnounced) {
-        const waiting = notifications.filter((n) => n.kind === 'peer_message').length;
+        const waiting = notifQueue.peerMessageCount();
         if (waiting > 0) {
           peerPausePendingAnnounced = true;
           bus.emit({
@@ -2596,7 +2441,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // messages — from one peer or several — becomes one turn, so the model sees
     // them together and replies/consolidates as it decides; bg_done/reminder ride
     // along. Each still renders its own scrollback line with its origin stamp.
-    const drained = notifications.splice(0);
+    const drained = notifQueue.drainAll();
     consecutiveWakes += 1;
     peerInboxFullAnnounced = false; // the queue drained → re-arm the inbox-full cue
     // Surface each notification in the scrollback as a system `info` entry (distinct
@@ -2671,6 +2516,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // function does the work without needing its own guard.
   const shutdown = async (): Promise<void> => {
     if (abortController !== null) abortController.abort();
+    // A /compact fold or a full/summary --resume prep holds the exclusive
+    // compaction handle (compactAbortController), NOT abortController — a
+    // process-level stop (SIGTERM/HUP/QUIT) or a Ctrl+D quit can land while one
+    // is in flight. Abort it so prepareResumeContext / the summary fold unwinds
+    // via its deterministic fallback instead of blocking teardown; the awaited
+    // settle below then lets its DB reads + bus emits finish before we close.
+    if (compactAbortController !== null) compactAbortController.abort();
     // SIGKILL an in-flight operator `!cmd`'s process group so it doesn't
     // outlive the REPL (detached → would keep running for up to the
     // timeout) and so its completion settles + emits BEFORE renderer.close
@@ -2701,6 +2553,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // settled with an error already surfaced as the bash card.
       }
     }
+    // Same use-after-close guard for an in-flight exclusive compaction /
+    // resume-prep (aborted above): let it settle — it reads the DB and emits to
+    // the bus — before renderer/DB teardown. Resolves from that work's own
+    // `finally`, so the await never throws.
+    const cp = compactionPromise;
+    if (cp !== null) await cp;
     modalManager.close();
     renderer.close();
     stdin.removeListener('data', onData);
@@ -2712,7 +2570,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // §13.7 broker drain BEFORE storage close — same rationale as
     // src/cli/run.ts. Awaits in-flight exec; closes idempotently.
     if (baseConfig.broker !== undefined) {
-      await baseConfig.broker.close();
+      try {
+        await baseConfig.broker.close();
+      } catch {
+        // Best-effort: a broker that rejects on close must not strand the
+        // rest of teardown (closeDb + resolveExit below) — an unguarded
+        // reject here escapes `void shutdown()` (no `.catch`), so
+        // `await exitPromise` never resolves: the REPL hangs forever with a
+        // dirty WAL. Matches the bgManager/mcpManager guards below.
+      }
     }
     // Session-scoped bg processes (spec ORCHESTRATION.md §3B.1): the
     // REPL owns the holder, so teardown runs HERE at session exit, not
@@ -2741,7 +2607,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // socket, remove the descriptor. The CLI owns this teardown
     // (harness/types.ts) — without it the .sock + descriptor leak on exit.
     if (baseConfig.meshManager !== undefined) {
-      await baseConfig.meshManager.shutdown();
+      try {
+        await baseConfig.meshManager.shutdown();
+      } catch {
+        // Best-effort — a mesh shutdown reject must not block closeDb /
+        // resolveExit (see the broker guard above); it would hang exit.
+      }
     }
     // Session-scoped reminders (ORCHESTRATION.md §3B.9): clear every
     // pending timer so a fired callback can't run after teardown. Pure
@@ -2984,9 +2855,17 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       compactAbortController = ctrl;
       compacting = true;
       syncBusy();
+      // Expose an awaitable settle so a shutdown() landing mid-fold waits for
+      // this compaction before closing the DB/renderer (resolved in `finally`).
+      let settleCompaction: () => void = () => {};
+      compactionPromise = new Promise<void>((resolve) => {
+        settleCompaction = resolve;
+      });
       try {
         return await fn(ctrl.signal);
       } finally {
+        settleCompaction();
+        compactionPromise = null;
         compactAbortController = null;
         compacting = false;
         syncBusy();
@@ -3229,7 +3108,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         }
         // Backspace shortens the query and re-runs the search.
         if (key.name === 'backspace') {
-          const q = reverseSearchQuery ?? '';
+          const q = reverseSearch.query() ?? '';
           refreshReverseSearch(q.slice(0, -1));
           cancelExitArm();
           return true;
@@ -3296,14 +3175,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // Esc to leave the overlay and then has the full editor
         // shortcut palette available again.
         if (key.ctrl) return true;
-        const q = reverseSearchQuery ?? '';
+        const q = reverseSearch.query() ?? '';
         refreshReverseSearch(q + key.char);
         cancelExitArm();
         return true;
       }
       // Paste: append the pasted text wholesale and re-search.
       if (key.kind === 'paste') {
-        const q = reverseSearchQuery ?? '';
+        const q = reverseSearch.query() ?? '';
         refreshReverseSearch(q + key.text);
         cancelExitArm();
         return true;
@@ -3890,6 +3769,30 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   };
   process.on('SIGINT', sigintHandler);
 
+  // SIGTERM / SIGHUP / SIGQUIT: process-level "stop" (operator, systemd,
+  // terminal close, SSH hangup) — distinct from SIGINT's interactive
+  // per-turn interrupt above. Pre-slice the long-lived REPL trapped NONE of
+  // these (only the one-shot `run.ts` path installs the full suite via
+  // `signal.ts`), so the runtime took Node's default termination: bg
+  // children the LLM spawned orphaned to PID 1 and the DB closed dirty (no
+  // WAL checkpoint). Trap them like the one-shot path — hard-abort a running
+  // turn so the harness unwinds, then run the same graceful `shutdown()`
+  // (bgManager.cleanup() SIGTERMs every live bg job; broker + DB close).
+  // The renderer no-ops after close(), so the aborted turn's async unwind
+  // can emit freely. Exit code is 128+signum, matching the shell convention
+  // and Node's own default for an untrapped signal.
+  const terminate = (code: number): void => {
+    if (running && abortController !== null) abortController.abort();
+    exitCode = code;
+    requestShutdown();
+  };
+  const sigtermHandler = (): void => terminate(143);
+  const sighupHandler = (): void => terminate(129);
+  const sigquitHandler = (): void => terminate(131);
+  process.on('SIGTERM', sigtermHandler);
+  process.on('SIGHUP', sighupHandler);
+  process.on('SIGQUIT', sigquitHandler);
+
   // Welcome banner (UI.md §4.10.9). Goes to scrollback before any
   // live frame so it sits at the top of the conversation transcript.
   // Env summary entries land conditionally — D68 says omit when
@@ -4137,6 +4040,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // into its deterministic fallback, so the prep still completes.
         const prepAbort = new AbortController();
         compactAbortController = prepAbort;
+        // Awaitable settle so a shutdown() landing mid-prep waits for the
+        // hydrate / compaction / replay (all DB + bus work) before teardown
+        // closes the DB/renderer (resolved in `finally`).
+        let settleCompaction: () => void = () => {};
+        compactionPromise = new Promise<void>((resolve) => {
+          settleCompaction = resolve;
+        });
         try {
           // Hydrate the WHOLE log (uncapped) and, for summary, compact BEFORE
           // replay (so the scrollback shows only what survives). Shared with the
@@ -4205,6 +4115,8 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           liveContext = ctx;
           resumeRecapPending = true;
         } finally {
+          settleCompaction();
+          compactionPromise = null;
           compactAbortController = null;
           resumePrepping = false;
           syncBusy();
@@ -4249,5 +4161,8 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
 
   await exitPromise;
   process.removeListener('SIGINT', sigintHandler);
+  process.removeListener('SIGTERM', sigtermHandler);
+  process.removeListener('SIGHUP', sighupHandler);
+  process.removeListener('SIGQUIT', sigquitHandler);
   return exitCode;
 };

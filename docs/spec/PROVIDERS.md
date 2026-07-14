@@ -102,6 +102,8 @@ Atualizada por release. Valores são representativos; ver `~/.config/agent/model
 
 \* OpenAI tem prefix-cache automático (não controlável; hit é probabilístico).
 
+**xai/grok-4.5** (família `xai`, nativa em api.x.ai — §3.6): tools `native` · cache `server_5min` (automático, sem breakpoints) · vision `no` (adapter text-only) · streaming `yes` · constrained `tools` · context 500k · out max 32k · max tools/step 12. Reasoning via `reasoning_effort` flat (low/medium/high, default high, não-desabilitável).
+
 Provider adicionado depois faz PR atualizando esta tabela.
 
 ---
@@ -196,6 +198,27 @@ Provider adicionado depois faz PR atualizando esta tabela.
 
 A documentar quando adapter for implementado. Notable: 1M context window; pricing model peculiar; cache different from Anthropic.
 
+### 3.6 xAI (Grok)
+
+Endpoint **nativo** `https://api.x.ai/v1` (bearer `XAI_API_KEY`), família `xai`. Distinto da rota via OpenRouter (`openrouter/x-ai/grok-4.5`): esta fala com a xAI direto.
+
+**Strengths:**
+- API OpenAI-compatible (Chat Completions) — reusa a montagem de mensagens/tools do adapter OpenAI (`toOpenAIMessages` / `toOpenAITools`).
+- Prompt cache automático server-side (read descontado ~4×; reportado em `usage.prompt_tokens_details.cached_tokens`).
+- `reasoning_content` streamado (chain-of-thought ao vivo) — exposto como `thinking_delta` para a UI.
+- grok-4.5: janela 500K, forte em coding/agentic (recomendação da própria xAI para código).
+
+**Quirks:**
+- **`reasoning_effort` é FLAT** (Chat Completions), não o objeto aninhado `reasoning:{effort}` do OpenRouter nem a Responses API do OpenAI. Valores `low`/`medium`/`high` (default `high`); **não há `none`/`xhigh`** e no grok-4.5 **reasoning não pode ser desabilitado**.
+- **`stop` é rejeitado por modelos de reasoning** (erro na API) — o adapter só envia `stop` para modelo não-reasoning.
+- **`max_completion_tokens`** é o campo corrente (limita a saída VISÍVEL, excluindo tokens de reasoning); `max_tokens` é deprecated.
+- **Sem replay de reasoning**: Chat Completions não tem slot de entrada para reasoning — o `reasoning_content` é só display; `replaysReasoning: false`.
+- Multimodal upstream, mas o adapter é **text-only** por ora (`vision: false`).
+
+**Defesas no adapter:**
+- Tradução do effort agnóstico via `XAI_REASONING_EFFORT` (low/medium/high 1:1; `xhigh`/`max` → `high`; disable intent `thinking_budget:0` é descartado pois grok-4.5 não para de raciocinar).
+- Gate de `stop` por capability de reasoning; `reasoning_content`/`reasoning` → `thinking_delta`; usage split `input = prompt − cached`, `cache_creation = 0`.
+
 ---
 
 ## 4. Recommended combos by workflow
@@ -237,6 +260,7 @@ User override em `~/.config/agent/config.toml`.
 | anthropic/haiku-4-5 | $0.25 | $1.25 | $0.025 |
 | openai/gpt-4o | $2.50 | $10.00 | n/a |
 | openai/gpt-4o-mini | $0.15 | $0.60 | n/a |
+| xai/grok-4.5 | $2.00 | $6.00 | $0.50 |
 | ollama/* | $0 | $0 | n/a |
 | llama.cpp/* | $0 | $0 | n/a |
 

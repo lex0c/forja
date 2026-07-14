@@ -114,7 +114,7 @@ export const SGR = {
   dim: `${CSI}2m`,
   // `secondary` is the visible-grey variant of dim, used for meta
   // that must stand out from the primary content (turn-end marker
-  // `Cogitated for X`). SGR 2 (faint) is invisible on many xterm
+  // `Worked for X`). SGR 2 (faint) is invisible on many xterm
   // configs; SGR 90 (bright-black ≈ grey) is universal. Distinct
   // token from `dim` so we don't recolor every dim element on the
   // screen — rules, footer hints, sub-content connectors stay in

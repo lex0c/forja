@@ -1,14 +1,14 @@
 // Resume scrollback replay. Reads persisted messages for a session
 // and emits the UIEvents that rebuild the visual scrollback the
 // operator saw at exit. Slice 3 (this file): user prompts +
-// assistant text + tool cards + the per-run `Cogitated for Xs`
+// assistant text + tool cards + the per-run `Worked for Xs`
 // footer.
 //
 // Why timestamps matter. The reducer's `assistant:end` branch reads
 // `event.ts - buf.startedAt` to fill `durationMs` on the assistant
 // PermanentItem (UI.md §3.2 turn-end marker). Synthesizing replay
 // timestamps from a single now() snapshot collapses the duration to
-// 0 and the footer renders `Cogitated for 0s` — accurate for the
+// 0 and the footer renders `Worked for 0s` — accurate for the
 // replay itself but a lie about the original turn. So we use the
 // persisted `createdAt` of each message: `assistant:start.ts` =
 // the immediately preceding message's createdAt (user submit for
@@ -22,7 +22,7 @@
 // assistant message per LLM completion: a run with tool_use can
 // produce assistant → user(tool_result) → assistant chains across
 // several rows (see src/harness/loop.ts). The live operator saw
-// ONE `Cogitated for Xs` footer at the end of the whole run, not
+// ONE `Worked for Xs` footer at the end of the whole run, not
 // one per assistant row. We mirror that here: `session:end` fires
 // only at the run boundary (= the last assistant message before
 // either end-of-session or a user message with STRING content,
@@ -59,6 +59,7 @@
 
 import { ALIGNMENT_FETCH_MARGIN, MAX_RESUME_MESSAGES, resumeWindowCut } from '../harness/resume.ts';
 import type { ProviderMessage } from '../providers/index.ts';
+import { sanitizeCardSubject, stripAnsi } from '../sanitize/index.ts';
 import { type DB, listMessageTailBySession } from '../storage/index.ts';
 import type { Bus } from '../tui/bus.ts';
 import { lookupToolVocab } from '../tui/tool-vocab.ts';
@@ -139,7 +140,12 @@ const subjectFromInput = (
 ): string | null => {
   if (typeof input !== 'object' || input === null || Array.isArray(input)) return null;
   try {
-    return vocab.subject?.(input as Record<string, unknown>) ?? null;
+    const raw = vocab.subject?.(input as Record<string, unknown>) ?? null;
+    // The subject is model-authored (a bash command / grep pattern /
+    // path). This replay path bypasses the live adapter, so a persisted
+    // ESC/BEL/CR would reach the terminal on resume — run it through the
+    // SAME `sanitizeCardSubject` the live card uses so both render alike.
+    return sanitizeCardSubject(raw);
   } catch {
     return null;
   }
@@ -244,7 +250,11 @@ const emitAssistantBlocks = (
   if (typeof content === 'string') {
     if (content.length > 0) {
       ensureStart();
-      bus.emit({ type: 'assistant:delta', ts: bodyTs, messageId, text: content });
+      // Persisted assistant prose is stored raw (collect.ts appends
+      // model text verbatim); the live path strips ANSI at the adapter,
+      // so this replay path must strip too or a resumed session renders
+      // raw model control bytes to the terminal.
+      bus.emit({ type: 'assistant:delta', ts: bodyTs, messageId, text: stripAnsi(content) });
     }
   } else if (Array.isArray(content)) {
     for (const block of content) {
@@ -258,7 +268,9 @@ const emitAssistantBlocks = (
       };
       if (b.type === 'text' && typeof b.text === 'string' && b.text.length > 0) {
         ensureStart();
-        bus.emit({ type: 'assistant:delta', ts: bodyTs, messageId, text: b.text });
+        // Strip ANSI/C0 (parity with the live adapter, which sanitizes
+        // assistant deltas at intake — see the string branch above).
+        bus.emit({ type: 'assistant:delta', ts: bodyTs, messageId, text: stripAnsi(b.text) });
       } else if (b.type === 'tool_use' && typeof b.id === 'string' && typeof b.name === 'string') {
         const vocab = lookupToolVocab(b.name);
         bus.emit({
@@ -434,7 +446,7 @@ export const replaySessionMessages = (
         // that clean stop: the prior run crashed / was killed
         // with a tool outstanding (or before its result was
         // persisted). Emitting reason='done' there would render a
-        // successful "Cogitated for Xs" marker over a dead run —
+        // successful "Worked for Xs" marker over a dead run —
         // misrepresenting it as completed and misleading the
         // operator about what the resumed context holds. Mark it
         // 'interrupted' so the footer reads "Interrupted after Xs"
@@ -473,7 +485,7 @@ const SUMMARY_MARKER = '[compacted_history]';
 // the scrollback. Unlike replaySessionMessages (DB rows with real createdAt),
 // this renders an in-memory array whose head is the synthetic compaction
 // summary — there are no per-message timestamps, so turn/tool durations render
-// as 0 / "Cogitated." (acceptable for a resumed-compacted view). The summary
+// as 0 / "Worked." (acceptable for a resumed-compacted view). The summary
 // head is painted in the secondary (scaffold) channel, NEVER as an operator
 // inverse bar. Compacting BEFORE replay is the whole point: the scrollback
 // shows only what survives (summary + preserved tail), not the folded history.
@@ -564,7 +576,7 @@ export const replayProviderMessages = (
         startTs: now,
         bodyTs: now,
       });
-      // Run boundary: close the footer (no durationMs → "Cogitated." without a
+      // Run boundary: close the footer (no durationMs → "Worked." without a
       // bogus "0s" — timestamps don't survive into the compacted array).
       if (!isMidRun && runActive) {
         bus.emit({

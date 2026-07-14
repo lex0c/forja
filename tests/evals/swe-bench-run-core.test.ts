@@ -134,6 +134,7 @@ describe('allowHostsFor', () => {
   const entries: CatalogEntry[] = [
     { id: 'openrouter/deepseek/deepseek-r1', api_key_env: 'OPENROUTER_API_KEY' },
     { id: 'google/gemini-2.5-flash', api_key_env: 'GOOGLE_API_KEY' },
+    { id: 'xai/grok-4.5', api_key_env: 'XAI_API_KEY' },
     {
       id: 'ollama/qwen3-coder:480b',
       base_url: 'https://ollama.com',
@@ -141,11 +142,12 @@ describe('allowHostsFor', () => {
     },
   ];
 
-  test('seeded openrouter/google (no base_url) resolve via the provider-family default', () => {
+  test('seeded openrouter/google/xai (no base_url) resolve via the provider-family default', () => {
     expect(allowHostsFor(['openrouter/deepseek/deepseek-r1'], entries)).toEqual(['openrouter.ai']);
     expect(allowHostsFor(['google/gemini-2.5-flash'], entries)).toEqual([
       'generativelanguage.googleapis.com',
     ]);
+    expect(allowHostsFor(['xai/grok-4.5'], entries)).toEqual(['api.x.ai']);
   });
   test("an entry's base_url wins over the family default", () => {
     expect(allowHostsFor(['ollama/qwen3-coder:480b'], entries)).toEqual(['ollama.com']);

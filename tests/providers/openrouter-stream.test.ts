@@ -154,6 +154,28 @@ describe('normalizeOpenRouterStream', () => {
     expect(ev.at(-1)).toEqual({ kind: 'stop', reason: 'tool_use' });
   });
 
+  test('a tool name split across deltas is accumulated to the full name', async () => {
+    // `read_` then `file` must reconstruct to `read_file`, not the first fragment.
+    const ev = await collect([
+      {
+        choices: [{ delta: { tool_calls: [{ index: 0, id: 'c1', function: { name: 'read_' } }] } }],
+      },
+      { choices: [{ delta: { tool_calls: [{ index: 0, function: { name: 'file' } }] } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{"p":1}' } }] } }] },
+      { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+    ]);
+    expect(ev.find((e) => e.kind === 'tool_use_start')).toEqual({
+      kind: 'tool_use_start',
+      id: 'c1',
+      name: 'read_file',
+    });
+    expect(ev.find((e) => e.kind === 'tool_use_stop')).toEqual({
+      kind: 'tool_use_stop',
+      id: 'c1',
+      final_args: { p: 1 },
+    });
+  });
+
   test('in-band error via finish_reason=error surfaces an error event and stops', async () => {
     const ev = await collect([
       { id: 'm1', choices: [{ delta: { content: 'partial' } }] },

@@ -18,7 +18,7 @@
 // the sub-second branch so a single skew tick doesn't visually jump
 // the chip between units.
 //
-// NOT used by the turn-end footer (`Cogitated for X`) or the live
+// NOT used by the turn-end footer (`Worked for X`) or the live
 // subagent row — those carry their own editorial / tabular duration
 // shapes by design (see permanent.ts §session-footer, subagent-row.ts).
 export const formatChipDuration = (ms: number): string => {
@@ -39,7 +39,7 @@ export const formatChipDuration = (ms: number): string => {
 };
 
 // Coarse duration for non-chip surfaces — the turn-end footer
-// (`Cogitated for 8s`) and the live subagent row (`· 2s`). Whole
+// (`Worked for 8s`) and the live subagent row (`· 2s`). Whole
 // seconds, no sub-second decimal: those lines read as prose / a
 // table cell where `8.2s` would be noise. Same `< 1s → ms` and
 // `≥ 1min → 1m23s` shape as `formatChipDuration`; only the

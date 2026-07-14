@@ -446,6 +446,93 @@ describe('repl — boot + smoke', () => {
     expect(stderr).toContain('forja: budget config: bad budget value');
   });
 
+  test('SIGTERM triggers graceful shutdown (broker + db close) and exits 143', async () => {
+    // The long-lived REPL must trap SIGTERM/SIGHUP/SIGQUIT like the one-shot
+    // path: pre-fix it wired only SIGINT, so a SIGTERM (systemd stop, SSH
+    // hangup, terminal close) took Node's default termination — bg children
+    // orphaned to PID 1 and the DB closed dirty. Now it runs the graceful
+    // shutdown() and exits 128+signum.
+    let brokerClosed = false;
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({
+        broker: {
+          close: async () => {
+            brokerClosed = true;
+          },
+        },
+      }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    process.emit('SIGTERM' as NodeJS.Signals);
+    expect(await promise).toBe(143);
+    expect(brokerClosed).toBe(true);
+  });
+
+  test('a broker that rejects on close still completes shutdown (no hang)', async () => {
+    // The two shutdown awaits (broker.close, meshManager.shutdown) were
+    // unguarded; a reject escaped `void shutdown()` (no `.catch`), so
+    // `await exitPromise` never resolved — the REPL hung with a dirty WAL.
+    // Guarded now: shutdown finishes and the REPL exits even when broker.close
+    // throws. (Without the guard this test hangs and times out.)
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({
+        broker: {
+          close: async () => {
+            throw new Error('broker close failed');
+          },
+        },
+      }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    process.emit('SIGTERM' as NodeJS.Signals);
+    expect(await promise).toBe(143);
+  });
+
+  test('SIGTERM mid-turn hard-aborts the running turn and still shuts down (exit 143)', async () => {
+    // The orphan scenario the fix targets: a turn is in flight (with the LLM's
+    // bg children) when SIGTERM lands. terminate() hard-aborts the turn, then
+    // shutdown() runs regardless — it does not wait for the turn (the REPL is
+    // event-driven; the aborted turn unwinds on its own into the closed,
+    // no-op renderer).
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+      errSink: () => undefined,
+    });
+    await tick();
+    stdin.feed('do something\r'); // starts a turn (running=true)
+    await tick();
+    process.emit('SIGTERM' as NodeJS.Signals);
+    // The signal hard-aborts the turn; a real runAgent observes the abort and
+    // unwinds. The stub ignores the signal, so settle it explicitly to model
+    // that unwind — shutdown then completes and the REPL exits 143.
+    ra.finish(0);
+    expect(await promise).toBe(143);
+  });
+
   test('aborts boot with exit 2 when the permission engine is refusing (matches run.ts)', async () => {
     // Regression: BootstrapResult is consumed by BOTH run.ts and runRepl,
     // but only run.ts honored `permissionState === 'refusing'`. The REPL
@@ -2583,6 +2670,69 @@ describe('repl — boot + smoke', () => {
     await tick();
     stdin.feed('\x04');
     expect(await promise).toBe(130);
+  });
+
+  test('SIGTERM during /compact waits for the compaction to settle before teardown', async () => {
+    // Regression: a process-level stop (SIGTERM/HUP/QUIT) landing mid-/compact
+    // holds compactAbortController, not abortController. Pre-fix terminate()
+    // only aborted a running turn and shutdown() awaited only runningPromise /
+    // operator bash — so teardown could close the DB/renderer while
+    // runExclusive's fold was still using them. shutdown() now aborts the
+    // compaction handle AND awaits the exclusive fold (compactionPromise).
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    stdin.feed('first\r');
+    await tick();
+    // Turn 1 finishes with a live context whose compact() we can pause.
+    let resolveCompact!: () => void;
+    const compactGate = new Promise<void>((r) => {
+      resolveCompact = r;
+    });
+    const liveCtx = {
+      sessionId: 'sess-1',
+      length: 10,
+      snapshot: () => ({ sessionId: 'sess-1', messages: [], lastMessageId: '' }),
+      restore: () => {},
+      getMessages: () => [],
+      relevanceElide: () => null,
+      compact: async () => {
+        await compactGate;
+        return {
+          messages: [],
+          strategy: 'llm',
+          foldedCount: 5,
+          usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+          usageSeen: true,
+        };
+      },
+    } as unknown as SessionContext;
+    ra.finish(0, { sessionContext: liveCtx });
+    await tick();
+    stdin.feed('/compact\r');
+    await tick(); // /compact is in flight, gated inside compact()
+    let exitCode: number | undefined;
+    void promise.then((c) => {
+      exitCode = c;
+    });
+    process.emit('SIGTERM' as NodeJS.Signals);
+    await tick();
+    await tick();
+    // The guarantee: shutdown is blocked awaiting the in-flight fold — it must
+    // NOT have torn down + resolved while the compaction is still running.
+    expect(exitCode).toBeUndefined();
+    // Release the fold → it settles → shutdown finishes → exit resolves (143).
+    resolveCompact();
+    expect(await promise).toBe(143);
   });
 
   test('Enter while a turn is in flight queues the input, drained at the boundary (INBOX)', async () => {

@@ -25,41 +25,41 @@ describe('formatPermanent', () => {
 
   describe('session-footer (turn-end marker, UI.md §3.2)', () => {
     // Spec change: session-footer renders as a blank line + verb +
-    // wall-clock duration (`Cogitated for 1m23s`, `Aborted after 12s`,
+    // wall-clock duration (`Worked for 1m23s`, `Aborted after 12s`,
     // etc). Both lines respect the §6.3 frame margin. When `durationMs`
     // is absent (legacy / replay), falls back to short form.
 
-    test('done with duration → `Cogitated for X`', () => {
+    test('done with duration → `Worked for X`', () => {
       // 8.2s: 8200ms ≈ 8s rounded.
       expect(
         formatPermanent({ kind: 'session-footer', reason: 'done', durationMs: 8200 }, ascii),
-      ).toEqual([pad(''), pad('Cogitated for 8s')]);
+      ).toEqual([pad(''), pad('Worked for 8s')]);
     });
 
-    test('done with sub-second duration → `Cogitated for Xms`', () => {
+    test('done with sub-second duration → `Worked for Xms`', () => {
       expect(
         formatPermanent({ kind: 'session-footer', reason: 'done', durationMs: 450 }, ascii),
-      ).toEqual([pad(''), pad('Cogitated for 450ms')]);
+      ).toEqual([pad(''), pad('Worked for 450ms')]);
     });
 
-    test('done with multi-minute duration → `Cogitated for XmYs`', () => {
+    test('done with multi-minute duration → `Worked for XmYs`', () => {
       // 13m21s = 801000ms.
       expect(
         formatPermanent({ kind: 'session-footer', reason: 'done', durationMs: 801000 }, ascii),
-      ).toEqual([pad(''), pad('Cogitated for 13m21s')]);
+      ).toEqual([pad(''), pad('Worked for 13m21s')]);
     });
 
     test('done with exact-minute duration drops the seconds clause', () => {
       // 2m exactly = 120000ms.
       expect(
         formatPermanent({ kind: 'session-footer', reason: 'done', durationMs: 120000 }, ascii),
-      ).toEqual([pad(''), pad('Cogitated for 2m')]);
+      ).toEqual([pad(''), pad('Worked for 2m')]);
     });
 
-    test('done WITHOUT duration → short `Cogitated.` fallback', () => {
+    test('done WITHOUT duration → short `Worked.` fallback', () => {
       expect(formatPermanent({ kind: 'session-footer', reason: 'done' }, ascii)).toEqual([
         pad(''),
-        pad('Cogitated.'),
+        pad('Worked.'),
       ]);
     });
 
@@ -121,7 +121,7 @@ describe('formatPermanent', () => {
           { kind: 'session-footer', reason: 'done', abortCause: 'soft', durationMs: 1000 },
           ascii,
         ),
-      ).toEqual([pad(''), pad('Cogitated for 1s')]);
+      ).toEqual([pad(''), pad('Worked for 1s')]);
     });
 
     test('unknown reason capitalizes + duration (graceful unknown)', () => {
@@ -303,7 +303,7 @@ describe('formatPermanent', () => {
   // Assistant kind emits just the AI prose, prepended with a blank
   // line (UI.md §6.3). The legacy `· Generated N tokens in Xs` chip
   // header was removed — duration lives in the turn-end marker
-  // (`Cogitated for Xs`) and tokens live in the footer's right
+  // (`Worked for Xs`) and tokens live in the footer's right
   // column. The chip header was duplicating both signals.
 
   test('assistant emits blank + text lines (single-line)', () => {

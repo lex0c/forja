@@ -45,7 +45,7 @@ describe('buildAutoTerse', () => {
     expect(result.markdown.trim().endsWith('.')).toBe(true);
     // Auto-display passes `omitMetrics: true` to the renderer
     // (RECAP §3.3) so the trailing `<duration>, <cost>.` suffix
-    // is dropped — the TUI surface lives below "Cogitated for X"
+    // is dropped — the TUI surface lives below "Worked for X"
     // which already shows duration + cost. Pin the absence so a
     // future refactor that drops the flag fails this assertion.
     // `, $X.XX.` is the canonical cost suffix shape from formatUsd;

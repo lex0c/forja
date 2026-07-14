@@ -700,7 +700,7 @@ export type PermanentItem =
       kind: 'session-footer';
       reason: string;
       // Wall-clock duration of the run; mirrors SessionEndEvent.
-      // Renderer formats as `Cogitated for 1m23s` for `done`.
+      // Renderer formats as `Worked for 1m23s` for `done`.
       // Optional for legacy paths that don't track timing.
       durationMs?: number;
       abortCause?: 'soft' | 'hard';
@@ -1006,7 +1006,11 @@ export const flushPendingToolEndBatch = (
 // composes the flush around it so the buffer logic stays
 // localized to one place rather than threaded through every
 // case that emits permanent items.
-const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
+type ControlUIEvent = Extract<
+  UIEvent,
+  { type: 'mode:change' | 'relay:change' | 'effort:change' | 'stats:refresh' }
+>;
+const applyControlEvent = (state: LiveState, event: ControlUIEvent): ApplyResult => {
   switch (event.type) {
     case 'mode:change':
       // Mirror the engine's new approval posture into status so the
@@ -1054,6 +1058,20 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         },
         permanent: [],
       };
+    default: {
+      const _exhaustive: never = event;
+      void _exhaustive;
+      throw new Error(`applyControlEvent: unhandled ${(event as { type: string }).type}`);
+    }
+  }
+};
+
+type SessionUIEvent = Extract<
+  UIEvent,
+  { type: 'session:start' | 'session:end' | 'session:banner' }
+>;
+const applySessionEvent = (state: LiveState, event: SessionUIEvent): ApplyResult => {
+  switch (event.type) {
     case 'session:start': {
       const status: StatusState = {
         ...state.status,
@@ -1229,6 +1247,30 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         ],
       };
 
+    default: {
+      const _exhaustive: never = event;
+      void _exhaustive;
+      throw new Error(`applySessionEvent: unhandled ${(event as { type: string }).type}`);
+    }
+  }
+};
+
+type InputUIEvent = Extract<
+  UIEvent,
+  {
+    type:
+      | 'user:submit'
+      | 'inbox:queued'
+      | 'inbox:drained'
+      | 'inbox:edit-start'
+      | 'inbox:edit-commit'
+      | 'inbox:remove'
+      | 'inbox:edit-cancel'
+      | 'input:update';
+  }
+>;
+const applyInputEvent = (state: LiveState, event: InputUIEvent): ApplyResult => {
+  switch (event.type) {
     case 'user:submit':
       return {
         // Clear the input AND reset `ended` so the REPL loop's next
@@ -1314,6 +1356,20 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         permanent: [],
       };
 
+    default: {
+      const _exhaustive: never = event;
+      void _exhaustive;
+      throw new Error(`applyInputEvent: unhandled ${(event as { type: string }).type}`);
+    }
+  }
+};
+
+type AssistantUIEvent = Extract<
+  UIEvent,
+  { type: 'assistant:start' | 'assistant:delta' | 'assistant:usage' | 'assistant:end' }
+>;
+const applyAssistantEvent = (state: LiveState, event: AssistantUIEvent): ApplyResult => {
+  switch (event.type) {
     case 'assistant:start':
       // Clear `awaitingProvider` — the model has started
       // streaming so the "Awaiting model" indicator isn't
@@ -1434,6 +1490,20 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       return { state: { ...state, status, pendingAssistant: null }, permanent };
     }
 
+    default: {
+      const _exhaustive: never = event;
+      void _exhaustive;
+      throw new Error(`applyAssistantEvent: unhandled ${(event as { type: string }).type}`);
+    }
+  }
+};
+
+type ThinkingUIEvent = Extract<
+  UIEvent,
+  { type: 'thinking:start' | 'thinking:delta' | 'thinking:end' }
+>;
+const applyThinkingEvent = (state: LiveState, event: ThinkingUIEvent): ApplyResult => {
+  switch (event.type) {
     case 'thinking:start':
       // Clear `awaitingProvider` — extended thinking started
       // streaming, the more specific indicator takes the slot.
@@ -1479,6 +1549,20 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       return { state: { ...state, thinking: null }, permanent };
     }
 
+    default: {
+      const _exhaustive: never = event;
+      void _exhaustive;
+      throw new Error(`applyThinkingEvent: unhandled ${(event as { type: string }).type}`);
+    }
+  }
+};
+
+type ToolUIEvent = Extract<
+  UIEvent,
+  { type: 'tool:start' | 'tool:execution-started' | 'tool:delta' | 'tool:end' | 'step:budget' }
+>;
+const applyToolEvent = (state: LiveState, event: ToolUIEvent): ApplyResult => {
+  switch (event.type) {
     case 'tool:start': {
       const tool: ActiveTool = {
         toolId: event.toolId,
@@ -1634,6 +1718,31 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       return { state: { ...state, status }, permanent: [] };
     }
 
+    default: {
+      const _exhaustive: never = event;
+      void _exhaustive;
+      throw new Error(`applyToolEvent: unhandled ${(event as { type: string }).type}`);
+    }
+  }
+};
+
+type ProgressUIEvent = Extract<
+  UIEvent,
+  {
+    type:
+      | 'provider:waiting:start'
+      | 'provider:waiting:end'
+      | 'compacting:start'
+      | 'compacting:end'
+      | 'checkpoint:create'
+      | 'screen:clear'
+      | 'slash:update'
+      | 'reverse-search:update'
+      | 'reverse-search:close';
+  }
+>;
+const applyProgressEvent = (state: LiveState, event: ProgressUIEvent): ApplyResult => {
+  switch (event.type) {
     case 'provider:waiting:start': {
       // Open the "Awaiting model" indicator. Idempotent on
       // resume / re-emit: the second start within the same step
@@ -1730,6 +1839,32 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       if (state.reverseSearch === null) return { state, permanent: [] };
       return { state: { ...state, reverseSearch: null }, permanent: [] };
 
+    default: {
+      const _exhaustive: never = event;
+      void _exhaustive;
+      throw new Error(`applyProgressEvent: unhandled ${(event as { type: string }).type}`);
+    }
+  }
+};
+
+type NoticesUIEvent = Extract<
+  UIEvent,
+  {
+    type:
+      | 'error'
+      | 'warn'
+      | 'info'
+      | 'operator-bash:done'
+      | 'busy:change'
+      | 'recap:terse'
+      | 'update:available'
+      | 'interrupt'
+      | 'interrupt:exit-arm'
+      | 'interrupt:exit-cancel';
+  }
+>;
+const applyNoticesEvent = (state: LiveState, event: NoticesUIEvent): ApplyResult => {
+  switch (event.type) {
     case 'error':
       return { state, permanent: [{ kind: 'error', message: event.message }] };
 
@@ -1818,6 +1953,253 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
     // `modal:answer`) clears the modal.
     // Producer (modal-manager) is responsible for re-emitting if
     // multiple modals queue up; the reducer never queues itself.
+    default: {
+      const _exhaustive: never = event;
+      void _exhaustive;
+      throw new Error(`applyNoticesEvent: unhandled ${(event as { type: string }).type}`);
+    }
+  }
+};
+
+type AmbientUIEvent = Extract<
+  UIEvent,
+  {
+    type:
+      | 'todo:update'
+      | 'bg:start'
+      | 'bg:end'
+      | 'bg:update'
+      | 'reminders:update'
+      | 'mesh:awaiting';
+  }
+>;
+const applyAmbientEvent = (state: LiveState, event: AmbientUIEvent): ApplyResult => {
+  switch (event.type) {
+    case 'todo:update':
+      // Full-replace per spec §7.4. Producer (TodoStore.set wrapper)
+      // already deep-clones via get(), but the reducer copies the
+      // outer array anyway — without the spread, two LiveStates
+      // produced from the same event (e.g. headless NDJSON replay,
+      // tests applying the same event twice) would alias the same
+      // array, and mutation in one would leak into the other. Inner
+      // items remain shared by reference; the renderer treats them
+      // read-only and we don't expose a mutation API.
+      return { state: { ...state, todos: [...event.items] }, permanent: [] };
+
+    case 'bg:start': {
+      // Insert into the live map. Duplicate processId from a
+      // misbehaving producer overwrites silently — Map.set is the
+      // natural semantic and the renderer's count stays correct.
+      const next = new Map(state.bgProcesses);
+      next.set(event.processId, { processId: event.processId, command: event.command });
+      return { state: { ...state, bgProcesses: next }, permanent: [] };
+    }
+
+    case 'bg:end': {
+      // Remove from the live map. Unknown processId is a no-op —
+      // out-of-order events (end without prior start) shouldn't
+      // crash, and the count stays correct without the entry.
+      if (!state.bgProcesses.has(event.processId)) return { state, permanent: [] };
+      const next = new Map(state.bgProcesses);
+      next.delete(event.processId);
+      return { state: { ...state, bgProcesses: next }, permanent: [] };
+    }
+
+    case 'bg:update':
+      // Free-form status string with no producer today. Reserved for
+      // a future "process tray" panel that surfaces per-process
+      // status changes without flapping the counter.
+      return { state, permanent: [] };
+
+    case 'reminders:update':
+      // Absolute pending count from the ReminderScheduler (§3B.9). Stored
+      // directly — the scheduler is the source of truth, so the reducer
+      // never derives it. No permanent scrollback line: the fire itself
+      // surfaces via the bg_done-style `● [reminder]` wake echo.
+      return { state: { ...state, reminderCount: event.count }, permanent: [] };
+
+    case 'mesh:awaiting':
+      // Passive owed-reply count (MESH.md §6.4). The REPL's awaitingReply set is the
+      // source of truth; the reducer just mirrors it for the footer chip. No
+      // permanent line — the ● [reply pending] nudge wake carries the narration.
+      return { state: { ...state, awaitingReplyCount: event.count }, permanent: [] };
+
+    default: {
+      const _exhaustive: never = event;
+      void _exhaustive;
+      throw new Error(`applyAmbientEvent: unhandled ${(event as { type: string }).type}`);
+    }
+  }
+};
+
+type SubagentUIEvent = Extract<
+  UIEvent,
+  { type: 'subagent:start' | 'subagent:update' | 'subagent:end' | 'parallel:status' }
+>;
+const applySubagentEvent = (state: LiveState, event: SubagentUIEvent): ApplyResult => {
+  switch (event.type) {
+    case 'subagent:start': {
+      // Insert a fresh row keyed by subagentId. Duplicate starts
+      // (defensive — producer is single-shot) overwrite the
+      // existing entry rather than no-oping; the new producer is
+      // the source of truth for any field the renderer reads.
+      const next = new Map(state.subagents);
+      // `name` and `goal` are model/child-authored — `goal` is the raw
+      // seed prompt verbatim — and the renderer paints them into the LIVE
+      // region every heartbeat tick (`name` and the `goal` slice share the
+      // row head, line 1). Now that `liveRegionActive`
+      // stays true for the whole subagent run, a raw ESC/BEL/CR would ring
+      // the bell, forge SGR, or move the cursor on every redraw. Sanitize at
+      // this STATE boundary — same chokepoint the sibling `currentTool`
+      // (harness-adapter) and the `read_file` path already use — so every
+      // downstream read (live row, end-block summary) sees clean text.
+      next.set(event.subagentId, {
+        subagentId: event.subagentId,
+        name: sanitizeOneLineForDisplay(event.name),
+        goal: sanitizeOneLineForDisplay(event.goal),
+        progress: '',
+        startedAt: event.ts,
+        liveCostUsd: 0,
+        currentTool: '',
+        toolCounts: new Map(),
+        toolTotal: 0,
+      });
+      return { state: { ...state, subagents: next }, permanent: [] };
+    }
+
+    case 'subagent:update': {
+      // Out-of-order updates (event arrives before the matching
+      // start; or after the end already removed the entry) are
+      // silently dropped. The renderer relies on the entry
+      // existing; instead of synthesizing a half-formed row, we
+      // wait for the producer's next start. This matches the
+      // bg:* reducer's same-shape policy.
+      const existing = state.subagents.get(event.subagentId);
+      if (existing === undefined) return { state, permanent: [] };
+      const next = new Map(state.subagents);
+      // `cumulativeCostUsd` is optional on subagent:update — only
+      // populated when the adapter routed a `cost_update` inner
+      // event. Other progress events leave it undefined, which
+      // means "no change" — preserves the existing value rather
+      // than zeroing it. Monotonic at the source (handle-store
+      // enforces) so we don't need a max() guard.
+      const liveCostUsd = event.cumulativeCostUsd ?? existing.liveCostUsd;
+      // `currentTool` (line 2) is set on tool-start and PERSISTS until the
+      // next tool starts — it is NOT cleared on `toolDone`. Clearing it
+      // would blank line 2 during the gap between tools (every model
+      // round-trip), flapping back to the bare `starting…` cue on
+      // each tool finish. Keeping the last tool shown (with the spinner
+      // still conveying "active") reads as the subagent's most recent
+      // action instead. `toolDone` only feeds the per-type aggregate.
+      const currentTool = event.currentTool ?? existing.currentTool;
+      let toolCounts = existing.toolCounts;
+      let toolTotal = existing.toolTotal;
+      if (event.toolDone !== undefined) {
+        toolCounts = new Map(existing.toolCounts);
+        toolCounts.set(event.toolDone, (toolCounts.get(event.toolDone) ?? 0) + 1);
+        toolTotal = existing.toolTotal + 1;
+      }
+      next.set(event.subagentId, {
+        ...existing,
+        progress: event.progress,
+        liveCostUsd,
+        currentTool,
+        toolCounts,
+        toolTotal,
+      });
+      return { state: { ...state, subagents: next }, permanent: [] };
+    }
+
+    case 'subagent:end': {
+      // Drop the live row + emit a one-line scrollback summary so
+      // the operator sees the run's terminal verdict even after
+      // the live region recycles. Same shape as bg:end / tool
+      // finalize: the live region collapses, the permanent line
+      // captures the outcome.
+      const existing = state.subagents.get(event.subagentId);
+      const next = new Map(state.subagents);
+      next.delete(event.subagentId);
+      const permanent: PermanentItem[] =
+        existing === undefined
+          ? []
+          : [
+              {
+                kind: 'subagent_summary',
+                ts: event.ts,
+                subagentId: event.subagentId,
+                name: existing.name,
+                status: event.status,
+                ...(event.reason !== undefined ? { reason: event.reason } : {}),
+                costUsd: event.costUsd,
+                summary: event.summary,
+                durationMs: event.durationMs,
+                // Freeze the accumulated per-type counts for the grouped
+                // scrollback trail (sorted desc by count, then name for a
+                // stable tie-break).
+                toolCounts: [...existing.toolCounts.entries()].sort(
+                  (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
+                ),
+                toolTotal: existing.toolTotal,
+              },
+            ];
+      return { state: { ...state, subagents: next }, permanent };
+    }
+
+    case 'parallel:status': {
+      // Snapshot the latest figures for the footer's
+      // `subagents R+Q/cap` and `tools R/cap` chips. The
+      // event arrives every time the harness's running /
+      // queued counts shift — we just overwrite the
+      // previous snapshot. No permanent emission: the
+      // footer is the only consumer.
+      return {
+        state: {
+          ...state,
+          parallelStatus: {
+            subagentsRunning: event.subagentsRunning,
+            subagentsQueued: event.subagentsQueued,
+            subagentsCap: event.subagentsCap,
+            toolsRunning: event.toolsRunning,
+            toolsCap: event.toolsCap,
+          },
+        },
+        permanent: [],
+      };
+    }
+
+    default: {
+      const _exhaustive: never = event;
+      void _exhaustive;
+      throw new Error(`applySubagentEvent: unhandled ${(event as { type: string }).type}`);
+    }
+  }
+};
+
+// Modal / permission-ask reducer (permission, trust variants, memory-scope,
+// history-clear, resume-mode). Security-adjacent — the case bodies move
+// verbatim; exhaustiveness is preserved at both switch levels.
+type ModalsUIEvent = Extract<
+  UIEvent,
+  {
+    type:
+      | 'permission:ask'
+      | 'modal:answer'
+      | 'modal:select'
+      | 'modal:queue-depth'
+      | 'clarify:ask'
+      | 'trust:ask'
+      | 'relay-start:ask'
+      | 'shared-trust:ask'
+      | 'mcp-trust:ask'
+      | 'history-clear:ask'
+      | 'resumemode:ask'
+      | 'memory:write:ask'
+      | 'memory:action:ask'
+      | 'memory:user-scope:ask';
+  }
+>;
+const applyModalsEvent = (state: LiveState, event: ModalsUIEvent): ApplyResult => {
+  switch (event.type) {
     case 'permission:ask': {
       // Layout follows design/permission-modal-redesign.md. Three
       // structural pieces:
@@ -2588,183 +2970,107 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       };
     }
 
+    default: {
+      const _exhaustive: never = event;
+      void _exhaustive;
+      throw new Error(`applyModalsEvent: unhandled ${(event as { type: string }).type}`);
+    }
+  }
+};
+
+const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
+  switch (event.type) {
+    case 'mode:change':
+    case 'relay:change':
+    case 'effort:change':
+    case 'stats:refresh':
+      return applyControlEvent(state, event);
+
+    case 'session:start':
+    case 'session:end':
+    case 'session:banner':
+      return applySessionEvent(state, event);
+
+    case 'user:submit':
+    case 'inbox:queued':
+    case 'inbox:drained':
+    case 'inbox:edit-start':
+    case 'inbox:edit-commit':
+    case 'inbox:remove':
+    case 'inbox:edit-cancel':
+    case 'input:update':
+      return applyInputEvent(state, event);
+
+    case 'assistant:start':
+    case 'assistant:delta':
+    case 'assistant:usage':
+    case 'assistant:end':
+      return applyAssistantEvent(state, event);
+
+    case 'thinking:start':
+    case 'thinking:delta':
+    case 'thinking:end':
+      return applyThinkingEvent(state, event);
+
+    case 'tool:start':
+    case 'tool:execution-started':
+    case 'tool:delta':
+    case 'tool:end':
+    case 'step:budget':
+      return applyToolEvent(state, event);
+
+    case 'provider:waiting:start':
+    case 'provider:waiting:end':
+    case 'compacting:start':
+    case 'compacting:end':
+    case 'checkpoint:create':
+    case 'screen:clear':
+    case 'slash:update':
+    case 'reverse-search:update':
+    case 'reverse-search:close':
+      return applyProgressEvent(state, event);
+
+    case 'error':
+    case 'warn':
+    case 'info':
+    case 'operator-bash:done':
+    case 'busy:change':
+    case 'recap:terse':
+    case 'update:available':
+    case 'interrupt':
+    case 'interrupt:exit-arm':
+    case 'interrupt:exit-cancel':
+      return applyNoticesEvent(state, event);
+
+    case 'permission:ask':
+    case 'modal:answer':
+    case 'modal:select':
+    case 'modal:queue-depth':
+    case 'clarify:ask':
+    case 'trust:ask':
+    case 'relay-start:ask':
+    case 'shared-trust:ask':
+    case 'mcp-trust:ask':
+    case 'history-clear:ask':
+    case 'resumemode:ask':
+    case 'memory:write:ask':
+    case 'memory:action:ask':
+    case 'memory:user-scope:ask':
+      return applyModalsEvent(state, event);
+
     case 'todo:update':
-      // Full-replace per spec §7.4. Producer (TodoStore.set wrapper)
-      // already deep-clones via get(), but the reducer copies the
-      // outer array anyway — without the spread, two LiveStates
-      // produced from the same event (e.g. headless NDJSON replay,
-      // tests applying the same event twice) would alias the same
-      // array, and mutation in one would leak into the other. Inner
-      // items remain shared by reference; the renderer treats them
-      // read-only and we don't expose a mutation API.
-      return { state: { ...state, todos: [...event.items] }, permanent: [] };
-
-    case 'bg:start': {
-      // Insert into the live map. Duplicate processId from a
-      // misbehaving producer overwrites silently — Map.set is the
-      // natural semantic and the renderer's count stays correct.
-      const next = new Map(state.bgProcesses);
-      next.set(event.processId, { processId: event.processId, command: event.command });
-      return { state: { ...state, bgProcesses: next }, permanent: [] };
-    }
-
-    case 'bg:end': {
-      // Remove from the live map. Unknown processId is a no-op —
-      // out-of-order events (end without prior start) shouldn't
-      // crash, and the count stays correct without the entry.
-      if (!state.bgProcesses.has(event.processId)) return { state, permanent: [] };
-      const next = new Map(state.bgProcesses);
-      next.delete(event.processId);
-      return { state: { ...state, bgProcesses: next }, permanent: [] };
-    }
-
+    case 'bg:start':
+    case 'bg:end':
     case 'bg:update':
-      // Free-form status string with no producer today. Reserved for
-      // a future "process tray" panel that surfaces per-process
-      // status changes without flapping the counter.
-      return { state, permanent: [] };
-
     case 'reminders:update':
-      // Absolute pending count from the ReminderScheduler (§3B.9). Stored
-      // directly — the scheduler is the source of truth, so the reducer
-      // never derives it. No permanent scrollback line: the fire itself
-      // surfaces via the bg_done-style `● [reminder]` wake echo.
-      return { state: { ...state, reminderCount: event.count }, permanent: [] };
-
     case 'mesh:awaiting':
-      // Passive owed-reply count (MESH.md §6.4). The REPL's awaitingReply set is the
-      // source of truth; the reducer just mirrors it for the footer chip. No
-      // permanent line — the ● [reply pending] nudge wake carries the narration.
-      return { state: { ...state, awaitingReplyCount: event.count }, permanent: [] };
+      return applyAmbientEvent(state, event);
 
-    case 'subagent:start': {
-      // Insert a fresh row keyed by subagentId. Duplicate starts
-      // (defensive — producer is single-shot) overwrite the
-      // existing entry rather than no-oping; the new producer is
-      // the source of truth for any field the renderer reads.
-      const next = new Map(state.subagents);
-      // `name` and `goal` are model/child-authored — `goal` is the raw
-      // seed prompt verbatim — and the renderer paints them into the LIVE
-      // region every heartbeat tick (`name` and the `goal` slice share the
-      // row head, line 1). Now that `liveRegionActive`
-      // stays true for the whole subagent run, a raw ESC/BEL/CR would ring
-      // the bell, forge SGR, or move the cursor on every redraw. Sanitize at
-      // this STATE boundary — same chokepoint the sibling `currentTool`
-      // (harness-adapter) and the `read_file` path already use — so every
-      // downstream read (live row, end-block summary) sees clean text.
-      next.set(event.subagentId, {
-        subagentId: event.subagentId,
-        name: sanitizeOneLineForDisplay(event.name),
-        goal: sanitizeOneLineForDisplay(event.goal),
-        progress: '',
-        startedAt: event.ts,
-        liveCostUsd: 0,
-        currentTool: '',
-        toolCounts: new Map(),
-        toolTotal: 0,
-      });
-      return { state: { ...state, subagents: next }, permanent: [] };
-    }
-
-    case 'subagent:update': {
-      // Out-of-order updates (event arrives before the matching
-      // start; or after the end already removed the entry) are
-      // silently dropped. The renderer relies on the entry
-      // existing; instead of synthesizing a half-formed row, we
-      // wait for the producer's next start. This matches the
-      // bg:* reducer's same-shape policy.
-      const existing = state.subagents.get(event.subagentId);
-      if (existing === undefined) return { state, permanent: [] };
-      const next = new Map(state.subagents);
-      // `cumulativeCostUsd` is optional on subagent:update — only
-      // populated when the adapter routed a `cost_update` inner
-      // event. Other progress events leave it undefined, which
-      // means "no change" — preserves the existing value rather
-      // than zeroing it. Monotonic at the source (handle-store
-      // enforces) so we don't need a max() guard.
-      const liveCostUsd = event.cumulativeCostUsd ?? existing.liveCostUsd;
-      // `currentTool` (line 2) is set on tool-start and PERSISTS until the
-      // next tool starts — it is NOT cleared on `toolDone`. Clearing it
-      // would blank line 2 during the gap between tools (every model
-      // round-trip), flapping back to the bare `starting…` cue on
-      // each tool finish. Keeping the last tool shown (with the spinner
-      // still conveying "active") reads as the subagent's most recent
-      // action instead. `toolDone` only feeds the per-type aggregate.
-      const currentTool = event.currentTool ?? existing.currentTool;
-      let toolCounts = existing.toolCounts;
-      let toolTotal = existing.toolTotal;
-      if (event.toolDone !== undefined) {
-        toolCounts = new Map(existing.toolCounts);
-        toolCounts.set(event.toolDone, (toolCounts.get(event.toolDone) ?? 0) + 1);
-        toolTotal = existing.toolTotal + 1;
-      }
-      next.set(event.subagentId, {
-        ...existing,
-        progress: event.progress,
-        liveCostUsd,
-        currentTool,
-        toolCounts,
-        toolTotal,
-      });
-      return { state: { ...state, subagents: next }, permanent: [] };
-    }
-
-    case 'subagent:end': {
-      // Drop the live row + emit a one-line scrollback summary so
-      // the operator sees the run's terminal verdict even after
-      // the live region recycles. Same shape as bg:end / tool
-      // finalize: the live region collapses, the permanent line
-      // captures the outcome.
-      const existing = state.subagents.get(event.subagentId);
-      const next = new Map(state.subagents);
-      next.delete(event.subagentId);
-      const permanent: PermanentItem[] =
-        existing === undefined
-          ? []
-          : [
-              {
-                kind: 'subagent_summary',
-                ts: event.ts,
-                subagentId: event.subagentId,
-                name: existing.name,
-                status: event.status,
-                ...(event.reason !== undefined ? { reason: event.reason } : {}),
-                costUsd: event.costUsd,
-                summary: event.summary,
-                durationMs: event.durationMs,
-                // Freeze the accumulated per-type counts for the grouped
-                // scrollback trail (sorted desc by count, then name for a
-                // stable tie-break).
-                toolCounts: [...existing.toolCounts.entries()].sort(
-                  (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
-                ),
-                toolTotal: existing.toolTotal,
-              },
-            ];
-      return { state: { ...state, subagents: next }, permanent };
-    }
-
-    case 'parallel:status': {
-      // Snapshot the latest figures for the footer's
-      // `subagents R+Q/cap` and `tools R/cap` chips. The
-      // event arrives every time the harness's running /
-      // queued counts shift — we just overwrite the
-      // previous snapshot. No permanent emission: the
-      // footer is the only consumer.
-      return {
-        state: {
-          ...state,
-          parallelStatus: {
-            subagentsRunning: event.subagentsRunning,
-            subagentsQueued: event.subagentsQueued,
-            subagentsCap: event.subagentsCap,
-            toolsRunning: event.toolsRunning,
-            toolsCap: event.toolsCap,
-          },
-        },
-        permanent: [],
-      };
-    }
+    case 'subagent:start':
+    case 'subagent:update':
+    case 'subagent:end':
+    case 'parallel:status':
+      return applySubagentEvent(state, event);
 
     default: {
       // Exhaustiveness guard: TypeScript marks `event` as `never` here
