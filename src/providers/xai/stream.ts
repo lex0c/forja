@@ -70,10 +70,15 @@ interface ToolCallInProgress {
   // Locked at the first delta for this `index` — the harness's name lookup keys
   // on the id already yielded in tool_use_start, so it must never change.
   id: string;
+  // Accumulated by APPENDING each delta's name fragment until the call starts,
+  // so a name split across deltas (`read_` then `file`) reconstructs to the full
+  // `read_file` rather than being truncated to its first fragment.
   name: string;
   partialArgs: string;
-  // Deferred until a non-empty `name` arrives (Grok can split the name across
-  // deltas); starting with name='' would invoke an unknown tool.
+  // tool_use_start is deferred until the first args fragment arrives (in the
+  // OpenAI streaming shape args always follow the COMPLETE name), or until
+  // finalization for a no-argument call — never on a first name fragment that
+  // may still be partial.
   started: boolean;
 }
 
@@ -180,15 +185,15 @@ export async function* normalizeXaiStream(
             let inProgress = toolCalls.get(tc.index);
             if (inProgress === undefined) {
               const id = tc.id ?? `call_${tc.index}_${crypto.randomUUID()}`;
-              const name = tc.function?.name ?? '';
-              inProgress = { id, name, partialArgs: '', started: false };
+              inProgress = { id, name: '', partialArgs: '', started: false };
               toolCalls.set(tc.index, inProgress);
-            } else if (
-              typeof tc.function?.name === 'string' &&
-              tc.function.name.length > 0 &&
-              inProgress.name.length === 0
-            ) {
-              inProgress.name = tc.function.name;
+            }
+            // Accumulate the (possibly multi-delta) name by APPENDING until the
+            // call starts. Replacing with the first fragment would start an
+            // unknown `read_` tool when the real name `read_file` streams across
+            // two deltas. Locked once started — the name was already emitted.
+            if (!inProgress.started && typeof tc.function?.name === 'string') {
+              inProgress.name += tc.function.name;
             }
 
             const argsChunk = tc.function?.arguments;
@@ -197,16 +202,20 @@ export async function* normalizeXaiStream(
               inProgress.partialArgs += argsChunk;
             }
 
-            if (!inProgress.started && inProgress.name.length > 0) {
+            // Defer tool_use_start until the first args fragment: args always
+            // follow the COMPLETE name in the OpenAI streaming shape, so their
+            // arrival is the signal the name is fully accumulated. Flush whatever
+            // args buffered so far (guaranteed non-empty here) as the first
+            // delta. A no-argument call never reaches this and is started at
+            // finalization instead.
+            if (!inProgress.started && hasArgs && inProgress.name.length > 0) {
               yield { kind: 'tool_use_start', id: inProgress.id, name: inProgress.name };
               inProgress.started = true;
-              if (inProgress.partialArgs.length > 0) {
-                yield {
-                  kind: 'tool_use_delta',
-                  id: inProgress.id,
-                  partial_args: inProgress.partialArgs,
-                };
-              }
+              yield {
+                kind: 'tool_use_delta',
+                id: inProgress.id,
+                partial_args: inProgress.partialArgs,
+              };
             } else if (inProgress.started && hasArgs) {
               yield {
                 kind: 'tool_use_delta',
@@ -227,7 +236,8 @@ export async function* normalizeXaiStream(
     // calls at end-of-stream, ordered by the original tool_call index.
     const sortedTools = Array.from(toolCalls.entries()).sort(([a], [b]) => a - b);
     for (const [, tool] of sortedTools) {
-      if (!tool.started) {
+      // A name never arrived across any delta — the call is uninvocable.
+      if (tool.name.length === 0) {
         yield {
           kind: 'error',
           code: 'xai.tool_use_no_name',
@@ -235,6 +245,12 @@ export async function* normalizeXaiStream(
           retryable: false,
         };
         continue;
+      }
+      // A no-argument call never triggered the args-based start above (start is
+      // deferred until args arrive); emit it now so its stop isn't orphaned.
+      if (!tool.started) {
+        yield { kind: 'tool_use_start', id: tool.id, name: tool.name };
+        tool.started = true;
       }
       let parsed: Record<string, unknown> = {};
       if (tool.partialArgs.length > 0) {

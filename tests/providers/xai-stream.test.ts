@@ -124,6 +124,70 @@ describe('normalizeXaiStream', () => {
     expect(events.some((e) => e.kind === 'tool_use_stop')).toBe(false);
   });
 
+  test('a tool name split across deltas is accumulated to the full name before start', async () => {
+    const events = await collectNonUsage(
+      normalizeXaiStream(
+        fromChunks([
+          {
+            id: 'c',
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    { index: 0, id: 'call_1', type: 'function', function: { name: 'read_' } },
+                  ],
+                },
+              },
+            ],
+          },
+          { choices: [{ delta: { tool_calls: [{ index: 0, function: { name: 'file' } }] } }] },
+          {
+            choices: [
+              { delta: { tool_calls: [{ index: 0, function: { arguments: '{"path":"a.ts"}' } }] } },
+            ],
+          },
+          { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+        ]),
+      ),
+    );
+    // Name is 'read_file' (accumulated), NOT the first fragment 'read_'.
+    expect(events).toEqual([
+      { kind: 'start', message_id: 'c' },
+      { kind: 'tool_use_start', id: 'call_1', name: 'read_file' },
+      { kind: 'tool_use_delta', id: 'call_1', partial_args: '{"path":"a.ts"}' },
+      { kind: 'tool_use_stop', id: 'call_1', final_args: { path: 'a.ts' } },
+      { kind: 'stop', reason: 'tool_use' },
+    ]);
+  });
+
+  test('a no-argument tool call starts (deferred to finalization) and stops with empty args', async () => {
+    const events = await collectNonUsage(
+      normalizeXaiStream(
+        fromChunks([
+          {
+            id: 'c',
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    { index: 0, id: 'call_1', type: 'function', function: { name: 'list_files' } },
+                  ],
+                },
+              },
+            ],
+          },
+          { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+        ]),
+      ),
+    );
+    expect(events).toEqual([
+      { kind: 'start', message_id: 'c' },
+      { kind: 'tool_use_start', id: 'call_1', name: 'list_files' },
+      { kind: 'tool_use_stop', id: 'call_1', final_args: {} },
+      { kind: 'stop', reason: 'tool_use' },
+    ]);
+  });
+
   test('usage: prompt includes cached; input = prompt - cached; cache_creation is 0', async () => {
     const events = await collect(
       normalizeXaiStream(

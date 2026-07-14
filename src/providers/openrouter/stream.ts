@@ -57,8 +57,14 @@ export interface RawORChunk {
 
 interface ToolCallInProgress {
   id: string;
+  // Accumulated by APPENDING each delta's name fragment until the call starts,
+  // so a name split across deltas (`read_` then `file`) reconstructs the full
+  // name instead of being truncated to its first fragment. Locked once started.
   name: string;
   partialArgs: string;
+  // tool_use_start is deferred until the first args fragment arrives (args
+  // always follow the complete name in the OpenAI-shape stream) or until
+  // finalization for a no-argument call — never on a partial first name.
   started: boolean;
 }
 
@@ -200,31 +206,29 @@ export async function* normalizeOpenRouterStream(
             let inProgress = toolCalls.get(tc.index);
             if (inProgress === undefined) {
               const id = tc.id ?? `call_${tc.index}_${crypto.randomUUID()}`;
-              const name = tc.function?.name ?? '';
-              inProgress = { id, name, partialArgs: '', started: false };
+              inProgress = { id, name: '', partialArgs: '', started: false };
               toolCalls.set(tc.index, inProgress);
-            } else if (
-              typeof tc.function?.name === 'string' &&
-              tc.function.name.length > 0 &&
-              inProgress.name.length === 0
-            ) {
-              inProgress.name = tc.function.name;
+            }
+            // Append the (possibly multi-delta) name until the call starts —
+            // replacing with the first fragment would truncate a split name.
+            if (!inProgress.started && typeof tc.function?.name === 'string') {
+              inProgress.name += tc.function.name;
             }
 
             const argsChunk = tc.function?.arguments;
             const hasArgs = typeof argsChunk === 'string' && argsChunk.length > 0;
             if (hasArgs) inProgress.partialArgs += argsChunk;
 
-            if (!inProgress.started && inProgress.name.length > 0) {
+            // Defer start until args begin (args follow the complete name), then
+            // flush the buffered args; a no-argument call starts at finalization.
+            if (!inProgress.started && hasArgs && inProgress.name.length > 0) {
               yield { kind: 'tool_use_start', id: inProgress.id, name: inProgress.name };
               inProgress.started = true;
-              if (inProgress.partialArgs.length > 0) {
-                yield {
-                  kind: 'tool_use_delta',
-                  id: inProgress.id,
-                  partial_args: inProgress.partialArgs,
-                };
-              }
+              yield {
+                kind: 'tool_use_delta',
+                id: inProgress.id,
+                partial_args: inProgress.partialArgs,
+              };
             } else if (inProgress.started && hasArgs) {
               yield { kind: 'tool_use_delta', id: inProgress.id, partial_args: argsChunk };
             }
@@ -263,7 +267,7 @@ export async function* normalizeOpenRouterStream(
 
     const sortedTools = Array.from(toolCalls.entries()).sort(([a], [b]) => a - b);
     for (const [, tool] of sortedTools) {
-      if (!tool.started) {
+      if (tool.name.length === 0) {
         yield {
           kind: 'error',
           code: 'openrouter.tool_use_no_name',
@@ -271,6 +275,11 @@ export async function* normalizeOpenRouterStream(
           retryable: false,
         };
         continue;
+      }
+      // A no-argument call never triggered the args-based start — emit it now.
+      if (!tool.started) {
+        yield { kind: 'tool_use_start', id: tool.id, name: tool.name };
+        tool.started = true;
       }
       let parsed: Record<string, unknown> = {};
       if (tool.partialArgs.length > 0) {
