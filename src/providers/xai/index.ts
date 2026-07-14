@@ -29,6 +29,15 @@ import { normalizeXaiStream, type RawXaiChunk } from './stream.ts';
 // levers behind a custom baseURL, neither of which fits Grok.
 export const DEFAULT_XAI_BASE_URL = 'https://api.x.ai/v1';
 
+// Trailing-slash-insensitive normalization for the base-URL comparison (no
+// regex, per the project's config-surface convention): `https://api.x.ai/v1`
+// and `https://api.x.ai/v1/` must both read as the canonical endpoint.
+const stripTrailingSlashes = (s: string): string => {
+  let end = s.length;
+  while (end > 0 && s.charCodeAt(end - 1) === 47 /* '/' */) end--;
+  return s.slice(0, end);
+};
+
 export interface CreateXaiProviderOptions {
   apiKey?: string;
   // xAI endpoint; overridable for a proxy. Falls back to the canonical base URL
@@ -99,10 +108,16 @@ export const createXaiProvider = (
   // (system + tools) via the shared openaiPromptCacheKey — the same derivation the
   // OpenAI adapter routes on — so every turn of a session, and any session with
   // the same prefix, routes together (system/tools don't change within a session).
-  // Only on the real api.x.ai path: a custom `base_url` (proxy) has its own
-  // routing and the header is meaningless there. `client`-injected callers (tests)
-  // pass no baseURL, so the header is still emitted and observable.
-  const sendConvId = options.baseURL === undefined;
+  // Send it on the real api.x.ai endpoint: baseURL unset (the default) OR an
+  // operator who explicitly pinned the CANONICAL url in the catalog — that is
+  // the same native client, so it must keep sticky routing. Suppress only for a
+  // genuinely different proxy `base_url`, which has its own routing. Trailing
+  // slashes are normalized so `.../v1` and `.../v1/` both count as canonical.
+  // `client`-injected callers (tests) pass no baseURL, so the header stays
+  // observable.
+  const sendConvId =
+    options.baseURL === undefined ||
+    stripTrailingSlashes(options.baseURL) === stripTrailingSlashes(DEFAULT_XAI_BASE_URL);
   const convIdOptions = (req: GenerateRequest): { headers: Record<string, string> } | undefined =>
     sendConvId ? { headers: { 'x-grok-conv-id': openaiPromptCacheKey(req) } } : undefined;
 

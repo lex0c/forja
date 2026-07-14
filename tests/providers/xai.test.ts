@@ -316,6 +316,28 @@ describe('createXaiProvider', () => {
     expect(options).toBeUndefined();
   });
 
+  test('x-grok-conv-id IS sent when base_url is the canonical api.x.ai (trailing slash ignored)', async () => {
+    const headerFor = async (baseURL: string): Promise<unknown> => {
+      let options: Body | undefined;
+      const p = createXaiProvider('grok-4.5', {
+        baseURL,
+        client: makeClient({
+          chunks: textChunks,
+          onOptions: (o) => {
+            options = o;
+          },
+        }),
+      });
+      await collect(
+        p.generate(reqGen({ system: 's', messages: [{ role: 'user', content: 'x' }] })),
+      );
+      return options?.headers?.['x-grok-conv-id'];
+    };
+    // Pinning the real endpoint in the catalog must NOT lose sticky cache routing.
+    expect(typeof (await headerFor('https://api.x.ai/v1'))).toBe('string');
+    expect(typeof (await headerFor('https://api.x.ai/v1/'))).toBe('string');
+  });
+
   test('generateConstrained forces a schema tool and returns output + usage', async () => {
     let body: Body = {};
     const p = createXaiProvider('grok-4.5', {
